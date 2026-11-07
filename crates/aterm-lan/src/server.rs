@@ -12,13 +12,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use aterm_keeper::identity::CheckError;
 use aterm_uds::CtlStream;
 use aterm_uds::lan::wire::{self, Frame, Reader, Request, Target};
 use aterm_uds::lan::{ConnectOptions, UdpOptions, here};
 
 use crate::bonjour::{self, Bonjour};
 
-/// The most connections served at once: one more is told the broker is busy and closed.
+/// The most connections served at once: one more is told the broker is busy
+/// ([`Frame::Unchecked`]) and closed.
 pub(crate) const MAX_LIVE: usize = 128;
 
 /// How long a client may take to send its hello and request once admitted.
@@ -98,22 +100,34 @@ impl Admission {
         }
     }
 
-    /// Whether the peer on `stream` is admitted.
-    fn check(&self, stream: &CtlStream) -> Result<(), String> {
+    /// Whether the peer on `stream` is admitted: a refusal of its uid or code, or a check that
+    /// could not run or finish, which judged nothing.
+    fn check(&self, stream: &CtlStream) -> Result<(), CheckError> {
         match self {
             Self::SameUid => match aterm_uds::peer::peer_uid(stream) {
                 Some(uid) if uid == aterm_uds::peer::our_uid() => Ok(()),
-                Some(uid) => Err(format!("peer uid {uid} is not ours")),
-                None => Err("the kernel did not name the peer's uid".to_owned()),
+                Some(uid) => Err(CheckError::Refused(format!("peer uid {uid} is not ours"))),
+                None => Err(CheckError::Unchecked(
+                    "the kernel did not name the peer's uid".to_owned(),
+                )),
             },
-            Self::Code(identity) => identity
-                .check_named(
-                    stream,
-                    aterm_uds::peer::peer_audit_token(stream),
-                    aterm_keeper::identity::PEER_CHECK_HANG,
-                )
-                .map_err(|why| why.to_string()),
+            Self::Code(identity) => identity.check_named(
+                stream,
+                aterm_uds::peer::peer_audit_token(stream),
+                aterm_keeper::identity::PEER_CHECK_HANG,
+            ),
         }
+    }
+}
+
+/// What a peer the broker did not admit is told instead of its hello: [`Frame::Refused`] for a
+/// uid or code it judged and will not serve, which stands until its socket is made again, and
+/// [`Frame::Unchecked`] for a check that could not run or did not finish (`trustd` did not
+/// answer), after which the client asks again.
+pub(crate) fn not_admitted(why: CheckError) -> Frame {
+    match why {
+        CheckError::Refused(words) => Frame::Refused { words },
+        CheckError::Unchecked(words) | CheckError::Unanswered(words) => Frame::Unchecked { words },
     }
 }
 
@@ -296,7 +310,7 @@ impl Server {
                 self.shared.live.fetch_sub(1, Ordering::AcqRel);
                 let _ = wire::send(
                     &stream,
-                    &Frame::Refused {
+                    &Frame::Unchecked {
                         words: format!("the LAN broker is serving {MAX_LIVE} connections"),
                     },
                 );
@@ -324,8 +338,13 @@ impl Server {
 pub(crate) fn connection(shared: &Shared, stream: &CtlStream) {
     let pid = aterm_uds::fdpass::peer_pid(stream).unwrap_or(0);
     if let Err(why) = shared.admission.check(stream) {
-        (shared.log)(format_args!("refused pid {pid}: {why}"));
-        let _ = wire::send(stream, &Frame::Refused { words: why });
+        let judged = if matches!(why, CheckError::Refused(_)) {
+            "refused"
+        } else {
+            "could not check"
+        };
+        (shared.log)(format_args!("{judged} pid {pid}: {why}"));
+        let _ = wire::send(stream, &not_admitted(why));
         return;
     }
     let hello = Frame::Hello {

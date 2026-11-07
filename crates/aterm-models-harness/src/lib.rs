@@ -208,6 +208,8 @@ mod models_receipt_acknowledgement;
 pub use models_receipt_acknowledgement::receipt_acknowledgement_model;
 mod models_receipt_creation;
 pub use models_receipt_creation::receipt_creation_model;
+mod models_receipt_index;
+pub use models_receipt_index::receipt_index_model;
 mod models_renewal_completion_publication;
 pub use models_renewal_completion_publication::renewal_completion_publication_model;
 mod models_renewal_root_recovery;

@@ -309,8 +309,8 @@ pub fn probe_cached(path_var: Option<&OsStr>, host: &CcHost, cache: Option<&CcCa
 /// now ([`crate::probe_cache::identity`]), the active developer directory (`DEVELOPER_DIR`,
 /// else `xcode-select`'s link, else Xcode or the standalone tools), the identity of its `clang`,
 /// the Command Line Tools receipt's time, the SDK a build would fall back to and the `PATH`
-/// the build sees, its minimum macOS deployment target, and whether project configuration is
-/// inherited. `None` when the compiler cannot
+/// the build sees, its minimum macOS deployment target, and the inherited environment's digest
+/// when project configuration is inherited. `None` when the compiler cannot
 /// be read or an explicit SDK is used:
 /// changes within that SDK have no Apple install receipt to retire a cached success.
 /// The fresh-output policy domain retires verdicts made by weaker output checks.
@@ -349,7 +349,7 @@ fn cc_key(
             .unwrap_or_default()
     }
     crate::probe_cache::key([
-        Some("fresh-executable-link-v3".to_owned()),
+        Some("fresh-executable-link-v4".to_owned()),
         Some(kind.to_owned()),
         crate::probe_cache::identity(cc),
         Some(developer_dir.display().to_string()),
@@ -359,7 +359,28 @@ fn cc_key(
         Some(lossy(path_var)),
         Some(lossy(host.deployment_target())),
         Some(host.inherit_environment.to_string()),
+        compiler_environment_key(host.inherit_environment),
     ])
+}
+
+/// Include arbitrary compiler configuration without persisting environment names or values.
+/// Native byte lengths delimit each name and value; sorting names removes enumeration order.
+fn compiler_environment_key(inherit: bool) -> Option<String> {
+    if !inherit {
+        return Some("isolated".to_owned());
+    }
+    let mut environment: Vec<_> = std::env::vars_os().collect();
+    environment.sort_by_key(|(name, _)| name.clone());
+    let mut digest = aterm_digest::Sha256::new();
+    digest.update(b"aterm-cc-environment-v1");
+    for (name, value) in environment {
+        for part in [&name, &value] {
+            let bytes = part.as_os_str().as_encoded_bytes();
+            digest.update(u64::try_from(bytes.len()).ok()?.to_le_bytes());
+            digest.update(bytes);
+        }
+    }
+    Some(aterm_codec::hex::encode_lower(&digest.finalize()))
 }
 
 /// [`probe`] over an injected host.
@@ -1242,6 +1263,79 @@ mod tests {
         assert_eq!(probe_cached(path, &host, None), ready);
         assert_eq!(runs(), 6, "no cache: the compiler is asked");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_changed_inherited_environment_retires_a_cached_compiler_fact() {
+        const CHILD: &str = "ATERM_CC_CACHE_ENVIRONMENT_CHILD";
+        const PRIVATE_VALUE: &str = "private environment fixture\nvalue-c1b4d6";
+        if let Some(root) = std::env::var_os(CHILD).map(PathBuf::from) {
+            let bin = root.join("bin");
+            let cache = CcCache {
+                file: root.join("state/cc"),
+                receipt: root.join("no-receipt"),
+            };
+            let verdict = probe_cached(Some(bin.as_os_str()), &plain_host(&root), Some(&cache));
+            let result = match verdict {
+                CcVerdict::Ready { .. } => "ready",
+                CcVerdict::Broken { why, .. } if why == "project headers refused" => "refused",
+                other => panic!("unexpected compiler verdict: {other:?}"),
+            };
+            std::fs::write(root.join("result"), result).unwrap();
+            return;
+        }
+        let root = scratch("changed-compiler-environment");
+        let bin = root.join("bin");
+        let asked = root.join("asked");
+        script(
+            &bin.join("cc"),
+            &format!(
+                "echo asked >> '{}'\n[ \"$1\" = --version ] && {{ echo cc; exit 0; }}\nif [ -n \"$CPATH\" ]; then echo 'project headers refused' >&2; exit 1; fi\nprintf x > \"$2\"\n/bin/chmod +x \"$2\"",
+                asked.display()
+            ),
+        );
+        for (cpath, expected, calls) in [
+            (None, "ready", 2),
+            (Some("project compiler configuration"), "refused", 4),
+            (None, "ready", 4),
+        ] {
+            let result = root.join("result");
+            let _ = std::fs::remove_file(&result);
+            let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+            cmd.args([
+                "--exact",
+                "prereq::tests::a_changed_inherited_environment_retires_a_cached_compiler_fact",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env(CHILD, root.as_path())
+            .env("ATPKG_PROBE_ENV_FIXTURE", PRIVATE_VALUE)
+            .env_remove("CPATH");
+            if let Some(cpath) = cpath {
+                cmd.env("CPATH", cpath);
+            }
+            let output = aterm_uds::deadline::output_until(
+                &mut cmd,
+                std::time::Instant::now() + Duration::from_secs(60),
+            )
+            .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(std::fs::read_to_string(&result).unwrap(), expected);
+            assert_eq!(
+                std::fs::read_to_string(&asked).unwrap().lines().count(),
+                calls
+            );
+        }
+        assert!(
+            !std::fs::read_to_string(root.join("state/cc"))
+                .unwrap()
+                .contains(PRIVATE_VALUE)
+        );
     }
 
     #[test]

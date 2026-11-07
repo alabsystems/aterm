@@ -33,6 +33,12 @@ use std::collections::BTreeSet;
 /// (§6.2).
 pub const WANT_WINDOW_SECS: u64 = 72 * 3600;
 
+/// How long a posted request may go with no custodian record before this Mac reads the
+/// custodian as silent on it ([`silent`]): the want window and a day more, since a custodian's
+/// window runs from when its own replica took the request in, and its decision takes a pass and
+/// a sync to come back.
+pub const SILENCE_SECS: u64 = WANT_WINDOW_SECS + 86_400;
+
 /// A requester's silence that lets a custodian retire its request (`lapsed`, §6.2).
 pub const LAPSE_SECS: u64 = 30 * 86_400;
 
@@ -234,13 +240,58 @@ pub struct Proof {
     /// Every member that may contribute swept the request and none holds it (the custodian's
     /// decision, step 3).
     pub swept_unheld: bool,
+    /// The want window ended before every member answered, and none that answered holds it
+    /// (the custodian's decision at the window's end, §6.2); the ask names who did not answer.
+    pub window_ended: bool,
+    /// It was made once [`SILENCE_SECS`] passed with no custodian record on the posted request
+    /// and no offer, so this Mac stood in for the silent custodian ([`silent`]).
+    pub custodian_silent: bool,
 }
 
 impl Proof {
     /// Whether asking a person on it was warranted: nothing holds it that a Mac could give.
     #[must_use]
     pub const fn warrants_asking(&self) -> bool {
-        self.absent && ((self.before_commons && self.every_locker_open) || self.swept_unheld)
+        self.absent
+            && (self.swept_unheld
+                || self.window_ended
+                || (self.every_locker_open && (self.before_commons || self.custodian_silent)))
+    }
+}
+
+/// The most members a custodian's window decision names; past that it counts them.
+pub const MAX_UNANSWERED: usize = 16;
+
+/// The members a custodian's decision at the want window's end names as not having answered
+/// the request (§6.2): no sweep and no offer on it. Empty when every member swept.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Unanswered {
+    /// Their vault host names, at most [`MAX_UNANSWERED`], in name order.
+    pub hosts: Vec<String>,
+    /// How many more did not answer: past that cap, or a member no `[machines]` row names.
+    pub others: u64,
+}
+
+impl Unanswered {
+    /// Every member answered.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.hosts.is_empty() && self.others == 0
+    }
+
+    /// Who did not answer, for a line: "m3", "m3 and m4", "m3 and 2 other Macs", "2 Macs".
+    fn words(&self) -> String {
+        let macs = |n: u64| if n == 1 { "Mac" } else { "Macs" };
+        let mut names = self.hosts.clone();
+        if self.others > 0 {
+            let other = if names.is_empty() { "" } else { "other " };
+            names.push(format!("{} {other}{}", self.others, macs(self.others)));
+        }
+        match names.split_last() {
+            Some((last, [])) => last.clone(),
+            Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+            None => String::new(),
+        }
     }
 }
 
@@ -299,6 +350,11 @@ pub struct Need {
     pub raised_again_on_change: Option<bool>,
     /// Posted to Commons (the model's `posted`, step 2).
     pub posted: bool,
+    /// [`SILENCE_SECS`] passed with no custodian record on the posted request ([`silent`]).
+    pub custodian_silent: bool,
+    /// A Mac that holds it offered it while a person was asked, and the ask names that copy
+    /// ([`Decision::Offered`]).
+    pub late_offer: bool,
     /// The posted request's operation digest in `credentials/requests/1`. A second flush
     /// repeats the same command under the same retry identity, so the table returns this
     /// receipt rather than a second request.
@@ -521,9 +577,28 @@ fn local_line(want: &Want, facts: &Facts, refused: Option<u64>) -> String {
     line
 }
 
+/// What the lab had heard on a request when its person is asked, which the ask's words rest on.
+#[derive(Debug, Clone, Copy)]
+enum Heard<'a> {
+    /// No Mac the lab can reach holds it: every member swept and none offered, or none could
+    /// be asked.
+    Nothing,
+    /// The want window ended before these members answered, and none that answered holds it.
+    Unanswered(&'a Unanswered),
+    /// A Mac that holds it offered it once the person was asked; the members the window's end
+    /// named as not having answered, one of which it is unless it joined since.
+    Offered(&'a Unanswered),
+}
+
 /// What a person is asked for a vault-only want the absence proof shows no Mac holds.
 #[must_use]
 pub fn ask_for(want: &Want, purpose: Purpose, host: &str) -> Option<Ask> {
+    ask_on(want, purpose, host, Heard::Nothing)
+}
+
+/// [`ask_for`], in words that rest on what the lab heard. A Mac that did not answer, or one that
+/// offered, may hold a copy, which saves making a new value, so that comes first.
+fn ask_on(want: &Want, purpose: Purpose, host: &str, heard: Heard<'_>) -> Option<Ask> {
     let entry = want.entry()?;
     let quoted = if entry.starts_with("~/") {
         format!("'{entry}'")
@@ -575,25 +650,90 @@ pub fn ask_for(want: &Want, purpose: Purpose, host: &str) -> Option<Ask> {
     .into_iter()
     .find(|step| fits(step, aterm_messages::need::STEP_CAP))
     .unwrap_or_default();
+    let hours = WANT_WINDOW_SECS / 3600;
+    let copy = want
+        .hold_path(std::path::Path::new("~"))
+        .map_or_else(|| entry.clone(), |path| path.display().to_string());
+    let (on, reasons, first) = match heard {
+        Heard::Nothing => (
+            "is on no Mac the lab can reach".to_owned(),
+            vec!["no Mac the lab can reach holds it".to_owned()],
+            None,
+        ),
+        // A Mac that did not answer may run a build with no sweep, so the words promise no
+        // offer: its copy, where it holds one, is the hand route's file.
+        Heard::Unanswered(unanswered) => {
+            let whom = unanswered.words();
+            (
+                format!("is on no Mac that answered in {hours} hours, and {whom} did not answer"),
+                vec![
+                    format!(
+                        "no Mac that answered in {hours} hours holds it, and {whom} did not answer"
+                    ),
+                    format!("no Mac that answered in {hours} hours holds it"),
+                ],
+                Some(format!(
+                    "{whom} did not answer: where one holds {copy}, that copy is the <file> the step takes, so no new one is made"
+                )),
+            )
+        }
+        // The custodian's runtime takes an offered copy over the LAN and publishes it, which
+        // takes the ask down (§8.2); until it does, that copy is the hand route's file.
+        Heard::Offered(unanswered) => {
+            let which = if unanswered.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " ({} had not answered when the window ended)",
+                    unanswered.words()
+                )
+            };
+            (
+                format!(
+                    "is on a Mac that offered it{which}, whose copy the vault custodian's running aterm takes over the authenticated LAN connection (until it does, that Mac's {copy} is the <file>)"
+                ),
+                vec![
+                    "a Mac offered it after a person was asked, and its copy has not reached the vault"
+                        .to_owned(),
+                    "a Mac's offered copy has not reached the vault".to_owned(),
+                ],
+                Some(format!(
+                    "a Mac that holds {} offered it after a person was asked{which}: the custodian's runtime takes the copy on its next authenticated LAN round with that Mac, and until then its {copy} is the file the admin's step takes, so no new one is made",
+                    want.title()
+                )),
+            )
+        }
+    };
+    let reason = reasons
+        .into_iter()
+        .find(|reason| fits(reason, aterm_messages::need::REASON_CAP))
+        .unwrap_or_default();
     let mut needs_you = format!(
-        "NEEDS YOU: {}{consumer} is on no Mac the lab can reach: on the vault's admin Mac run {route}",
+        "NEEDS YOU: {}{consumer} {on}: on the vault's admin Mac run {route}",
         want.title()
     );
     if let Some(extra) = &extra {
         needs_you.push_str(&format!(", {extra}"));
     }
-    let mut more = vec![format!("on the vault's admin Mac: {route}")];
-    if let Some(extra) = extra {
-        more.push(extra);
-    }
+    // A fact for later keeps three detail lines, so a mailbox's TOTP rides on the route's.
+    let mut more: Vec<String> = first.into_iter().collect();
+    more.push(match &extra {
+        Some(extra) => format!("on the vault's admin Mac: {route}, {extra}"),
+        None => format!("on the vault's admin Mac: {route}"),
+    });
     more.push(format!("it comes from: {}", want.source()));
     Some(Ask {
         what,
         step,
-        reason: "no Mac the lab can reach holds it".to_owned(),
+        reason,
         more,
         needs_you,
     })
+}
+
+/// Whether a member's sweep can offer `want`: its hold probe names a path.
+fn offerable(want: &Want) -> bool {
+    want.hold_path(std::path::Path::new("~")).is_some()
 }
 
 fn capitalized(words: &str) -> String {
@@ -697,6 +837,8 @@ pub fn fresh(id: [u8; 16], want: Want, purpose: Purpose, facts: &Facts) -> Need 
         got_authorized: false,
         raised_again_on_change: None,
         posted: false,
+        custodian_silent: false,
+        late_offer: false,
         record: None,
     }
 }
@@ -871,6 +1013,8 @@ pub fn act(need: &Need, facts: &Facts, act: &Act) -> Option<Need> {
                     every_locker_open: !sight.hidden,
                     before_commons: !facts.writer(),
                     swept_unheld: false,
+                    window_ended: false,
+                    custodian_silent: false,
                 }),
                 line: ask.needs_you.clone(),
                 ask: Some(ask),
@@ -1012,6 +1156,8 @@ pub fn act(need: &Need, facts: &Facts, act: &Act) -> Option<Need> {
                     got: false,
                     got_authorized: false,
                     posted: false,
+                    custodian_silent: false,
+                    late_offer: false,
                     record: None,
                     line: local_line(&need.want, facts, need.refused),
                     seq: facts.sight.as_ref().map(|sight| sight.seq),
@@ -1060,16 +1206,19 @@ pub fn act(need: &Need, facts: &Facts, act: &Act) -> Option<Need> {
 /// evidence checked (`aterm_db::credentials` holds the checks, §6.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
-    /// A Mac that holds it offered it: the custodian takes the offer (§8.2).
-    Offered,
+    /// A Mac that holds it offered it: the custodian takes the offer (§8.2). On a request
+    /// already awaiting a person, the ask names that copy until the custodian's runtime
+    /// publishes it, and who the window's end named as not having answered (empty where it
+    /// named nobody).
+    Offered(Unanswered),
     /// The custodian copied it into this Mac's own host section at vault `seq` (§8.1).
     Published {
         /// The vault version that carries it.
         seq: u64,
     },
-    /// Every Mac allowed to give it swept and none holds it, or the want window ended, and a
-    /// person can make it.
-    NeedsPerson,
+    /// Every Mac allowed to give it swept and none holds it, or the want window ended before
+    /// the members it names answered, and a person can make it.
+    NeedsPerson(Unanswered),
     /// Retired with a reason whose writer and evidence checked.
     Retired(Retirement),
 }
@@ -1086,6 +1235,8 @@ pub enum Absorb {
     Reissued { nonce: [u8; 16], record: Vec<u8> },
     /// The lab decided it.
     Decided(Decision),
+    /// [`SILENCE_SECS`] passed with no custodian record on it and no offer ([`silent`]).
+    CustodianSilent,
 }
 
 /// The line a lab retirement leaves.
@@ -1131,8 +1282,28 @@ pub fn decided(need: &Need, facts: &Facts, decision: &Decision) -> Option<Need> 
     if !need.posted || !live {
         return None;
     }
+    let host = facts
+        .sight
+        .as_ref()
+        .map_or("<host>", |sight| sight.host.as_str());
     match decision {
-        Decision::Offered => {
+        // A Mac that answered late holds what a person was asked for. The ask stays up until
+        // the custodian's runtime publishes that copy (the model's `LateOffer`), and moves to
+        // it, once.
+        Decision::Offered(unanswered) if need.state == State::AwaitingPerson => {
+            if need.late_offer || !facts.policy.allows(&need.want) {
+                return None;
+            }
+            let ask = ask_on(&need.want, need.purpose, host, Heard::Offered(unanswered))?;
+            Some(Need {
+                late_offer: true,
+                line: ask.needs_you.clone(),
+                ask: Some(ask),
+                updated: now,
+                ..need.clone()
+            })
+        }
+        Decision::Offered(_) => {
             (need.state == State::Open && facts.policy.allows(&need.want)).then(|| {
                 Need {
                     state: State::Offered,
@@ -1161,26 +1332,47 @@ pub fn decided(need: &Need, facts: &Facts, decision: &Decision) -> Option<Need> 
             updated: now,
             ..need.clone()
         }),
-        Decision::NeedsPerson => {
-            if need.state == State::AwaitingPerson
+        Decision::NeedsPerson(unanswered) => {
+            // An ask that rests on less than this decision is restated on it, once: one this
+            // Mac made standing in for a silent custodian ([`silent`]) on the custodian's own,
+            // and one the window's end made on every member's sweep once each has answered.
+            let restates = need.state == State::AwaitingPerson
+                && !need.late_offer
+                && need
+                    .proof
+                    .is_some_and(|proof| proof.custodian_silent || proof.window_ended);
+            if (need.state == State::AwaitingPerson && !restates)
                 || !facts.policy.allows(&need.want)
                 || facts.holds(&need.want)
             {
                 return None;
             }
-            let host = facts.sight.as_ref().map_or("<host>", |sight| sight.host.as_str());
-            let ask = ask_for(&need.want, need.purpose, host)?;
+            // A decision the window's end made rests on fewer sweeps than every member's: it
+            // says so, and the ask names who did not answer where one of them could hold it.
+            let window = !unanswered.is_empty();
+            let heard = if window && offerable(&need.want) {
+                Heard::Unanswered(unanswered)
+            } else {
+                Heard::Nothing
+            };
+            let ask = ask_on(&need.want, need.purpose, host, heard)?;
+            let proof = Proof {
+                seq: facts.sight.as_ref().map_or(0, |sight| sight.seq),
+                absent: !facts.holds(&need.want),
+                every_locker_open: !facts.hidden(),
+                before_commons: false,
+                swept_unheld: !window,
+                window_ended: window,
+                custodian_silent: false,
+            };
+            if restates && need.ask.as_ref() == Some(&ask) && need.proof == Some(proof) {
+                return None;
+            }
             Some(Need {
                 state: State::AwaitingPerson,
                 wait: Wait::Person,
                 asking: true,
-                proof: Some(Proof {
-                    seq: facts.sight.as_ref().map_or(0, |sight| sight.seq),
-                    absent: !facts.holds(&need.want),
-                    every_locker_open: !facts.hidden(),
-                    before_commons: false,
-                    swept_unheld: true,
-                }),
+                proof: Some(proof),
                 line: ask.needs_you.clone(),
                 ask: Some(ask),
                 updated: now,
@@ -1194,6 +1386,103 @@ pub fn decided(need: &Need, facts: &Facts, decision: &Decision) -> Option<Need> 
             now,
         )),
     }
+}
+
+/// `need` once [`SILENCE_SECS`] passed with no custodian record on its posted request and no
+/// offer it could take (§6.1): the vault admin's aterm wrote nothing on it (no window there runs
+/// a build with the custodian pass, or its pass waits on what it cannot do), so the line says so
+/// and a fact for later sends the person to that Mac ([`exceptions`]). A person-sourced
+/// vault-only want this Mac's absence proof shows no Mac but an admin holds goes to a person
+/// instead, as before Commons: the model's `NeedsPerson`, this Mac standing in for the silent
+/// custodian. A want that reached this Mac's own section (the hand route the line names, run on
+/// the admin Mac) is delivered, as a custodian's copy is; a refused value is new only at a later
+/// vault version. A member cannot read which Mac is the admin (the admin locker is sealed to the
+/// admins, a Commons binding carries no name), so the words name its role. Each pass reads it
+/// again, so a sight that was missing or a locker that was hidden then moves it on; `None` for a
+/// need not open or offered on the table, or one this observation leaves as it is.
+#[must_use]
+pub fn silent(need: &Need, facts: &Facts) -> Option<Need> {
+    if !need.posted || !matches!(need.state, State::Open | State::Offered) {
+        return None;
+    }
+    if let Some(sight) = facts.sight.as_ref()
+        && facts.holds(&need.want)
+        && facts.policy.allows(&need.want)
+        && need.refused.is_none_or(|refused| sight.seq > refused)
+    {
+        return Some(Need {
+            state: State::Published,
+            wait: Wait::Requester,
+            got: true,
+            got_authorized: true,
+            custodian_silent: true,
+            line: format!(
+                "the vault gives this Mac {} at seq {}, with no custodian record on the request; its consumer's next check fulfils it",
+                entry_words(&need.want),
+                sight.seq
+            ),
+            seq: Some(sight.seq),
+            updated: facts.now,
+            ..need.clone()
+        });
+    }
+    if need.state != State::Open {
+        return None;
+    }
+    let silent = Need {
+        custodian_silent: true,
+        updated: facts.now,
+        ..need.clone()
+    };
+    let unmoved = |next: Need| {
+        (Need {
+            updated: need.updated,
+            ..next.clone()
+        } != *need)
+            .then_some(next)
+    };
+    if let Some(sight) = facts.sight.as_ref()
+        && need.want.class() == Class::VaultOnly
+        && need.want.person_sourced()
+        && !sight.hidden
+        && !facts.holds(&need.want)
+        && facts.policy.allows(&need.want)
+        && let Some(ask) = ask_for(&need.want, need.purpose, &sight.host)
+    {
+        return unmoved(Need {
+            state: State::AwaitingPerson,
+            wait: Wait::Person,
+            asking: true,
+            proof: Some(Proof {
+                seq: sight.seq,
+                absent: true,
+                every_locker_open: true,
+                before_commons: false,
+                swept_unheld: false,
+                window_ended: false,
+                custodian_silent: true,
+            }),
+            line: ask.needs_you.clone(),
+            ask: Some(ask),
+            seq: Some(sight.seq),
+            ..silent
+        });
+    }
+    let host = facts
+        .sight
+        .as_ref()
+        .map_or("<host>", |sight| sight.host.as_str());
+    let route = hand_route(&need.want, host).map_or_else(String::new, |route| {
+        format!("; meanwhile a person with the value runs {route}")
+    });
+    unmoved(Need {
+        wait: Wait::Custodian,
+        line: format!(
+            "posted to the lab: the vault admin's aterm has written no Commons record on it in the {} hours since it was posted, and no Mac offered it; an aterm window on the vault's admin Mac, on a build with the custodian pass, decides it{route}",
+            SILENCE_SECS / 3600
+        ),
+        ..silent
+    })
 }
 
 /// A fresh request id: 16 random bytes. A source that fails leaves zeros, which a ledger row
@@ -1336,29 +1625,102 @@ pub fn exception(need: &Need) -> Option<aterm_messages::exceptions::Entry> {
     Some(entry)
 }
 
-/// The exceptions entries of every need awaiting a person, one per want key (the same text on
-/// every Mac the want blocks). A want's other rows (another purpose's, retired or waiting)
-/// never hide the one that asks.
-#[must_use]
-pub fn exceptions(needs: &[Need]) -> Vec<aterm_messages::exceptions::Entry> {
-    let mut seen = BTreeSet::new();
-    needs
-        .iter()
-        .filter_map(|need| exception(need).map(|entry| (need, entry)))
-        .filter(|(need, _)| seen.insert(need.want.key()))
-        .map(|(_, entry)| entry)
-        .collect()
-}
-
-/// The `NEEDS YOU:` lines of every need awaiting a person, one per want key.
-#[must_use]
-pub fn needs_you(needs: &[Need]) -> Vec<String> {
-    let mut seen = BTreeSet::new();
-    needs
+/// The rows that ask, one per want key (the same text on every Mac the want blocks): of a want's
+/// rows, the one whose ask rests on the most the lab heard (a copy a Mac offered, then who did
+/// not answer, which save making a new value), the oldest among equals. A want's other rows
+/// (another purpose's, retired or waiting) never hide the one that asks.
+fn asking(needs: &[Need]) -> Vec<(&Need, &Ask)> {
+    let heard = |need: &Need| {
+        (
+            need.late_offer,
+            need.proof.is_some_and(|proof| proof.window_ended),
+        )
+    };
+    let mut chosen: Vec<(&Need, &Ask)> = Vec::new();
+    for (need, ask) in needs
         .iter()
         .filter(|need| need.asking)
         .filter_map(|need| need.ask.as_ref().map(|ask| (need, ask)))
-        .filter(|(need, _)| seen.insert(need.want.key()))
+    {
+        match chosen
+            .iter_mut()
+            .find(|(row, _)| row.want.key() == need.want.key())
+        {
+            Some(row) if heard(need) > heard(row.0) => *row = (need, ask),
+            Some(_) => {}
+            None => chosen.push((need, ask)),
+        }
+    }
+    chosen
+}
+
+/// The exceptions entries of every need awaiting a person, one per want key ([`asking`]), then
+/// the one fact for later of the needs a silent custodian left open ([`silent`]).
+#[must_use]
+pub fn exceptions(needs: &[Need]) -> Vec<aterm_messages::exceptions::Entry> {
+    asking(needs)
+        .into_iter()
+        .filter_map(|(need, _)| exception(need))
+        .chain(silent_custodian(needs))
+        .collect()
+}
+
+/// `secrets.need.custodian.silent`, a fact for later with `Why::YourAction` (§6.1, as §12.4's
+/// founding fact): one for the vault. Its step is the one that works whatever the admin Mac
+/// runs, each request's `aterm secrets set` there (a delivery ends the request, [`silent`]); its
+/// detail lines say a build with the custodian pass decides them itself, then name each
+/// request's line while they fit and count the rest. `None` while no need is open past
+/// [`SILENCE_SECS`] with no custodian record.
+fn silent_custodian(needs: &[Need]) -> Option<aterm_messages::exceptions::Entry> {
+    use aterm_messages::exceptions::{Entry, Family, MORE_LINES};
+    use aterm_messages::need::{Reason as Words, Then, Why};
+    let open: Vec<&Need> = needs
+        .iter()
+        .filter(|need| need.state == State::Open && need.custodian_silent)
+        .collect();
+    if open.is_empty() {
+        return None;
+    }
+    let hours = SILENCE_SECS / 3600;
+    let wants: BTreeSet<String> = open.iter().map(|need| need.want.key()).collect();
+    let mut entry = Entry::new(
+        Family::Secrets,
+        "custodian",
+        "silent",
+        "The vault admin's aterm is silent",
+        Why::YourAction(Words::new(format!(
+            "it wrote no Commons record on a request of this Mac's in {hours} hours"
+        ))),
+        Then::step("Set each entry the lines below name on the vault's admin Mac"),
+    )
+    .log_line(format!(
+        "secrets need: no custodian record in {hours} hours on {}",
+        wants.into_iter().collect::<Vec<_>>().join(", ")
+    ))
+    .more("each line names its aterm secrets set step there; a window on a build with the custodian pass decides them itself (aterm secrets need pass runs it by hand)");
+    let room = MORE_LINES.saturating_sub(1);
+    let shown = if open.len() > room {
+        room.saturating_sub(1)
+    } else {
+        room
+    };
+    for need in open.iter().take(shown) {
+        entry = entry.more(format!("{}: {}", need.want.key(), need.line));
+    }
+    if open.len() > shown {
+        entry = entry.more(format!(
+            "{} more: aterm secrets need ls names each",
+            open.len() - shown
+        ));
+    }
+    Some(entry)
+}
+
+/// The `NEEDS YOU:` lines of every need awaiting a person, one per want key ([`asking`]).
+#[must_use]
+pub fn needs_you(needs: &[Need]) -> Vec<String> {
+    asking(needs)
+        .into_iter()
         .map(|(_, ask)| ask.needs_you.clone())
         .collect()
 }
@@ -1535,7 +1897,7 @@ fn alab_for_tests(paths: &crate::client::Paths) -> bool {
     aterm_spec_anchor::spec_unmodeled(
         machine = "DbCredentialRequest",
         action = "Widen",
-        reason = "A custodian's copy from vault text into the requester's own host section is aterm_db::credentials::custodian_pass_at on the admin Mac; this ledger takes its Published record in through need::decided."
+        reason = "A custodian's copy from vault text into the requester's own host section is aterm_db::credentials::custodian_pass_at on the admin Mac; this ledger takes its Published record in through need::decided, or, where no custodian record came for SILENCE_SECS, need::silent reads the delivery off this Mac's own section (a person's hand route)."
     )
 )]
 #[cfg_attr(
@@ -1591,7 +1953,7 @@ fn alab_for_tests(paths: &crate::client::Paths) -> bool {
     aterm_spec_anchor::spec_unmodeled(
         machine = "DbCredentialRequest",
         action = "NeedsPerson",
-        reason = "A custodian's attested NeedsPerson record is aterm_db::credentials::custodian_pass_at, which this ledger takes in through need::decided; before Commons the requester's own Absent move asks instead."
+        reason = "A custodian's attested NeedsPerson record is aterm_db::credentials::custodian_pass_at, which this ledger takes in through need::decided; before Commons the requester's own Absent move asks instead, and once SILENCE_SECS passed with no custodian record on a posted request need::silent asks on the same absence proof (aterm_db::credentials::pass_at reads the silence off the table)."
     )
 )]
 #[cfg_attr(
@@ -1599,7 +1961,7 @@ fn alab_for_tests(paths: &crate::client::Paths) -> bool {
     aterm_spec_anchor::spec_unmodeled(
         machine = "DbCredentialRequest",
         action = "LateOffer",
-        reason = "A request awaiting a person keeps its ask until the runtime accepts and publishes the late holder's delivery; this ledger consumes that Published record."
+        reason = "A request awaiting a person keeps its ask until the runtime accepts and publishes the late holder's delivery; this ledger consumes that Published record, and until it comes need::decided (Decision::Offered) moves the ask to the holder's copy, once."
     )
 )]
 #[cfg_attr(

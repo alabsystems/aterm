@@ -22,8 +22,6 @@ aterm-json = { workspace = true }
 aterm-durable = { workspace = true }
 atpkg = { workspace = true }
 libc = { workspace = true }
-
-[target.'cfg(target_os = "macos")'.dependencies]
 jobserver_utils = { workspace = true }
 
 [dev-dependencies]

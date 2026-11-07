@@ -816,7 +816,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_compiler_commit_is_what_trustc_answers() {
-        crate::discovery::set_probe_bound_for_test(aterm_spec::wait::MUST_HAPPEN);
         let bin = scratch("trust-lock-commit").join("bin");
         std::fs::create_dir_all(&bin).expect("mkdir");
         let trustc = bin.join("trustc");

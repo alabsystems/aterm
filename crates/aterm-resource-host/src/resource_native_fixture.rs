@@ -30,11 +30,27 @@ const HANG: Duration = Duration::from_secs(60);
 /// Dispatch the standalone native fixture before any libtest argument parser.
 /// This exists only on the currently implemented host-member platform in tests.
 pub fn entry(args: &[OsString]) -> ExitCode {
+    // Exercise the actual production original-store helper path. The legacy
+    // private fixture below intentionally remains separate from this route.
+    if args
+        .first()
+        .is_some_and(|arg| arg == trust_resource_controller::WorkloadHelperFds::ENTRY)
+    {
+        return crate::resource_proxy::entry(
+            args,
+            &mut crate::resource_proxy_backend::NativeBackend::account(),
+        )
+        .unwrap();
+    }
     if args.first().is_some_and(|v| v == SCOPED_CPU_MEMBER) {
         return scoped_cpu_member(&args[1..]);
     }
     let pending = trust_resource_controller::client::sdk::snapshot_sdk_lease().unwrap();
-    let gnu = if matches!(args, [arg] if arg == "-vV") {
+    let gnu = if matches!(args, [arg] if arg == "-vV")
+        || matches!(args, [worker, subgroup, name, value]
+            if worker == "--resource-worker-v3" && subgroup == "--resource-subgroups-v3"
+                && name == "--crate-name" && value == "original_store_helper_fixture")
+    {
         Some(
             jobserver_utils::recover_named_fifo_resources(
                 &std::env::var_os("CARGO_JOBSERVER_HANDOFF").unwrap(),

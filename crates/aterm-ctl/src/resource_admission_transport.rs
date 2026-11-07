@@ -13,6 +13,9 @@ use std::{
     time::Instant,
 };
 
+#[path = "resource_admission_store_expectation.rs"]
+pub mod store_expectation;
+
 fn invalid() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -145,25 +148,7 @@ fn attach_mode(
 ) -> io::Result<()> {
     time(deadline)?;
     let bytes = request.encode()?;
-    if !Path::new(path).is_absolute() {
-        return Err(io::ErrorKind::InvalidInput.into());
-    }
-    let pinned = crate::pin_alias(path);
-    let stream = aterm_uds::connect::until(Path::new(&pinned), deadline)?;
-    stream.set_nonblocking(true)?;
-    if aterm_uds::peer::peer_uid(&stream) != Some(aterm_uds::peer::our_uid()) {
-        return Err(denied());
-    }
-    let (_, token) = crate::read_token_file_at(&pinned).map_err(|_| denied())?;
-    let token = aterm_uds::secret::Secret::from_vec(token.into_bytes());
-    let mut hello = b"AUTH ".to_vec();
-    hello.extend(token.expose());
-    hello.extend(b"\nversion\n");
-    let hello = aterm_uds::secret::Secret::from_vec(hello);
-    write_all(&stream, hello.expose(), deadline)?;
-    if !read_line(&stream, deadline)?.starts_with("OK ") {
-        return Err(denied());
-    }
+    let stream = connect_owner(path, deadline)?;
     write_all(
         &stream,
         if accounted {
@@ -204,6 +189,28 @@ fn attach_mode(
         return Err(invalid());
     }
     Ok(())
+}
+fn connect_owner(path: &str, deadline: Instant) -> io::Result<CtlStream> {
+    if !Path::new(path).is_absolute() {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    let pinned = crate::pin_alias(path);
+    let stream = aterm_uds::connect::until(Path::new(&pinned), deadline)?;
+    stream.set_nonblocking(true)?;
+    if aterm_uds::peer::peer_uid(&stream) != Some(aterm_uds::peer::our_uid()) {
+        return Err(denied());
+    }
+    let (_, token) = crate::read_token_file_at(&pinned).map_err(|_| denied())?;
+    let token = aterm_uds::secret::Secret::from_vec(token.into_bytes());
+    let mut hello = b"AUTH ".to_vec();
+    hello.extend(token.expose());
+    hello.extend(b"\nversion\n");
+    let hello = aterm_uds::secret::Secret::from_vec(hello);
+    write_all(&stream, hello.expose(), deadline)?;
+    if !read_line(&stream, deadline)?.starts_with("OK ") {
+        return Err(denied());
+    }
+    Ok(stream)
 }
 /// Transfer the exact four rights on an already authenticated private lane.
 /// Completion proves descriptor delivery only, never refusal or execution.

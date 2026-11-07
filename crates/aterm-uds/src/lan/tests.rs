@@ -269,31 +269,121 @@ fn a_broker_of_another_protocol_is_outdated() {
     served.join().unwrap();
 }
 
+/// A stand-in broker at `path` that admits nothing on its one connection: it sends `told` instead
+/// of its hello, as the broker does, or (`None`) reads the client's hello and closes.
+fn admitting_nothing_at(
+    path: &std::path::Path,
+    told: Option<Frame>,
+) -> std::thread::JoinHandle<()> {
+    let listener = crate::CtlListener::bind(path).unwrap();
+    std::thread::spawn(move || {
+        let (stream, _) = crate::accept(&listener).unwrap();
+        match told {
+            Some(frame) => wire::send(&stream, &frame).unwrap(),
+            None => {
+                let hello = Reader::new(0)
+                    .frame(&stream, Some(Instant::now() + MUST_HAPPEN))
+                    .unwrap();
+                assert!(matches!(hello, Some(Frame::Hello { .. })), "{hello:?}");
+            }
+        }
+    })
+}
+
+/// The seam that points this thread's client at `path`.
+fn at(path: &std::path::Path) -> Seam {
+    Seam {
+        socket: Some(path.to_path_buf()),
+        ..Seam::default()
+    }
+}
+
 #[test]
 fn a_broker_that_refuses_this_code_says_why() {
     let root = aterm_tempfile::tempdir().unwrap();
     let path = root.path().join("broker.sock");
-    let listener = crate::CtlListener::bind(&path).unwrap();
-    let served = std::thread::spawn(move || {
-        let (stream, _) = crate::accept(&listener).unwrap();
-        wire::send(
-            &stream,
-            &Frame::Refused {
-                words: "not aterm's code".into(),
-            },
-        )
-        .unwrap();
-    });
-    let seam = Seam {
-        socket: Some(path),
-        ..Seam::default()
-    };
-    let refused = seam_here(seam, broker::hello).unwrap_err();
+    let served = admitting_nothing_at(
+        &path,
+        Some(Frame::Refused {
+            words: "not aterm's code".into(),
+        }),
+    );
+    let refused = seam_here(at(&path), broker::hello).unwrap_err();
     assert!(
         matches!(&refused, LanError::Unavailable(Unavailable::Refused(why)) if why.contains("not aterm's code")),
         "{refused:?}"
     );
     served.join().unwrap();
+}
+
+/// A broker that did not judge this process, by saying so or by closing before its hello, reads
+/// apart from a refusal of its code, in the broker's words.
+#[test]
+fn a_broker_that_did_not_judge_this_code_is_unchecked_not_refused() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let told = root.path().join("told.sock");
+    let served = admitting_nothing_at(
+        &told,
+        Some(Frame::Unchecked {
+            words: "trustd did not answer".into(),
+        }),
+    );
+    let unchecked = seam_here(at(&told), broker::hello).unwrap_err();
+    assert!(
+        matches!(&unchecked, LanError::Unavailable(Unavailable::Unchecked(why)) if why.contains("trustd did not answer")),
+        "{unchecked:?}"
+    );
+    assert!(
+        unchecked
+            .to_string()
+            .contains("has not judged this process yet"),
+        "{unchecked}"
+    );
+    served.join().unwrap();
+    let closed = root.path().join("closed.sock");
+    let served = admitting_nothing_at(&closed, None);
+    let unchecked = seam_here(at(&closed), broker::hello).unwrap_err();
+    assert!(
+        matches!(&unchecked, LanError::Unavailable(Unavailable::Unchecked(why)) if why.contains("before its hello")),
+        "{unchecked:?}"
+    );
+    served.join().unwrap();
+}
+
+/// A broker that did not judge this process is asked again on a back-off; one that refused its
+/// code is not, until its socket is made again.
+#[cfg(target_os = "macos")]
+#[test]
+fn broker_arrivals_ask_again_where_nothing_was_judged_and_not_after_a_refusal() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let path = root.path().join("broker.sock");
+    let unchecked = admitting_nothing_at(
+        &path,
+        Some(Frame::Unchecked {
+            words: "the LAN broker is serving 128 connections".into(),
+        }),
+    );
+    let mut changes = seam_here(at(&path), Arrivals::new);
+    assert!(!changes.poll().unwrap());
+    unchecked.join().unwrap();
+    assert!(
+        changes.wait_for(MUST_HAPPEN) < MUST_HAPPEN,
+        "a broker that judged nothing is asked again"
+    );
+    std::fs::remove_file(&path).unwrap();
+    let refused = admitting_nothing_at(
+        &path,
+        Some(Frame::Refused {
+            words: "not aterm's code".into(),
+        }),
+    );
+    assert!(!changes.poll().unwrap());
+    refused.join().unwrap();
+    assert_eq!(
+        changes.wait_for(MUST_HAPPEN),
+        MUST_HAPPEN,
+        "a refusal of this code is not asked again"
+    );
 }
 
 /// On macOS, a TCP dial of a local-network address goes to the broker, which hands back the

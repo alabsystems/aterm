@@ -19,6 +19,7 @@ pub(super) enum Kind {
     Targo,
     Metadata,
     Resolver,
+    Workload,
 }
 pub(super) struct Probe {
     worker: Option<preparation::Worker<()>>,
@@ -149,6 +150,11 @@ impl Recipe {
                 "resolver service requires the closed fixed-one request",
             ));
         }
+        if workload::purpose(request) && !workload::closed_request(request) {
+            return Err(refused(
+                "workload service requires its closed cooperative request",
+            ));
+        }
         if request.cpu_units > physical {
             return Err(refused("requested CPU width exceeds this host"));
         }
@@ -188,7 +194,10 @@ impl Recipe {
         let managed = requested
             .filter(|name| matches!(*name, "ay" | "targo"))
             .and_then(|name| managed_artifact_in(layout?, name, &program));
-        if metadata_request(request) || resolver_root::closed_request(request) {
+        if metadata_request(request)
+            || resolver_root::closed_request(request)
+            || workload::closed_request(request)
+        {
             let selected =
                 managed.ok_or_else(|| refused("managed metadata service unavailable"))?;
             if requested != Some("targo") {
@@ -197,7 +206,8 @@ impl Recipe {
                 ));
             }
             let resolver = resolver_root::closed_request(request);
-            let mut environment = service_environment(request, &selected, resolver)?;
+            let workload = workload::closed_request(request);
+            let mut environment = service_environment(request, &selected, resolver || workload)?;
             // No preparatory subprocess: actual ARM/BIND/root ownership must
             // exist before ANY selected service code runs. Live readiness is
             // negotiated by that same original root before member admission.
@@ -208,12 +218,21 @@ impl Recipe {
             if resolver {
                 sdk.require_resolver_protocol(Instant::now() + Duration::from_secs(30))?;
             }
+            if workload {
+                sdk.require_workload_protocol(Instant::now() + Duration::from_secs(30))?;
+                // Still in the paid Preparing worker, before any Root GO or
+                // project/configuration. Capture the compiler/runtime once;
+                // Ready and each graph member reuse its original held inputs.
+                sdk.capture_workload_compiler(Instant::now() + Duration::from_secs(30))?;
+            }
             for (key, value) in sdk.runtime_environment()? {
                 environment.retain(|(old, _)| old != &key);
                 environment.push((key, value));
             }
             return Ok(Some(Self {
-                kind: if resolver {
+                kind: if workload {
+                    Kind::Workload
+                } else if resolver {
                     Kind::Resolver
                 } else {
                     Kind::Metadata
@@ -222,9 +241,9 @@ impl Recipe {
                 arguments,
                 environment,
                 cwd,
-                width: 1,
+                width: if workload { request.cpu_units } else { 1 },
+                compiler: workload.then(|| compiler::Selection::HeldSdk(sdk.clone())),
                 metadata_sdk: Some(sdk),
-                compiler: None,
             }));
         }
         let compiler = if requested == Some("targo") {

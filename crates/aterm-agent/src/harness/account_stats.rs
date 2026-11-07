@@ -11,7 +11,7 @@ use aterm_json::{Map, Value};
 
 use super::accounts::{
     self, Account, Credits, SESSION_LIMIT, SESSION_WINDOW_S, SOURCE_SAMPLE, WEEK_LIMIT,
-    WEEK_WINDOW_S, WindowFig, WindowSaid, merge_fig,
+    WEEK_WINDOW_S, WeekSaid, WindowFig, WindowSaid, merge_fig,
 };
 use super::profile::{self, Bucket, NoProfile, Profile};
 use super::spend::{self, Spend};
@@ -234,6 +234,13 @@ pub struct Win {
     pub length_s: i64,
     /// The figure, current or void or cut by a reset used inside it.
     pub fig: Option<WindowFig>,
+    /// WHERE THE FIGURE NAMED NO RESET (a wall that gave none: `100%, no reset given`, the stats
+    /// design's Q11), the instant it is void at: the reset an older reading of the same week named
+    /// after it, and never later than a week after the reading, since no week outlasts its length
+    /// ([`unnamed_week`]). The window has reset by then; the figure's `reset` holds the same
+    /// instant, so [`WindowFig::current`] reads it, and the window's own reset is unknown
+    /// ([`Self::resets_at`]).
+    pub void_at: Option<i64>,
     /// Why it says nothing now.
     pub missing: Option<Missing>,
 }
@@ -243,6 +250,15 @@ impl Win {
     #[must_use]
     pub fn current(&self, now: i64) -> Option<&WindowFig> {
         self.fig.as_ref().filter(|f| f.current(now) && !f.cut())
+    }
+
+    /// The window's reset, where its figure named one.
+    #[must_use]
+    pub fn resets_at(&self) -> Option<i64> {
+        self.fig
+            .as_ref()
+            .filter(|_| self.void_at.is_none())
+            .map(|f| f.reset)
     }
 }
 
@@ -311,6 +327,77 @@ fn said_fig(said: &WindowSaid, by: &str) -> Option<WindowFig> {
 fn said_refill(said: Option<&WindowSaid>) -> Option<i64> {
     said.filter(|s| s.pct.is_none() && s.reset.is_none())
         .map(|s| s.at)
+}
+
+/// The source word of a model's week a screen said: its wall's or its warning's.
+const fn week_source(said: &WeekSaid) -> &'static str {
+    if said.wall {
+        SOURCE_WALL
+    } else {
+        SOURCE_WARNING
+    }
+}
+
+/// The figure a screen's word on a model's week says where it named the week's reset.
+fn week_said_fig(said: &WeekSaid) -> Option<WindowFig> {
+    Some(fig(
+        said.pct?.saturating_mul(10),
+        said.reset?,
+        said.at,
+        &said.by,
+        week_source(said),
+    ))
+}
+
+/// The instant a screen's word says a limit reset was USED on a model's week
+/// ([`accounts::reset_outcome`]), as [`said_refill`] reads the session's and the week's.
+fn week_refill(said: Option<&WeekSaid>) -> Option<i64> {
+    said.filter(|s| s.pct.is_none() && s.reset.is_none())
+        .map(|s| s.at)
+}
+
+/// A MODEL'S WEEK READ WITH NO RESET (the stats design's Q11), where it is the newest word on the
+/// week: the newer of the screen's wall that named none (`said`, [`Account::weeks_said`]; a
+/// warning that named none is no figure, as a session or weekly one is not, [`said_fig`]) and a
+/// wall recorded with none (`wall`, a 429 that named no reset), unless a figure of the same week
+/// (`sources`) or a limit reset on it ([`week_refill`]'s word, or a lift's) came with it or after
+/// it. It is the figure until it is void ([`Win::void_at`]): at the reset an older reading of that
+/// week named after it (a figure of `sources`, or the screen's [`WeekSaid::ends_by`]), since the
+/// week that held both readings ends there, and never later than a week after it, since no week
+/// outlasts its length. Another week's reset (the week of all models) is another window's and
+/// ends nothing here. A merge cannot hold it ([`merge_fig`]): an invented reset would be a window
+/// of its own.
+fn unnamed_week(
+    said: Option<&WeekSaid>,
+    wall: Option<&accounts::Wall>,
+    sources: &[WindowFig],
+) -> Option<(WindowFig, i64)> {
+    let reset_word = said.filter(|w| w.pct.is_none()).map(|w| w.at);
+    let said = said.filter(|w| w.wall && w.reset.is_none());
+    let read = said.and_then(|w| Some((w.pct?.saturating_mul(10), w.at, w.by.as_str())));
+    let wall = wall
+        .filter(|w| !w.cleared && w.until.is_none())
+        .map(|w| (1000, w.at, w.by.as_str()));
+    let (pct_x10, at, by) = [wall, read]
+        .into_iter()
+        .flatten()
+        .max_by_key(|(_, at, _)| *at)?;
+    if sources
+        .iter()
+        .map(|f| f.at)
+        .chain(reset_word)
+        .any(|t| t >= at)
+    {
+        return None;
+    }
+    let void_at = sources
+        .iter()
+        .map(|f| f.reset)
+        .chain(said.and_then(|w| w.ends_by))
+        .filter(|end| *end > at)
+        .chain([at.saturating_add(WEEK_WINDOW_S)])
+        .min()?;
+    Some((fig(pct_x10, void_at, at, by, SOURCE_WALL), void_at))
 }
 
 /// WHETHER CLAUDE CODE REPORTS NO FIVE-HOUR FIGURE FOR `account` NOW ([`Missing::NotReported`];
@@ -442,6 +529,7 @@ pub fn view(look: &Look<'_>) -> View {
             length_s,
             missing,
             fig: f,
+            void_at: None,
         });
     }
     let mut weeks = vec![
@@ -463,10 +551,22 @@ pub fn view(look: &Look<'_>) -> View {
             .into_iter()
             .find_map(|w| w.name.as_ref())
             .map(|n| n.as_str().to_owned());
-        let sources = held(bucket.id())
+        let said = account
+            .filter(|_| model.is_none())
+            .and_then(|a| a.weeks_said.get(bucket.id()));
+        let sources: Vec<WindowFig> = held(bucket.id())
             .into_iter()
-            .chain(cached_figs(bucket, model));
-        let f = one_figure(sources, None, WEEK_WINDOW_S, now);
+            .chain(cached_figs(bucket, model))
+            .chain(said.and_then(week_said_fig))
+            .collect();
+        let wall = account.and_then(|a| a.walls.get(bucket.id()));
+        let (f, void_at) = match unnamed_week(said, wall, &sources) {
+            Some((f, void_at)) => (Some(f), Some(void_at)),
+            None => (
+                one_figure(sources, week_refill(said), WEEK_WINDOW_S, now),
+                None,
+            ),
+        };
         if bucket != Bucket::Fable && f.is_none() {
             continue;
         }
@@ -477,6 +577,7 @@ pub fn view(look: &Look<'_>) -> View {
             length_s: WEEK_WINDOW_S,
             missing: state_of(&f, cache_missing()),
             fig: f,
+            void_at,
         });
     }
     let tenths = windows
@@ -566,7 +667,8 @@ pub fn dollars(look: &Look<'_>, view: &View, win: &Win) -> Option<spend::Figure>
         "model_weekly" => Some(week_family(win.id)?),
         _ => None,
     };
-    let current = win.current(look.now);
+    // A figure that named no reset gives no window start, so its week is the rolling one.
+    let current = win.current(look.now).filter(|_| win.void_at.is_none());
     let reading = current.map(|f| spend::Reading {
         pct_x10: f.pct_x10,
         at: f.at,
@@ -722,6 +824,9 @@ fn row_label(win: &Win) -> String {
 fn missing_text(win: &Win, look: &Look<'_>, tz_at: &dyn Fn(i64) -> i64) -> String {
     let at = |t: i64| clock_local(t, look.now, tz_at);
     match (win.missing, win.fig.as_ref()) {
+        (Some(Missing::WindowReset), Some(f)) if win.void_at.is_some() => {
+            format!("window reset by {}, no reading since", at(f.reset))
+        }
         (Some(Missing::WindowReset), Some(f)) => {
             format!("window reset {}, no reading since", at(f.reset))
         }
@@ -787,6 +892,13 @@ fn window_row(
     let now = look.now;
     let label = row_label(win);
     let mut row = match win.current(now) {
+        Some(f) if win.void_at.is_some() => format!(
+            "{}, no reset given{DOT}as of {} ({}, {})",
+            percent(f.pct_x10, view.tenths),
+            span(now.saturating_sub(f.at)),
+            source_word(&f.source),
+            machine_word(&f.by, look)
+        ),
         Some(f) => {
             let left = 1000u32.saturating_sub(f.pct_x10);
             let mut row = format!(
@@ -1013,8 +1125,9 @@ pub fn window_value(win: &Win, now: i64) -> Value {
         Value::from(current.map(|f| 100u32.saturating_sub((f.pct_x10 + 5) / 10))),
     );
     let f = win.fig.as_ref();
-    put_time(&mut o, "resets_at", f.map(|f| f.reset));
+    put_time(&mut o, "resets_at", win.resets_at());
     put_time(&mut o, "epoch_at", f.and_then(|f| f.epoch_at));
+    put_time(&mut o, "void_at", win.void_at);
     o.insert(
         "state".to_owned(),
         Value::from(f.map(|f| if f.current(now) { "current" } else { "void" })),

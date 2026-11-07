@@ -6,7 +6,6 @@
 
 use super::Grid;
 use crate::{CellCoord, Row};
-use std::fmt::Write as _;
 
 impl Grid {
     /// The resolved character at a grid position.
@@ -289,25 +288,31 @@ impl Grid {
                         crate::push_underline_color_sgr(s, color);
                     }
                     if let Some(rgb) = want_fg_rgb {
-                        let _ = write!(s, ";38;2;{};{};{}", rgb[0], rgb[1], rgb[2]);
+                        s.push_str(";38;2");
+                        crate::extra::push_sgr_rgb(s, rgb, ';');
                     } else if let Some(idx) = want_fg_indexed {
+                        s.push(';');
                         if idx < 8 {
-                            let _ = write!(s, ";{}", 30 + idx);
+                            crate::push_sgr_byte(s, 30 + idx);
                         } else if idx < 16 {
-                            let _ = write!(s, ";{}", 90 + idx - 8);
+                            crate::push_sgr_byte(s, 90 + idx - 8);
                         } else {
-                            let _ = write!(s, ";38;5;{idx}");
+                            s.push_str("38;5;");
+                            crate::push_sgr_byte(s, idx);
                         }
                     }
                     if let Some(rgb) = want_bg_rgb {
-                        let _ = write!(s, ";48;2;{};{};{}", rgb[0], rgb[1], rgb[2]);
+                        s.push_str(";48;2");
+                        crate::extra::push_sgr_rgb(s, rgb, ';');
                     } else if let Some(idx) = want_bg_indexed {
+                        s.push(';');
                         if idx < 8 {
-                            let _ = write!(s, ";{}", 40 + idx);
+                            crate::push_sgr_byte(s, 40 + idx);
                         } else if idx < 16 {
-                            let _ = write!(s, ";{}", 100 + idx - 8);
+                            crate::push_sgr_byte(s, 100 + idx - 8);
                         } else {
-                            let _ = write!(s, ";48;5;{idx}");
+                            s.push_str("48;5;");
+                            crate::push_sgr_byte(s, idx);
                         }
                     }
                     s.push('m');

@@ -1973,6 +1973,9 @@ fn broker_answers() -> std::result::Result<(), &'static str> {
             Err(LanError::Unavailable(Unavailable::Refused(_))) => {
                 Err("Waits for a LAN broker that admits this aterm")
             }
+            Err(LanError::Unavailable(Unavailable::Unchecked(_))) => {
+                Err("Waits for the LAN broker to check this aterm")
+            }
             Err(LanError::Io(_)) => Err("Waits for the LAN broker to answer"),
         }
     }

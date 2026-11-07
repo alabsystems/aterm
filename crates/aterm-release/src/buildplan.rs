@@ -1035,6 +1035,9 @@ fn cargo_build_args(
         // ([`Units`]); the compiler's diagnostics still read as text in the log.
         "--message-format=json-render-diagnostics".into(),
     ]);
+    if verb == "build" && pkg == "aterm" {
+        args.extend(["--bin".into(), "aterm".into()]);
+    }
     if let Some(triple) = target {
         args.extend(["--target".into(), triple.into()]);
     }
@@ -1578,8 +1581,13 @@ fn run_slice_profile(
     };
 
     let banner = format!(
-        "==> {driver_name} {verb} --release {}-p {pkg}  [{lane}]",
-        target.map(|t| format!("--target {t} ")).unwrap_or_default()
+        "==> {driver_name} {verb} --release {}-p {pkg}{}  [{lane}]",
+        target.map(|t| format!("--target {t} ")).unwrap_or_default(),
+        if verb == "build" && pkg == "aterm" {
+            " --bin aterm"
+        } else {
+            ""
+        }
     );
     if let Some(log) = log {
         use std::io::Write as _;
@@ -3536,6 +3544,7 @@ mod tests {
             );
             assert!(args.contains(&"--locked".to_owned()));
             assert!(args.contains(&"--offline".to_owned()));
+            assert!(args.windows(2).any(|pair| pair == ["--bin", "aterm"]));
         }
         assert_eq!(native.first().map(String::as_str), Some("--unverified"));
         assert!(!compat.contains(&"--unverified".to_owned()));
@@ -3636,6 +3645,7 @@ mod tests {
         );
         assert!(args.windows(2).any(|pair| pair == ["--target", triple]));
         assert!(!args.contains(&"--unverified".to_owned()));
+        assert!(!args.contains(&"--bin".to_owned()));
         let native = text(cargo_build_args(
             "build", config, config, manifest, "aterm", None, true,
         ));

@@ -506,7 +506,8 @@ Options:
       --timeout <s|off>   hang ceiling on each child's work (default 3h); its
                           waits for a lock or for room are left out
       --log <path>        where the full log goes (default: a new file in
-                          <target>/verify/logs.noindex, the newest 20 kept)
+                          <target>/verify/logs.noindex/runs.noindex; retention
+                          targets 20 while preserving all running logs)
       --passed-binaries <path>
                           with release and its test check: binaries that passed
                           in this tree, `<sha256> <spec>` per line; each whose

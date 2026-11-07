@@ -5,7 +5,7 @@
 //! Only bounded byte parsing is used; no unaligned native struct references.
 
 #[cfg(target_os = "macos")]
-use super::{MAX_MESSAGES, MAX_REPLY, Socket, option, sequence, set_option};
+use super::{MAX_REPLY, Socket, option, sequence, set_option};
 use super::{Route, align4, refuse, u16_at, u32_at};
 use std::{
     io,
@@ -219,7 +219,7 @@ pub(super) fn lookup(
         return Err(io::Error::last_os_error());
     }
     let mut buffer = vec![0; MAX_REPLY];
-    for _ in 0..MAX_MESSAGES {
+    super::receive_route(until, || {
         socket.readable(until)?;
         // SAFETY: buffer is writable for its full length on this live socket.
         let received = unsafe {
@@ -236,15 +236,12 @@ pub(super) fn lookup(
                 error.kind(),
                 io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
             ) {
-                continue;
+                return Ok(None);
             }
             return Err(error);
         }
-        if let Some(route) = parse(&buffer[..received as usize], sequence, pid)? {
-            return Ok(route);
-        }
-    }
-    Err(refuse("route query reply bound exceeded"))
+        parse(&buffer[..received as usize], sequence, pid)
+    })
 }
 
 /// Whether a routing-socket message of type `kind` can change what `getifaddrs`, an interface's

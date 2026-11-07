@@ -28,6 +28,14 @@ impl Owner {
         let Some(job) = self.jobs.get_mut(&key) else {
             return false;
         };
+        if job.workload.is_some()
+            && !matches!(
+                request.role,
+                wire::Role::Compile | wire::Role::MachOLinker(_)
+            )
+        {
+            return false; // Workload queries use their mandatory distinct owner.
+        }
         if self.faulted
             || !job.native_targo
             || !job.launched
@@ -139,6 +147,11 @@ fn translate(
     memory_bytes: u64,
 ) -> io::Result<subgroup::Request> {
     input.validate()?;
+    if !input.role.is_proxy_member() {
+        return Err(refused(
+            "direct member purpose cannot enter the producer proxy",
+        ));
+    }
     let cpu = input
         .delegations
         .cpu

@@ -30,7 +30,13 @@ const MARKER: &str = "ATERM_MEMBER_FIXTURE_MARKER";
 const MODE: &str = "ATERM_MEMBER_FIXTURE_ACCOUNTING_MODE";
 
 pub(super) fn run(args: &[OsString], gnu: Option<[OwnedFd; 2]>) -> std::process::ExitCode {
-    if matches!(args, [arg] if arg == "-vV") {
+    if matches!(args, [arg] if arg == "-vV")
+        || matches!(args, [worker, subgroup, name, value]
+            if worker == "--resource-worker-v3" && subgroup == "--resource-subgroups-v3"
+                && name == "--crate-name" && value == "original_store_helper_fixture")
+    {
+        // The compiled stand-in tests native helper/store/resource custody;
+        // it does not claim to compile a Rust crate or implement bank startup.
         metadata(gnu, "trustc native fixture metadata");
     } else if matches!(args, [arg] if arg == "--print=sysroot" || arg == "--print=target-list") {
         assert!(gnu.is_none());
@@ -275,14 +281,23 @@ fn host(unknown: bool) {
             Err(error) => panic!("actual member accept: {error}"),
         }
     }
-    let accounted = aterm_types::resource_admission::AccountedEventFrame::decode(
-        &wire::read_frame(&events, Instant::now() + HANG).unwrap(),
-        &binding,
-    )
-    .unwrap();
+    let raw_terminal = wire::read_frame(&events, Instant::now() + HANG).unwrap();
+    // Preserve the original terminal before interpretation/assertions. A failed
+    // native world survives Drop, including this private diagnostic frame.
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o400)
+        .open(world.scratch.path.join("root-accounted-terminal.frame"))
+        .unwrap()
+        .write_all(&raw_terminal)
+        .unwrap();
+    let accounted =
+        aterm_types::resource_admission::AccountedEventFrame::decode(&raw_terminal, &binding)
+            .unwrap();
     assert!(
         matches!(accounted.finished.event, Event::Finished { outcome: Outcome::Exit(code), cause: CompletionCause::Exited, .. } if code == if unknown { 101 } else { 0 }),
-        "actual root outcome: {:?}; root stderr: {}",
+        "actual root terminal {:?}; submissions={submissions}; root stderr {}",
         accounted.finished.event,
         fs::read_to_string(&root_log).unwrap()
     );
@@ -291,7 +306,7 @@ fn host(unknown: bool) {
     );
     assert_eq!(
         submissions,
-        if unknown { 1 } else { 5 },
+        if unknown { 1 } else { 6 },
         "actual root: {}",
         fs::read_to_string(&root_log).unwrap()
     );
@@ -463,6 +478,11 @@ fn root() {
     let mut request = request;
     let unknown = std::env::var(MODE).is_ok_and(|mode| mode == "unknown");
     if unknown {
+        request.role = control::Role::Compile;
+        request.command.args = vec![
+            b"--crate-name".to_vec(),
+            b"original_store_helper_fixture".to_vec(),
+        ];
         request
             .command
             .environment
@@ -475,18 +495,18 @@ fn root() {
         assert!(flags >= 0);
         (raw, flags)
     });
-    let mut child = client
-        .member_accounted(
-            &request,
-            MemberIo {
-                stdin: std::process::Stdio::null(),
-                stdout: std::process::Stdio::null(),
-                stderr: std::process::Stdio::inherit(),
-                descriptions: vec![cpu, read, write],
-            },
-            end,
-        )
-        .unwrap();
+    let member_io = MemberIo {
+        stdin: std::process::Stdio::null(),
+        stdout: std::process::Stdio::null(),
+        stderr: std::process::Stdio::inherit(),
+        descriptions: vec![cpu, read, write],
+    };
+    let mut child = (if unknown {
+        client.workload_member_accounted(&request, member_io, end)
+    } else {
+        client.member_accounted(&request, member_io, end)
+    })
+    .unwrap();
     let status = loop {
         assert!(Instant::now() < end, "actual proxy member did not complete");
         if let Some(status) = child.try_wait(end) {
@@ -519,6 +539,14 @@ fn root() {
     let accounting = child
         .accounting()
         .expect("negotiated original wait observation");
+    let helper = child
+        .helper_observation()
+        .expect("original validated local helper");
+    assert_eq!(helper.outcome, Some(control::Outcome::Exit(0)));
+    assert_ne!(
+        Some(helper.identity),
+        child.started().map(|started| started.identity)
+    );
     assert_eq!(
         accounting.scope,
         control::accounting::Scope::ChildAndWaitedDescendantsV1
@@ -536,16 +564,23 @@ fn root() {
     drop(child);
     // The same original CPU lease and FIFO back every sample. These are
     // native child outcomes, not fabricated saved terminal measurements.
-    for (offset, mode) in ["fail", "cancel"].into_iter().enumerate() {
+    for (offset, mode) in ["", "fail", "cancel"].into_iter().enumerate() {
         let cpu = aterm_uds::kept_out(|| lease.as_fd().try_clone_to_owned()).unwrap();
         let read = aterm_uds::kept_out(|| original.as_fd().try_clone_to_owned()).unwrap();
         let write = aterm_uds::kept_out(|| original.as_fd().try_clone_to_owned()).unwrap();
         let mut sample = request.clone();
+        sample.role = control::Role::Compile;
+        sample.command.args = vec![
+            b"--crate-name".to_vec(),
+            b"original_store_helper_fixture".to_vec(),
+        ];
         sample.member_attempt = [offset as u8 + 31; 16];
-        sample
-            .command
-            .environment
-            .push((MODE.as_bytes().to_vec(), mode.as_bytes().to_vec()));
+        if !mode.is_empty() {
+            sample
+                .command
+                .environment
+                .push((MODE.as_bytes().to_vec(), mode.as_bytes().to_vec()));
+        }
         sample.delegations.cpu.as_mut().unwrap().source = cpu.as_raw_fd() as u32;
         let control::GnuTransport::NamedFifo {
             read: sample_read,
@@ -558,7 +593,7 @@ fn root() {
         sample_read.source = read.as_raw_fd() as u32;
         sample_write.source = write.as_raw_fd() as u32;
         let mut child = client
-            .member_accounted(
+            .workload_member_accounted(
                 &sample,
                 MemberIo {
                     stdin: std::process::Stdio::null(),
@@ -590,15 +625,15 @@ fn root() {
             }
             std::thread::sleep(POLL);
         };
-        if mode == "fail" {
+        if mode != "cancel" {
             assert!(
                 matches!(
                     status,
                     control::Status::Finished {
-                        outcome: control::Outcome::Exit(7),
+                        outcome: control::Outcome::Exit(code),
                         cause: control::CompletionCause::Exited,
                         ..
-                    }
+                    } if code == if mode == "fail" { 7 } else { 0 }
                 ),
                 "{status:?}"
             );
@@ -618,7 +653,11 @@ fn root() {
         }
         let observed = child
             .accounting()
-            .expect("known native failure retains original wait observation");
+            .expect("known native outcome retains original wait observation");
+        assert_eq!(
+            child.helper_observation().unwrap().outcome,
+            Some(control::Outcome::Exit(0))
+        );
         assert!(observed.cpu_times.is_some() && observed.peak_rss_bytes.is_some());
     }
     let mut token = [0];

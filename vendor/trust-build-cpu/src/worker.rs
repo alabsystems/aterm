@@ -11,6 +11,9 @@ use std::time::Duration;
 
 use crate::{ExternalDebt, Lease, LegacyFence, Owner, Pool, invalid};
 
+mod gate;
+pub use gate::WorkerPause;
+
 /// A local jobserver with one already-owned implicit global credit.
 ///
 /// The caller must borrow an inherited implicit credit for synchronous nested
@@ -25,6 +28,7 @@ pub struct WorkerClient {
     limit: Arc<dyn Fn(u32) -> u32 + Send + Sync>,
     owner: Owner,
     fence: Option<Arc<LegacyFence>>,
+    admission_gate: Option<Arc<gate::Gate>>,
 }
 
 impl WorkerClient {
@@ -45,7 +49,16 @@ impl WorkerClient {
         if owner.pid == 0 || !pool.contains(&implicit)? {
             return Err(invalid("worker implicit credit does not belong to its CPU pool"));
         }
-        Ok(Self { local, pool, shared: None, implicit, limit, owner, fence: None })
+        Ok(Self {
+            local,
+            pool,
+            shared: None,
+            implicit,
+            limit,
+            owner,
+            fence: None,
+            admission_gate: None,
+        })
     }
 
     /// Join local tokens to the activated native/external transaction. Retained
@@ -60,6 +73,7 @@ impl WorkerClient {
     ) -> io::Result<Self> {
         let mut client = Self::new(local, debt.native_pool()?, implicit, limit, owner)?;
         client.shared = Some(debt);
+        client.admission_gate = Some(gate::Gate::new());
         Ok(client)
     }
 
@@ -81,10 +95,39 @@ impl WorkerClient {
         self.fence.as_ref()
     }
 
+    /// Exclude extras only after the caller separately quiesces implicit work.
+    /// Returns None while an acquisition or offered/active extra is outstanding.
+    /// Legacy non-shared workers do not support this phase transition.
+    pub fn try_pause_extras(&self) -> io::Result<Option<WorkerPause>> {
+        self.admission_gate
+            .as_ref()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "legacy workers cannot enter a retained loan phase",
+                )
+            })?
+            .pause()
+    }
+
+    /// Observe extra admission state; this is not an implicit dispatch permit.
+    /// The execution owner must serialize implicit dispatch with its own phase
+    /// transition, not authorize it from this potentially stale observation.
+    pub fn extra_admission_running(&self) -> bool {
+        self.admission_gate.as_ref().is_none_or(|gate| gate.running())
+    }
+
     /// Acquire both credits, or neither, without waiting on either semaphore.
     /// A global refusal immediately returns the local token, preventing the
     /// hold-and-wait deadlock between independent pools and nested roots.
     pub fn try_acquire(&self) -> io::Result<Option<Credit>> {
+        let attempt = match &self.admission_gate {
+            Some(gate) => match gate.begin()? {
+                Some(attempt) => Some(attempt),
+                None => return Ok(None),
+            },
+            None => None,
+        };
         let Some(local) = self.local.try_acquire()? else { return Ok(None) };
         let cpu = match &self.shared {
             Some(debt) => debt.try_acquire_observed(self.owner, |held| (self.limit)(held))?,
@@ -98,6 +141,7 @@ impl WorkerClient {
             cpu: Arc::new(cpu),
             ticket: Arc::new(AtomicU8::new(OFFERED)),
             fence: self.fence.clone(),
+            admission: attempt.map(gate::Attempt::publish).transpose()?,
         }))
     }
 
@@ -165,6 +209,8 @@ pub struct Credit {
     cpu: Arc<Lease>,
     ticket: Arc<AtomicU8>,
     fence: Option<Arc<LegacyFence>>,
+    // LAST: do not report a drained extra before its original backing drops.
+    admission: Option<gate::Permit>,
 }
 
 const OFFERED: u8 = 0;
@@ -181,6 +227,9 @@ impl Credit {
     /// A helper cancellation that wins this race refuses the dispatch. A
     /// committed worker retains its backing until it and its children finish.
     pub fn commit(&mut self) -> bool {
+        if let Some(admission) = &self.admission {
+            return admission.commit(&self.ticket);
+        }
         self.ticket
             .compare_exchange(OFFERED, COMMITTED, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()

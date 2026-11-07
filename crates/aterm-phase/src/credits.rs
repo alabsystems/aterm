@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! USAGE CREDITS, AND THE VENDOR'S OWN WORD THAT A WINDOW IS FILLING: what Claude Code says of the account's usage beside the composer, read for the record.
+//! USAGE CREDITS, AND THE VENDOR'S OWN WORD THAT A WINDOW IS FILLING OR A MODEL'S WEEK IS FULL: what Claude Code says of the account's usage beside the composer and at a turn's end, read for the record.
 
 /// Which window a notice names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +57,93 @@ pub struct Warning {
     pub pct: u8,
     /// The window's reset as printed (`Oct 18 at 8:50pm (America/Los_Angeles)`).
     pub reset: Option<String>,
+}
+
+/// A model whose own week Claude Code names on screen ([`model_week`]): only the names a capture
+/// measured. Opus, a numbered Fable (`Fable 5 limit`) and the usage-credits limit are no capture's,
+/// so none of them is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeekModel {
+    /// The Fable week (`Fable limit`).
+    Fable,
+    /// The Sonnet week (`Sonnet limit`).
+    Sonnet,
+}
+
+impl WeekModel {
+    /// The word the records print.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            WeekModel::Fable => "fable",
+            WeekModel::Sonnet => "sonnet",
+        }
+    }
+
+    /// The model a wall's message names by its head: `You've hit your Fable limit`,
+    /// `You've reached your Fable limit` or `You've hit your Sonnet limit`, the head the whole
+    /// message, or followed by a blank, a full stop or the notice's `·`.
+    fn of_wall(message: &str) -> Option<WeekModel> {
+        [
+            (crate::anchor!("wall.fable_hit"), WeekModel::Fable),
+            (crate::anchor!("wall.fable"), WeekModel::Fable),
+            (crate::anchor!("wall.sonnet_hit"), WeekModel::Sonnet),
+        ]
+        .into_iter()
+        .find_map(|(head, model)| {
+            let rest = message.strip_prefix(head)?;
+            (rest.is_empty() || rest.starts_with([' ', '.', '\u{b7}'])).then_some(model)
+        })
+    }
+}
+
+/// A model's week as Claude Code last said it on screen ([`model_week`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelWeek {
+    pub model: WeekModel,
+    /// Whole percent used, 0 to 100: 100 at its wall.
+    pub pct: u8,
+    /// The week's reset as printed (`1:36am (America/Los_Angeles)`); `None` where the notice names
+    /// none (`You've hit your Fable limit`, `You've reached your Fable limit. Run /usage-credits …`).
+    pub reset: Option<String>,
+    /// It was read off the model's wall, not its warning.
+    pub wall: bool,
+}
+
+/// THE WEEK OF A MODEL, as Claude Code says it on `rows`: the model's wall, the notice the turn
+/// ended on ([`crate::wall::wall`]: `You've hit your Fable limit · resets 1:36am (…)`, with no
+/// reset, or `You've reached your Fable limit. Run /usage-credits …`; `You've hit your Sonnet
+/// limit · resets …`), read as 100% with the reset it names; else the Fable warning beside the
+/// composer (`You've used 85% of your Fable limit · resets Oct 19 at 11:36pm (…)`, read as
+/// [`usage_warning`] reads the session's and the week's). The wall wins where both show: the
+/// footer keeps a warning drawn before the wall that followed it. Only the measured names are
+/// read ([`WeekModel`]); any other model's week, a numbered name and the usage-credits limit
+/// read `None`.
+#[must_use]
+pub fn model_week(rows: &[String]) -> Option<ModelWeek> {
+    if !rows.iter().any(|row| row.contains("limit")) {
+        return None;
+    }
+    let wall = crate::wall::wall(rows)
+        .filter(|w| matches!(w.kind, crate::wall::WallKind::ModelBucket { .. }))
+        .and_then(|w| Some((WeekModel::of_wall(&w.message)?, w.reset)));
+    if let Some((model, reset)) = wall {
+        return Some(ModelWeek {
+            model,
+            pct: 100,
+            reset,
+            wall: true,
+        });
+    }
+    let fable = const { crate::anchor!("usage.fable_limit") };
+    find_warning(rows, |pct, name, after| {
+        (name == fable).then(|| ModelWeek {
+            model: WeekModel::Fable,
+            pct,
+            reset: crate::phase::notice_reset(after),
+            wall: false,
+        })
+    })
 }
 
 /// Whether usage credits carry the session, by Claude Code's own notice: the lasting
@@ -162,6 +249,22 @@ fn started(rest: &str) -> Started {
 /// The vendor's warning that the session or the weekly window is filling (module docs): `You've used <n>% of your session limit · resets <time>` (`5-hour limit` from 2.1.312), or of the `weekly limit`.
 #[must_use]
 pub fn usage_warning(rows: &[String]) -> Option<Warning> {
+    find_warning(rows, |pct, name, after| {
+        Some(Warning {
+            window: Window::of_name(name)?,
+            pct,
+            reset: crate::phase::notice_reset(after),
+        })
+    })
+}
+
+/// The first `You've used <n>% of your <limit> · <rest>` the notice segments hold, the footer's
+/// first ([`segments`]), that `read` takes: its whole percent (at most 100), the limit's name and
+/// what follows the name's `·` (empty where nothing does).
+fn find_warning<T>(
+    rows: &[String],
+    mut read: impl FnMut(u8, &str, &str) -> Option<T>,
+) -> Option<T> {
     let lead = const { crate::anchor!("usage.warning") };
     let transcript = crate::phase::Transcript::of(rows);
     segments(rows, &transcript).find_map(|segment| {
@@ -174,11 +277,7 @@ pub fn usage_warning(rows: &[String]) -> Option<Warning> {
             .flatten()
             .filter(|&p| p <= 100)?;
         let (name, after) = rest.split_once(" \u{b7} ").unwrap_or((rest, ""));
-        Some(Warning {
-            window: Window::of_name(crate::text::trim_end(name))?,
-            pct,
-            reset: crate::phase::notice_reset(after),
-        })
+        read(pct, crate::text::trim_end(name), after)
     })
 }
 

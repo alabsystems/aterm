@@ -879,7 +879,7 @@ fn a_build_runs_under_exactly_what_the_proof_chose() {
         assert_eq!(
             recs[build_log].out,
             format!(
-                "proxy[{PIN}] build --release -p aterm --target-dir {root}/target --config {UNVERIFIED_LANE} (rustc: {})",
+                "proxy[{PIN}] build --release -p aterm --bin aterm --target-dir {root}/target --config {UNVERIFIED_LANE} (rustc: {})",
                 lab.p(rustc)
             ),
             "{label}"
@@ -993,7 +993,7 @@ fn the_managed_store_lane_comes_first_and_builds_on_targos_explicit_lane() {
     assert_eq!(
         recs[build_log].out,
         format!(
-            "targo[9192] --unverified build --release -p aterm --target-dir {root}/target (PATH first: {store_bin})"
+            "targo[9192] --unverified build --release -p aterm --bin aterm --target-dir {root}/target (PATH first: {store_bin})"
         )
     );
     assert_eq!(

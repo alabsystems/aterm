@@ -16838,6 +16838,7 @@ fn the_usage_recorder_records_only_where_a_record_is_kept() {
             pct: 80,
             reset: None,
         }),
+        week: None,
     };
     let read = |settled: bool, env: &[String], answer: Option<i64>, now: i64| {
         let settled = || {
@@ -16931,6 +16932,7 @@ fn claude_admission_gates_usage_notes_from_an_existing_worker() {
             pct,
             reset: None,
         }),
+        week: None,
     };
     idle.usage_seen(&seen(80));
     let own = aterm_agent::harness::cli::ACCOUNTS_OWN_LABEL;
@@ -17059,6 +17061,7 @@ fn the_usage_recorder_reads_the_roster_through_this_machines_logins() {
             pct: 92,
             reset: None,
         }),
+        week: None,
     };
     let read = |roster: &accounts::UsageRoster, login: &str, sid: &str, answer: i64| {
         let env = vec![format!("{}={login}", accounts::LOGIN_ENV)];
@@ -17137,6 +17140,7 @@ fn a_screen_read_around_a_new_answer_is_no_word_of_it() {
             pct: 96,
             reset: None,
         }),
+        week: None,
     };
     let read = |now: i64| {
         let settled = || true;
@@ -17161,6 +17165,74 @@ fn a_screen_read_around_a_new_answer_is_no_word_of_it() {
 }
 
 #[test]
+fn usage_said_maps_a_models_week_to_its_bucket_and_places_its_reset() {
+    use aterm_phase::credits::{Warning, Window};
+    use aterm_phase::{ModelWeek, WeekModel};
+    const PDT: i64 = -7 * 3600;
+    let at = 1_793_514_600; // 2026-10-31T23:30:00-07:00
+    let seen = |model, pct, reset: Option<&str>, wall| UsageSeen {
+        week: Some(ModelWeek {
+            model,
+            pct,
+            reset: reset.map(str::to_string),
+            wall,
+        }),
+        ..UsageSeen::default()
+    };
+    assert_eq!(
+        usage_said(&seen(WeekModel::Fable, 100, Some("1:36am"), true), at, PDT).week,
+        Some(accounts::WeekRead {
+            bucket: "seven_day_overage_included",
+            pct: 100,
+            reset: Some(1_793_522_160), // 2026-11-01T01:36:00-07:00
+            wall: true,
+        })
+    );
+    assert_eq!(
+        usage_said(&seen(WeekModel::Fable, 100, None, true), at, PDT).week,
+        Some(accounts::WeekRead {
+            bucket: "seven_day_overage_included",
+            pct: 100,
+            reset: None,
+            wall: true,
+        }),
+        "a wall that named no reset"
+    );
+    for (what, week) in [
+        (
+            "a warning that named no reset",
+            seen(WeekModel::Fable, 85, None, false),
+        ),
+        (
+            "a reset no clock places",
+            seen(WeekModel::Fable, 100, Some("when the moon is full"), true),
+        ),
+    ] {
+        assert_eq!(usage_said(&week, at, PDT).week, None, "{what}");
+    }
+    assert_eq!(
+        usage_said(&seen(WeekModel::Sonnet, 100, None, true), at, PDT)
+            .week
+            .map(|w| w.bucket),
+        Some("seven_day_sonnet")
+    );
+    let weekly = UsageSeen {
+        warning: Some(Warning {
+            window: Window::Weekly,
+            pct: 85,
+            reset: Some("Nov 2 at 9am".to_string()),
+        }),
+        ..UsageSeen::default()
+    };
+    let said = usage_said(&weekly, at, PDT);
+    assert_eq!(
+        (said.week, said.warning.map(|w| (w.weekly, w.pct))),
+        (None, Some((true, 85))),
+        "the control: the week of all models is no model's"
+    );
+}
+
+#[test]
 fn footer_usage_resets_across_a_daylight_change_take_the_resets_offset() {
     use aterm_phase::credits::{Credits, Started, Warning, Window};
     const PDT: i64 = -7 * 3600;
@@ -17180,6 +17252,7 @@ fn footer_usage_resets_across_a_daylight_change_take_the_resets_offset() {
             pct: 85,
             reset: Some("Nov 2 at 9am".to_string()),
         }),
+        week: None,
     };
     let said = usage_said_local(&fall_seen, fall_at, &fall_local);
     assert_eq!(said.day, 20_757);
@@ -17217,6 +17290,7 @@ fn footer_usage_resets_across_a_daylight_change_take_the_resets_offset() {
             pct: 90,
             reset: Some("Mar 9 at 9am".to_string()),
         }),
+        week: None,
     };
     let said = usage_said_local(&spring_seen, spring_at, &spring_local);
     assert_eq!(said.day, 20_519);
@@ -34052,6 +34126,84 @@ fn the_harness_labels_a_typed_disk_resume_only_while_no_need_is_open() {
         failed.labels().is_empty(),
         "under an open need the harness labels nothing: {:?}",
         failed.labels()
+    );
+}
+
+/// A recorded tap reading's series row carries the record's keys, and a reading held back for
+/// another login is one `another-account` row: the tap step reads the label's lab key and
+/// account key with its windows under the store's lock and hands them, the transaction's events
+/// and whether it held the reading back to the readings series once the transaction commits
+/// (`account_series::note_committed`). Negative controls: the host handing no keys writes the
+/// `fig` row without them; the host saying nothing was held back writes a `fig` row for the
+/// held-back reading.
+#[cfg(unix)]
+#[test]
+fn a_recorded_tap_readings_series_row_carries_the_records_lab_key() {
+    const AC: &str = "ac-0123456789abcdef";
+    let (a, b) = (
+        "11111111-1111-4111-8111-111111111111",
+        "22222222-2222-4222-8222-222222222222",
+    );
+    let w = TapWorld::new();
+    let home = w.tmp.path().join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    *w.env.lock().unwrap() = vec![format!("HOME={}", home.display())];
+    let sign_in = |uuid: &str| {
+        let text = format!(r#"{{"oauthAccount":{{"accountUuid":"{uuid}"}}}}"#);
+        std::fs::write(home.join(".claude.json"), text).expect("profile");
+    };
+    sign_in(a);
+    accounts::Store::at(&w.state())
+        .transact(w.clock(), &mut None, |state| {
+            state.accounts.entry("main".into()).or_default().pk = Some(AC.into());
+            Ok(Vec::new())
+        })
+        .expect("the record's lab key");
+    let idle = w.worker(&tap_on(), tapped_argv(), true);
+    w.tap(10, 42, None);
+    assert_eq!(idle.tap_step(TapAt::Point), Some("reading recorded"));
+    let rows = || {
+        let (state, _) = accounts::Store::at(&w.state())
+            .load(w.clock())
+            .expect("the store");
+        account_series::read(&w.state(), "main", &state.machine)
+    };
+    let first = rows();
+    assert!(
+        matches!(
+            first.as_slice(),
+            [account_series::SeriesRow {
+                said: account_series::Said::Fig {
+                    five_hour: Some(five),
+                    ac: Some(ac),
+                    key: Some(key),
+                    ..
+                },
+                ..
+            }] if ac == AC && Some(*key) == profile::AccountKey::claude(a) && five.pct_x10 == 420
+        ),
+        "{first:?}"
+    );
+    sign_in(b);
+    w.later(10);
+    w.tap(30, 50, None);
+    assert_eq!(
+        idle.tap_step(TapAt::Point),
+        Some("reading recorded"),
+        "the epoch"
+    );
+    let kinds: Vec<&str> = rows()
+        .iter()
+        .map(|row| match &row.said {
+            account_series::Said::Fig { .. } => "fig",
+            account_series::Said::Event(_) => "event",
+            _ => "other",
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        ["fig", "event"],
+        "one another-account row, and no figure while the new login is adopted"
     );
 }
 

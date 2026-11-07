@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use aterm_uds::file_watch::{FileStamp, FileWatch};
 
 /// Why aterm cannot reach the LAN on macOS: the LAN broker's hello's error in its own words (not
-/// installed and no allowed direct path, another protocol, refused), from
+/// installed and no allowed direct path, another protocol, refused, not checked now), from
 /// `aterm_uds::lan::broker::hello`. `None` where a hello is answered (by the broker, or while
 /// none is installed by the allowed direct path, `aterm_uds::lan::direct`), and off macOS, where
 /// the LAN is reached in-process.
@@ -88,10 +88,10 @@ const ALLOWANCE: u64 = 2;
 /// ([`aterm_uds::lan::direct::record`]), each heard through a [`FileWatch`] on a thread of its own
 /// (`lan-broker-events`) whose first look at each comes before the first ask; and again, from
 /// [`RETRY_FIRST`] doubling to [`RETRY_MOST`], while a hello fails in a way nothing heard ends
-/// ([`Answer::Transient`]), a refusal among them, so a process the broker refuses by its code asks
-/// again every [`RETRY_MOST`]. Where no file events can be had it asks every [`ABSENT_POLL`] while
-/// none answers and every [`PRESENT_POLL`] while one does. Off macOS, where nothing waits for a
-/// broker, it returns at once.
+/// ([`Answer::Transient`]). A process the broker refuses by its code asks nothing more until the
+/// broker's socket is made again. Where no file events can be had it asks every [`ABSENT_POLL`]
+/// while none answers and every [`PRESENT_POLL`] while one does. Off macOS, where nothing waits
+/// for a broker, it returns at once.
 pub fn watch_arrivals(arrived: impl FnMut()) {
     if !cfg!(target_os = "macos") {
         return;
@@ -109,13 +109,16 @@ enum Answer {
         /// The direct path answered.
         direct: bool,
     },
-    /// Not answered, in a way only a change the watch hears ends: no socket and no allowance, or a
-    /// broker of another protocol (a broker that starts makes its socket again).
+    /// Not answered, in a way only a change the watch hears ends: no socket and no allowance, a
+    /// broker of another protocol, or one that refused this process's code or is not the broker
+    /// (a broker that starts makes its socket again). A broker that predates
+    /// `Unavailable::Unchecked` also refuses while it could not check: it adopts the update that
+    /// brings that, its socket made again.
     Settled,
     /// Not answered, in a way that can end with nothing heard: a socket there that nothing listens
-    /// on (a broker between its bind and its listen, or one that went and left it), a refusal (the
-    /// broker refuses a code it does not admit, and also while it serves its most connections or
-    /// cannot check one, and says which only in words), or an exchange that failed or hung.
+    /// on (a broker between its bind and its listen, or one that went and left it), a broker that
+    /// did not judge this process (its code check did not finish, or it was serving its most
+    /// connections), or an exchange that failed or hung.
     Transient,
 }
 
@@ -126,10 +129,10 @@ impl Answer {
         use aterm_uds::lan::{LanError, Unavailable};
         match error {
             LanError::Unavailable(Unavailable::NotInstalled) if socket_there => Self::Transient,
-            LanError::Unavailable(Unavailable::Refused(_)) | LanError::Io(_) => Self::Transient,
-            LanError::Unavailable(Unavailable::NotInstalled | Unavailable::Outdated { .. }) => {
-                Self::Settled
-            }
+            LanError::Unavailable(Unavailable::Unchecked(_)) | LanError::Io(_) => Self::Transient,
+            LanError::Unavailable(
+                Unavailable::NotInstalled | Unavailable::Outdated { .. } | Unavailable::Refused(_),
+            ) => Self::Settled,
         }
     }
 }
@@ -538,9 +541,9 @@ mod tests {
 
     /// A hello that found no broker is settled where no socket is there (one made is heard) and
     /// transient where one is (a broker between its bind and its listen); another protocol is
-    /// settled (a broker that starts makes its socket again); a refusal is transient, since the
-    /// broker also refuses while it serves its most connections or cannot check a peer, and an
-    /// exchange's own failure is transient.
+    /// settled (a broker that starts makes its socket again), and so is a refusal of this code; a
+    /// broker that did not judge this process (serving its most connections, or its check did not
+    /// finish) and an exchange's own failure are transient.
     #[test]
     fn a_failed_hello_is_settled_only_where_a_heard_change_ends_it() {
         use aterm_uds::lan::{LanError, Unavailable};
@@ -552,8 +555,10 @@ mod tests {
         );
         let outdated = LanError::Unavailable(Unavailable::Outdated { ours: 1, theirs: 2 });
         assert_eq!(Answer::of_failure(&outdated, true), Answer::Settled);
+        let refused = LanError::Unavailable(Unavailable::Refused("not aterm's code".into()));
+        assert_eq!(Answer::of_failure(&refused, true), Answer::Settled);
         let busy = || {
-            LanError::Unavailable(Unavailable::Refused(
+            LanError::Unavailable(Unavailable::Unchecked(
                 "the LAN broker is serving 128 connections".into(),
             ))
         };

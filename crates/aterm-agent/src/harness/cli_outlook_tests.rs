@@ -76,6 +76,7 @@ fn seeded(tmp: &Tmp, env: &Env) {
                     epoch: None,
                 }),
             ),
+            (None, None),
             at,
             std::time::Duration::from_secs(60),
         )
@@ -124,7 +125,7 @@ fn card_outlook(env: &Env) -> outlook::Outlook {
     let (state, _) = store.load(env.now).expect("load");
     let (logins, _) = store.load_logins(env.now).expect("logins");
     let enrolled = accounts::enrolled(&roster);
-    let series = outlook::series_of(&env.state, &roster, &state.machine);
+    let series = outlook::series_of(&env.state, &roster, &state.machine, env.now);
     let policy = SupervisorConfig::from_path(env.config.as_deref()).0;
     outlook::outlook(&outlook::Inputs {
         roster: &roster,

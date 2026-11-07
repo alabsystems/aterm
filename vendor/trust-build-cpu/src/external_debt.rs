@@ -35,6 +35,38 @@ pub struct ExternalDebt {
     retirement: LegacyRetirement,
 }
 
+/// One actual native lease per slot, paired with crash-retained exclusion for
+/// that SAME domain. The exclusion is not another set of execution credits.
+/// Dropping either live description set never settles the durable obligation.
+/// No record, count or public observation can construct this value.
+pub struct NativeDomainReservation {
+    native: Vec<Lease>,
+    retained: Vec<RetainedLease>,
+}
+impl NativeDomainReservation {
+    /// Original live kernel guards. A custodian may explicitly inherit these
+    /// SAME descriptions; it must never synthesize replacements from a count.
+    pub fn native_leases(&self) -> &[Lease] {
+        &self.native
+    }
+
+    /// Settle only after independently establishing the original execution
+    /// scope's positive retirement. This primitive observes no process and is
+    /// not a closure proof. Native guards remain held while exclusion settles.
+    pub fn settle_exclusion(&mut self) -> io::Result<()> {
+        while let Some(lease) = self.retained.last_mut() {
+            lease.settle_held()?;
+            self.retained.pop();
+        }
+        Ok(())
+    }
+    /// Whether this original capability's exclusion has settled. This is
+    /// bookkeeping only and establishes no process or execution-scope closure.
+    pub fn exclusion_settled(&self) -> bool {
+        self.retained.is_empty()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Binding {
     native_dev: u64,
@@ -48,6 +80,171 @@ struct Binding {
 }
 
 impl ExternalDebt {
+    /// Continue the sole root bank's actual worker description; no fresh
+    /// native/debt admission occurs and no count/decoded reply can construct it.
+    #[cfg(all(feature = "native-host", any(target_os = "linux", target_os = "macos")))]
+    pub fn adopt_workload_worker(
+        &self,
+        received: trust_resource_controller::client::workload::AuthenticatedWorkerCpu,
+    ) -> io::Result<(Lease, trust_resource_controller::client::workload::WorkerLoan)> {
+        self.validate()?;
+        let (reply, file, loan) = received.into_original();
+        let (device, inode) = self.native_manifest_identity()?;
+        let trust_resource_controller::Cpu::CooperativeShared { ceiling, native_manifest } =
+            reply.context.context.cpu
+        else {
+            return Err(invalid("original workload worker is not cooperative"));
+        };
+        let width = self.native.slots().get();
+        if native_manifest.device != device
+            || native_manifest.inode != inode
+            || ceiling != width
+            || self.reserved()? != width
+        {
+            return Err(invalid("workload worker original domain or exclusion differs"));
+        }
+        let trust_resource_controller::workload::host::worker::Decision::Granted { slot, .. } =
+            reply.decision
+        else {
+            return Err(invalid("workload worker has no original grant"));
+        };
+        if loan.slot() != slot {
+            return Err(invalid("workload worker loan differs from original slot"));
+        }
+        Ok((self.native.continue_workload_original(slot, file)?, loan))
+    }
+    /// Continue a live registered workload compiler's actual primary. The
+    /// opaque receiver, not a decoded Context/File, establishes original custody.
+    #[cfg(all(feature = "native-host", any(target_os = "linux", target_os = "macos")))]
+    pub fn adopt_workload_member(
+        &self,
+        received: trust_resource_controller::client::workload::AuthenticatedMemberCpu,
+    ) -> io::Result<(trust_resource_controller::workload::host::MemberOriginalReply, Lease)> {
+        self.validate()?;
+        let (reply, file) = received.into_original();
+        let (device, inode) = self.native_manifest_identity()?;
+        let trust_resource_controller::Cpu::CooperativeShared { ceiling, native_manifest } =
+            reply.context.context.cpu
+        else {
+            return Err(invalid("original workload member is not cooperative"));
+        };
+        let width = self.native.slots().get();
+        if native_manifest.device != device
+            || native_manifest.inode != inode
+            || ceiling != width
+            || self.reserved()? != width
+        {
+            return Err(invalid("registered workload member domain or original exclusion differs"));
+        }
+        let lease = self.native.continue_workload_original(reply.cpu.slot, file)?;
+        Ok((reply, lease))
+    }
+    /// Consume ONLY original descriptions received on the authenticated live
+    /// workload startup exchange. Ordinary inherited-file adoption is unchanged
+    /// and cannot bypass retained headroom. No lock is acquired or replaced.
+    #[cfg(all(feature = "native-host", any(target_os = "linux", target_os = "macos")))]
+    pub fn adopt_workload_startup(
+        &self,
+        startup: trust_resource_controller::client::workload::AuthenticatedWorkloadStartup,
+    ) -> io::Result<(
+        trust_resource_controller::workload::host::ReadyReply,
+        Vec<Lease>,
+        trust_resource_controller::client::workload::WorkloadControl,
+    )> {
+        use trust_resource_controller::Cpu;
+        self.validate()?;
+        let (reply, files, control) = startup.into_originals();
+        let (device, inode) = self.native_manifest_identity()?;
+        let Cpu::CooperativeShared { ceiling, native_manifest } = reply.context.context.cpu else {
+            return Err(invalid("workload original root is not cooperative"));
+        };
+        let width = self.native.slots().get();
+        if native_manifest.device != device
+            || native_manifest.inode != inode
+            || ceiling != width
+            || files.len() != width as usize
+            || self.reserved()? != width
+        {
+            return Err(invalid("original workload domain or retained exclusion differs"));
+        }
+        let observations: Vec<_> = reply.cpu_set().cloned().collect();
+        if observations.len() != files.len() {
+            return Err(invalid("original workload set differs"));
+        }
+        let mut leases = Vec::with_capacity(files.len());
+        for (file, observed) in files.into_iter().zip(observations) {
+            leases.push(self.native.continue_workload_original(observed.slot, file)?);
+        }
+        // Closing all originals on failure leaves the host's live set and its
+        // durable exclusion intact; it never returns a partial set to startup.
+        Ok((reply, leases, control))
+    }
+    /// Admit one complete native domain, or nothing, under ONE manifest
+    /// transaction. Original private recovery material must already be bound
+    /// and durably persisted by the custodian before any publication.
+    ///
+    /// Existing native work or retained/unknown debt leaves the preparation
+    /// unconsumed and returns None. No partial native acquisition is kept while
+    /// waiting. Every issued native guard is paired with matching durable
+    /// exclusion before any capability is returned to execution. Only an
+    /// original held-only continuation may borrow those native guards while
+    /// this exclusion exists; ordinary fresh admission remains blocked.
+    pub fn try_acquire_all_recoverable(
+        &self,
+        prepared: &mut PreparedRecovery,
+    ) -> io::Result<Option<NativeDomainReservation>> {
+        prepared.validate_issuance(self.recovery_domain()?)?;
+        let Some(_transaction) = transaction(&self.native)? else { return Ok(None) };
+        let domain = self.recovery_domain()?;
+        prepared.validate_issuance(domain)?;
+        let width = self.native.slots();
+        if prepared.width() != width {
+            return Err(invalid("all-domain preparation differs from the actual native domain"));
+        }
+        if self.reserved()? != 0
+            || self
+                .native
+                .snapshot()?
+                .iter()
+                .any(|slot| !matches!(slot, SlotState::Available { .. }))
+        {
+            return Ok(None);
+        }
+        let mut native = Vec::with_capacity(width.get() as usize);
+        for _ in 0..width.get() {
+            let Some(lease) = self.native.try_acquire_in_transaction(prepared.owner())? else {
+                // Nothing has escaped to execution. Closing these unexported
+                // original guards rolls back the entire native attempt.
+                return Ok(None);
+            };
+            native.push(lease);
+        }
+        let mut retained = Vec::with_capacity(width.get() as usize);
+        for unit in prepared.take_units()? {
+            match self.retained.try_acquire_recoverable(
+                prepared.owner(),
+                width,
+                &domain,
+                &prepared.context(),
+                &unit,
+            ) {
+                Ok(Some(lease)) => retained.push(lease),
+                result => {
+                    // No target or downstream owner received any description.
+                    // Conclusively issued prior units can be cancelled; an
+                    // uncertain write remains discoverable original debt.
+                    let error = result.err().unwrap_or_else(|| {
+                        invalid("all-domain exclusion changed inside native transaction")
+                    });
+                    for lease in retained {
+                        lease.settle()?;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(Some(NativeDomainReservation { native, retained }))
+    }
     /// Observe native slots and retained external slots in one nonblocking
     /// admission transaction, without creating or repairing either domain.
     ///

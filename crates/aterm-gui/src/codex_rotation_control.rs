@@ -79,16 +79,8 @@ impl Preparation {
     }
 }
 
-fn index(env: &Env, job: &Preparation) -> Option<PathBuf> {
-    let key = aterm_json::to_string(&(&job.intent, job.process.pid, job.process.birth, &job.start))
-        .ok()?;
-    let digest = aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(key.as_bytes()));
-    Some(
-        env.accounts_store_for(accounts::Cli::Codex)?
-            .dir
-            .join("renewal-follow")
-            .join(format!("quota-intent-{digest}")),
-    )
+fn index(job: &Preparation) -> Option<renewal::IndexKey> {
+    renewal::IndexKey::quota(&job.intent, job.process.pid, job.process.birth, &job.start).ok()
 }
 
 #[cfg(debug_assertions)]
@@ -301,14 +293,11 @@ pub(super) fn prepare(
             job
         }
     };
-    let Some(index) = index(env, &job) else {
+    let Some(index) = index(&job) else {
         return WAITING.into();
     };
-    match renewal::read_index(&index) {
-        Ok(Some(id)) => {
-            let Some(receipt) = renewal::read_receipt(env, &id) else {
-                return WAITING.into();
-            };
+    match renewal::with_receipt_writer(env, |writer| writer.read_indexed(&index)) {
+        Ok(Some(Some(receipt))) => {
             if receipt.intent != job.intent
                 || receipt.old_pid != job.process.pid
                 || receipt.old_birth != job.process.birth
@@ -323,8 +312,8 @@ pub(super) fn prepare(
                 return acknowledged_receipt_reply(env, &receipt);
             }
         }
-        Err(_) => return WAITING.into(),
-        Ok(None) => {}
+        Err(_) | Ok(None) => return WAITING.into(),
+        Ok(Some(None)) => {}
     }
     let mut progress = job.progress.lock().unwrap_or_else(|p| p.into_inner());
     match &mut *progress {
@@ -364,7 +353,7 @@ fn publish(
     resume: &self_claimed::Resume,
     job: &Preparation,
     selected: &Selection,
-    index: &Path,
+    index: &renewal::IndexKey,
 ) -> Result<Receipt, &'static str> {
     let authority = ctx
         .meta
@@ -415,14 +404,11 @@ fn publish(
         revoked: false,
     };
     pool::with_prepared_writer(env, &receipt, |_, writer| {
-        if let Some(id) = renewal::read_index(index)?
-            && renewal::read_receipt(env, &id).is_none_or(|old| !old.may_replace())
-        {
+        let prior = writer.read_indexed(index)?;
+        if prior.as_ref().is_some_and(|old| !old.may_replace()) {
             return Err("existing-receipt");
         }
-        writer.create(&receipt)?;
-        aterm_agent::harness::upgrade_models::write_atomic_mode(index, &receipt.id, Some(0o600))
-            .map_err(|_| "index")?;
+        writer.publish_indexed(index, prior.as_ref(), &receipt)?;
         Ok(receipt.clone())
     })?
     .ok_or("writer-busy")
@@ -647,18 +633,15 @@ mod tests {
     fn codex_rotation_index_retains_source_intent_across_candidate_changes() {
         let proof = crate::session_timeline::scoped_input_tests::scoped(&[Scope::Relaunch]).proven;
         let mut job = job(&proof);
-        let mut env = Env::from_process().unwrap();
-        env.home = Some("/fixture/home".into());
-        env.state = "/fixture/state".into();
-        let original = index(&env, &job).unwrap();
+        let original = index(&job).unwrap();
         // A destination is deliberately not in the key: a lost Ready response
         // must find its original receipt before another candidate can be chosen.
         *job.progress.lock().unwrap() = Progress::NotNeeded;
-        assert_eq!(index(&env, &job).unwrap(), original);
+        assert_eq!(index(&job).unwrap(), original);
         job.intent.wall = "00000000-0000-0000-0000-000000000003".into();
-        assert_ne!(index(&env, &job).unwrap(), original);
+        assert_ne!(index(&job).unwrap(), original);
         job.intent.wall = "00000000-0000-0000-0000-000000000002".into();
         job.process.birth += 1;
-        assert_ne!(index(&env, &job).unwrap(), original);
+        assert_ne!(index(&job).unwrap(), original);
     }
 }

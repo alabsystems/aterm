@@ -33,7 +33,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use aterm_json::{Map, Value};
 
-use super::account_series::{self, PlanSaid, SeriesRow};
+use super::account_series::{self, Began, PlanSaid, Run, SeriesRow};
 use super::accounts::{
     self, Advice, Class, Condition, Me, Mode, Mover, Point, Roster, State, StayWhy, TapRead,
     WindowRead,
@@ -1030,7 +1030,7 @@ pub struct Inputs<'a> {
 }
 
 /// How far either side of now an outlook says instants on their own offsets: the week ahead and
-/// the series' eight days back, with a day to spare.
+/// the series' eight days back ([`super::account_series::VIEW_S`]), with a day to spare.
 const OFFSETS_SPAN_S: i64 = 9 * DAY;
 
 /// The step [`Offsets::around`] samples a zone at, 72 looks a build: shorter than any gap
@@ -1285,51 +1285,14 @@ fn next_reset(passed: i64, len: i64, now: i64) -> i64 {
 // ---------------------------------------------------------------------------------------------
 // Pace (§5)
 
-/// How a run began (§5.2), which says where its rise starts when no row precedes the lookback.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Began {
-    /// A window's first run: empty at `reset − W`.
-    Window,
-    /// After a limit reset used inside the window: empty at the epoch.
-    Epoch(i64),
-    /// After a refill: at its first row.
-    Refill,
-}
-
-/// One run of one window: rows of one reset, no refill, no epoch cut between them.
-#[derive(Clone, Debug)]
-struct Run<'a> {
-    began: Began,
-    figs: Vec<&'a account_series::Fig>,
-}
-
+/// `w`'s runs in `rows` (§5.2, [`account_series::runs`]), of the figures the display admits at
+/// `now` ([`super::profile::usage_read_age`]).
 fn runs<'a>(rows: &'a [SeriesRow], w: Window, now: i64) -> Vec<Run<'a>> {
-    let mut figs: Vec<&account_series::Fig> = rows
-        .iter()
-        .filter_map(|r| r.fig(w.id()))
-        .filter(|figure| super::profile::usage_read_age(figure.at, now).is_some())
-        .collect();
-    figs.sort_by_key(|f| f.at);
-    let mut out: Vec<Run<'a>> = Vec::new();
-    for fig in figs {
-        let began = match out.last().and_then(|run| run.figs.last()) {
-            None => Some(Began::Window),
-            Some(prev) if prev.reset != fig.reset => Some(Began::Window),
-            Some(prev) => match fig.epoch.filter(|e| *e > prev.at && *e <= fig.at) {
-                Some(epoch) => Some(Began::Epoch(epoch)),
-                None => (fig.pct_x10.saturating_add(accounts::REFILL_MIN_X10) <= prev.pct_x10)
-                    .then_some(Began::Refill),
-            },
-        };
-        match (began, out.last_mut()) {
-            (None, Some(run)) => run.figs.push(fig),
-            (began, _) => out.push(Run {
-                began: began.unwrap_or(Began::Refill),
-                figs: vec![fig],
-            }),
-        }
-    }
-    out
+    account_series::runs(
+        rows.iter()
+            .filter_map(|r| r.fig(w.id()))
+            .filter(|figure| super::profile::usage_read_age(figure.at, now).is_some()),
+    )
 }
 
 /// The rise of every label's `w` runs that touch `[now − lookback, now]`, weighted by plan
@@ -2608,13 +2571,15 @@ pub fn renewals_of(roster: &Roster, logins: &accounts::Logins) -> BTreeMap<Strin
         .collect()
 }
 
-/// Each roster row's series on `machine` under `harness_state` ([`account_series::read`]),
-/// rows with none left out ([`Inputs::series`]).
+/// Each roster row's series on `machine` under `harness_state` as the outlook reads it at `now`
+/// ([`account_series::outlook_view`], what the card's [`account_series::Tail`] holds), rows with
+/// none left out ([`Inputs::series`]).
 #[must_use]
 pub fn series_of(
     harness_state: &std::path::Path,
     roster: &Roster,
     machine: &str,
+    now: i64,
 ) -> BTreeMap<String, Vec<SeriesRow>> {
     roster
         .rows
@@ -2622,7 +2587,10 @@ pub fn series_of(
         .map(|r| {
             (
                 r.label.clone(),
-                account_series::read(harness_state, &r.label, machine),
+                account_series::outlook_view(
+                    account_series::read(harness_state, &r.label, machine),
+                    now,
+                ),
             )
         })
         .filter(|(_, rows)| !rows.is_empty())
@@ -2651,7 +2619,7 @@ pub fn for_report(
     (mode, credits): (Mode, bool),
     (now, offset): (i64, fn(i64) -> i64),
 ) -> Outlook {
-    let series = series_of(harness_state, roster, &state.machine);
+    let series = series_of(harness_state, roster, &state.machine, now);
     let renewals = renewals_of(roster, logins);
     outlook(&Inputs {
         roster,
@@ -3022,7 +2990,10 @@ fn reads_of(rows: &[SeriesRow], now: i64) -> Vec<Read> {
                 last
             }
             account_series::Said::Beat => last.map(|prev| Read { t: row.t, ..prev }),
-            account_series::Said::Plan(_) => None,
+            account_series::Said::Plan(_)
+            | account_series::Said::Close(_)
+            | account_series::Said::Day(_)
+            | account_series::Said::Event(_) => None,
         };
         let Some(read) = read else {
             continue;

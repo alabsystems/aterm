@@ -72,6 +72,7 @@ pub mod fabric_grammar;
 pub mod resource_admission;
 pub mod resource_inspection;
 pub mod resource_subgroup;
+pub mod verb_page;
 
 pub mod fabric_command;
 pub mod fs_restricted;

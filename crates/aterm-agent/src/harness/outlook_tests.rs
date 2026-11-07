@@ -129,6 +129,8 @@ impl Fx {
             said: Said::Fig {
                 five_hour: fig(five),
                 seven_day: fig(week),
+                ac: None,
+                key: None,
             },
         });
         rows.sort_by_key(|r| r.t);
@@ -360,6 +362,36 @@ fn demand_survives_a_rotation() {
     );
 }
 
+/// THE PACE READS A WEEK AND ITS LOOKBACK OF THE SERIES, as the card and the report read it
+/// ([`account_series::outlook_view`]): a weekly figure seven and a half days old, then nothing
+/// until a week that began 12 hours ago, is a row before the 24 h lookback, so the week's pace
+/// spreads the new week's rise over the whole lookback. Negative control: a view of seven days
+/// drops the old figure, and the pace divides by the new week's 12 hours (twice the pace).
+#[test]
+fn the_pace_reads_a_week_and_its_lookback_of_the_series() {
+    let mut fx = Fx::new(&[("me", Class::Preferred)]);
+    fx.plan("me", "max", Some("20x"), NOW - 9 * D);
+    let began = NOW - 12 * H;
+    let reset = began + 7 * D;
+    fx.fig("me", NOW - 7 * D - 12 * H, None, Some((900, began)));
+    fx.fig("me", NOW - 11 * H, None, Some((20, reset)));
+    fx.read("me", None, Some((60, reset)), NOW - H);
+    let rows = fx.series.remove("me").expect("a series");
+    fx.series
+        .insert("me".into(), account_series::outlook_view(rows, NOW));
+    assert!(
+        rise_of(&fx, Window::Week, WEEK_LOOKBACK_S).2,
+        "the old figure is a row before the lookback"
+    );
+    let pace = fx.outlook().demand.week.expect("the week's pace stands");
+    assert_eq!(pace.span_s, WEEK_LOOKBACK_S);
+    assert_eq!(
+        pace.x10_m_per_day,
+        60 * 20,
+        "six points of a 20x week a day"
+    );
+}
+
 /// T4: RUNS SPLIT AT A RESET, A REFILL AND AN EPOCH, so no rise spans one. Negative control:
 /// merging the runs counts the reset's drop as no rise at all.
 #[test]
@@ -389,6 +421,8 @@ fn runs_split_at_reset_refill_epoch() {
                     src: "tap".into(),
                     epoch: Some(epoch),
                 }),
+                ac: None,
+                key: None,
             },
         });
     }
@@ -1712,6 +1746,7 @@ fn replay_writes_nothing_and_never_probes() {
             if let Said::Fig {
                 five_hour,
                 seven_day,
+                ..
             } = &row.said
             {
                 account_series::note_within(
@@ -1719,6 +1754,7 @@ fn replay_writes_nothing_and_never_probes() {
                     label,
                     MACHINE,
                     (five_hour.clone(), seven_day.clone()),
+                    (None, None),
                     row.t,
                     std::time::Duration::from_secs(60),
                 )

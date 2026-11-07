@@ -116,7 +116,7 @@ const HELP_HEAD: &str = concat!(
     "                              e.g. for piped or CI runs.\n",
     "    aterm help [topic]        The manual: what aterm is, how to drive it, and\n",
     "                              every tool. Inside an aterm tab it prints the\n",
-    "                              agent operating brief. Start here.\n",
+    "                              agent brief. Start here.\n",
     "    aterm <verb> [args]       A verb (see VERBS) or a tool (see TOOLCHAIN).\n",
     "    aterm <SUBCOMMAND>        Print diagnostics and exit; `doctor` also\n",
     "                              repairs (see SUBCOMMANDS).\n",

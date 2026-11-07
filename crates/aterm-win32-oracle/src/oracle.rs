@@ -128,6 +128,25 @@ pub fn artifacts(messages: &[u8]) -> Result<BTreeMap<String, PathBuf>> {
     }
     Ok(out)
 }
+/// What an import inspection that fell short adds to its refusal: off macOS, where the nm that
+/// read it is not LLVM's, that nm and where LLVM's comes from, since GNU nm reads no Windows
+/// import library ([`crate::Tools`]' nm: `$NM`, `llvm-nm` on `PATH`, the stock pin's
+/// llvm-tools, then `nm`); otherwise nothing.
+pub fn nm_hint(tools: &Tools) -> String {
+    let llvm = tools
+        .nm
+        .file_name()
+        .is_some_and(|n| n.to_string_lossy().contains("llvm-nm"));
+    if cfg!(target_os = "macos") || llvm {
+        String::new()
+    } else {
+        format!(
+            " (read with {}, not llvm-nm: `targo --unverified verify provision rustup` gives the \
+             stock pin the llvm-tools whose llvm-nm reads Windows import libraries)",
+            tools.nm.display()
+        )
+    }
+}
 pub fn nm(runner: &mut impl Runner, tools: &Tools, args: &[String], cwd: &Path) -> Result<String> {
     let out = required(runner.output(&tools.nm, args, cwd, None)?, "nm inspection")?;
     String::from_utf8(out.stdout).map_err(|e| e.to_string())
@@ -219,7 +238,8 @@ pub fn import_table(
     }
     if refs.is_empty() || refs.iter().any(|s| !defs.contains_key(s)) {
         return Err(format!(
-            "{feature} imports could not be completely inspected"
+            "{feature} imports could not be completely inspected{}",
+            crate::oracle::nm_hint(tools)
         ));
     }
     Ok(refs

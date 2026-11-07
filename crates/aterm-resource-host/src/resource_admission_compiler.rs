@@ -16,6 +16,9 @@ use std::{
 #[derive(Clone)]
 pub(super) enum Selection {
     Managed(Arc<Selected>),
+    // The distinct workload route selects this original whole manager SDK
+    // without executing a preparatory compiler/version subprocess.
+    HeldSdk(Arc<sdk::Keeper>),
     // A private, actual native fixture image qualifies only the custom integration binary.
     #[cfg(all(test, target_os = "macos"))]
     NativeFixture {
@@ -28,6 +31,7 @@ impl Selection {
     pub(super) fn execution(&self) -> &Path {
         match self {
             Self::Managed(selected) => selected.execution(),
+            Self::HeldSdk(selected) => selected.execution(),
             #[cfg(all(test, target_os = "macos"))]
             Self::NativeFixture { execution, .. } => execution,
         }
@@ -35,6 +39,7 @@ impl Selection {
     pub(super) fn lease_descriptor(&self) -> io::Result<std::os::fd::OwnedFd> {
         match self {
             Self::Managed(selected) => selected.lease_descriptor(),
+            Self::HeldSdk(selected) => selected.descriptor(),
             #[cfg(all(test, target_os = "macos"))]
             Self::NativeFixture { lease, .. } => lease.try_clone_descriptor(),
         }
@@ -42,6 +47,7 @@ impl Selection {
     pub(super) fn check_lease(&self) -> io::Result<()> {
         match self {
             Self::Managed(selected) => selected.check_lease(),
+            Self::HeldSdk(selected) => selected.validate(),
             #[cfg(all(test, target_os = "macos"))]
             Self::NativeFixture { lease, .. } => lease.check_current(),
         }
@@ -49,6 +55,7 @@ impl Selection {
     pub(super) fn lease_path(&self) -> &Path {
         match self {
             Self::Managed(selected) => selected.lease_path(),
+            Self::HeldSdk(selected) => selected.lease_path(),
             #[cfg(all(test, target_os = "macos"))]
             Self::NativeFixture { lease, .. } => lease.path(),
         }
@@ -56,6 +63,7 @@ impl Selection {
     pub(super) fn build(&self) -> u64 {
         match self {
             Self::Managed(selected) => selected.build(),
+            Self::HeldSdk(selected) => selected.build(),
             #[cfg(all(test, target_os = "macos"))]
             Self::NativeFixture { build, .. } => *build,
         }

@@ -92,9 +92,14 @@ pub enum Unavailable {
         /// The broker's.
         theirs: u32,
     },
-    /// Something at the socket is not the root broker (its peer is not uid 0), or it refused this
-    /// process's code.
+    /// Something at the socket is not the root broker (its peer is not uid 0), or it checked this
+    /// process's code and refused it: an answer that stands until the socket is made again.
     Refused(String),
+    /// Nothing judged this process: the broker's check of its code could not run or did not
+    /// finish (`trustd` did not answer), the broker was serving its most connections or closed
+    /// before its hello, or the kernel did not name the uid serving the socket. Asked again, the
+    /// broker may admit it.
+    Unchecked(String),
 }
 
 impl std::fmt::Display for Unavailable {
@@ -111,6 +116,9 @@ impl std::fmt::Display for Unavailable {
                  build's Mac password"
             ),
             Self::Refused(why) => write!(f, "the LAN broker refused this process: {why}"),
+            Self::Unchecked(why) => {
+                write!(f, "the LAN broker has not judged this process yet: {why}")
+            }
         }
     }
 }

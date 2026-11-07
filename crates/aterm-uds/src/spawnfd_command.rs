@@ -270,6 +270,10 @@ impl Command {
         self.arg0 = Some(arg0.as_ref().to_owned());
         self
     }
+    /// The explicit lossless argv[0] override, if one was configured.
+    pub fn get_arg0(&self) -> Option<&OsStr> {
+        self.arg0.as_deref()
+    }
 
     /// Append one argument.
     pub fn arg(&mut self, arg: impl AsRef<OsStr>) -> &mut Self {

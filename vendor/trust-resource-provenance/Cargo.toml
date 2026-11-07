@@ -19,5 +19,5 @@ tempfile = { package = "aterm-tempfile", path = "../../crates/aterm-tempfile" }
 
 [package.metadata.aterm-vendor]
 upstream = "https://github.com/alabsystems/trust"
-commit = "69a1a7f53847f70b34d869163f161e76a1fd96a4"
+commit = "8e3adfc1df7bb0fa79b129a9f20df4fadad52143"
 subdir = "crates/trust-resource-provenance"

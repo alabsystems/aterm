@@ -425,13 +425,17 @@ impl AgentVerdict {
     }
 }
 
-/// The one adapter between a session's screen and its published agent verdict.
+/// The one adapter between a session's screen and its published agent verdict. `title` is the
+/// program's window title, read under the lock the rows were read under (`""` where it set
+/// none): a turn its screen does not show but its title runs reads busy
+/// ([`aterm_phase::ScreenReader::read_seen`]).
 pub(crate) fn agent_verdict(
     program: Option<&str>,
     program_pending: bool,
     known_agent: Option<aterm_phase::Program>,
     rows: &[String],
     cursor: Cursor,
+    title: &str,
     now: Instant,
 ) -> AgentVerdict {
     use aterm_phase::ScreenReader;
@@ -459,7 +463,7 @@ pub(crate) fn agent_verdict(
         return AgentVerdict::NotAgent;
     };
     let (rows, cursor) = verdict_rows(reader, whole, cursor);
-    let (reading, subject, turn) = classify(reader, rows, cursor, now);
+    let (reading, subject, turn) = classify(reader, rows, cursor, title, now);
     AgentVerdict::Agent {
         reading,
         by_frame,
@@ -485,6 +489,15 @@ fn verdict_rows<'a>(
     }
 }
 
+/// The title's run bit the agent watch keeps: whether any agent's reader reads `title` as its
+/// run going on ([`aterm_phase::ScreenReader::runs`]). Claude Code's two busy frames and Muse
+/// Code's spinner frames flip under it, so a flip moves nothing; a turn starting or ending does.
+pub(crate) fn title_runs(title: &str) -> bool {
+    aterm_phase::Program::ALL
+        .iter()
+        .any(|p| p.reader().runs(Some(title)) == Some(true))
+}
+
 /// Whether the reader a screen sniff answered ([`aterm_phase::identify`]) names an agent.
 const fn names_agent(program: aterm_phase::Program) -> bool {
     match program {
@@ -499,6 +512,11 @@ const fn names_agent(program: aterm_phase::Program) -> bool {
 }
 
 /// [`agent_verdict`] behind the screen reader's panic fence ([`crate::reader_guard`]).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "agent_verdict's seven inputs, passed through whole, and the session the fence's \
+              warning names; a wrapper struct would relocate the list, not simplify it"
+)]
 pub(crate) fn agent_verdict_guarded(
     session: u64,
     program: Option<&str>,
@@ -506,10 +524,19 @@ pub(crate) fn agent_verdict_guarded(
     known_agent: Option<aterm_phase::Program>,
     rows: &[String],
     cursor: Cursor,
+    title: &str,
     now: Instant,
 ) -> AgentVerdict {
     fenced_verdict(session, program, program_pending, known_agent, rows, || {
-        agent_verdict(program, program_pending, known_agent, rows, cursor, now)
+        agent_verdict(
+            program,
+            program_pending,
+            known_agent,
+            rows,
+            cursor,
+            title,
+            now,
+        )
     })
 }
 
@@ -557,19 +584,22 @@ fn unreadable_verdict(
     }
 }
 
-/// Classify one screen with one program's reader.
+/// Classify one screen with one program's reader, its phase read beside the program's window
+/// `title` ([`aterm_phase::ScreenReader::read_seen`]; `""` says nothing).
 pub(crate) fn classify(
     reader: &dyn aterm_phase::ScreenReader,
     rows: &[String],
     cursor: Cursor,
+    title: &str,
     now: Instant,
 ) -> (AgentReading, Option<String>, TurnFacts) {
     #[cfg(test)]
     CLASSIFIER_CALLS.with(|c| c.set(c.get() + 1));
+    let runs = reader.runs(Some(title));
     let r = match cursor {
-        Cursor::At(row) => reader.read_at(rows, row, None),
+        Cursor::At(row) => reader.read_seen(rows, row, None, runs),
         #[cfg(test)]
-        Cursor::Unknown => reader.read(rows, None),
+        Cursor::Unknown => reader.read_titled(rows, None, runs),
     };
     let turn = TurnFacts::of(reader.program(), &r);
     let wall = |kind: aterm_phase::WallKind, reset: Option<String>| {
@@ -589,10 +619,12 @@ pub(crate) fn classify(
     // composer takes the next message. The reader's phase stays busy for the supervisor's breaks.
     // The rest stands only as the reader's own reading of that phase would: authoritative, and
     // an idle one only where the cursor is in the composer (an agents panel holding it, or no
-    // cursor read, keeps the busy the reader read).
+    // cursor read, keeps the busy the reader read). A title that runs a turn the screen does not
+    // show rests nothing: the title runs for a turn and not for a shell or a monitor
+    // ([`aterm_phase::ScreenReader::background_rest_seen`]).
     let read = match r.phase {
         aterm_phase::Phase::Busy => reader
-            .background_rest(rows)
+            .background_rest_seen(rows, runs)
             .filter(|rest| {
                 let rested = aterm_phase::Reading {
                     phase: rest.clone(),
@@ -799,6 +831,7 @@ mod tests {
             None,
             &rows,
             Cursor::At(Some(under)),
+            "",
             t0(),
         );
         assert_eq!(
@@ -807,7 +840,15 @@ mod tests {
         );
         // A pane too short for it publishes the intro too, read cut.
         let short = screen(CHROME_INTRO_HEAD_OFF[0].1);
-        let v = agent_verdict(Some("claude"), false, None, &short, Cursor::Unknown, t0());
+        let v = agent_verdict(
+            Some("claude"),
+            false,
+            None,
+            &short,
+            Cursor::Unknown,
+            "",
+            t0(),
+        );
         assert_eq!(
             (v.word(), v.detail()),
             ("prompt", Some("chrome-intro".to_string()))
@@ -969,6 +1010,7 @@ mod tests {
                 &aterm_phase::ClaudeReader,
                 screen,
                 Cursor::Unknown,
+                "",
                 Instant::now(),
             );
             let want = if verdict.phase_authoritative {
@@ -995,6 +1037,7 @@ mod tests {
                 "",
             ]),
             Cursor::Unknown,
+            "",
             Instant::now(),
         );
         if let AgentPhase::Wall { reset, .. } = &limited.phase {
@@ -1015,7 +1058,16 @@ mod tests {
             IDLE_SHELLS_2_1_271, WAITING_WORKFLOWS_2_1_310, screen,
         };
         let word = |rows: &[String], cursor: Option<usize>| {
-            agent_verdict(Some("claude"), false, None, rows, Cursor::At(cursor), t0()).word()
+            agent_verdict(
+                Some("claude"),
+                false,
+                None,
+                rows,
+                Cursor::At(cursor),
+                "",
+                t0(),
+            )
+            .word()
         };
         let caret_of = |rows: &[String]| rows.iter().rposition(|r| r.starts_with('❯'));
         let workflows = screen(WAITING_WORKFLOWS_2_1_310);
@@ -1080,7 +1132,16 @@ mod tests {
             WRAPUP_WAITING_2_1_283, screen,
         };
         let word = |rows: &[String], cursor: Option<usize>| {
-            agent_verdict(Some("claude"), false, None, rows, Cursor::At(cursor), t0()).word()
+            agent_verdict(
+                Some("claude"),
+                false,
+                None,
+                rows,
+                Cursor::At(cursor),
+                "",
+                t0(),
+            )
+            .word()
         };
         let panel = screen(AGENTS_PANEL_AGENT_SELECTED_2_1_304);
         assert_eq!(
@@ -1131,7 +1192,16 @@ mod tests {
         use aterm_phase::prompt::fixtures::{WRAPUP_WAITING_2_1_283, screen};
         let word = |rows: &[String]| {
             let caret = rows.iter().rposition(|r| r.starts_with('❯'));
-            agent_verdict(Some("claude"), false, None, rows, Cursor::At(caret), t0()).word()
+            agent_verdict(
+                Some("claude"),
+                false,
+                None,
+                rows,
+                Cursor::At(caret),
+                "",
+                t0(),
+            )
+            .word()
         };
         let unnoticed: Vec<String> = screen(WRAPUP_WAITING_2_1_283)
             .into_iter()
@@ -1165,7 +1235,16 @@ mod tests {
             INFERRING_OVER_BACKGROUND_2_1_316, WAITING_AGENTS_WORKFLOWS_2_1_316, screen,
         };
         let word = |rows: &[String], cursor: Option<usize>| {
-            agent_verdict(Some("claude"), false, None, rows, Cursor::At(cursor), t0()).word()
+            agent_verdict(
+                Some("claude"),
+                false,
+                None,
+                rows,
+                Cursor::At(cursor),
+                "",
+                t0(),
+            )
+            .word()
         };
         let rest = screen(WAITING_AGENTS_WORKFLOWS_2_1_316);
         assert_eq!(
@@ -1179,6 +1258,98 @@ mod tests {
         let caret = live.iter().rposition(|r| r.starts_with('❯'));
         assert!(caret.is_some(), "the composer's row");
         assert_eq!(word(&live, caret), "busy", "a live turn");
+        for title in ["◐ Claude Code", "◑ Claude Code"] {
+            let titled = |rows: &[String], cursor: Option<usize>| {
+                agent_verdict(
+                    Some("claude"),
+                    false,
+                    None,
+                    rows,
+                    Cursor::At(cursor),
+                    title,
+                    t0(),
+                )
+                .word()
+            };
+            assert_eq!(
+                titled(&rest, Some(47)),
+                "idle",
+                "{title}: the title runs for the handed-off work, not for a turn"
+            );
+            assert_eq!(titled(&live, caret), "busy", "{title}: a live turn");
+        }
+    }
+
+    /// The window title beside the rows (ATERM-KI-1027-3): Claude Code 2.1.311 draws its reply
+    /// under a status line with no busy sign on the screen, so its running title (`◐`/`◑`) is
+    /// what reads it busy; a title at rest, one with no glyph and none at all read the screen
+    /// alone, and the finished reply's done row stands under a running title.
+    #[test]
+    fn a_reply_under_a_status_line_reads_busy_by_its_running_title() {
+        use aterm_phase::prompt::fixtures::{
+            STATUSLINE_MIDREPLY_2_1_311, STATUSLINE_REPLY_DONE_2_1_311, screen,
+        };
+        let word = |rows: &[String], title: &str| {
+            let caret = rows.iter().rposition(|r| r.starts_with('❯'));
+            assert!(caret.is_some(), "the composer's row");
+            agent_verdict(
+                Some("claude"),
+                false,
+                None,
+                rows,
+                Cursor::At(caret),
+                title,
+                t0(),
+            )
+            .word()
+        };
+        let mid = screen(STATUSLINE_MIDREPLY_2_1_311);
+        let done = screen(STATUSLINE_REPLY_DONE_2_1_311);
+        for title in ["◐ Claude Code", "◑ Claude Code"] {
+            assert_eq!(word(&mid, title), "busy", "{title}: mid-reply");
+            assert_eq!(word(&done, title), "idle", "{title}: its done row");
+        }
+        for title in ["✳ Claude Code", "Claude Code", ""] {
+            assert_eq!(word(&mid, title), "idle", "{title:?}: the screen alone");
+        }
+    }
+
+    /// A shell pill under a reply its title runs is the live turn, not a turn that rests beside
+    /// the agent's own background work: the rest is read beside the title
+    /// ([`aterm_phase::ScreenReader::background_rest_seen`]), so the word stays busy, and the
+    /// same screen with no title running publishes the rest.
+    #[test]
+    fn a_shell_pill_under_a_running_title_publishes_no_rest() {
+        use aterm_phase::ScreenReader as _;
+        use aterm_phase::prompt::fixtures::{STATUSLINE_MIDREPLY_2_1_311, screen};
+        let mut shells = screen(STATUSLINE_MIDREPLY_2_1_311);
+        let footer = shells
+            .iter_mut()
+            .find(|r| r.contains("(shift+tab to cycle)"))
+            .expect("the footer");
+        *footer = footer.replace("(shift+tab to cycle)", "(shift+tab to cycle) · 2 shells");
+        assert_eq!(
+            aterm_phase::ClaudeReader.background_rest(&shells),
+            Some(aterm_phase::Phase::Idle),
+            "the screen alone: a turn over under a shell"
+        );
+        let caret = shells.iter().rposition(|r| r.starts_with('❯'));
+        let word = |title: &str| {
+            agent_verdict(
+                Some("claude"),
+                false,
+                None,
+                &shells,
+                Cursor::At(caret),
+                title,
+                t0(),
+            )
+            .word()
+        };
+        assert_eq!(word(""), "idle", "CONTROL: no title publishes the rest");
+        for title in ["◐ Claude Code", "◑ Claude Code"] {
+            assert_eq!(word(title), "busy", "{title}");
+        }
     }
 
     #[test]
@@ -1242,9 +1413,18 @@ mod tests {
             None,
             &rows,
             Cursor::Unknown,
+            "",
             t0(),
         );
-        let plain = agent_verdict(Some("claude"), false, None, &rows, Cursor::Unknown, t0());
+        let plain = agent_verdict(
+            Some("claude"),
+            false,
+            None,
+            &rows,
+            Cursor::Unknown,
+            "",
+            t0(),
+        );
         assert_eq!(guarded, plain);
         assert_eq!(guarded.word(), "prompt");
         assert!(guarded.subject().is_some());
@@ -1284,9 +1464,9 @@ mod tests {
             ("quoted 529", quoted, "idle"),
         ];
         for (name, rows, want) in &cases {
-            let v = agent_verdict(Some("claude"), false, None, rows, Cursor::Unknown, t0());
+            let v = agent_verdict(Some("claude"), false, None, rows, Cursor::Unknown, "", t0());
             assert_eq!(v.word(), *want, "{name}");
-            let shell = agent_verdict(Some("zsh"), false, None, rows, Cursor::Unknown, t0());
+            let shell = agent_verdict(Some("zsh"), false, None, rows, Cursor::Unknown, "", t0());
             assert_eq!(shell.word(), "-", "{name}: a shell is never an agent");
         }
         let session = agent_verdict(
@@ -1295,6 +1475,7 @@ mod tests {
             None,
             &cases[1].1,
             Cursor::Unknown,
+            "",
             t0(),
         );
         assert_eq!(
@@ -1319,6 +1500,7 @@ mod tests {
                 None,
                 &screen(text),
                 Cursor::Unknown,
+                "",
                 t0(),
             );
             assert_eq!(v.word(), "unknown", "{name}: {v:?}");
@@ -1329,6 +1511,7 @@ mod tests {
                 None,
                 &screen(text),
                 Cursor::Unknown,
+                "",
                 t0(),
             );
             assert_eq!(shell.word(), "-", "{name}: a shell is never an agent");
@@ -1339,6 +1522,7 @@ mod tests {
             None,
             &screen(LAUNCH_REPL_READY),
             Cursor::Unknown,
+            "",
             t0(),
         );
         assert_eq!(ready.word(), "idle", "the control: {ready:?}");
@@ -1352,6 +1536,7 @@ mod tests {
                 None,
                 &screen(text),
                 Cursor::Unknown,
+                "",
                 t0(),
             );
             assert_eq!(v.word(), "idle", "{name}: {v:?}");
@@ -1362,6 +1547,7 @@ mod tests {
             None,
             &screen(TRUST),
             Cursor::Unknown,
+            "",
             t0(),
         );
         assert_eq!(
@@ -1384,11 +1570,19 @@ mod tests {
         for rows in [50, 51, 80, 200] {
             let ready = pad(INLINE_REPL_READY, rows);
             for program in ["claude", "node"] {
-                let v = agent_verdict(Some(program), false, None, &ready, Cursor::Unknown, t0());
+                let v = agent_verdict(
+                    Some(program),
+                    false,
+                    None,
+                    &ready,
+                    Cursor::Unknown,
+                    "",
+                    t0(),
+                );
                 assert_eq!(v.word(), "idle", "{program} at {rows} rows: {v:?}");
                 assert_eq!(v.program(), Some(aterm_phase::Program::Claude));
             }
-            let shell = agent_verdict(Some("zsh"), false, None, &ready, Cursor::Unknown, t0());
+            let shell = agent_verdict(Some("zsh"), false, None, &ready, Cursor::Unknown, "", t0());
             assert_eq!(shell.word(), "-", "a shell is never an agent");
             let dialog = agent_verdict(
                 Some("claude"),
@@ -1396,6 +1590,7 @@ mod tests {
                 None,
                 &pad(INLINE_TRUST, rows),
                 Cursor::Unknown,
+                "",
                 t0(),
             );
             assert_eq!(
@@ -1413,6 +1608,7 @@ mod tests {
                     None,
                     &pad(text, rows),
                     Cursor::Unknown,
+                    "",
                     t0(),
                 );
                 assert_eq!(v.word(), "unknown", "{name} at {rows} rows: {v:?}");
@@ -1420,7 +1616,15 @@ mod tests {
         }
         let full = screen(LAUNCH_REPL_READY);
         assert_eq!(full.len(), 50);
-        let v = agent_verdict(Some("claude"), false, None, &full, Cursor::Unknown, t0());
+        let v = agent_verdict(
+            Some("claude"),
+            false,
+            None,
+            &full,
+            Cursor::Unknown,
+            "",
+            t0(),
+        );
         assert_eq!(v.word(), "idle", "the fullscreen REPL: {v:?}");
     }
 
@@ -1432,7 +1636,15 @@ mod tests {
         };
         let at = |text: &str| Cursor::At(cursor(text).map(|(row, _)| row));
         let stale = screen(INLINE_RELAUNCH_BEFORE_REPL);
-        let v = agent_verdict(Some("claude"), false, None, &stale, Cursor::Unknown, t0());
+        let v = agent_verdict(
+            Some("claude"),
+            false,
+            None,
+            &stale,
+            Cursor::Unknown,
+            "",
+            t0(),
+        );
         assert_eq!(v.word(), "idle", "RED: the old box by its frame alone");
         for rows in [50, 80] {
             let pad = |text: &str| {
@@ -1456,7 +1668,7 @@ mod tests {
                 ),
                 ("the new REPL", INLINE_RELAUNCH_REPL_READY, "idle", None),
             ] {
-                let v = agent_verdict(Some("claude"), false, None, &pad(text), at(text), t0());
+                let v = agent_verdict(Some("claude"), false, None, &pad(text), at(text), "", t0());
                 assert_eq!(
                     (v.word(), v.detail().as_deref()),
                     (word, detail),
@@ -1482,7 +1694,7 @@ mod tests {
             ("on no row read", Cursor::At(None), "unknown"),
             ("in the old box", Cursor::At(Some(old_caret)), "idle"),
         ] {
-            let v = agent_verdict(Some("claude"), false, None, &ready, cursor, t0());
+            let v = agent_verdict(Some("claude"), false, None, &ready, cursor, "", t0());
             assert_eq!(v.word(), word, "the cursor {name}: {v:?}");
         }
     }
@@ -1508,18 +1720,35 @@ mod tests {
             r
         };
         let live = screen(&format!("{banner:>118}"), "");
-        let v = agent_verdict(Some("claude"), false, None, &live, Cursor::Unknown, t0());
+        let v = agent_verdict(
+            Some("claude"),
+            false,
+            None,
+            &live,
+            Cursor::Unknown,
+            "",
+            t0(),
+        );
         assert_eq!(v.word(), "wall:memory");
         assert_eq!(v.detail(), None);
         assert!(!aterm_phase::WallKind::Memory.reads_limited());
         let quoted = screen("", &banner);
         assert_eq!(
-            agent_verdict(Some("claude"), false, None, &quoted, Cursor::Unknown, t0()).word(),
+            agent_verdict(
+                Some("claude"),
+                false,
+                None,
+                &quoted,
+                Cursor::Unknown,
+                "",
+                t0()
+            )
+            .word(),
             "busy",
             "the draft's quote"
         );
         assert_eq!(
-            agent_verdict(Some("zsh"), false, None, &live, Cursor::Unknown, t0()).word(),
+            agent_verdict(Some("zsh"), false, None, &live, Cursor::Unknown, "", t0()).word(),
             "-"
         );
     }
@@ -1533,7 +1762,7 @@ mod tests {
              quit\n\n  Press enter to continue\n",
         );
         for rows in [idle, gate] {
-            match agent_verdict(Some("codex"), false, None, &rows, Cursor::Unknown, t0()) {
+            match agent_verdict(Some("codex"), false, None, &rows, Cursor::Unknown, "", t0()) {
                 AgentVerdict::Agent { reading, .. } => {
                     assert_eq!(reading.phase, AgentPhase::Unknown);
                     assert_eq!(reading.phase.word(), "unknown");
@@ -1547,6 +1776,7 @@ mod tests {
             None,
             &screen(TRUST),
             Cursor::Unknown,
+            "",
             t0(),
         );
         assert_eq!(claude.word(), "prompt", "the control");
@@ -1561,6 +1791,7 @@ mod tests {
             None,
             &screen(BOX_RM),
             Cursor::Unknown,
+            "",
             t0(),
         );
         assert_eq!(rm.word(), "prompt");
@@ -1573,6 +1804,7 @@ mod tests {
             None,
             &screen(END_529),
             Cursor::Unknown,
+            "",
             t0(),
         );
         assert_eq!(wall.subject(), None);
@@ -1610,6 +1842,7 @@ mod tests {
             None,
             &screen(API_ERROR_ENOTFOUND),
             Cursor::Unknown,
+            "",
             now,
         );
         assert_eq!(out.word(), "wall:api-error");
@@ -1620,6 +1853,7 @@ mod tests {
             None,
             &screen(API_ERROR_SLEEP),
             Cursor::Unknown,
+            "",
             now,
         );
         assert_eq!(cut.subject(), Some(API_CUT_OFF));
@@ -1629,6 +1863,7 @@ mod tests {
             None,
             &screen(API_ERROR_529),
             Cursor::Unknown,
+            "",
             now,
         );
         assert_eq!(overloaded.word(), "wall:overloaded");
@@ -1774,7 +2009,7 @@ mod tests {
         let rows = screen(API_ERROR_TALL_PANE_MEASURED);
         let caret = Cursor::At(rows.iter().rposition(|r| r.trim() == "❯"));
         for program in [Some("claude"), None] {
-            let v = agent_verdict(program, false, None, &rows, caret, t0());
+            let v = agent_verdict(program, false, None, &rows, caret, "", t0());
             assert_eq!(v.word(), "wall:api-error", "{program:?}");
             assert_eq!(v.subject(), Some(API_UNREACHABLE), "{program:?}");
         }
@@ -1807,7 +2042,7 @@ mod tests {
         let focus = on(&trust, |r| r == " ❯ No, exit");
         assert_eq!(focus, Cursor::At(Some(17)), "the measured cursor");
         for program in [Some("claude"), None] {
-            let v = agent_verdict(program, false, None, &trust, focus, t0());
+            let v = agent_verdict(program, false, None, &trust, focus, "", t0());
             assert_eq!(v.word(), "prompt", "{program:?}");
             assert_eq!(v.detail().as_deref(), Some("trust"), "{program:?}");
             assert_eq!(v.program(), Some(aterm_phase::Program::Claude));
@@ -1820,7 +2055,7 @@ mod tests {
         assert!(blank_foot(&boxed));
         let focus = on(&boxed, |r| r == " ❯ 1. Yes");
         for program in [Some("claude"), None] {
-            let v = agent_verdict(program, false, None, &boxed, focus, t0());
+            let v = agent_verdict(program, false, None, &boxed, focus, "", t0());
             assert_eq!(v.word(), "prompt", "{program:?}");
             assert_eq!(
                 v.detail().as_deref(),
@@ -1846,7 +2081,7 @@ mod tests {
         assert!(blank_foot(&idle));
         let caret = on(&idle, |r| r.starts_with('❯'));
         for program in [Some("claude"), None] {
-            let v = agent_verdict(program, false, None, &idle, caret, t0());
+            let v = agent_verdict(program, false, None, &idle, caret, "", t0());
             assert_eq!(v.word(), "idle", "{program:?}");
         }
 
@@ -2017,7 +2252,7 @@ mod tests {
     }
 
     fn detail_of(rows: &[String]) -> Option<String> {
-        match classify(&aterm_phase::ClaudeReader, rows, Cursor::Unknown, t0())
+        match classify(&aterm_phase::ClaudeReader, rows, Cursor::Unknown, "", t0())
             .0
             .phase
         {
@@ -2155,6 +2390,7 @@ mod tests {
                 None,
                 &screen(text),
                 Cursor::Unknown,
+                "",
                 t0(),
             )
         };
@@ -2304,7 +2540,7 @@ mod tests {
         let idle = screen("\u{203a} Ask Codex to do anything\n\n  gpt-5 \u{00b7} ~/src\n");
         assert!(
             matches!(
-                agent_verdict(Some("node"), false, None, &idle, Cursor::Unknown, t0()),
+                agent_verdict(Some("node"), false, None, &idle, Cursor::Unknown, "", t0()),
                 AgentVerdict::NotAgent
             ),
             "a Codex composer names nothing"
@@ -2315,6 +2551,7 @@ mod tests {
             Some(Program::Codex),
             &idle,
             Cursor::Unknown,
+            "",
             t0(),
         ) {
             AgentVerdict::Agent {
@@ -2327,7 +2564,15 @@ mod tests {
         }
         let mut framed = rows(&["\u{23fa} Done.", ""]);
         framed.extend(composer("  ? for shortcuts"));
-        match agent_verdict(Some("node"), false, None, &framed, Cursor::Unknown, t0()) {
+        match agent_verdict(
+            Some("node"),
+            false,
+            None,
+            &framed,
+            Cursor::Unknown,
+            "",
+            t0(),
+        ) {
             AgentVerdict::Agent {
                 by_frame, program, ..
             } => assert!(by_frame && program == Program::Claude, "{program:?}"),
@@ -2350,7 +2595,15 @@ mod tests {
             for known in [None, Some(aterm_phase::Program::Claude)] {
                 assert!(
                     matches!(
-                        agent_verdict(Some(program), false, known, &rows, Cursor::Unknown, t0()),
+                        agent_verdict(
+                            Some(program),
+                            false,
+                            known,
+                            &rows,
+                            Cursor::Unknown,
+                            "",
+                            t0()
+                        ),
                         AgentVerdict::NotAgent
                     ),
                     "{program} (known={known:?}) is not an agent"
@@ -2358,11 +2611,11 @@ mod tests {
             }
         }
         assert!(matches!(
-            agent_verdict(None, true, None, &rows, Cursor::Unknown, t0()),
+            agent_verdict(None, true, None, &rows, Cursor::Unknown, "", t0()),
             AgentVerdict::NotAgent
         ));
         for program in [None, Some("node")] {
-            match agent_verdict(program, false, None, &rows, Cursor::Unknown, t0()) {
+            match agent_verdict(program, false, None, &rows, Cursor::Unknown, "", t0()) {
                 AgentVerdict::Agent {
                     reading, by_frame, ..
                 } => {

@@ -526,6 +526,28 @@ fn a_press_on_the_rewritten_row_reports_claudes_column() {
                 last = released(&own);
             }
         }
+        if rewritten {
+            let (kept_x, kept_y) = px_of(&app, wid, (row, shells.0));
+            let (vacated_x, vacated_y) = px_of(&app, wid, (row, vacated));
+            assert_eq!(
+                usize::from(app.pixel_to_cell(wid, kept_x, kept_y).1),
+                col_of(&grid, "14 shells"),
+                "control: laid grid shifts kept column"
+            );
+            assert!(app.glass_swallows_at(wid, vacated_x, vacated_y));
+            // Resizing the window before the next frame invalidates the laid GlassGrid, so stale
+            // pre-resize shifts neither remap columns nor swallow presses.
+            assert!(app.apply_term_resize(wid, 30, COLS as u16));
+            assert_eq!(
+                usize::from(app.pixel_to_cell(wid, kept_x, kept_y).1),
+                shells.0,
+                "stale pre-resize shift does not remap columns"
+            );
+            assert!(
+                !app.glass_swallows_at(wid, vacated_x, vacated_y),
+                "stale pre-resize shift does not swallow presses"
+            );
+        }
     }
 }
 

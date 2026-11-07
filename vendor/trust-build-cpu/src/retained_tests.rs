@@ -337,16 +337,17 @@ fn actor_command() -> Option<u8> {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn fail_settlement_with_file_limit(root: &Path) {
+fn fail_settlement_with_file_limit(root: &Path, retry: bool) {
     let pool = RetainedPool::open_existing(root).unwrap().unwrap();
-    let lease = pool.try_acquire(Owner::current(None)).unwrap().unwrap();
-    let path = slot(root, lease.slot());
+    let mut lease = Some(pool.try_acquire(Owner::current(None)).unwrap().unwrap());
+    let path = slot(root, lease.as_ref().unwrap().slot());
     let retained = std::fs::read(&path).unwrap();
     assert!(retained.len() > 8);
     let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
     // SAFETY: this initialized rlimit is writable for getrlimit's output. The
     // fixture is a separate process, so its limits cannot affect the driver.
     assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_FSIZE, &raw mut limit) }, 0);
+    let original_limit = limit;
     assert!(limit.rlim_max >= 8, "fixture requires an eight-byte file limit");
     limit.rlim_cur = 8;
     // SAFETY: change only this actor's file-size soft limit, preserving its hard
@@ -355,12 +356,34 @@ fn fail_settlement_with_file_limit(root: &Path) {
     // SAFETY: SIG_IGN is a valid disposition; this actor must receive EFBIG
     // instead of dying before it can report the actual failed write_all.
     assert_ne!(unsafe { libc::signal(libc::SIGXFSZ, libc::SIG_IGN) }, libc::SIG_ERR);
-    let error = lease.settle().expect_err("the real settlement write must exceed RLIMIT_FSIZE");
+    let error =
+        if retry { lease.as_mut().unwrap().settle_held() } else { lease.take().unwrap().settle() }
+            .expect_err("the real settlement write must exceed RLIMIT_FSIZE");
     assert_eq!(error.raw_os_error(), Some(libc::EFBIG));
     let damaged = std::fs::read(&path).unwrap();
     assert!(damaged.len() <= 8, "settlement must actually truncate or partially write the slot");
     assert_ne!(damaged, retained);
     mark(SETTLEMENT_FAILED);
+    if retry {
+        assert!(
+            pool.try_acquire(Owner::current(None)).unwrap().is_none(),
+            "the same original guard remains held across uncertain settlement"
+        );
+        // SAFETY: restore only this isolated actor's original soft/hard limit.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &raw const original_limit) }, 0);
+        lease
+            .as_mut()
+            .unwrap()
+            .settle_held()
+            .expect("same original held capability must repair its own uncertain write");
+        assert!(
+            pool.try_acquire(Owner::current(None)).unwrap().is_none(),
+            "Free bytes alone cannot release the still-held original kernel guard"
+        );
+        drop(lease.take());
+        pool.try_acquire(Owner::current(None)).unwrap().unwrap().settle().unwrap();
+        mark("settlement-retried");
+    }
 }
 
 #[test]
@@ -401,7 +424,11 @@ fn subprocess_retained_actor() {
         }
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         "failed-settlement" => {
-            fail_settlement_with_file_limit(&PathBuf::from(std::env::var_os(ROOT).unwrap()));
+            fail_settlement_with_file_limit(&PathBuf::from(std::env::var_os(ROOT).unwrap()), false);
+        }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        "retry-held-settlement" => {
+            fail_settlement_with_file_limit(&PathBuf::from(std::env::var_os(ROOT).unwrap()), true);
         }
         other => panic!("unknown retained actor role {other}"),
     }
@@ -567,6 +594,22 @@ fn failed_settlement_write_leaves_damaged_debt_instead_of_new_capacity() {
     assert!(Pool::open_in(&root, width(1)).is_err());
     assert!(Pool::open_existing(&root).is_err());
     assert_eq!(std::fs::read(slot(&root, 0)).unwrap(), damaged);
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn same_original_held_capability_retries_real_failed_write_without_new_admission() {
+    let _fixture = kernel_fixture();
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("retained");
+    let pool = RetainedPool::create_private(&root, width(1)).unwrap();
+    let mut actor = Actor::start_role("retry-held-settlement", &root);
+    assert_eq!(actor.marker(SETTLEMENT_FAILED), actor.child.id());
+    assert_eq!(actor.marker("settlement-retried"), actor.child.id());
+    assert!(actor.wait_exit().success());
+    actor.finish_output();
+    assert!(matches!(pool.snapshot().unwrap().as_slice(), [RetainedSlotState::Available { .. }]));
+    pool.try_acquire(owner()).unwrap().unwrap().settle().unwrap();
 }
 
 #[test]

@@ -24,6 +24,7 @@ enum Command<'a> {
     Capabilities,
     Attach,
     AttachAccounted,
+    AttachAccountedExpected,
     Inspect(&'a str),
     Enroll(&'a str),
 }
@@ -45,6 +46,7 @@ fn parse(rest: &str) -> Option<Command<'_>> {
         ["capabilities"] => Some(Command::Capabilities),
         ["attach"] => Some(Command::Attach),
         ["attach-accounted-v1"] => Some(Command::AttachAccounted),
+        ["attach-accounted-original-store-v1"] => Some(Command::AttachAccountedExpected),
         ["enroll", field] => {
             let nonce = field.strip_prefix("nonce=")?;
             aterm_codec::hex::is_lower(nonce, 64).then_some(Command::Enroll(nonce))
@@ -200,8 +202,8 @@ pub(crate) fn serve(
                 }
                 json_reply("inspect", observation)
             }
-            Command::Attach | Command::AttachAccounted => {
-                let accounted = matches!(command, Command::AttachAccounted);
+            Command::Attach | Command::AttachAccounted | Command::AttachAccountedExpected => {
+                let accounted = !matches!(command, Command::Attach);
                 let admitted = Cell::new(None);
                 let authorize = |request: &aterm_types::resource_admission::Submission,
                                  peer: Peer| {
@@ -233,7 +235,36 @@ pub(crate) fn serve(
                         crate::resource_admission_host::submit(authorized)
                     }
                 };
-                if accounted {
+                if matches!(command, Command::AttachAccountedExpected) {
+                    let address = stream.local_addr()?;
+                    let endpoint = address.as_pathname().ok_or_else(denied)?;
+                    crate::resource_admission_attach::attach_accounted_expected(
+                        stream,
+                        true,
+                        deadline,
+                        authorize,
+                        |expected| {
+                            crate::resource_admission_host::matches_original_store_at(
+                                endpoint, expected,
+                            )
+                        },
+                        |authorized, expected| {
+                            let fence = admitted.get().ok_or_else(denied)?;
+                            if !session_matches(
+                                store,
+                                &authorized.request.binding.session,
+                                authorized.peer,
+                                fence,
+                                deadline,
+                            ) {
+                                return Err(denied());
+                            }
+                            crate::resource_admission_host::submit_accounted_expected(
+                                authorized, expected,
+                            )
+                        },
+                    )
+                } else if accounted {
                     crate::resource_admission_attach::attach_accounted(
                         stream, true, deadline, authorize, submit,
                     )
@@ -248,7 +279,10 @@ pub(crate) fn serve(
             }
         }
     })();
-    if matches!(command, Command::Attach | Command::AttachAccounted) {
+    if matches!(
+        command,
+        Command::Attach | Command::AttachAccounted | Command::AttachAccountedExpected
+    ) {
         // A final error reply cannot buy more time after the handoff expired.
         // Closing without another line preserves ambiguous-delivery semantics.
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
@@ -291,6 +325,10 @@ mod tests {
             Some(Command::Inspect("s-a912afd80a5a598f9ace"))
         );
         assert_eq!(parse("attach"), Some(Command::Attach));
+        assert_eq!(
+            parse("attach-accounted-original-store-v1"),
+            Some(Command::AttachAccountedExpected)
+        );
         assert_eq!(parse("capabilities"), Some(Command::Capabilities));
         let nonce = "a".repeat(64);
         assert_eq!(
@@ -300,6 +338,7 @@ mod tests {
         for rest in [
             "",
             "attach session=s-a",
+            "attach-accounted-original-store-v1 path=/foreign",
             "inspect pid=2",
             "inspect session=s-a cpu_units=1",
             "inspect session=s-A",

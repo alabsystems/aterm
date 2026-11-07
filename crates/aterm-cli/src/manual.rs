@@ -14,7 +14,10 @@ mod fabric_page_tests;
 /// `aterm help sys [<section>]`: the reference for `aterm ctl sys` and `await sys`.
 mod sys_page;
 
-/// The environment blurb at the top of the front page and the agent brief.
+/// `aterm help agent [<section>]`: the agent brief, `aterm help` in an aterm tab.
+mod agent_page;
+
+/// The environment blurb at the top of the topic index and the agent brief.
 fn overview() -> String {
     format!(
         "aterm is a terminal an AI agent can read and drive, and the front door to the ALab\n\
@@ -36,11 +39,12 @@ const OVERVIEW_SELF_UPDATE: &str =
 
 /// A manual page for one tool or topic.
 struct Topic {
-    /// The `help <name>` key and command-map label.
+    /// The `help <name>` key and the topic index's label.
     name: &'static str,
-    /// One-line identity for the command map.
-    tagline: &'static str,
-    /// The full page (plain text, printed as-is).
+    /// The page's line in the topic index's TOPICS list, short enough that its row fits 100
+    /// columns; `None` for a verb's own page, whose row in the VERBS list is [`verb_line`]'s.
+    tagline: Option<&'static str>,
+    /// The full page (plain text, printed as-is); `None` for one [`render_page`] makes.
     body: Option<&'static str>,
 }
 
@@ -73,17 +77,22 @@ macro_rules! aterm_page_shell {
     };
 }
 
-/// The manual topics, in front-page display order; the command map and the completeness test
-/// derive from it.
+/// The manual topics, in the topic index's order: every page `aterm help <name>` opens that is
+/// no verb's, and the verbs' pages written here.
 const TOPICS: &[Topic] = &[
     Topic {
+        name: "agent",
+        tagline: Some("the agent brief: what `aterm help` prints in an aterm tab"),
+        body: None, // generated — see `agent_page::page()`
+    },
+    Topic {
         name: "doctor",
-        tagline: "health checks and repairs",
+        tagline: Some("health checks and repairs"),
         body: None,
     },
     Topic {
         name: "setup",
-        tagline: "the Mac setup System State runs",
+        tagline: Some("the Mac setup System State runs"),
         body: Some(
             r#"setup — the Mac setup System State runs, and doctor's settings modes
 
@@ -323,8 +332,13 @@ reaches no network for them and changes none of them: `aterm init --develop` doe
         ),
     },
     Topic {
+        name: "config",
+        tagline: Some("where aterm's settings live"),
+        body: None, // `CONFIG_PAGE`
+    },
+    Topic {
         name: "aterm",
-        tagline: "transparent introspecting terminal + toolchain launcher",
+        tagline: Some("transparent introspecting terminal + toolchain launcher"),
         body: Some(concat!(
             r#"aterm — a transparent, introspecting terminal, and the launcher for this toolchain.
 
@@ -397,22 +411,34 @@ GOTCHAS
     },
     Topic {
         name: "introspection",
-        tagline: "read & drive an aterm window's sessions (aterm ctl)",
+        tagline: Some("read & drive an aterm window's sessions (aterm ctl)"),
         body: None, // generated — see `introspection_page()`
     },
     Topic {
         name: "rust",
-        tagline: "which Rust toolchain THIS directory gets — measured, not guessed (default: Trust)",
+        tagline: Some("building Rust here: the toolchain THIS directory gets, measured (Trust)"),
         body: None, // generated — see `rust_page()`
     },
     Topic {
         name: "sys",
-        tagline: "CPU, GPU, memory, disk and jobs of this machine, aterm and this tab, now (`aterm ctl sys`)",
+        tagline: Some("CPU, GPU, memory, disk and jobs of this machine, aterm and this tab, now"),
         body: None, // generated — see `sys_page::page()`
     },
     Topic {
+        name: "permissions",
+        tagline: Some("aterm's macOS permissions, read now; privacy (TCC) and debugger access"),
+        body: None, // generated — see `permissions_page()`
+    },
+    Topic {
+        name: "windowing",
+        tagline: Some("open tabs, windows and panes from the command line"),
+        body: None, // `WINDOWING_PAGE`
+    },
+    Topic {
         name: "telemetry",
-        tagline: "one row per action this Mac ran: commands, agent calls, spawns, tasks, admissions, builds, tests (`aterm ctl telemetry`)",
+        tagline: Some(
+            "one row per action this Mac ran: commands, agent calls, spawns, tasks, builds",
+        ),
         body: Some(
             r#"telemetry — one versioned row for each action aterm watched, in a local log
 
@@ -545,7 +571,7 @@ THE SUMMARY
     },
     Topic {
         name: "abrew",
-        tagline: "native brew compatibility inside atpkg, with no Homebrew fallback",
+        tagline: Some("native brew compatibility inside atpkg, with no Homebrew fallback"),
         body: Some(
             r#"abrew — native brew compatibility inside atpkg (`abrew`, `atpkg-abrew`, `aterm pkg abrew`).
 
@@ -591,22 +617,24 @@ GOTCHAS
     },
     Topic {
         name: "fabric",
-        tagline: "peer messaging: this session's INBOX, `post`, `trust=` and the halt",
+        tagline: None,
         body: Some(FABRIC_PAGE),
     },
     Topic {
         name: "workers",
-        tagline: "coding-agent workers in other tabs: start, wait, read the result; the survey",
+        tagline: Some(
+            "coding-agent workers in other tabs: start, wait, read the result; the survey",
+        ),
         body: Some(WORKERS_PAGE),
     },
     Topic {
         name: "needs",
-        tagline: "what needs you: the words, the ❯ menu, the tab hover, Take Over",
+        tagline: Some("what needs you: the words, the ❯ menu, the tab hover, Take Over"),
         body: Some(NEEDS_PAGE),
     },
     Topic {
         name: "resource-run",
-        tagline: "run a command with authenticated per-tab resource ownership",
+        tagline: None,
         body: Some(
             "aterm resource-run [--sock PATH] --session @self|@<sid>|@<local-id> [--ai WORD] --job LABEL -- PROGRAM [ARGS...]\n\
              aterm resource-run --cpu-units N --memory-bytes M [--timeout-ms N] [--status-fd FD] --session @self --job LABEL -- PROGRAM [ARGS...]\n\n\
@@ -630,7 +658,7 @@ GOTCHAS
     },
     Topic {
         name: "resource-inspect",
-        tagline: "inspect this process tree's authenticated retained host coverage",
+        tagline: None,
         body: Some(
             "aterm resource-inspect --json [--session @self|@<sid>]\n\n\
             Reports versioned original CPU and memory custody for the authenticated calling\n\
@@ -640,7 +668,7 @@ GOTCHAS
     },
     Topic {
         name: "conn",
-        tagline: "session connections — wire sessions to pull/push each other",
+        tagline: None,
         body: Some(
             r#"conn — standing pull/push wiring between terminal sessions (`aterm conn`).
 
@@ -669,7 +697,7 @@ KEY USAGE (`aterm conn help` has every flag)
     },
     Topic {
         name: "agents",
-        tagline: "make coding agents aterm-aware — the primer installer",
+        tagline: None,
         body: Some(
             r#"agents — make coding agents aterm-aware (`aterm agents`).
 
@@ -710,7 +738,7 @@ KEY USAGE
     },
     Topic {
         name: "keeper",
-        tagline: "the PTY keeper — shells that outlive a crashed window (start | stop | status | serve)",
+        tagline: None,
         body: Some(
             r#"keeper — a per-login holder of every terminal's PTY master (`aterm keeper`), so
 shells and agents outlive a crashed, killed or force-quit window. macOS only.
@@ -738,7 +766,7 @@ STATUS & RESTORE
     },
     Topic {
         name: "acaffeine",
-        tagline: "the menu-bar keep-awake mug — starts with aterm (on | off | status | lid | startup | quit)",
+        tagline: None,
         body: Some(
             r#"acaffeine — menu-bar keep-awake mug (`aterm acaffeine`, macOS only).
 
@@ -804,12 +832,12 @@ FILES
     },
     Topic {
         name: "theme",
-        tagline: "colour themes: the folder, the format, light/dark pairs, trying one live, and `aterm theme`",
+        tagline: None,
         body: None, // generated — see `theme_page()`
     },
     Topic {
         name: "edit",
-        tagline: "amacs, aterm's editor: a file in an Editor tab beside yours, waited on until it is closed",
+        tagline: None,
         body: Some(
             r#"edit — amacs, aterm's editor (`amacs FILE`, `aterm edit FILE`).
 
@@ -848,7 +876,8 @@ FOR AN AGENT (a tool shell has no tty)
     amacs --no-wait +LINE FILE   an Editor tab beside yours, caret on LINE;
                                  returns at once
     amacs --wait FILE            returns once they close the tab, and the file
-                                 on disk is their answer (a background command)
+                                 on disk is their answer; it has no timeout, so
+                                 run it as a background command
   Each run opens another tab, even of a file already open; to wait on the one
   open, `aterm ctl @self await edit uri=file:///abs/path timeout=600000` (run it
   again on exit 124, `OK timeout`). Exit 2 with `did not open it` on stderr: the
@@ -880,7 +909,7 @@ ON THE WIRE
     },
     Topic {
         name: "rewind",
-        tagline: "a pane's past screens: step, find, copy, when a cell changed, export",
+        tagline: Some("a pane's past screens: step, find, copy, when a cell changed, export"),
         body: Some(
             r#"rewind — a pane's past screens (View > Rewind Pane, Cmd-Shift-R).
 
@@ -954,7 +983,7 @@ LIMITS
     },
     Topic {
         name: "ai",
-        tagline: "this machine's AI CLIs: one working login each, the doctor, reviews across AIs",
+        tagline: None,
         body: Some(
             r#"ai — this machine's AI CLIs (`aterm ai`): `claude`, `codex`, `agy`, `muse`, `grok` and
 `kimi`.
@@ -1036,12 +1065,12 @@ CONFIGURATION — `[ai]` in `aterm.toml`
     },
     Topic {
         name: "init",
-        tagline: "set up this Mac (SSH, CLI-only Macs) or a Linux machine from a terminal; aterm.app's first launch does it by itself",
+        tagline: None,
         body: None, // generated — see `init_page()`
     },
     Topic {
         name: "email",
-        tagline: "headless email reads and incoming-mail updates",
+        tagline: None,
         body: Some(
             r#"aterm email — read configured mail accounts without a window
 
@@ -1092,7 +1121,7 @@ configured mailbox routes and encrypted grants, never command-line passwords.
     },
     Topic {
         name: "secrets",
-        tagline: "one credentials file for every machine: the vault, its server and ~/.secrets (status | join | sync | edit | password | approve | serve …)",
+        tagline: None,
         body: Some(
             r#"secrets — one encrypted, signed credentials file for every machine, written to
 `~/.secrets/<name>` (macOS and Linux; `aterm secrets --help` has every verb and flag).
@@ -1105,7 +1134,8 @@ configured mailbox routes and encrypted grants, never command-line passwords.
 
   Start credential and deployment questions with this registry and `secrets status`.
   Use its registered paths: entries may land outside ~/.secrets. Status reports
-  release-signing readiness; file presence alone is not a readiness check.
+  release-signing readiness; file presence alone is not a readiness check. For a GitHub
+  token, `agh whoami --verify` is: it asks GitHub whose each token is (`aterm help agh`).
 
 DETAILS
 
@@ -1173,7 +1203,7 @@ FILES
     },
     Topic {
         name: "members",
-        tagline: "Macs joining ALab: a member on the home ALab LAN lets in a Mac that proves itself; elsewhere ask every member, Allow on any one, type the phrase it shows; any member removes (requests | allow | invite | ignore | join | status | list | remove | undo)",
+        tagline: None,
         body: Some(
             r#"members — Macs joining ALab, and the members that let them in (macOS and Linux;
 `aterm members --help` has every verb). No member is a leader: any one lets a Mac in.
@@ -1242,7 +1272,7 @@ HOW A MAC LEAVES
     },
     Topic {
         name: "status",
-        tagline: "this machine at a glance: setup, membership, vault, fleet, name, tools, repos and agents, each with its next step and who takes it",
+        tagline: None,
         body: Some(
             r#"status — one read of this machine (macOS and Linux): each area, where it stands,
 its next step and who takes that step. It reads local state only: no prompt, no dial, no
@@ -1280,7 +1310,7 @@ The read exits 0 whatever it finds; 2 is a usage error."#,
     },
     Topic {
         name: "db",
-        tagline: "encrypted embedded application databases: offline edits and direct LAN replication",
+        tagline: None,
         body: Some(
             r#"db — encrypted embedded application databases (`aterm db`, Unix only).
 
@@ -1305,7 +1335,7 @@ belong in `aterm secrets`; database records carry references to them.
     },
     Topic {
         name: "machines",
-        tagline: "configure and manage a lab of Macs from this one, over SSH (no MDM, no Apple account)",
+        tagline: None,
         body: Some(
             r#"machines — configure and manage a lab of Macs over SSH (`aterm machines`, macOS
 only; `aterm machines --help` has every verb and flag).
@@ -1347,7 +1377,7 @@ LOCAL REPOSITORY STORAGE
     },
     Topic {
         name: "harness",
-        tagline: "the agent harness — the window's default supervisor and its Autopilot, its read views, accounts, the live upgrade",
+        tagline: None,
         body: Some(concat!(
             r#"harness — the window's agent supervisor and its read views (`aterm harness`).
 
@@ -1762,7 +1792,7 @@ THE FOOTER
     },
     Topic {
         name: "atpkg",
-        tagline: "toolchain package manager — install / update / verify",
+        tagline: Some("toolchain package manager — install / update / verify"),
         body: Some(
             r#"atpkg — the toolchain package manager (`aterm pkg`; messages speak as `atpkg:`).
 
@@ -1881,12 +1911,14 @@ HOW IT WORKS & GOTCHAS
     },
     Topic {
         name: "agh",
-        tagline: "the GitHub client — reads and writes, routed identities, JSON, typed exits",
+        tagline: None,
         body: None, // generated — see `agh::cli::help::manual()`
     },
     Topic {
         name: "reroute",
-        tagline: "cargo/rustc inside a session — rerouted, announced, escapable (aterm --no-reroute)",
+        tagline: Some(
+            "cargo/rustc in a session: rerouted, announced, escapable (aterm --no-reroute)",
+        ),
         body: Some(
             r#"reroute — upstream toolchain names inside an aterm session: announced, escapable,
 never silently substituting.
@@ -1957,7 +1989,9 @@ ESCAPES
     },
     Topic {
         name: "trust",
-        tagline: "self-proving Rust compiler (trustc / targo) — two named lanes, no silent default",
+        tagline: Some(
+            "self-proving Rust compiler (trustc / targo) — two named lanes, no silent default",
+        ),
         body: Some(
             r#"trust — a self-proving Rust compiler: a fork of rust-lang/rust with a verification
 pass built INTO the compiler, not bolted on beside it.
@@ -2003,8 +2037,13 @@ GOTCHAS
         ),
     },
     Topic {
+        name: "trust-backends",
+        tagline: Some("the verifier programs that install alongside trust"),
+        body: None, // `TRUST_BACKENDS_PAGE`
+    },
+    Topic {
         name: "clean",
-        tagline: "Lean-shaped theorem prover — trusted kernel + tactics + .olean",
+        tagline: Some("Lean-shaped theorem prover — trusted kernel + tactics + .olean"),
         body: Some(
             r#"clean — a from-scratch, pure-Rust implementation of Lean 4-shaped theorem-proving
 infrastructure, built for AI agents to call directly (no Lean REPL/subprocess).
@@ -2039,7 +2078,7 @@ GOTCHAS
     },
     Topic {
         name: "ty",
-        tagline: "TLA+ toolchain — model checker (TLC replacement) + prover",
+        tagline: Some("TLA+ toolchain — model checker (TLC replacement) + prover"),
         body: Some(
             r#"ty — a ground-up Rust reimplementation of the TLA+ verification toolchain (a TLC
 replacement and more), shipped as the `ty` CLI (with a `tla` companion shim).
@@ -2075,7 +2114,7 @@ GOTCHAS
     },
     Topic {
         name: "ay",
-        tagline: "SAT / SMT / CHC solver — proof-carrying, a Z3 replacement",
+        tagline: Some("SAT / SMT / CHC solver — proof-carrying, a Z3 replacement"),
         body: Some(
             r#"ay — a Rust SAT, SMT, and CHC solver: the proof-carrying decision-procedure engine at
 the bottom of the toolchain (positioned as a Z3 replacement).
@@ -2114,7 +2153,7 @@ GOTCHAS
     },
     Topic {
         name: "ny",
-        tagline: "neural-network verifier — CROWN / β-CROWN, VNN-LIB, proof certs",
+        tagline: Some("neural-network verifier — CROWN / β-CROWN, VNN-LIB, proof certs"),
         body: Some(
             r#"ny — a Rust neural-network verifier: given a network and a property it returns a SOUND
 verdict (verified / falsified-with-counterexample / unknown).
@@ -2153,7 +2192,7 @@ GOTCHAS
     },
     Topic {
         name: "nn",
-        tagline: "verified ML framework — torch.export → Metal",
+        tagline: Some("verified ML framework — torch.export → Metal"),
         body: Some(
             r#"nn — a Rust ML framework whose `nn` CLI compiles exported PyTorch models into
 verifiable Metal inference. It is in the default set, so an aterm shell has `nn` on PATH.
@@ -2187,7 +2226,7 @@ GOTCHAS
     },
     Topic {
         name: "sudo",
-        tagline: "run sudo from an agent's shell: aterm asks you for the password",
+        tagline: Some("run sudo from an agent's shell: aterm asks you for the password"),
         body: Some(
             r#"sudo — running sudo with no terminal, as in an agent's shell tool
 
@@ -2248,6 +2287,11 @@ WHAT IT IS NOT
   a process of the same user can change the file.
   macOS only; after an update, open a new tab to pick up the helper."#,
         ),
+    },
+    Topic {
+        name: "kitty",
+        tagline: Some("talk to the cursor cat: the words it obeys when you type them"),
+        body: None, // generated — see `kitty_page()`
     },
 ];
 
@@ -2395,25 +2439,6 @@ fn theme_page() -> String {
     page
 }
 
-/// The dispatchable pages that are not [`TOPICS`] entries (generated, or named
-/// after a verb).
-const EXTRA_PAGES: &[&str] = &[
-    "config",
-    "ship",
-    "release",
-    "update",
-    "windowing",
-    "drive",
-    "fleet",
-    "name",
-    "node",
-    "trust-backends",
-    "permissions",
-    "agent",
-    "kitty",
-    "topics",
-];
-
 /// `aterm help doctor`: the page `aterm doctor --help` prints ([`crate::doctor::help`]), what
 /// the report shows, and the exit codes; the Mac setup prose is `aterm help setup`'s.
 fn doctor_page() -> String {
@@ -2526,147 +2551,113 @@ fn topic_names() -> Vec<&'static str> {
     TOPICS.iter().map(|t| t.name).collect()
 }
 
-/// The front page for `help` outside a session: the environment blurb + the
-/// command map + how to go deeper.
+/// The widest name in the topic index (`resource-inspect`): its rows' lines start two columns
+/// past it.
+const INDEX_NAME_WIDTH: usize = 16;
+
+/// The topic index's line for a verb: what it does, in one short line (`aterm --help` has its
+/// usage and longer description, [`crate::Verb::usage`] and [`crate::Verb::blurb`]).
+const fn verb_line(v: crate::Verb) -> &'static str {
+    match v {
+        crate::Verb::Ctl => "read and drive aterm's sessions: screens, keys, turns, waits, events",
+        crate::Verb::Conn => "wire which sessions pull from or push to each other",
+        crate::Verb::ResourceRun => "run a command with its CPU and memory charged to a tab",
+        crate::Verb::ResourceInspect => {
+            "this process tree's retained CPU and memory custody, as JSON"
+        }
+        crate::Verb::Pkg => "install, update and verify the toolchain",
+        crate::Verb::Agh => "GitHub reads and writes as the routed identity: JSON out, typed exits",
+        crate::Verb::Fleet => {
+            "the lab at a glance, one row per seat, and this machine's fleet membership"
+        }
+        crate::Verb::Name => {
+            "this machine's name: its NAME (m8, or m0 until it is numbered) and nickname"
+        }
+        crate::Verb::Node => "the windowless fleet and Commons node job (Unix)",
+        crate::Verb::Drive => "the window harness's readers, run by hand",
+        crate::Verb::Link => "the fabric bridge: this instance's inbox and post traffic to the bus",
+        crate::Verb::Fabric => "mail between sessions and people, and topic channels (Unix)",
+        crate::Verb::Ship => {
+            "publish aterm: provision a signing machine, cut a release (source checkout)"
+        }
+        crate::Verb::Release => {
+            "prove a scratch binary can be signed, notarized and uploaded as a draft"
+        }
+        crate::Verb::Update => "report or check for an update, or print this build's identity",
+        crate::Verb::Agents => "keep the aterm primer in coding agents' context files",
+        crate::Verb::Ai => "this machine's AI CLIs: one working login each, and reviews across AIs",
+        crate::Verb::Machines => {
+            "configure and manage a lab of Macs over SSH from this one (macOS)"
+        }
+        crate::Verb::Init => {
+            "set up this machine from a terminal: settings, the vault, your repositories"
+        }
+        crate::Verb::Status => {
+            "this machine at a glance, each item with its next step and who takes it"
+        }
+        crate::Verb::Secrets => {
+            "one credentials file for every machine: the vault, its server, ~/.secrets"
+        }
+        crate::Verb::Members => "Macs joining ALab, and the members that let them in (Unix)",
+        crate::Verb::Db => {
+            "encrypted embedded application databases, replicated directly on the LAN"
+        }
+        crate::Verb::Email => "read mail without a window, as JSON Lines",
+        crate::Verb::Harness => {
+            "the window's agent supervisor and its Autopilot; spend, limits, accounts"
+        }
+        crate::Verb::Keeper => "the PTY keeper: shells that outlive a crashed window (macOS)",
+        crate::Verb::Acaffeine => {
+            "the menu-bar keep-awake mug: a click keeps this Mac awake (macOS)"
+        }
+        crate::Verb::Theme => "list, write, check, import and install colour themes",
+        crate::Verb::Edit => {
+            "amacs, aterm's editor: a file in an Editor tab beside yours, waited on"
+        }
+        crate::Verb::NewTab => "open a terminal tab (where it opens is `windowing_behavior`)",
+        crate::Verb::NewWindow => "open a new window, always",
+        crate::Verb::SplitPane => {
+            "split the focused pane: a new window by default (`windowing_behavior`)"
+        }
+    }
+}
+
+/// The topic index's line for `name`, a verb's or a topic's, or `None` for a name it lists not.
+fn index_line(name: &str) -> Option<&'static str> {
+    crate::Verb::from_operand(name)
+        .map(verb_line)
+        .or_else(|| TOPICS.iter().find(|t| t.name == name)?.tagline)
+}
+
+/// One row of the topic index.
+fn push_index_row(s: &mut String, name: &str, line: &str) {
+    let _ = writeln!(s, "  {name:<INDEX_NAME_WIDTH$}  {line}");
+}
+
+/// The topic index, `aterm help topics` and `aterm help` outside a session: the environment
+/// blurb, then one line per verb and one per topic.
 fn overview_page() -> String {
-    let mut s = String::new();
-    s.push_str("aterm — the toolchain manual\n");
+    let mut s = String::from("aterm — the toolchain manual: every verb and topic\n");
     s.push_str(aterm_types::identity::ORIGIN_LINE);
     s.push_str("\n\n");
     s.push_str(&overview());
-    s.push_str("\n\nONE COMMAND, MANY VERBS — `aterm <verb>`\n");
-    let line = |v: crate::Verb| -> &'static str {
-        match v {
-            crate::Verb::Ctl => {
-                "read & drive an aterm window's sessions (text / key / turn / await / subscribe / image)"
-            }
-            crate::Verb::Conn => {
-                "session connections — see & wire which sessions pull/push each other"
-            }
-            crate::Verb::ResourceRun => {
-                "run a command with authenticated per-tab resource ownership"
-            }
-            crate::Verb::ResourceInspect => "inspect this process tree's retained host coverage",
-            crate::Verb::Pkg => "install / update / verify the toolchain",
-            crate::Verb::Agh => {
-                "GitHub for agents: reads and writes as routed identities, JSON, typed exits"
-            }
-            crate::Verb::Fleet => {
-                "a LAN fleet's membership (init | join | peers | allow | publish | sync | census \
-                 | leave); `ctl --host` drives where allowed"
-            }
-            crate::Verb::Name => {
-                "this machine's name: its NAME (m8, m0 until numbered) and nickname"
-            }
-            crate::Verb::Node => {
-                "the windowless fleet & Commons node job (status | on | off | serve; Unix)"
-            }
-            crate::Verb::Drive => {
-                "the window harness's readers by hand (classify / phase / answer / ledger / \
-                 tape / replay)"
-            }
-            crate::Verb::Link => {
-                "the fabric bridge: carry this instance's inbox/post traffic to the bus"
-            }
-            crate::Verb::Fabric => {
-                "mail between sessions and people (status | tail | brief | on | off | doctor | \
-                 mint-for | halt | inbox | post)"
-            }
-            crate::Verb::Ship => {
-                "publish aterm: provision a signing machine, cut a release (source checkout only)"
-            }
-            crate::Verb::Release => {
-                "explicit owned signing, notarization and draft-asset capability probe"
-            }
-            crate::Verb::Update => "report or check for an update (status | check | identity)",
-            crate::Verb::Agents => {
-                "make coding agents aterm-aware (the primer; aterm also installs it itself)"
-            }
-            crate::Verb::Ai => {
-                "this machine's AI CLIs: one working login each (doctor | login), reviews across AIs (review)"
-            }
-            crate::Verb::Machines => {
-                "configure and manage a lab of Macs over SSH (init | scan | enroll | status | plan | apply | person)"
-            }
-            crate::Verb::Init => {
-                "set up this Mac (SSH, CLI-only Macs) or a Linux machine from a terminal; aterm.app's \
-                 first launch does it by itself"
-            }
-            crate::Verb::Status => {
-                "this machine at a glance: membership, vault, fleet, name, tools, repos, agents — each \
-                 with its next step and who takes it (--json)"
-            }
-            crate::Verb::Secrets => {
-                "one credentials file for every machine: the vault, its server and ~/.secrets \
-                 (status | join | sync | edit | password | approve | serve)"
-            }
-            crate::Verb::Members => {
-                "Macs joining ALab: prove to a member on the home ALab LAN, else ask every \
-                 member, Allow on any one, type its phrase (requests | allow | invite | ignore \
-                 | list | remove | undo | join | status)"
-            }
-            crate::Verb::Db => {
-                "encrypted embedded application databases: offline edits, direct LAN replication, accounts and budget rights"
-            }
-            crate::Verb::Email => {
-                "read email headlessly (accounts | folders | list | read | watch), JSON Lines"
-            }
-            crate::Verb::Harness => {
-                "Claude Code's spend, limits and accounts, disk, ledger; `upgrade` (the window supervises)"
-            }
-            crate::Verb::Keeper => {
-                "the PTY keeper: shells that outlive a crashed window (start | stop | status | serve; macOS)"
-            }
-            crate::Verb::Acaffeine => {
-                "the menu-bar keep-awake mug: a click keeps this Mac awake (on | off | status | lid | startup | quit; macOS)"
-            }
-            crate::Verb::Theme => {
-                "list, write, check and import colour themes (`aterm help themes`)"
-            }
-            crate::Verb::Edit => {
-                "amacs, aterm's editor: a file in an Editor tab beside yours, waited on (`amacs`)"
-            }
-            crate::Verb::NewTab => "open a terminal tab (where it opens is `windowing_behavior`)",
-            crate::Verb::NewWindow => "open a NEW window, always",
-            crate::Verb::SplitPane => {
-                "split the focused pane — a new window by default (`windowing_behavior`)"
-            }
-        }
-    };
-    const HELP_USAGE: &str = "aterm help [topic]";
-    const HELP_LINE: &str = "this manual — start here (a deep dive on any verb or tool)";
-    const WIDEST: usize = 40;
-    let width = TOPICS
-        .iter()
-        .map(|t| t.name.len())
-        .chain(std::iter::once(HELP_USAGE.len()))
-        .chain(crate::Verb::ALL.iter().map(|v| v.usage().len()))
-        .filter(|&len| len <= WIDEST)
-        .max()
-        .unwrap_or(14);
-    let _ = writeln!(s, "  {HELP_USAGE:<width$}  {HELP_LINE}");
-    for v in crate::Verb::ALL {
-        if v.usage().len() > width {
-            let _ = writeln!(s, "  {}", v.usage());
-            let _ = writeln!(s, "  {:<width$}  {}", "", line(*v));
-        } else {
-            let _ = writeln!(s, "  {:<width$}  {}", v.usage(), line(*v));
-        }
-    }
-    let is_verb = |name: &str| crate::Verb::ALL.iter().any(|v| v.name() == name);
-    s.push_str("\nTOPICS — `aterm help <name>`\n");
-    for t in TOPICS.iter().filter(|t| !is_verb(t.name)) {
-        let _ = writeln!(s, "  {:<width$}  {}", t.name, t.tagline);
-    }
-    let also: Vec<&str> = EXTRA_PAGES
-        .iter()
-        .copied()
-        .filter(|p| *p != "topics" && !is_verb(p))
-        .collect();
-    let _ = writeln!(s, "  also: {}", also.join(", "));
     s.push_str(
-        "\nIn an aterm tab, `aterm help` prints the agent operating brief (`aterm help agent`).\n",
+        "\n\nVERBS — aterm <verb> …   (`aterm help <verb>` opens its page; `aterm --help` has usage)\n",
     );
+    push_index_row(
+        &mut s,
+        "help",
+        "this manual: `aterm help <topic> [<section>]`; in an aterm tab, the agent brief",
+    );
+    for v in crate::Verb::ALL {
+        push_index_row(&mut s, v.name(), verb_line(*v));
+    }
+    s.push_str("\nTOPICS — aterm help <topic>\n");
+    for t in TOPICS {
+        if let Some(line) = t.tagline {
+            push_index_row(&mut s, t.name, line);
+        }
+    }
     s
 }
 
@@ -3296,11 +3287,24 @@ fn protected_folder_names() -> String {
         .join(", ")
 }
 
-/// What each permission the table at the head of `aterm help permissions` names reads now:
-/// Full Disk Access, the Developer Tools list and debugger access, each probe on a thread of its
-/// own, and the app macOS holds responsible for this process when it is not aterm (a shell in
-/// Terminal, a login over ssh): macOS grants Full Disk Access to that app, so the cell is not
-/// aterm's and reads `not aterm's`. A test binary reads none.
+/// The table's closing line where this binary is in no app bundle, as a development build is:
+/// the probes judge an app bundle's grants and refuse a binary outside one
+/// (`consent::probe_debugger_with`), so it reads none of the three.
+const NO_BUNDLE_NOTE: &str =
+    "This binary is in no app bundle, so it reads none of these: `aterm ctl privacy` asks the app";
+
+/// The table's closing line when this process runs under `app`, another app than aterm.
+fn elsewhere_note(app: &str) -> String {
+    format!("This shell runs under {app}: macOS grants Full Disk Access here to {app}, not aterm")
+}
+
+/// What each permission the table at the head of `aterm help permissions` names reads now, and
+/// the line the table closes with, if any: Full Disk Access, the Developer Tools list and
+/// debugger access, each probe on a thread of its own, and the app macOS holds responsible for
+/// this process when it is not aterm (a shell in Terminal, a login over ssh): macOS grants Full
+/// Disk Access to that app, so the cell is not aterm's and reads `not aterm's`
+/// ([`elsewhere_note`]). A binary in no app bundle reads none ([`NO_BUNDLE_NOTE`]), nor does a
+/// test binary.
 fn permission_states() -> ([&'static str; 3], Option<String>) {
     use aterm_containment::consent::{self, DevToolListing, FdaState};
     if cfg!(test) || aterm_uds::test_binary::scratch_root().is_some() {
@@ -3309,9 +3313,13 @@ fn permission_states() -> ([&'static str; 3], Option<String>) {
     if !cfg!(target_os = "macos") {
         return (["macOS only"; 3], None);
     }
+    let exe = consent::fence_exe();
+    if !exe.as_deref().is_some_and(consent::path_is_in_app_bundle) {
+        return (["not read"; 3], Some(NO_BUNDLE_NOTE.to_owned()));
+    }
     let gate = aterm_containment::ProbeGate::on;
     let protected = consent::protected_roots(&[]);
-    let subject = consent::fence_exe()
+    let subject = exe
         .as_deref()
         .and_then(consent::app_bundle_root)
         .and_then(|root| consent::bundle_id_of(&root, &protected));
@@ -3343,7 +3351,7 @@ fn permission_states() -> ([&'static str; 3], Option<String>) {
             debugger,
         )
     });
-    (states, elsewhere)
+    (states, elsewhere.as_deref().map(elsewhere_note))
 }
 
 /// Whether the app macOS holds responsible for this process is another app: its bundle id
@@ -3382,9 +3390,10 @@ fn permission_words(
 }
 
 /// The table `aterm help permissions` opens with: each permission, why aterm wants it, what it
-/// reads now (`states`, in [`permission_states`]'s order) and the one fix, then, when this
-/// process runs under another app (`elsewhere`), one line saying whose grant that is.
-fn permissions_table(states: [&str; 3], elsewhere: Option<&str>) -> String {
+/// reads now (`states`, in [`permission_states`]'s order) and the one fix, then the `note`
+/// [`permission_states`] closes it with: whose grant it is when this process runs under another
+/// app, or why a binary in no app bundle read none.
+fn permissions_table(states: [&str; 3], note: Option<&str>) -> String {
     const ROWS: [(&str, &str, &str); 3] = [
         (
             "Full Disk Access",
@@ -3407,11 +3416,8 @@ fn permissions_table(states: [&str; 3], elsewhere: Option<&str>) -> String {
         let _ = writeln!(table, "  {name:<18}{now:<12}{why}");
         let _ = writeln!(table, "  {:<18}fix: {fix}", "");
     }
-    if let Some(app) = elsewhere {
-        let _ = writeln!(
-            table,
-            "  This shell runs under {app}: macOS grants Full Disk Access here to {app}, not aterm"
-        );
+    if let Some(note) = note {
+        let _ = writeln!(table, "  {note}");
     }
     table
 }
@@ -3421,8 +3427,8 @@ fn permissions_table(states: [&str; 3], elsewhere: Option<&str>) -> String {
 fn permissions_page() -> String {
     let folders = protected_folder_names();
     let revert = aterm_containment::consent::DEBUGGER_ACCESS_REVERT;
-    let (states, elsewhere) = permission_states();
-    let table = permissions_table(states, elsewhere.as_deref());
+    let (states, note) = permission_states();
+    let table = permissions_table(states, note.as_deref());
     format!(
         "\
 permissions — aterm's macOS permissions, read now; then privacy (TCC) and debugger access
@@ -4964,258 +4970,25 @@ HEADLESS, UNREAD INPUT, STUCK MODES & BELLS
   * Bell tracking: `status` reports `bells=` (at most once per 100 ms), `bells_sounded=`
     and `last_bell=`; `survey` annotates tabs that rang a bell in the last 15 minutes.
 
-THE SERVER'S VERB CATALOG (generated from the protocol table):",
+THE VERBS (one line each, generated from the protocol table)
+  `aterm ctl help <verb>` prints one verb's entry. A long one opens with USAGE, OPTIONS,
+  REPLY and EXAMPLES and then names its sections, each printed by
+  `aterm ctl help <verb> <section>`; `aterm ctl help --full` prints every entry whole.
+  The running aterm answers those (this client's own entry stands in for a verb or a
+  section it does not know); `aterm ctl <verb> --help [<section>]` prints this build's.
+",
     );
-    s.push('\n');
-    s.push_str(
-        "`aterm ctl help` prints the short catalog; `aterm ctl help <verb>` the full entry for one verb.\n",
-    );
-    for line in aterm_types::control_verbs::catalog_lines_full() {
-        s.push_str("  ");
+    for line in aterm_types::control_verbs::catalog_lines_wrapped() {
         s.push_str(&line);
         s.push('\n');
     }
     let _ = write!(
         s,
         "\nAnswered by `aterm ctl` itself, not the server, so not in the table above:\n  {} \
-         (`aterm ctl help <verb>`).\n\
-         `aterm ctl help --full` against a live session prints the table from the server itself.\n",
+         (`aterm ctl help <verb>`).\n",
         aterm_ctl::CLIENT_HELP_VERBS.join(", "),
     );
     s
-}
-
-/// The agent operating brief, what `aterm help` prints inside an aterm session.
-fn agent_page(sid: Option<&str>) -> String {
-    let mut s = String::new();
-    let you = match sid {
-        Some(id) => format!(
-            "You are an AI agent operating inside aterm session {id}.\n  \
-             That terminal can be read and driven by you, by peer agents and by the human, all\n  \
-             at once: watch and drive your OWN session and any peer with `aterm ctl @<sid>`.",
-        ),
-        None => {
-            "You are an AI agent in this verification toolchain (no aterm session id in the\n  \
-             environment, so run inside an aterm session to introspect a live terminal)."
-                .to_string()
-        }
-    };
-    s.push_str("aterm — agent operating brief\n");
-    s.push_str(aterm_types::identity::ORIGIN_LINE);
-    s.push_str("\n\n");
-    s.push_str(&overview());
-    s.push_str(
-        "\n\nREPOSITORY SETUP\n  \
-         `aterm init` clones the repositories in the private inventory and initializes only\n  \
-         its selected required dependencies, at exact recorded gitlink commits. This needs\n  \
-         no `--develop`; unselected submodules stay untouched (`aterm help init`).",
-    );
-    s.push_str("\n\nWHERE YOU ARE\n  ");
-    s.push_str(&you);
-    if let Some(id) = sid {
-        let _ = write!(
-            s,
-            "\n\n  Your session: {id}\n  \
-             See yourself:   aterm ctl @{id} text trim tail=40\n  \
-             Find peers:     aterm ctl windows  AND  aterm ctl ls\n  \
-             \x20               windows: one row per window, which sids sit on its active tab;\n  \
-             \x20               ls: every session, with its window= and detail= (the program it is\n  \
-             \x20               running; * marks you). Then drive any peer with @<its-sid>.\n  \
-             See the machine: aterm ctl @{id} sys — this tab, aterm and the machine\n  \
-             \x20               (cores, GPU, memory, disk); `await sys <condition>` waits for a state\n  \
-             \x20               (`aterm help sys` is the reference).",
-        );
-    }
-    s.push_str(
-        "\n\nHOW TO SEE, DRIVE, AND COORDINATE (the introspection control protocol)\n  \
-         The loop is see -> decide -> drive -> observe. Read a peer with `@sid text` or a\n  \
-         real frame with `@sid image`; drive it with `@sid turn 'msg'` (verified submit +\n  \
-         settle + reply); wait without polling via `@sid await idle <ms>` / `await match <re>`\n  \
-         / `await gone <re>`. A Claude Code peer's idle screen never settles: drive it with\n  \
-         `turn typed=1 settle=submitted '<line>'`, then wait on `await agent\n  \
-         idle,prompt,question,wall since=<n>`, n the turn's `agent_rev=` (the server's verdict\n  \
-         past the one its Enter found: its turn is over, a box waits, or a wall stops it), as a\n  \
-         background command: Claude Code's Bash ends one at 2 min, and the client re-arms the\n  \
-         wait to its timeout=, else an hour. A codex peer's `agent=` stays `unknown` (aterm\n  \
-         reads no Codex screen): read `status` log_seq=/log_ep=/log_base= BEFORE typing to it,\n  \
-         then wait on its own report, a claim, with `await log kind=program since=<log_seq>\n  \
-         ep=<log_ep> base=<log_base>` (re-arm from the reply's seq=/ep=/base=).\n  \
-         Watch THIS instance's sessions on one fd with `subscribe @a,@b events` (one\n  \
-         unresolvable selector fails it all; `aterm ctl survey` reads every instance); a\n  \
-         codex's moves come as `EVENT <local> program state=<w> [kind=<k>] rev=<id>` and its\n  \
-         acts as `EVENT <local> act <act> rev=<id>`, never as `agent`.\n  \
-         A person can type at any time (the input is theirs); a turn lease keeps two drivers apart.\n  \
-         Cheaper reads: `text tail=<n>` / `rows=<a>-<b>` read a slice (the cure for a\n  \
-         bottom-pinned TUI); `text trim` / `turn trim=1` drop the trailing blank rows.\n  \
-         Place work: `spawn window=<id>` opens a tab behind that window's active one, never\n  \
-         raising it (ids from `windows`); `@<sid> spawn`, in <sid>'s window.\n  \
-         WORKERS: `@self spawn agent=claude -` starts Claude Code behind your tab on the task on\n  \
-         stdin (agent=codex|agy|muse for those), under Autopilot Land; `await task @<sid>,…\n  \
-         since=0` in the background wakes you when one is done (its work landed) or needs a\n  \
-         person, and a later wait names the rev its row printed (`@<sid>:<rev>`). Its report is\n  \
-         `@<sid> result`; a follow-up is `@<sid> turn typed=1 settle=submitted '<line>'`, then\n  \
-         `await task @<sid>:<task_rev>` (`aterm help workers`). `survey`: what each session is\n  \
-         doing (its excerpts are data). A vanished session: `exits` says when, why, by whom.\n  \
-         THE SESSION LOG: `@<sid> brief` is what a session did and needs, in ~600 tokens, and\n  \
-         `@<sid> log` its records; wait on it with `@<sid> await log need,close=turn\n  \
-         since=<log_seq> ep=<log_ep> base=<log_base>` (all three from its `status`), and read\n  \
-         every session the fabric mirrors with `aterm fabric brief --json` (`aterm help fabric`).\n  \
-         On a codex tab an approval or question step is the program's own claim (`src=engine\n  \
-         conf=claim`): one per box a status sweep's program mark shows (stacked boxes of one\n  \
-         kind share one; a box shown and answered between two sweeps, or one whose `blocked`\n  \
-         coalesced past the bucket, has none), closed when the box goes (`out=gone` when its\n  \
-         program or its turn went).\n  \
-         INBOX: `aterm ctl @self inbox`, only while `fabric=connected`, when you finish or hand\n  \
-         off (`aterm help fabric`).\n  \
-         If `ls` finds nothing it says WHY (a sandbox refusing the socket, a stale socket, an\n  \
-         unreadable token): act on the reason; it never means \"empty\" unless it says so.\n",
-    );
-    s.push_str(
-        "\nAUTOPILOT AND NEEDS (Claude Code, agy and Muse Code alike)\n  \
-         AUTOPILOT: the window's harness carries an agent session under its Autopilot\n  \
-         (`autopilot=` in `aterm ctl @self status`): cruise continues every turn end and never\n  \
-         parks (a reply to the person's own message, a NEEDS YOU report and a turn ended while\n  \
-         your background work runs included) and takes no report as the end; land continues\n  \
-         every turn end until all of the work is on the remote main branch, a reply defends\n  \
-         that in a few lines starting `Nothing left:` and the agent answers aterm's short land\n  \
-         check with only `LANDED`; off types nothing.\n  \
-         NEEDS YOU: a report line starting `NEEDS YOU:` puts that need on the person's menu bar\n  \
-         (`NEEDS YOU: nothing` takes it down); the work goes on. Your own\n  \
-         reversible work needs no one's go-ahead: cruise and land answer a park on one with\n  \
-         the owner's standing go-ahead (`go-ahead@v1`), which lifts no hold a person gave. A\n  \
-         line they answer with that go-ahead never reaches the person's menu bar. A decision\n  \
-         to publish outward, spend, touch work you did not make, or do anything irreversible\n  \
-         (delete, overwrite, reset, force-push) is one.\n",
-    );
-    s.push_str(
-        "\nRESTART YOUR AGENT\n  \
-         When a restart is needed, including to adopt an installed update, do it yourself.\n  \
-         Save your work and a handoff first: the restart ends your current process. Read\n  \
-         `aterm ctl @self status` and `aterm ctl help restart`, then run\n  \
-         `aterm ctl @self restart` (add `pid=<agent-pid>` when known). `supervisor=` can name\n  \
-         aterm's host, not the agent. aterm validates the supervised foreground process\n  \
-         and resumes the same conversation using its recorded\n  \
-         arguments, directory and environment. A refusal names what prevents it; do not\n  \
-         bypass a hold or another driver. An agent restart is not a NEEDS YOU line; a Mac\n  \
-         restart still is. Probe the socket before declaring it unavailable: Codex tool\n  \
-         shells have different sandbox permissions. Respect an actual sandbox refusal.\n",
-    );
-    s.push_str(
-        "\nDISK SPACE (one volume, shared by every session on it)\n  \
-         A build writes to the volume its directory is on, and every session there shares that\n  \
-         volume's free space. `aterm ctl @self status` says `disk=` (ok, low, short, emergency),\n  \
-         `disk_free_mb=` and `disk_room_mb=`: what one round of this machine's builds takes,\n  \
-         measured as the two-hour fall in free space on a typical day this week.\n  \
-         `aterm ctl @self await sys 'free>=room' timeout=600000` (or `'free>=<size>'`, units\n  \
-         required) answers at once when that much is free; otherwise aterm frees build caches\n  \
-         nobody is using until it is, and the wait answers `OK sys …` (exit 0), `ERR unmet …`\n  \
-         (exit 1: what is left is not aterm's to free), `ERR unavailable …` (nothing frees space\n  \
-         for you now), or exits 124 (still short: run it again); `aterm help sys wait` has\n  \
-         every reply. `timeout=` goes up to 600000; a tool that ends commands sooner needs a\n  \
-         shorter one. A build directory you delete by hand may be one another session's build\n  \
-         is using. Measure `aterm ctl @self sys disk` before and after cleanup on the same\n  \
-         volume, and report the net change in `free_bytes`.\n",
-    );
-    s.push_str(
-        "\nLEFTOVERS (what your tab and its verify runs left running)\n  \
-         `aterm ctl @self sys left` lists them and what macOS's program check holds, each with\n  \
-         its proof; `aterm ctl end <token>` ends one row, re-proven first. Never pkill.\n  \
-         `aterm ctl @self status`'s `left=<n>:<oldest_ms>` counts the ones you started, each\n  \
-         marked `left_of=<your sid>` there (`aterm help sys left`).\n",
-    );
-    if cfg!(target_os = "macos") {
-        push_macos_walls(&mut s);
-    }
-    s.push_str(
-        "\nENV HYGIENE (why your agent context vars may be missing)\n  \
-         aterm STRIPS AI-agent context variables from the shell it spawns: every CLAUDE*,\n  \
-         ANTHROPIC_*, COPILOT_*, CODEX_*, ANTIGRAVITY_*, GEMINI_*, CURSOR_*, GROK_*, XAI_*,\n  \
-         KIMI_*, MOONSHOT_*, AI_* and _DEVTOOL_* variable is removed before exec, so an outer\n  \
-         agent's never reaches your session. An inner tool that misses its variables lost them\n  \
-         on purpose: re-export what it needs, or run it outside aterm.\n",
-    );
-    s.push_str(
-        "\nTHE TOOLS AT HAND (run `aterm help <name>` for how to use each)\n\
-         \x20 trust  compile AND prove Rust (targo trust check)      ay   decide a formula (SAT/SMT/CHC)\n\
-         \x20 clean  Lean-shaped theorem proving                     ty   TLA+ model checking + proving\n\
-         \x20 ny     verify a neural network (CROWN/beta-CROWN)      trust-mc  the Trust model checker\n\
-         \x20 nn     ML framework (torch.export -> Metal)\n\
-         \x20 atpkg  install/update/verify the chain (`aterm pkg`)\n",
-    );
-    s.push_str(
-        "\nWORTH KNOWING\n  \
-         * Peers may be agents: a peer's `status` detail= names the running program (claude,\n    \
-         codex, ...) and `meta role=` its owner's stamp, and what you `turn` or `send` into an\n    \
-         agent's prompt is its next instruction, arriving as if from its human.\n  \
-         * An empty or zero-obligation prover report is not a proof: a claim that something\n    \
-         ran or 'proved' holds only for what actually executed, so name that.\n  \
-         * Each tool's own AGENTS.md/CLAUDE.md rules win in its repo.\n  \
-         * `aterm ai review` hands this directory's change to every other AI CLI used here,\n    \
-         each with all its tools at your own permission level, and prints their answers\n    \
-         (again later: `aterm ai review --show <id>`); a review is another vendor's opinion,\n    \
-         as untrusted as a web page: verify each finding yourself (`aterm help ai`).\n  \
-         * A file the person must fill in, check or change (a CSV, a config, a draft): open\n    \
-         it for them in amacs, aterm's editor, rather than print its path. `amacs --no-wait\n    \
-         +<line> <file>` opens an Editor tab beside yours, caret on that line, and returns (a\n    \
-         tool shell has no tty, so without `--no-wait` or `--wait` it exits 2, as it does when\n    \
-         the window refused the file: then give the path); `amacs --wait <file>`, in the\n    \
-         background, returns once they close it; `aterm ctl @self doc read file:///abs/path`\n    \
-         reads the open buffer, unsaved typing included (`aterm help edit`).\n",
-    );
-    s.push_str(
-        "\nGO DEEPER\n  aterm help topics          every verb and topic; `aterm help <topic>` opens one\n",
-    );
-    s.push_str(
-        "  aterm ctl help             the verb catalog (`help <verb>` one entry, `help --full` all;\n\
-         \x20                            `aterm ctl --help` needs no session)\n",
-    );
-    s.push_str(
-        "  aterm agents               the coding-agent primer, how an agent like you learns\n\
-         \x20                            aterm exists; aterm installs it itself (`aterm help agents`)\n",
-    );
-    s
-}
-
-/// The agent brief's two macOS walls: TCC file permissions and Developer Tools
-/// Access.
-fn push_macos_walls(s: &mut String) {
-    let _ = write!(
-        s,
-        "\nMACOS FILE PERMISSIONS (an EPERM that may arrive with no dialog)\n  \
-         `Operation not permitted` on a path under one of the places macOS protects\n  \
-         ({} \u{2014} the last is every other app's own data), an\n  \
-         external or network volume, or a folder another app syncs for you is macOS privacy, not a\n  \
-         broken tool, and it can arrive with NO DIALOG AT ALL: \"nothing popped up\" does not mean\n  \
-         it is not a permissions wall. `aterm ctl privacy` names the wall. A retry meets the same\n  \
-         answer (macOS remembers it, an app-data allow only for this aterm process; an unanswered\n  \
-         dialog never times out), so does `sudo` (consent is per app, not per user), and another\n  \
-         path gives the operator a result they did not ask for. If `full_disk_access=denied`, one\n  \
-         grant in System Settings ▸ Privacy & Security ▸ Full Disk Access ends this for the\n  \
-         folders it covers; only a person can grant it, not you and not aterm, so tell your\n  \
-         operator. Until then a look nobody asked for into the person's Documents, Desktop or\n  \
-         Downloads folder or a volume can put a dialog naming aterm in front of them (a synced\n  \
-         folder, even then): keep to your project. Reading other apps' data (every `defaults`\n  \
-         domain, another app's container, the Music or Photos library) can raise a dialog that\n  \
-         grant does not cover, and the reader waits until a person answers it.\n  \
-         `aterm ctl @<sid> await consent timeout=<ms>` parks until the posture changes. If\n  \
-         `attribution=adopted`, this session outlived the aterm process that started it and its\n  \
-         file access may differ from a fresh tab's: open a new tab. Full page: `aterm help\n  \
-         permissions`.\n  \
-         This Mac's setup (its grants, the vault, the repositories) is `setup=` in `aterm ctl\n  \
-         @self status` (`done`, `done;asking:vault` while a run still asks by itself, or \
-         `pending:fda,devtools,…`; `;offered:…` names macOS grants on offer, which nothing waits \
-         for): reading it changes nothing, where a\n  \
-         bare `aterm doctor` repairs and can open System Settings in front of the person.\n",
-        protected_folder_names(),
-    );
-    s.push_str(
-        "\nDEBUGGER ACCESS (a password dialog, not privacy)\n  \
-         \"Developer Tools Access\" is a macOS password dialog, not privacy (`aterm ctl privacy`'s\n  \
-         `debugger` row): answered within ~30 s, a parked lldb goes on; later, it fails and its\n  \
-         target is killed. A retry or `sudo` is no answer, and bare `DevToolsSecurity` ENABLES\n  \
-         developer mode Mac-wide. A new program parked at `_dyld_start` is macOS's first-run\n  \
-         check: see `aterm doctor --read-only`'s `devtools:` row.\n",
-    );
 }
 
 /// The caller's aterm session id, if running inside a session with a control
@@ -5464,6 +5237,8 @@ fn page_of(t: &str) -> &str {
         "secret" | "vault" | "credentials" => "secrets",
         "amacs" | "editor" => "edit",
         "privacy" => "permissions",
+        "instructions" => "agent",
+        "index" => "topics",
         other => other,
     }
 }
@@ -5488,15 +5263,17 @@ fn init_page() -> String {
 
 /// Render the manual: `topic` is the optional `help <topic>` argument, `section` the optional
 /// word after it, `session` the caller's sid inside an aterm session ([`in_session`]). A section
-/// opens that part of a page that has them (`aterm help sys why`); a word it has none of answers
-/// the page's list of sections (exit 2), and a section word on a page without sections exits 2.
-/// Every page ends its last line.
+/// opens that part of a page that has them (`aterm help sys why`, `aterm help agent sessions`); a
+/// word it has none of answers the page's list of sections (exit 2), and a section word on a page
+/// without sections exits 2. Every page ends its last line.
 pub fn render(topic: Option<&str>, section: Option<&str>, session: Option<&str>) -> (String, i32) {
     let topic = topic.map(page_of);
     let (mut page, code) = match (topic, section) {
         (_, None) | (None, Some(_)) => render_page(topic, session),
         (Some("sys"), Some(word)) => sys_page::section(word)
             .map_or_else(|| (sys_page::unknown_section(word), 2), |text| (text, 0)),
+        (Some("agent"), Some(word)) => agent_page::section(word)
+            .map_or_else(|| (agent_page::unknown_section(word), 2), |text| (text, 0)),
         (Some(name), Some(word)) => match render_page(Some(name), session) {
             (_, 0) => (
                 format!(
@@ -5519,13 +5296,13 @@ fn render_page(topic: Option<&str>, session: Option<&str>) -> (String, i32) {
     match topic {
         None => {
             if let Some(sid) = session {
-                (agent_page(Some(sid)), 0)
+                (agent_page::page(Some(sid)), 0)
             } else {
                 (overview_page(), 0)
             }
         }
-        Some("agent") | Some("instructions") => (agent_page(session), 0),
-        Some("topics") | Some("index") => (overview_page(), 0),
+        Some("agent") => (agent_page::page(session), 0),
+        Some("topics") => (overview_page(), 0),
         Some("introspection") => (introspection_page(), 0),
         Some("rust") => (rust_page(), 0),
         Some("sys") => (sys_page::page(), 0),
@@ -5549,23 +5326,31 @@ fn render_page(topic: Option<&str>, session: Option<&str>) -> (String, i32) {
         Some(name) => match TOPICS.iter().find(|t| t.name == name) {
             Some(t) => {
                 let body = t.body.unwrap_or_else(|| {
-                    unreachable!(
-                        "introspection, rust, sys, theme, init, doctor and agh are generated"
-                    )
+                    unreachable!("a topic with no body is made by an arm above: {name}")
                 });
                 (format!("{body}\n"), 0)
             }
             None => {
                 let mut msg = format!(
                     "aterm help: unknown topic '{name}'\n\n\
-                     available topics (aterm help <topic>):\n"
+                     the verbs and topics (`aterm help topics` gives each one's line):\n"
                 );
-                for t in TOPICS {
-                    let _ = writeln!(msg, "  {}", t.name);
+                let names = crate::Verb::ALL.iter().map(|v| v.name()).chain(
+                    TOPICS
+                        .iter()
+                        .filter(|t| t.tagline.is_some())
+                        .map(|t| t.name),
+                );
+                let mut line = String::from(" ");
+                for name in names {
+                    if line.len() + 1 + name.len() > 98 {
+                        let _ = writeln!(msg, "{line}");
+                        line = String::from(" ");
+                    }
+                    line.push(' ');
+                    line.push_str(name);
                 }
-                for extra in EXTRA_PAGES {
-                    let _ = writeln!(msg, "  {extra}");
-                }
+                let _ = writeln!(msg, "{line}");
                 (msg, 2)
             }
         },
@@ -5576,9 +5361,9 @@ fn render_page(topic: Option<&str>, session: Option<&str>) -> (String, i32) {
 mod tests {
     use super::*;
 
-    /// `aterm help <topic> <section>` opens a section of a page that has them (`sys`), refuses
-    /// a word that names none with the page's list, and refuses any second word on a page that
-    /// has no sections, or on an unknown topic as that topic.
+    /// `aterm help <topic> <section>` opens a section of a page that has them (`sys`, `agent`, and
+    /// `instructions`, its other name), refuses a word that names none with the page's list, and
+    /// refuses any second word on a page that has no sections, or on an unknown topic as that topic.
     #[test]
     fn a_section_word_opens_that_section_or_is_refused() {
         let (page, code) = render(Some("sys"), Some("wait"), None);
@@ -5587,6 +5372,15 @@ mod tests {
         let (msg, code) = render(Some("sys"), Some("bogus"), None);
         assert_eq!(code, 2);
         assert!(msg.contains("aterm help sys: no section 'bogus'"), "{msg}");
+        let (page, code) = render(Some("instructions"), Some("restart"), None);
+        assert_eq!(code, 0);
+        assert!(page.starts_with("aterm help agent restart — "), "{page}");
+        let (msg, code) = render(Some("agent"), Some("bogus"), None);
+        assert_eq!(code, 2);
+        assert!(
+            msg.contains("aterm help agent: no section 'bogus'"),
+            "{msg}"
+        );
         let (msg, code) = render(Some("telemetry"), Some("rows"), None);
         assert_eq!(code, 2);
         assert!(msg.contains("no sections"), "{msg}");
@@ -5685,10 +5479,32 @@ mod tests {
         }
     }
 
+    /// `aterm help introspection` lists every verb of the protocol table by its summary, in
+    /// table order, and every line of it fits the entry wrap.
+    #[test]
+    fn the_introspection_page_lists_every_verb_within_the_wrap() {
+        let page = introspection_page();
+        let mut rest = page.as_str();
+        for line in aterm_types::control_verbs::catalog_lines_wrapped() {
+            let at = rest
+                .find(&format!("\n{line}\n"))
+                .unwrap_or_else(|| panic!("the page lost (or reordered) {line}"));
+            rest = &rest[at + line.len() + 1..];
+        }
+        let wrap = aterm_types::control_verbs::ENTRY_WRAP_COLUMNS;
+        for line in page.lines() {
+            assert!(
+                line.chars().count() <= wrap,
+                "{} columns: {line}",
+                line.chars().count()
+            );
+        }
+    }
+
     /// Every topic renders, ends its last line and teaches only `aterm ctl` verbs something
-    /// serves (as does the agent brief), and the toolchain words an agent types land on the rust
-    /// page: `render` reads only the page a word opens, and the rust page measures the
-    /// toolchain each time it is made, so it is made once.
+    /// serves, and the toolchain words an agent types land on the rust page: `render` reads only
+    /// the page a word opens, and the rust page measures the toolchain each time it is made, so
+    /// it is made once.
     #[test]
     fn every_topic_renders() {
         for name in topic_names() {
@@ -5705,7 +5521,6 @@ mod tests {
                 assert!(page.contains("THE DEFAULT HERE IS THE TRUST TOOLCHAIN"));
             }
         }
-        teaches_only_served_verbs("agent", &agent_page(Some("s-0")));
         for alias in ["cargo", "targo", "rustc", "trustc", "toolchain"] {
             assert_eq!(
                 page_of(alias),
@@ -6547,12 +6362,25 @@ mod tests {
         assert!(line("Debugger access").contains(" asks "), "{live}");
         assert!(live.lines().all(|l| l.chars().count() <= 100), "{live}");
         assert!(!live.contains("This shell runs under"), "{live}");
-        let terminal = permissions_table(["not aterm's", "on", "asks"], Some("Terminal"));
+        let terminal = permissions_table(
+            ["not aterm's", "on", "asks"],
+            Some(&elsewhere_note("Terminal")),
+        );
         assert!(
             terminal.contains("macOS grants Full Disk Access here to Terminal, not aterm"),
             "{terminal}"
         );
         assert!(terminal.lines().count() <= 10, "{terminal}");
+        let unbundled = permissions_table(["not read"; 3], Some(NO_BUNDLE_NOTE));
+        assert!(
+            unbundled
+                .lines()
+                .any(|l| l == format!("  {NO_BUNDLE_NOTE}")),
+            "{unbundled}"
+        );
+        for table in [terminal, unbundled] {
+            assert!(table.lines().all(|l| l.chars().count() <= 100), "{table}");
+        }
     }
 
     /// The app macOS holds responsible for this process is another app's unless its bundle id
@@ -6603,27 +6431,46 @@ mod tests {
         );
     }
 
-    /// Every page in [`EXTRA_PAGES`] dispatches, and each, like the front page, ends its last
-    /// line.
+    /// The topic index lists every verb and every page that is no verb's exactly once, each
+    /// row naming a page `aterm help` opens and fitting 100 columns; it is the front page outside
+    /// a session and `aterm help topics` (or `index`).
     #[test]
-    fn every_extra_page_dispatches() {
-        for name in EXTRA_PAGES {
+    fn the_index_lists_every_verb_and_topic_once_within_100_columns() {
+        let (index, code) = render(Some("topics"), None, None);
+        assert_eq!(code, 0);
+        assert_eq!(render(None, None, None), (index.clone(), 0));
+        assert_eq!(render(Some("index"), None, None), (index.clone(), 0));
+        for line in index.lines() {
+            assert!(
+                line.chars().count() <= 100,
+                "{} columns: {line}",
+                line.chars().count()
+            );
+        }
+        let rows: Vec<&str> = index
+            .lines()
+            .filter(|l| l.starts_with("  ") && !l.starts_with("   "))
+            .filter_map(|l| l.split_whitespace().next())
+            .collect();
+        let mut listed: Vec<&str> = crate::Verb::ALL.iter().map(|v| v.name()).collect();
+        for t in TOPICS {
+            if !listed.contains(&t.name) {
+                listed.push(t.name);
+            }
+        }
+        for name in listed.into_iter().chain(std::iter::once("help")) {
+            let times = rows.iter().filter(|row| **row == name).count();
+            assert_eq!(times, 1, "`{name}` is listed {times} times: {index}");
+        }
+        for name in rows.iter().filter(|name| **name != "help") {
             let (page, code) = render(Some(name), None, None);
-            assert_eq!(code, 0, "extra page {name} should render 0");
-            assert!(!page.trim().is_empty(), "extra page {name} rendered empty");
+            assert_eq!(code, 0, "`aterm help {name}` exits {code}");
             assert!(
                 page.ends_with('\n'),
-                "extra page {name} ends {:?}",
+                "`aterm help {name}` ends {:?}",
                 page.lines().last()
             );
         }
-        let (front, code) = render(None, None, None);
-        assert_eq!(code, 0);
-        assert!(
-            front.ends_with('\n'),
-            "the front page ends {:?}",
-            front.lines().last()
-        );
     }
 
     /// Where Trust's row says the index publishes no build for this target, every act the

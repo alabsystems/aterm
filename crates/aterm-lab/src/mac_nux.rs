@@ -2027,7 +2027,15 @@ fn build_app(run: &Path) -> Result<PathBuf, Fail> {
     // An alias, past the shim: claimed as the build it runs.
     let claim = crate::util::claim_build(
         args,
-        Some(&["--unverified", "build", "--release", "-p", "aterm"]),
+        Some(&[
+            "--unverified",
+            "build",
+            "--release",
+            "-p",
+            "aterm",
+            "--bin",
+            "aterm",
+        ]),
         &crate::paths::paths().repo,
     )
     .map_err(|e| Fail::die(format!("ship dev-app: {e}")))?;

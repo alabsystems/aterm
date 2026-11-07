@@ -102,8 +102,6 @@ struct Fixture {
 
 impl Fixture {
     fn new(label: &str) -> Self {
-        // The stand-ins print and exit: their answer must come, whatever the machine's load.
-        atpkg::toolchain::set_probe_bound_for_test(aterm_spec::wait::MUST_HAPPEN);
         let dir = crate::shared::scratch(label);
         let root = std::fs::canonicalize(dir.path()).expect("the scratch dir");
         Self {

@@ -194,6 +194,32 @@ fn help_after_a_verb_becomes_a_catalog_query_not_an_action() {
             "`{req}`"
         );
     }
+    // A word after the flag that names a section of the verb's page asks for that section; any
+    // other word is the verb's arguments, as before.
+    let section = aterm_types::control_verbs::spec("turn")
+        .and_then(|s| s.page)
+        .expect("turn's entry is a page")
+        .sections[0]
+        .name;
+    for (req, asks) in [
+        (
+            format!("turn --help {section}"),
+            vec!["help", "turn", section],
+        ),
+        (
+            format!("@s-abc turn -h {section}"),
+            vec!["help", "turn", section],
+        ),
+        ("turn --help nope".to_string(), vec!["help", "turn"]),
+        (format!("turn --help {section} extra"), vec!["help", "turn"]),
+        (format!("text --help {section}"), vec!["help", "text"]),
+    ] {
+        assert_eq!(
+            help_request_rewrite(&p(req.as_str())),
+            Some(asks.iter().map(|w| w.to_string()).collect::<Vec<String>>()),
+            "`{req}`"
+        );
+    }
 }
 
 /// `help <verb>` against an older server: a verb it calls unknown is still
@@ -210,7 +236,7 @@ fn help_fills_what_an_older_server_cannot_say() {
     let listener = UnixListener::bind(&sock).expect("bind mock socket");
     let srv = std::thread::spawn(move || {
         let mut seen = Vec::new();
-        for _ in 0..3 {
+        for _ in 0..4 {
             let (conn, _) = listener.accept().expect("accept");
             let mut r = std::io::BufReader::new(conn.try_clone().expect("clone"));
             let mut line = String::new();
@@ -244,9 +270,25 @@ fn help_fills_what_an_older_server_cannot_say() {
     assert_eq!(ask("resizes"), ExitCode::SUCCESS, "this client's entry");
     assert_eq!(ask("cast"), ExitCode::SUCCESS, "the server's entry");
     assert_eq!(ask("status"), ExitCode::FAILURE, "a refusal stays one");
+    let section = aterm_types::control_verbs::spec("turn")
+        .and_then(|s| s.page)
+        .expect("turn's entry is a page")
+        .sections[0]
+        .name;
+    let turn_section = format!("turn {section}");
+    assert_eq!(
+        ask(turn_section.as_str()),
+        ExitCode::SUCCESS,
+        "a section a server without pages refuses is this client's"
+    );
     assert_eq!(
         srv.join().expect("server"),
-        ["help resizes", "help cast", "help status"]
+        [
+            "help resizes".to_string(),
+            "help cast".to_string(),
+            "help status".to_string(),
+            format!("help {turn_section}"),
+        ]
     );
 }
 
@@ -2120,6 +2162,29 @@ fn completions_cover_every_verb_per_shell_and_reject_unknown() {
     assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
 }
 
+/// `aterm ctl --help` fits the entry wrap, and its VERBS table names every verb of the protocol
+/// table at the table's indent, in table order.
+#[test]
+fn the_overview_fits_the_wrap_and_lists_every_verb() {
+    let help = help_text();
+    let wrap = aterm_types::control_verbs::ENTRY_WRAP_COLUMNS;
+    for line in help.lines() {
+        assert!(
+            line.chars().count() <= wrap,
+            "{} columns: {line}",
+            line.chars().count()
+        );
+    }
+    let mut rest = &help[help.find("\nVERBS (").expect("a VERBS table")..];
+    for spec in aterm_types::control_verbs::VERBS {
+        let at = rest
+            .find(&format!("\n    {} ", spec.name))
+            .unwrap_or_else(|| panic!("VERBS lost (or reordered) `{}`", spec.name));
+        rest = &rest[at + 1..];
+    }
+    assert!(help.contains(SYNOPSIS));
+}
+
 #[test]
 fn uds_token_name_mirror_matches_aterm_types() {
     let cases = [
@@ -2368,6 +2433,31 @@ fn help_is_answered_client_side_only_for_what_the_client_knows() {
     }
     assert_eq!(
         client_help_reply(&strings(&["help", "nonesuch"]), HelpAsked::ByFlag),
+        None
+    );
+    for verb in aterm_types::control_verbs::VERBS {
+        for section in verb.page.map_or(&[][..], |page| page.sections) {
+            let parts = strings(&["help", verb.name, section.name]);
+            let rows = verb.section_lines(section.name).expect("a listed section");
+            let mut expected = format!("OK {}\n", rows.len());
+            for row in &rows {
+                expected.push_str(row);
+                expected.push('\n');
+            }
+            assert_eq!(
+                client_help_reply(&parts, HelpAsked::ByFlag),
+                Some(expected),
+                "{parts:?}"
+            );
+            assert_eq!(
+                client_help_reply(&parts, HelpAsked::ByVerb),
+                None,
+                "{parts:?} is the server's to answer"
+            );
+        }
+    }
+    assert_eq!(
+        client_help_reply(&strings(&["help", "turn", "nope"]), HelpAsked::ByFlag),
         None
     );
     let ls = client_help_reply(&strings(&["help", "ls"]), HelpAsked::ByVerb).unwrap();

@@ -23,6 +23,19 @@ pub struct MemberIo {
     pub stderr: Stdio,
     pub descriptions: Vec<OwnedFd>,
 }
+/// Original LOCAL helper only, distinct from the hosted target. No metric or
+/// lifecycle authority is reconstructed from these optional observations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HelperObservation {
+    pub identity: Identity,
+    pub outcome: Option<crate::Outcome>,
+}
+#[derive(Clone, Copy)]
+enum Route {
+    Legacy,
+    Accounted,
+    Workload,
+}
 /// Once Request is offered, ambiguous delivery retains the original child.
 pub enum MemberError {
     BeforeRequest(io::Error),
@@ -62,6 +75,7 @@ pub struct ProxyChild {
     accounting: Option<crate::accounting::Observation>,
     pending_terminal: Option<Status>,
     observed_terminal: Option<Status>,
+    helper_observation: Option<HelperObservation>,
 }
 fn invalid() -> io::Error {
     io::ErrorKind::InvalidData.into()
@@ -142,6 +156,16 @@ fn source_slots(request: &Request) -> Vec<u32> {
     slots.sort_unstable();
     slots
 }
+fn after_helper_exit(control: &Channel, proof: &Channel, proof_done: bool) -> io::Result<()> {
+    // The SAME owning wait may observe exit after the initial readiness
+    // checks. Read its queued final frames (or actual EOF refusal) next;
+    // helper exit is never itself a hosted-target terminal or retirement.
+    if control.ready_to_receive()? || (!proof_done && proof.ready_to_receive()?) {
+        Ok(())
+    } else {
+        Err(io::ErrorKind::UnexpectedEof.into())
+    }
+}
 impl Client {
     /// Caller retains its logical CPU/GNU unit until positive Finished/Refused.
     /// Unknown requires conservative root failure, never argument-file retry.
@@ -151,7 +175,7 @@ impl Client {
         io: MemberIo,
         deadline: Instant,
     ) -> Result<ProxyChild, MemberError> {
-        self.member_inner(request, io, deadline, false)
+        self.member_inner(request, io, deadline, Route::Legacy)
     }
     /// Require the negotiated original-owning-wait route. Unsupported helpers
     /// or custodians refuse; this never retries through ordinary execution.
@@ -161,19 +185,36 @@ impl Client {
         io: MemberIo,
         deadline: Instant,
     ) -> Result<ProxyChild, MemberError> {
-        self.member_inner(request, io, deadline, true)
+        self.member_inner(request, io, deadline, Route::Accounted)
+    }
+    /// The original-store native compiler helper. Its selected store is
+    /// transferred by descriptor; no account discovery or legacy retry is
+    /// permitted after this route is selected. Actual host admission is still
+    /// required, and the original local helper/target owners stay distinct.
+    pub fn workload_member_accounted(
+        &self,
+        request: &Request,
+        io: MemberIo,
+        deadline: Instant,
+    ) -> Result<ProxyChild, MemberError> {
+        self.member_inner(request, io, deadline, Route::Workload)
     }
     fn member_inner(
         &self,
         request: &Request,
         io: MemberIo,
         deadline: Instant,
-        accounted: bool,
+        route: Route,
     ) -> Result<ProxyChild, MemberError> {
+        let accounted = !matches!(route, Route::Legacy);
+        let original_store = matches!(route, Route::Workload);
         require_member_inheritance().map_err(MemberError::BeforeRequest)?;
         let prepare = || -> io::Result<_> {
             request.validate()?;
-            if matches!(request.role, crate::Role::SealedMetadata | crate::Role::ResolverQuery) {
+            if !request.role.is_proxy_member() {
+                return Err(invalid());
+            }
+            if original_store && request.role != crate::Role::Compile {
                 return Err(invalid());
             }
             // Even metadata borrows the original real CPU continuation; live
@@ -194,7 +235,7 @@ impl Client {
                     return Err(invalid());
                 }
             }
-            let (offered, descriptions) = inheritance_copies(request, &io.descriptions)?;
+            let (offered, mut descriptions) = inheritance_copies(request, &io.descriptions)?;
             let payload = if accounted {
                 crate::accounting::AccountedRequest {
                     request: offered.clone(),
@@ -205,6 +246,14 @@ impl Client {
                 offered.encode()?
             };
             self.host.validate(deadline)?;
+            let store = if original_store {
+                let original = self.host.duplicate_original_store(deadline)?;
+                let descriptor = original.as_raw_fd() as u32;
+                descriptions.push(original);
+                Some(descriptor)
+            } else {
+                None
+            };
             let (control, child_control) = UnixStream::pair()?;
             let (proof, child_proof) = UnixStream::pair()?;
             let child_control = duplicate_for_inheritance(child_control.as_fd())?;
@@ -214,12 +263,19 @@ impl Client {
                 producer: child_proof.as_raw_fd() as u32,
             };
             fds.validate_delegations(&offered.delegations)?;
+            let arguments = if let Some(store) = store {
+                let original = crate::WorkloadHelperFds { transport: fds, store };
+                original.validate_delegations(&offered.delegations)?;
+                original.arguments()?
+            } else if accounted {
+                fds.accounted_arguments()?
+            } else {
+                fds.arguments()?
+            };
             let mut inherited: Vec<_> = descriptions.iter().map(AsRawFd::as_raw_fd).collect();
             inherited.extend([child_control.as_raw_fd(), child_proof.as_raw_fd()]);
             let mut command = Command::new(self.host.helper_path());
-            command
-                .args(if accounted { fds.accounted_arguments()? } else { fds.arguments()? })
-                .env_clear();
+            command.args(arguments).env_clear();
             // These transient intentional copies are not close-on-fork guarded.
             // All local v3 launches must use this paired helper; any future
             // foreign local phase needs a shared fork guard or SCM transport.
@@ -252,12 +308,27 @@ impl Client {
             accounting: None,
             pending_terminal: None,
             observed_terminal: None,
+            helper_observation: None,
         };
-        if let Err(error) = child.host.validate_child(&child.helper, deadline) {
-            // A helper was actually spawned. An identity/refusal failure does
-            // not establish its retirement or return the caller's paid loan.
-            return Err(MemberError::Unknown { child: Box::new(child), error });
-        }
+        let actual = match child.host.validate_child(&child.helper, deadline) {
+            Ok(actual) => actual,
+            Err(error) => {
+                // A helper was actually spawned. Identity failure does not
+                // establish retirement or return the original paid loan.
+                return Err(MemberError::Unknown { child: Box::new(child), error });
+            }
+        };
+        child.helper_observation = Some(HelperObservation {
+            identity: Identity {
+                pid: actual.pid,
+                birth: actual.birth,
+                #[cfg(target_os = "macos")]
+                birth_kind: BirthKind::MacosWallMicroseconds,
+                #[cfg(target_os = "linux")]
+                birth_kind: BirthKind::LinuxStartTicks,
+            },
+            outcome: None,
+        });
         if let Err(error) = child.control.send(&payload, deadline) {
             return Err(MemberError::Unknown { child: Box::new(child), error });
         }
@@ -312,6 +383,27 @@ mod inheritance_tests {
     }
 }
 impl ProxyChild {
+    /// Identity was validated against the original image at spawn; an outcome
+    /// appears only after this same Child owner's actual wait observes it.
+    /// The root's owning-wait scope already includes helpers it waited for.
+    pub fn helper_observation(&self) -> Option<HelperObservation> {
+        self.helper_observation
+    }
+    fn poll_helper(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        use std::os::unix::process::ExitStatusExt as _;
+        let status = self.helper.try_wait()?;
+        if let Some(status) = status {
+            let outcome = status
+                .code()
+                .map(crate::Outcome::Exit)
+                .or_else(|| status.signal().map(crate::Outcome::Signal))
+                .ok_or_else(invalid)?;
+            if let Some(observed) = &mut self.helper_observation {
+                observed.outcome = Some(outcome);
+            }
+        }
+        Ok(status)
+    }
     /// These are real helper-owned pipe endpoints forwarded as target stdio;
     /// they confer no target process identity or lifecycle control.
     pub fn take_stdin(&mut self) -> Option<ChildStdin> {
@@ -418,7 +510,7 @@ impl ProxyChild {
             if self.proof.ready_to_receive()? && !self.proof.at_eof()? {
                 return Err(invalid());
             }
-            return match self.helper.try_wait()? {
+            return match self.poll_helper()? {
                 Some(status) if status.success() => Ok(self.pending_terminal.take()),
                 Some(_) => Err(invalid()),
                 None => Ok(None),
@@ -484,18 +576,35 @@ impl ProxyChild {
             }
             return Ok(None);
         }
-        if self.helper.try_wait()?.is_some() {
-            // The helper may have written its last frames, and exited, after the ready checks
-            // above: the next poll reads what it left (a frame, or the end that refuses it)
-            // before its lifecycle reads as lost.
-            if self.control.ready_to_receive()?
-                || (!self.proof_done && self.proof.ready_to_receive()?)
-            {
-                return Ok(None);
-            }
-            return Err(io::ErrorKind::UnexpectedEof.into());
+        if self.poll_helper()?.is_some() {
+            after_helper_exit(&self.control, &self.proof, self.proof_done)?;
         }
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+    #[test]
+    fn owning_helper_exit_rechecks_frames_that_arrived_after_initial_readiness() {
+        let (control, sender) = UnixStream::pair().unwrap();
+        let (proof, _proof_sender) = UnixStream::pair().unwrap();
+        let mut control = Channel::new(control).unwrap();
+        let proof = Channel::new(proof).unwrap();
+        assert!(!control.ready_to_receive().unwrap());
+        assert!(!proof.ready_to_receive().unwrap());
+        // A real owning wait closes the helper-exit window. A frame queued
+        // since the initial checks must be read on the next poll, rather than
+        // treating that wait result as evidence that the lifecycle was lost.
+        let mut child = Command::new("/usr/bin/true").spawn().unwrap();
+        let mut sender = Channel::new(sender).unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(3);
+        sender.send(b"original queued frame", deadline).unwrap();
+        assert!(child.wait().unwrap().success());
+        after_helper_exit(&control, &proof, false).unwrap();
+        assert_eq!(control.receive(deadline).unwrap(), b"original queued frame");
+        assert!(after_helper_exit(&control, &proof, true).is_err());
     }
 }
 impl Drop for ProxyChild {

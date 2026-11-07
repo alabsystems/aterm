@@ -97,6 +97,8 @@ impl Request {
         }
         match self.role {
             Role::ResolverQuery => crate::resolver::validate_member(self)?,
+            Role::WorkloadQuery => crate::workload::host::validate_query_member(self)?,
+            Role::WorkloadProduced => crate::workload::host::produced::validate_member(self)?,
             Role::MachOLinker(loan) if !linker_loan_shape(self, loan) => {
                 return Err(invalid());
             }

@@ -117,6 +117,8 @@ fn autopilot_off_retires_a_normal_wait_until_a_fresh_same_binding_decision() {
                             src: accounts::SOURCE_TAP.into(),
                             epoch: None,
                         }),
+                        ac: None,
+                        key: None,
                     },
                 })
                 .collect();

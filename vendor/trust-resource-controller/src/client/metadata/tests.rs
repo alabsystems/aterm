@@ -16,6 +16,7 @@ fn actual_streams() -> (MetadataStreams, UnixStream, std::io::PipeWriter, std::i
             state: Lifecycle::default(),
             observed: ObservedEvents::default(),
             cancel_sent: false,
+            failed: false,
         },
         peer,
         stdout,
@@ -476,4 +477,177 @@ fn resolver_query_incomplete_native_stream_retains_actual_failed_bytes_without_c
     assert_eq!(failed.event_prefix, partial);
     assert_eq!(failed.member_attempt, request.member.member_attempt);
     assert!(streams.state.completed.is_none());
+}
+
+fn workload_request() -> NativeQueryRequest {
+    let old = resolver_request();
+    let mut member = old.member;
+    member.role = Role::WorkloadQuery;
+    member.delegations.cpu = Some(Descriptor { source: 8, target: 6 });
+    member.delegations.gnu = GnuTransport::None;
+    let value = crate::workload::host::CompilerQuery {
+        member,
+        root: old.root,
+        program_sha256: old.program_sha256,
+    };
+    value.validate().unwrap();
+    NativeQueryRequest::Workload(value)
+}
+
+#[test]
+fn workload_observer_receives_each_actual_binary_read_before_pipe_eof() {
+    let (mut capture, mut stdout, mut stderr) = Capture::new().unwrap();
+    let mut actual = [Vec::new(), Vec::new()];
+    let mut calls = Vec::new();
+    let mut observer = |stream, bytes: &[u8]| {
+        let index = match stream {
+            crate::client::MetadataOutputStream::Stdout => 0,
+            crate::client::MetadataOutputStream::Stderr => 1,
+        };
+        calls.push((stream, bytes.to_vec()));
+        actual[index].extend_from_slice(bytes);
+        Ok(())
+    };
+    stdout.write_all(b"first\0partial").unwrap();
+    stderr.write_all(b"diagnostic\xff").unwrap();
+    capture.drain_observed(&mut Some(&mut observer)).unwrap();
+    assert_eq!(capture.eof, [false; 2]);
+    stdout.write_all(b"second\xfe").unwrap();
+    capture.drain_observed(&mut Some(&mut observer)).unwrap();
+    drop((stdout, stderr));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !capture.eof.iter().all(|value| *value) && Instant::now() < deadline {
+        capture.drain_observed(&mut Some(&mut observer)).unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(capture.eof, [true; 2]);
+    assert_eq!(actual, capture.bytes);
+    assert_eq!(actual[0], b"first\0partialsecond\xfe");
+    assert_eq!(actual[1], b"diagnostic\xff");
+    assert!(calls.len() >= 3, "separate writes were observed before EOF");
+    assert!(calls.iter().all(|(_, bytes)| !bytes.is_empty() && bytes.len() <= 4096));
+}
+
+#[test]
+fn workload_observer_failure_keeps_received_prefix_and_overflow_before_error_without_retry() {
+    let (mut streams, _peer, mut stdout, mut stderr) = actual_streams();
+    for _ in 0..16 {
+        stdout.write_all(&[b'a'; 2048]).unwrap();
+        stderr.write_all(&[b'b'; 2048]).unwrap();
+        streams.output.drain().unwrap();
+    }
+    assert_eq!(streams.output.bytes.iter().map(Vec::len).sum::<usize>(), METADATA_MAX_OUTPUT);
+    assert!(!streams.output.exceeded);
+    let original = streams.output.bytes.clone();
+    let overflow = b"actual overflow\0\xff";
+    stdout.write_all(overflow).unwrap();
+    let mut received = Vec::new();
+    let error = streams
+        .output
+        .drain_observed(&mut Some(&mut |stream, bytes: &[u8]| {
+            assert_eq!(stream, MetadataOutputStream::Stdout);
+            received.extend_from_slice(bytes);
+            Err(io::Error::new(io::ErrorKind::WriteZero, "controlled original sink failure"))
+        }))
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::WriteZero);
+    assert_eq!(received, overflow, "overflow reads still reach the actual sink");
+    assert_eq!(streams.output.bytes, original, "bounded prefix remains intact");
+    assert!(streams.output.exceeded, "overflow survives callback failure");
+    stderr.write_all(b"unread after failed observer").unwrap();
+    let mut retried = false;
+    let failed = streams.take_failure_observation_inner(
+        &workload_request(),
+        &mut Some(&mut |_, _| {
+            retried = true;
+            Ok(())
+        }),
+    );
+    assert!(!retried, "a failed original observer must never be replayed");
+    assert_eq!(failed.stdout, original[0]);
+    assert_eq!(failed.stderr, original[1]);
+    assert!(failed.output_limit_exceeded);
+    assert!(failed.capture_error.as_deref().unwrap().contains("observer failed"));
+    assert!(!failed.stdout_eof && !failed.stderr_eof);
+    assert!(streams.state.completed.is_none() && streams.state.accounting.is_none());
+    failed.validate().unwrap();
+}
+
+#[test]
+fn workload_final_failed_drain_observes_new_bytes_and_retains_them_on_sink_failure() {
+    let (mut streams, _peer, mut stdout, mut stderr) = actual_streams();
+    let mut observed = [Vec::new(), Vec::new()];
+    let mut observer = |stream, bytes: &[u8]| {
+        let index = match stream {
+            MetadataOutputStream::Stdout => 0,
+            MetadataOutputStream::Stderr => 1,
+        };
+        observed[index].extend_from_slice(bytes);
+        Ok(())
+    };
+    stdout.write_all(b"before failure").unwrap();
+    assert!(matches!(
+        streams
+            .poll_inner(
+                &workload_request(),
+                Instant::now() + Duration::from_secs(10),
+                &mut Some(&mut observer),
+            )
+            .unwrap(),
+        StreamReady::Pending
+    ));
+    stderr.write_all(b"last received stderr\0").unwrap();
+    let failed = streams.take_failure_observation_inner(
+        &workload_request(),
+        &mut Some(&mut |stream, bytes: &[u8]| {
+            observer(stream, bytes)?;
+            Err(io::Error::other("controlled last-drain failure"))
+        }),
+    );
+    assert_eq!(failed.stdout, b"before failure");
+    assert_eq!(failed.stderr, b"last received stderr\0");
+    assert_eq!(observed, [failed.stdout.clone(), failed.stderr.clone()]);
+    assert!(failed.capture_error.as_deref().unwrap().contains("last-drain failure"));
+    assert!(!failed.stdout_eof && !failed.stderr_eof);
+    assert!(streams.state.completed.is_none() && streams.state.accounting.is_none());
+    failed.validate().unwrap();
+}
+
+#[test]
+fn incremental_query_observer_is_closed_to_workload_purpose() {
+    require_workload_observer(&workload_request()).unwrap();
+    for request in
+        [NativeQueryRequest::Metadata(request()), NativeQueryRequest::Resolver(resolver_request())]
+    {
+        assert_eq!(
+            require_workload_observer(&request).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+    }
+}
+
+#[test]
+fn caught_workload_observer_unwind_cannot_resume_the_original_capture() {
+    let (mut capture, mut stdout, _stderr) = Capture::new().unwrap();
+    stdout.write_all(b"received before observer unwind\0").unwrap();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = capture
+            .drain_observed(&mut Some(&mut |_, _| panic!("controlled original observer unwind")));
+    }));
+    assert!(result.is_err());
+    assert_eq!(capture.bytes[0], b"received before observer unwind\0");
+    assert!(capture.observer_failed);
+    stdout.write_all(b"must remain unread").unwrap();
+    let mut called = false;
+    assert!(
+        capture
+            .drain_observed(&mut Some(&mut |_, _| {
+                called = true;
+                Ok(())
+            }))
+            .is_err()
+    );
+    assert!(!called);
+    assert_eq!(capture.bytes[0], b"received before observer unwind\0");
+    assert_eq!(capture.eof, [false; 2]);
 }

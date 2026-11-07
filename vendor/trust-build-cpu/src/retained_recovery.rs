@@ -92,6 +92,7 @@ impl RetainedPool {
                         return Err(invalid("original recovery commitment differs"));
                     }
                     leases.push(RetainedLease {
+                        settlement_attempted: false,
                         pool: self.clone(),
                         slot,
                         owner,

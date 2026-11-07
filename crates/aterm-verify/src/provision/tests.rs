@@ -161,7 +161,10 @@ impl stock::Rustup for Provisioned {
                 stock::RELEASE_TARGETS.join("\n")
             }
             (["target", "list", "--installed"], _) => String::new(),
-            (["component", "list", "--installed"], _) => format!("clippy-{host}\n"),
+            (["component", "list", "--installed"], _) => stock::PIN_COMPONENTS
+                .iter()
+                .map(|c| format!("{c}-{host}\n"))
+                .collect(),
             (other, _) => return Err(format!("this rustup changes nothing: {other:?}")),
         })
     }

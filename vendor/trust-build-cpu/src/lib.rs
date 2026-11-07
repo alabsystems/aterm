@@ -153,8 +153,12 @@ pub use fence::LegacyFence;
 mod kernel_memory;
 #[cfg(unix)]
 pub use kernel_memory::{available_memory, default_memory_reserve};
+#[cfg(all(feature = "native-host", any(target_os = "linux", target_os = "macos")))]
+mod native_observation;
 #[cfg(unix)]
 mod native_usage;
+#[cfg(all(feature = "native-host", any(target_os = "linux", target_os = "macos")))]
+pub use native_observation::NativeHostObservation;
 #[cfg(unix)]
 pub mod process_cpu;
 #[cfg(unix)]
@@ -167,7 +171,7 @@ pub use protocol::{IMPLICIT_FD_ENV, duplicate_descriptor, duplicate_descriptors}
 #[cfg(all(unix, feature = "jobserver"))]
 mod worker;
 #[cfg(all(unix, feature = "jobserver"))]
-pub use worker::{Credit, WorkerClient, WorkerHelper};
+pub use worker::{Credit, WorkerClient, WorkerHelper, WorkerPause};
 
 #[cfg(unix)]
 mod retained;
@@ -193,7 +197,7 @@ pub use legacy_retirement::LegacyRetirement;
 #[cfg(unix)]
 mod external_debt;
 #[cfg(unix)]
-pub use external_debt::ExternalDebt;
+pub use external_debt::{ExternalDebt, NativeDomainReservation};
 
 #[cfg(unix)]
 mod recovery_material;

@@ -464,6 +464,10 @@ pub trait ScreenReader: Sync {
     fn usage_warning(&self, _rows: &[String]) -> Option<crate::credits::Warning> {
         None
     }
+    /// A model's week shown on `rows` (its wall or its warning), if any.
+    fn model_week(&self, _rows: &[String]) -> Option<crate::credits::ModelWeek> {
+        None
+    }
     /// Leading glyph of the composer's caret row, if the program has a composer.
     fn caret(&self) -> Option<char> {
         None
@@ -799,6 +803,9 @@ impl ScreenReader for ClaudeReader {
     }
     fn usage_warning(&self, rows: &[String]) -> Option<crate::credits::Warning> {
         crate::credits::usage_warning(rows)
+    }
+    fn model_week(&self, rows: &[String]) -> Option<crate::credits::ModelWeek> {
+        crate::credits::model_week(rows)
     }
     fn caret(&self) -> Option<char> {
         Some('❯')

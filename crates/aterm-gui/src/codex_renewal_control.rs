@@ -343,22 +343,11 @@ fn opts(env: &Env, sid: &str) -> Option<aterm_agent::harness::upgrade_drive::Opt
 }
 
 fn index_path(
-    env: &Env,
     next: &renewal::Successor,
     proof: &crate::self_claim::Proven,
     intent: &Intent,
-) -> Option<PathBuf> {
-    let key = format!(
-        "{}:{}:{}:{}",
-        proof.pid, proof.start, intent.wall, next.generation
-    );
-    let hash = aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(key.as_bytes()));
-    Some(
-        env.accounts_store_for(accounts::Cli::Codex)?
-            .dir
-            .join("renewal-follow")
-            .join(format!("intent-{hash}")),
-    )
+) -> renewal::IndexKey {
+    renewal::IndexKey::login(proof.pid, &proof.start, &intent.wall, next.generation)
 }
 
 fn make_prepare(
@@ -542,10 +531,9 @@ fn serve_inner(
                 .unwrap_or_else(|| copy.home.join("auth.json"));
             let result =
                 renewal::with_successor_writer(&env, &old, &intent.identity, |next, writer| {
-                    let index = index_path(&env, next, &proof, &intent).ok_or("index")?;
-                    if let Some(id) = renewal::read_index(&index)? {
-                        let mut receipt =
-                            renewal::read_receipt(&env, &id).ok_or("indexed-receipt")?;
+                    let index = index_path(next, &proof, &intent);
+                    let prior = writer.read_indexed(&index)?;
+                    if let Some(mut receipt) = prior.clone() {
                         let same_source = receipt.sid == ctx.self_id.as_str()
                             && receipt.old_pid == proof.pid
                             && receipt.old_birth == process.birth
@@ -607,13 +595,7 @@ fn serve_inner(
                         current_attempt: None,
                         revoked: false,
                     };
-                    writer.create(&receipt)?;
-                    aterm_agent::harness::upgrade_models::write_atomic_mode(
-                        &index,
-                        &receipt.id,
-                        Some(0o600),
-                    )
-                    .map_err(|_| "index")?;
+                    writer.publish_indexed(&index, prior.as_ref(), &receipt)?;
                     Ok(receipt)
                 });
             match result {

@@ -26,6 +26,9 @@ mod forward;
 #[path = "../src/inspection.rs"]
 mod inspection;
 #[cfg(unix)]
+#[path = "../src/linker_transport.rs"]
+mod linker_transport;
+#[cfg(unix)]
 #[path = "../src/metadata_prelude.rs"]
 mod metadata_prelude;
 #[cfg(unix)]
@@ -70,6 +73,9 @@ mod subgroup_delegation;
 #[cfg(all(unix, not(target_os = "macos")))]
 #[path = "../src/subgroup_delegation_unsupported.rs"]
 mod subgroup_delegation;
+#[cfg(unix)]
+#[path = "../src/workload_transport.rs"]
+mod workload_transport;
 #[cfg(unix)]
 pub use client::{authorize, capabilities_at, inspect_at, submit};
 #[cfg(unix)]

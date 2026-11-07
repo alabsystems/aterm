@@ -312,7 +312,11 @@ fn disk_room(df: &str, disk_gb: u32) -> bool {
 fn verifier_log(stdout: &str) -> Option<&str> {
     stdout.lines().find_map(|line| {
         let path = line.strip_prefix("log: ")?;
-        let file = path.strip_prefix(&format!("{ROOT}/target.noindex/verify/logs.noindex/"))?;
+        let relative = path.strip_prefix(&format!("{ROOT}/target.noindex/verify/logs.noindex/"))?;
+        if !relative_member(relative) {
+            return None;
+        }
+        let file = Path::new(relative).file_name()?.to_str()?;
         let (time, pid) = file.strip_suffix(".log")?.split_once('-')?;
         (!time.is_empty()
             && !pid.is_empty()
@@ -322,7 +326,11 @@ fn verifier_log(stdout: &str) -> Option<&str> {
 }
 
 fn ledger_member(path: &str) -> bool {
-    path.starts_with("docs/measured/")
+    path.starts_with("docs/measured/") && relative_member(path)
+}
+
+fn relative_member(path: &str) -> bool {
+    !path.is_empty()
         && path
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"/-_.".contains(&b))
@@ -933,10 +941,15 @@ mod tests {
 
     #[test]
     fn retained_rows_stay_under_the_guest_run_and_disk_units_match_tart() {
-        let log = format!("log: {ROOT}/target.noindex/verify/logs.noindex/123-456.log");
+        let log =
+            format!("log: {ROOT}/target.noindex/verify/logs.noindex/runs.noindex/123-456.log");
         assert!(verifier_log(&log).is_some());
         assert!(verifier_log("log: /etc/shadow").is_none());
         assert!(verifier_log(&log.replace("123-456.log", "../secret.log")).is_none());
+        assert!(verifier_log(&log.replace("runs.noindex/", "runs.noindex/../")).is_none());
+        assert!(verifier_log(&log.replace("runs.noindex/", "/")).is_none());
+        assert!(verifier_log(&log.replace("123-456.log", "123-pid.log")).is_none());
+        assert!(verifier_log(&log.replace("runs.noindex/", "runs.noindex/next/")).is_some());
         assert!(ledger_member("docs/measured/fabric/take-1.json"));
         assert!(!ledger_member("docs/measured/../../secret"));
         assert!(!ledger_member("/docs/measured/fabric/take-1.json"));

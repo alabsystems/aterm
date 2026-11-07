@@ -148,7 +148,7 @@ version = "0.2.0"
 
 [[package]]
 name = "aterm"
-version = "0.169.0"
+version = "0.170.0"
 dependencies = [
  "agh",
  "astream-broker",
@@ -2134,6 +2134,7 @@ dependencies = [
  "aterm-containment",
  "aterm-ctl",
  "aterm-digest",
+ "aterm-dirfd",
  "aterm-forge",
  "aterm-hash",
  "aterm-json",
@@ -2543,6 +2544,7 @@ dependencies = [
  "jobserver_utils",
  "libc",
  "trust-resource-provenance",
+ "trust-sha2",
 ]
 
 [[package]]

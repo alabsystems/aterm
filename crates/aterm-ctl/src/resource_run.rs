@@ -7,11 +7,15 @@ use std::ffi::OsString;
 use std::io;
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: aterm resource-run [--sock PATH] [--session @self|@<sid>|@<local-id>] [--ai WORD] --job LABEL [--cpu-units N --memory-bytes M [--timeout-ms N] [--status-fd N] [--accounted]] -- PROGRAM [ARGS...]\n       aterm resource-run [--sock PATH] [--session @self|@<sid>] --capabilities";
+const USAGE: &str = "usage: aterm resource-run [--sock PATH] [--session @self|@<sid>|@<local-id>] [--ai WORD] --job LABEL [--cpu-units N --memory-bytes M [--timeout-ms N] [--status-fd N] [--accounted] [--expect-original-store-fd N]] -- PROGRAM [ARGS...]\n       aterm resource-run [--sock PATH] [--session @self|@<sid>] --capabilities";
 
 #[cfg(unix)]
 #[path = "resource_run_admission.rs"]
 mod admission;
+
+#[path = "resource_run_early.rs"]
+mod early;
+pub use early::{OriginalRootStore, capture_original_root_store};
 
 #[cfg(any(unix, test))]
 struct Resources {
@@ -62,14 +66,35 @@ struct Args {
     resources: Option<Resources>,
     capabilities: bool,
     accounted: bool,
+    #[cfg(unix)]
+    expected_store: Option<std::fs::File>,
 }
 
+#[cfg(test)]
 fn parse(argv: Vec<OsString>) -> io::Result<Option<Args>> {
+    parse_with_original_store(argv, None)
+}
+
+fn parse_with_original_store(
+    argv: Vec<OsString>,
+    original: Option<OriginalRootStore>,
+) -> io::Result<Option<Args>> {
+    #[cfg(unix)]
+    if let Some(original) = &original {
+        original.check_arguments(&argv)?;
+    }
+    #[cfg(unix)]
+    let mut original = original;
+    #[cfg(not(unix))]
+    let _ = original;
+    #[cfg(unix)]
+    let captured_arguments = argv.clone();
     let mut args = argv.into_iter();
     let (mut sock, mut session, mut ai, mut job) = (None, None, None, None);
     let (mut cpus, mut memory, mut timeout, mut status) = (None, None, None, None);
     let mut capabilities = false;
     let mut accounted = false;
+    let mut expected_store_fd: Option<String> = None;
     while let Some(arg) = args.next() {
         let Some(word) = arg.to_str() else {
             return Err(super::usage(USAGE));
@@ -101,6 +126,44 @@ fn parse(argv: Vec<OsString>) -> io::Result<Option<Args>> {
             {
                 return Err(super::usage(USAGE));
             }
+            let expected_store: Option<std::fs::File> = if let Some(value) = expected_store_fd {
+                if !accounted
+                    || !matches!(command.as_slice(), [_, entry] if entry == "--resource-workload-v1")
+                {
+                    return Err(super::usage(USAGE));
+                }
+                let fd = value.parse::<i32>().map_err(|_| super::usage(USAGE))?;
+                if fd < 6 {
+                    return Err(super::usage(USAGE));
+                }
+                #[cfg(unix)]
+                {
+                    if resources.as_ref().is_none_or(|value| {
+                        value.timeout_ms.is_none() || value.status_fd == Some(fd)
+                    }) {
+                        return Err(super::usage(USAGE));
+                    }
+                    Some(
+                        original
+                            .take()
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::PermissionDenied,
+                                    "original Store expectation was not captured at native startup",
+                                )
+                            })?
+                            .into_file(&captured_arguments, fd)?,
+                    )
+                }
+                #[cfg(not(unix))]
+                {
+                    return Err(io::ErrorKind::Unsupported.into());
+                }
+            } else {
+                None
+            };
+            #[cfg(not(unix))]
+            let _ = expected_store;
             return Ok(Some(Args {
                 sock,
                 session: match session {
@@ -114,6 +177,8 @@ fn parse(argv: Vec<OsString>) -> io::Result<Option<Args>> {
                 resources,
                 capabilities: false,
                 accounted,
+                #[cfg(unix)]
+                expected_store,
             }));
         }
         let slot = match word {
@@ -125,6 +190,7 @@ fn parse(argv: Vec<OsString>) -> io::Result<Option<Args>> {
             "--memory-bytes" => &mut memory,
             "--timeout-ms" => &mut timeout,
             "--status-fd" => &mut status,
+            "--expect-original-store-fd" => &mut expected_store_fd,
             _ => return Err(super::usage(USAGE)),
         };
         if slot.is_some() {
@@ -144,6 +210,7 @@ fn parse(argv: Vec<OsString>) -> io::Result<Option<Args>> {
         && memory.is_none()
         && timeout.is_none()
         && status.is_none()
+        && expected_store_fd.is_none()
     {
         return Ok(Some(Args {
             sock,
@@ -154,6 +221,8 @@ fn parse(argv: Vec<OsString>) -> io::Result<Option<Args>> {
             resources: None,
             capabilities: true,
             accounted: false,
+            #[cfg(unix)]
+            expected_store: None,
         }));
     }
     Err(super::usage(USAGE))
@@ -199,19 +268,31 @@ fn resources(
 
 /// Register this process, then become the exact requested command.
 pub fn main_entry(argv: Vec<OsString>) -> ExitCode {
-    let admitted = argv.iter().any(|word| {
-        matches!(
-            word.to_str(),
-            Some(
-                "--cpu-units"
-                    | "--memory-bytes"
-                    | "--timeout-ms"
-                    | "--status-fd"
-                    | "--capabilities"
+    main_entry_with_original_store(argv, None)
+}
+
+/// Consume an original startup capture; the late parser never reads its raw FD.
+pub fn main_entry_with_original_store(
+    argv: Vec<OsString>,
+    original: Option<OriginalRootStore>,
+) -> ExitCode {
+    let admitted = argv
+        .iter()
+        .take_while(|word| word.as_os_str() != "--")
+        .any(|word| {
+            matches!(
+                word.to_str(),
+                Some(
+                    "--cpu-units"
+                        | "--memory-bytes"
+                        | "--timeout-ms"
+                        | "--status-fd"
+                        | "--capabilities"
+                        | "--expect-original-store-fd"
+                )
             )
-        )
-    });
-    match run_registered_command(argv) {
+        });
+    match run_registered_command_with_original_store(argv, original) {
         Ok(code) => code,
         Err(error) => {
             let _ = crate::stderr_prefixed("aterm resource-run: ", &error.to_string());
@@ -224,8 +305,16 @@ pub fn main_entry(argv: Vec<OsString>) -> ExitCode {
     }
 }
 
+#[cfg(all(test, unix))]
 fn run_registered_command(argv: Vec<OsString>) -> io::Result<ExitCode> {
-    let Some(args) = parse(argv)? else {
+    run_registered_command_with_original_store(argv, None)
+}
+
+fn run_registered_command_with_original_store(
+    argv: Vec<OsString>,
+    original: Option<OriginalRootStore>,
+) -> io::Result<ExitCode> {
+    let Some(args) = parse_with_original_store(argv, original)? else {
         use std::io::Write;
         let stdout = io::stdout();
         let mut output = crate::StdoutSink::new(stdout.lock());
@@ -358,6 +447,83 @@ mod tests {
             ["tool", "", "--ai", "private words"].map(OsString::from)
         );
         assert!(parsed.ai.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn original_store_expectation_requires_a_bounded_accounted_workload_and_distinct_fd() {
+        use std::os::fd::AsRawFd as _;
+        let directory = crate::test_scratch_dir("root-store-argument");
+        let mut file = std::fs::File::open(directory.path()).unwrap();
+        let mut lower = Vec::new();
+        while file.as_raw_fd() < 6 {
+            lower.push(file);
+            file = std::fs::File::open(directory.path()).unwrap();
+        }
+        let fd = file.as_raw_fd().to_string();
+        let prefix = [
+            "--accounted",
+            "--cpu-units",
+            "1",
+            "--memory-bytes",
+            "1024",
+            "--timeout-ms",
+            "1000",
+            "--expect-original-store-fd",
+            &fd,
+            "--job",
+            "workload",
+        ];
+        let argv = |prefix: &[&str], command: &[&str]| {
+            prefix
+                .iter()
+                .copied()
+                .chain(["--"])
+                .chain(command.iter().copied())
+                .map(OsString::from)
+                .collect()
+        };
+        let arguments: Vec<OsString> = argv(&prefix, &["targo", "--resource-workload-v1"]);
+        let mut startup = vec![OsString::from("resource-run")];
+        startup.extend(arguments.iter().cloned());
+        // SAFETY: this test owns the source File for the complete capture.
+        let original = unsafe { capture_original_root_store(&startup) }.unwrap();
+        let valid = parse_with_original_store(arguments, original)
+            .unwrap()
+            .unwrap();
+        assert!(valid.expected_store.is_some());
+        for command in [
+            vec!["targo", "--resource-metadata-v1"],
+            vec!["targo", "--resource-resolver-v1"],
+            vec!["targo", "--resource-workload-v1", "extra"],
+        ] {
+            assert!(parse(argv(&prefix, &command)).is_err());
+        }
+        let without_accounted = &prefix[1..];
+        assert!(
+            parse(argv(
+                without_accounted,
+                &["targo", "--resource-workload-v1"]
+            ))
+            .is_err()
+        );
+        let without_timeout = prefix[..5]
+            .iter()
+            .chain(prefix[7..].iter())
+            .copied()
+            .collect::<Vec<_>>();
+        assert!(parse(argv(&without_timeout, &["targo", "--resource-workload-v1"])).is_err());
+        let mut alias = prefix.to_vec();
+        alias.extend(["--status-fd", &fd]);
+        assert!(parse(argv(&alias, &["targo", "--resource-workload-v1"])).is_err());
+        let opaque = parse(argv(
+            &["--session", "@self", "--job", "plain"],
+            &["tool", "--expect-original-store-fd", &fd],
+        ))
+        .unwrap()
+        .unwrap();
+        assert!(opaque.expected_store.is_none());
+        assert_eq!(opaque.command[1], "--expect-original-store-fd");
     }
 
     #[test]

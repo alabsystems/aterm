@@ -46,6 +46,43 @@ pub struct Client {
     host: Arc<PinnedHelper>,
 }
 impl Client {
+    /// Observe the independently selected original Store for equality checks.
+    /// This data cannot select discovery, replace validation or grant a root.
+    pub fn original_store_path(&self) -> &std::path::Path {
+        self.host.original_store_path()
+    }
+    /// Bind the initial invocation inside the actual original cooperative
+    /// workload root. Neither these bytes nor the reply grants execution.
+    /// Missing support refuses; there is no generic-context fallback.
+    pub fn workload_ready(
+        &self,
+        request: &crate::workload::host::ReadyRequest,
+        early: workload::EarlyCpuSet,
+        deadline: Instant,
+    ) -> Result<workload::AuthenticatedWorkloadStartup, CallError> {
+        use crate::workload::{WORKLOAD_READY_ROLE, host};
+        let payload = request.encode().map_err(before)?;
+        let hello = format!(
+            "{{\"version\":3,\"role\":\"{WORKLOAD_READY_ROLE}\",\"session\":\"{}\",\"capabilities\":{}}}",
+            request.query.binding.session,
+            host::READY_CAPABILITIES_JSON,
+        );
+        let original = self.host.connect(deadline).map_err(before)?;
+        let mut channel =
+            Channel::new(original.stream().try_clone().map_err(before)?).map_err(before)?;
+        channel.send(hello.as_bytes(), deadline).map_err(before)?;
+        let exchanged = (|| {
+            original.revalidate(deadline)?;
+            channel.send(&payload, deadline)?;
+            let reply = host::ReadyReply::decode(&channel.receive(deadline)?, request)?;
+            original.revalidate(deadline)?;
+            let startup = workload::receive_originals(&channel, reply, early, request, deadline)?;
+            original.revalidate(deadline)?;
+            channel.send(&[1], deadline)?;
+            Ok(startup.attach_control(channel, Arc::clone(&self.host)))
+        })();
+        exchanged.map_err(|error| CallError { delivery: Delivery::ContextUnavailable, error })
+    }
     pub fn discover(deadline: Instant) -> io::Result<Self> {
         Self::from_store(Store::open_account()?, deadline)
     }
@@ -61,6 +98,14 @@ impl Client {
     }
     pub fn from_helper(host: Arc<PinnedHelper>) -> Self {
         Self { host }
+    }
+    /// Reconnect only to the independently selected ORIGINAL pin. This is
+    /// discovery/authentication, never admission or a fallback to account state.
+    pub fn connect_original_host(
+        &self,
+        deadline: Instant,
+    ) -> io::Result<trust_resource_provenance::Host> {
+        self.host.connect(deadline)
     }
     /// Obtain observations on an authenticated direct native connection before
     /// choosing initial-vs-borrowed admission. No helper process is spawned and
@@ -200,10 +245,14 @@ impl Client {
 }
 
 mod member;
-pub use member::{MemberError, MemberIo, ProxyChild, inherit_descriptions};
+pub use member::{HelperObservation, MemberError, MemberIo, ProxyChild, inherit_descriptions};
 
 mod metadata;
-pub use metadata::{MetadataError, MetadataIo, MetadataMember, MetadataResult};
+pub use metadata::{
+    LinkerError, LinkerMember, LinkerOutcome, LinkerResult, MetadataError, MetadataIo,
+    MetadataMember, MetadataOutputStream, MetadataResult, ProducedError,
+    ProducedFailureObservation, ProducedMember, ProducedResult,
+};
 
 mod telemetry;
 pub use telemetry::ReceivedTelemetry;
@@ -212,3 +261,4 @@ mod liveness;
 pub use liveness::HostLifeline;
 
 pub mod sdk;
+pub mod workload;

@@ -19,8 +19,23 @@ use std::{
 
 #[path = "resource_admission_owner.rs"]
 mod owner;
+pub(super) use owner::workload::MemberOriginalCustody as WorkloadMemberOriginal;
+pub(super) use owner::workload::ReadyCustody as WorkloadReady;
+pub(super) use owner::workload::{WorkerCustody, WorkerOffer, WorkerReturn};
 
-const RPC: Duration = Duration::from_secs(2);
+const RPC: Duration = Duration::from_secs(60);
+fn receive_reply<T>(read: mpsc::Receiver<T>) -> Result<T, mpsc::RecvTimeoutError> {
+    receive_reply_at(read, Instant::now())
+}
+fn receive_reply_at<T>(
+    read: mpsc::Receiver<T>,
+    started: Instant,
+) -> Result<T, mpsc::RecvTimeoutError> {
+    let remaining = (started + RPC)
+        .checked_duration_since(Instant::now())
+        .ok_or(mpsc::RecvTimeoutError::Timeout)?;
+    read.recv_timeout(remaining)
+}
 const MAX_REQUESTS: usize = 256;
 type Key = (String, [u8; 16]);
 fn key(binding: &Binding) -> Key {
@@ -35,6 +50,49 @@ fn unavailable() -> io::Error {
 
 enum Message {
     Wake,
+    WorkloadOutputLocks {
+        peer: Peer,
+        session: String,
+        request: trust_resource_controller::workload::host::output::Request,
+        descriptions: Vec<std::os::fd::OwnedFd>,
+        reply: SyncSender<io::Result<trust_resource_controller::workload::host::output::Reply>>,
+    },
+    #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+    TestStop(SyncSender<bool>),
+    #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+    TestControlEofBeforeReap {
+        binding: Binding,
+        reply: SyncSender<bool>,
+    },
+    AuthorizeWorkloadProduced {
+        peer: Peer,
+        request: Box<trust_resource_controller::workload::host::produced::ProducedRequest>,
+        reply: SyncSender<bool>,
+    },
+    SubmitWorkloadProduced {
+        incoming: Box<crate::workload_transport::ProducedIncoming>,
+        reply: SyncSender<io::Result<()>>,
+    },
+    WorkloadRegister {
+        peer: Peer,
+        session: String,
+        request: trust_resource_controller::workload::host::produced::Registration,
+        original: std::os::fd::OwnedFd,
+        reply: SyncSender<io::Result<owner::workload::RegistrationPending>>,
+    },
+    WorkloadCensus {
+        peer: Peer,
+        session: String,
+        request: trust_resource_controller::workload::host::census::Request,
+        reply: SyncSender<io::Result<trust_resource_controller::workload::host::census::Reply>>,
+    },
+    WorkloadPhase {
+        peer: Peer,
+        session: String,
+        request: trust_resource_controller::workload::host::phase::Request,
+        descriptions: Vec<std::os::fd::OwnedFd>,
+        reply: SyncSender<io::Result<trust_resource_controller::workload::host::phase::Reply>>,
+    },
     Capabilities(SyncSender<aterm_json::Value>),
     Idle(SyncSender<bool>),
     Authorize {
@@ -48,6 +106,8 @@ enum Message {
     },
     SubmitMetadata(Box<crate::metadata_transport::Incoming>),
     SubmitResolverQuery(Box<crate::resolver_transport::Incoming>),
+    SubmitWorkloadQuery(Box<crate::workload_transport::Incoming>),
+    SubmitLinker(Box<crate::linker_transport::Incoming>),
     SubmitMember(Box<aterm_ctl::resource_subgroup_client::AuthorizedSubgroup>),
     SubmitProxy(Box<crate::resource_proxy_intake::Incoming>),
     ProvisionalProxy {
@@ -56,7 +116,7 @@ enum Message {
         reply: SyncSender<bool>,
     },
     AuthorizeMember {
-        request: owner::members::Authorization,
+        request: Box<owner::members::Authorization>,
         reply: SyncSender<bool>,
     },
     Context {
@@ -73,6 +133,41 @@ enum Message {
         peer: Peer,
         query: trust_resource_controller::ContextQuery,
         reply: SyncSender<io::Result<trust_resource_controller::ContextReply>>,
+    },
+    WorkloadReady {
+        peer: Peer,
+        request: Box<trust_resource_controller::workload::host::ReadyRequest>,
+        reply: SyncSender<io::Result<WorkloadReady>>,
+    },
+    WorkloadMemberOriginal {
+        peer: Peer,
+        request: trust_resource_controller::workload::host::MemberOriginalRequest,
+        reply: SyncSender<io::Result<WorkloadMemberOriginal>>,
+    },
+    InstallWorkloadControl {
+        peer: Peer,
+        session: String,
+        attempt: [u8; 16],
+        link: crate::workload_transport::Link,
+        reply: SyncSender<io::Result<()>>,
+    },
+    WorkloadWorkerOffer {
+        peer: Peer,
+        request: trust_resource_controller::workload::host::worker::Request,
+        reply: SyncSender<io::Result<WorkerOffer>>,
+    },
+    WorkloadWorkerAccept {
+        offer: WorkerOffer,
+        reply: SyncSender<io::Result<WorkerCustody>>,
+    },
+    WorkloadWorkerReturn {
+        peer: Peer,
+        request: trust_resource_controller::workload::host::worker::Return,
+        reply: SyncSender<io::Result<WorkerReturn>>,
+    },
+    WorkloadWorkerReturned {
+        returned: WorkerReturn,
+        reply: SyncSender<io::Result<trust_resource_controller::workload::host::worker::Returned>>,
     },
     Inspect {
         peer: Peer,
@@ -98,6 +193,26 @@ pub(super) fn activate_process() -> io::Result<()> {
         .spawn(move || run(receiver, owner))?;
     HOST.set(Handle { sender }).map_err(|_| unavailable())
 }
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+fn activate_test(owner: owner::Owner) -> io::Result<std::thread::JoinHandle<()>> {
+    let (sender, receiver) = mpsc::sync_channel(MAX_REQUESTS);
+    HOST.set(Handle { sender }).map_err(|_| unavailable())?;
+    std::thread::Builder::new()
+        .name("native-owner-fixture".into())
+        .spawn(move || run(receiver, owner))
+}
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+fn stop_test() -> io::Result<bool> {
+    let (reply, read) = mpsc::sync_channel(1);
+    send(Message::TestStop(reply))?;
+    receive_reply(read).map_err(|_| unavailable())
+}
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+pub(super) fn control_eof_before_reap_test(binding: Binding) -> io::Result<bool> {
+    let (reply, read) = mpsc::sync_channel(1);
+    send(Message::TestControlEofBeforeReap { binding, reply })?;
+    receive_reply(read).map_err(|_| unavailable())
+}
 fn actor() -> io::Result<&'static Handle> {
     // Actual child controls must never be created in the GUI process.
     // Only the authenticated immutable custodian bootstrap enables this role.
@@ -110,7 +225,7 @@ fn send(message: Message) -> io::Result<()> {
 pub fn capabilities() -> aterm_json::Value {
     let (reply, read) = mpsc::sync_channel(1);
     if send(Message::Capabilities(reply)).is_ok()
-        && let Ok(value) = read.recv_timeout(RPC)
+        && let Ok(value) = receive_reply(read)
     {
         return value;
     }
@@ -118,7 +233,7 @@ pub fn capabilities() -> aterm_json::Value {
 }
 pub(super) fn idle() -> bool {
     let (reply, read) = mpsc::sync_channel(1);
-    send(Message::Idle(reply)).is_ok() && read.recv_timeout(RPC).unwrap_or(false)
+    send(Message::Idle(reply)).is_ok() && receive_reply(read).unwrap_or(false)
 }
 /// Check an already authenticated GUI submission. The caller must establish
 /// actual kernel peer and live session authorization before this boundary.
@@ -136,7 +251,7 @@ pub fn authorize(request: &Submission, peer: Peer) -> bool {
         reply,
     })
     .is_ok()
-        && read.recv_timeout(RPC).unwrap_or(false)
+        && receive_reply(read).unwrap_or(false)
 }
 /// Accept four privately delegated descriptors after caller authorization.
 /// Acceptance alone supplies no launch or allocation fact.
@@ -163,8 +278,12 @@ pub(super) fn authorize_member(
         return false;
     };
     let (reply, read) = mpsc::sync_channel(1);
-    send(Message::AuthorizeMember { request, reply }).is_ok()
-        && read.recv_timeout(RPC).unwrap_or(false)
+    send(Message::AuthorizeMember {
+        request: Box::new(request),
+        reply,
+    })
+    .is_ok()
+        && receive_reply(read).unwrap_or(false)
 }
 pub(super) fn authorize_metadata(
     request: &aterm_types::resource_subgroup::Request,
@@ -175,8 +294,12 @@ pub(super) fn authorize_metadata(
     };
     request.metadata = true;
     let (reply, read) = mpsc::sync_channel(1);
-    send(Message::AuthorizeMember { request, reply }).is_ok()
-        && read.recv_timeout(RPC).unwrap_or(false)
+    send(Message::AuthorizeMember {
+        request: Box::new(request),
+        reply,
+    })
+    .is_ok()
+        && receive_reply(read).unwrap_or(false)
 }
 pub(super) fn submit_metadata(member: crate::metadata_transport::Incoming) -> io::Result<()> {
     send(Message::SubmitMetadata(Box::new(member)))
@@ -190,8 +313,12 @@ pub(super) fn authorize_resolver_query(
     };
     request.resolver = true;
     let (reply, read) = mpsc::sync_channel(1);
-    send(Message::AuthorizeMember { request, reply }).is_ok()
-        && read.recv_timeout(RPC).unwrap_or(false)
+    send(Message::AuthorizeMember {
+        request: Box::new(request),
+        reply,
+    })
+    .is_ok()
+        && receive_reply(read).unwrap_or(false)
 }
 pub(super) fn submit_resolver_query(member: crate::resolver_transport::Incoming) -> io::Result<()> {
     send(Message::SubmitResolverQuery(Box::new(member)))
@@ -199,11 +326,221 @@ pub(super) fn submit_resolver_query(member: crate::resolver_transport::Incoming)
 pub(super) fn resolver_binding(value: &aterm_json::Value) -> io::Result<Binding> {
     owner::members::binding_role(value, "sealed-resolver-query-v1")
 }
+pub(super) fn workload_binding(value: &aterm_json::Value) -> io::Result<Binding> {
+    owner::members::binding_role(
+        value,
+        trust_resource_controller::workload::host::QUERY_PURPOSE,
+    )
+}
+pub(super) fn authorize_workload_query(
+    request: &aterm_types::resource_subgroup::Request,
+    peer: Peer,
+    query: &trust_resource_controller::workload::host::CompilerQuery,
+) -> bool {
+    let Ok(mut request) = owner::members::Authorization::of(request, peer) else {
+        return false;
+    };
+    request.workload_query = Some(query.clone());
+    let (reply, read) = mpsc::sync_channel(1);
+    send(Message::AuthorizeMember {
+        request: Box::new(request),
+        reply,
+    })
+    .is_ok()
+        && receive_reply(read).unwrap_or(false)
+}
+pub(super) fn submit_workload_query(member: crate::workload_transport::Incoming) -> io::Result<()> {
+    send(Message::SubmitWorkloadQuery(Box::new(member)))
+}
+pub(crate) fn authorize_linker(
+    request: &aterm_types::resource_subgroup::Request,
+    peer: Peer,
+    sealed: &trust_resource_controller::linker::Request,
+) -> bool {
+    let Ok(mut request) = owner::members::Authorization::of(request, peer) else {
+        return false;
+    };
+    request.linker = Some(sealed.clone());
+    let (reply, read) = mpsc::sync_channel(1);
+    send(Message::AuthorizeMember {
+        request: Box::new(request),
+        reply,
+    })
+    .is_ok()
+        && receive_reply(read).unwrap_or(false)
+}
+pub(crate) fn submit_linker(incoming: crate::linker_transport::Incoming) -> io::Result<()> {
+    send(Message::SubmitLinker(Box::new(incoming)))
+}
+pub(super) fn workload_ready(
+    peer: Peer,
+    request: trust_resource_controller::workload::host::ReadyRequest,
+) -> io::Result<WorkloadReady> {
+    let (reply, read) = mpsc::sync_channel(1);
+    send(Message::WorkloadReady {
+        peer,
+        request: Box::new(request),
+        reply,
+    })?;
+    receive_reply(read).map_err(|_| unavailable())?
+}
+pub(super) fn workload_member_original(
+    peer: Peer,
+    request: trust_resource_controller::workload::host::MemberOriginalRequest,
+) -> io::Result<WorkloadMemberOriginal> {
+    let (reply, read) = mpsc::sync_channel(1);
+    send(Message::WorkloadMemberOriginal {
+        peer,
+        request,
+        reply,
+    })?;
+    receive_reply(read).map_err(|_| unavailable())?
+}
+pub(super) fn install_workload_control(
+    peer: Peer,
+    session: String,
+    attempt: [u8; 16],
+    link: crate::workload_transport::Link,
+) -> io::Result<()> {
+    let (reply, read) = mpsc::sync_channel(1);
+    send(Message::InstallWorkloadControl {
+        peer,
+        session,
+        attempt,
+        link,
+        reply,
+    })?;
+    receive_reply(read).map_err(|_| unavailable())?
+}
+pub(super) fn workload_worker_offer(
+    peer: Peer,
+    request: trust_resource_controller::workload::host::worker::Request,
+) -> io::Result<WorkerOffer> {
+    let (reply, read) = mpsc::sync_channel(1);
+    send(Message::WorkloadWorkerOffer {
+        peer,
+        request,
+        reply,
+    })?;
+    receive_reply(read).map_err(|_| unavailable())?
+}
+pub(super) fn workload_worker_accept(offer: WorkerOffer) -> io::Result<WorkerCustody> {
+    let (reply, read) = mpsc::sync_channel(1);
+    send(Message::WorkloadWorkerAccept { offer, reply })?;
+    receive_reply(read).map_err(|_| unavailable())?
+}
+pub(super) fn workload_worker_return(
+    peer: Peer,
+    request: trust_resource_controller::workload::host::worker::Return,
+) -> io::Result<WorkerReturn> {
+    let (reply, read) = mpsc::sync_channel(1);
+    send(Message::WorkloadWorkerReturn {
+        peer,
+        request,
+        reply,
+    })?;
+    receive_reply(read).map_err(|_| unavailable())?
+}
+pub(super) fn workload_worker_returned(
+    returned: WorkerReturn,
+) -> io::Result<trust_resource_controller::workload::host::worker::Returned> {
+    let (reply, read) = mpsc::sync_channel(1);
+    send(Message::WorkloadWorkerReturned { returned, reply })?;
+    receive_reply(read).map_err(|_| unavailable())?
+}
+pub(super) fn workload_phase(
+    peer: Peer,
+    session: String,
+    request: trust_resource_controller::workload::host::phase::Request,
+    descriptions: Vec<std::os::fd::OwnedFd>,
+) -> io::Result<trust_resource_controller::workload::host::phase::Reply> {
+    let (reply, read) = mpsc::sync_channel(1);
+    send(Message::WorkloadPhase {
+        peer,
+        session,
+        request,
+        descriptions,
+        reply,
+    })?;
+    receive_reply(read).map_err(|_| unavailable())?
+}
+pub(super) fn workload_census(
+    peer: Peer,
+    session: String,
+    request: trust_resource_controller::workload::host::census::Request,
+) -> io::Result<trust_resource_controller::workload::host::census::Reply> {
+    let (reply, read) = mpsc::sync_channel(1);
+    send(Message::WorkloadCensus {
+        peer,
+        session,
+        request,
+        reply,
+    })?;
+    receive_reply(read).map_err(|_| unavailable())?
+}
+pub(super) fn workload_output_locks(
+    peer: Peer,
+    session: String,
+    request: trust_resource_controller::workload::host::output::Request,
+    descriptions: Vec<std::os::fd::OwnedFd>,
+) -> io::Result<trust_resource_controller::workload::host::output::Reply> {
+    let (reply, read) = mpsc::sync_channel(1);
+    send(Message::WorkloadOutputLocks {
+        peer,
+        session,
+        request,
+        descriptions,
+        reply,
+    })?;
+    receive_reply(read).map_err(|_| unavailable())?
+}
 pub(super) fn metadata_binding(value: &aterm_json::Value) -> io::Result<Binding> {
     owner::members::binding_role(value, "sealed-metadata-v1")
 }
+pub(super) fn workload_register(
+    peer: Peer,
+    session: String,
+    request: trust_resource_controller::workload::host::produced::Registration,
+    original: std::os::fd::OwnedFd,
+) -> io::Result<owner::workload::RegistrationPending> {
+    let (reply, read) = mpsc::sync_channel(1);
+    send(Message::WorkloadRegister {
+        peer,
+        session,
+        request,
+        original,
+        reply,
+    })?;
+    receive_reply(read).map_err(|_| unavailable())?
+}
+pub(super) fn authorize_workload_produced(
+    peer: Peer,
+    request: trust_resource_controller::workload::host::produced::ProducedRequest,
+) -> bool {
+    let (reply, read) = mpsc::sync_channel(1);
+    send(Message::AuthorizeWorkloadProduced {
+        peer,
+        request: Box::new(request),
+        reply,
+    })
+    .is_ok()
+        && receive_reply(read).unwrap_or(false)
+}
+pub(super) fn submit_workload_produced(
+    incoming: crate::workload_transport::ProducedIncoming,
+) -> io::Result<()> {
+    let (reply, read) = mpsc::sync_channel(1);
+    send(Message::SubmitWorkloadProduced {
+        incoming: Box::new(incoming),
+        reply,
+    })?;
+    receive_reply(read).map_err(|_| unavailable())?
+}
 pub(super) fn member_binding(value: &aterm_json::Value) -> io::Result<Binding> {
     owner::members::binding(value)
+}
+pub(super) fn member_binding_role(value: &aterm_json::Value, role: &str) -> io::Result<Binding> {
+    owner::members::binding_role(value, role)
 }
 pub(super) fn submit_member(
     member: aterm_ctl::resource_subgroup_client::AuthorizedSubgroup,
@@ -221,7 +558,7 @@ pub(super) fn provisional_proxy(
         reply,
     })
     .is_ok()
-        && read.recv_timeout(RPC).unwrap_or(false)
+        && receive_reply(read).unwrap_or(false)
 }
 pub(super) fn proxy_binding(value: &aterm_json::Value) -> io::Result<Binding> {
     owner::members::binding_role(value, "proxy-member")
@@ -253,7 +590,7 @@ pub fn inspect(peer: Peer, session: &str) -> io::Result<Inspection> {
         session: session.to_owned(),
         reply,
     })?;
-    read.recv_timeout(RPC).map_err(|_| unavailable())?
+    receive_reply(read).map_err(|_| unavailable())?
 }
 
 pub(super) fn context(
@@ -262,7 +599,7 @@ pub(super) fn context(
 ) -> io::Result<trust_resource_controller::ContextReply> {
     let (reply, read) = mpsc::sync_channel(1);
     send(Message::Context { peer, query, reply })?;
-    read.recv_timeout(RPC).map_err(|_| unavailable())?
+    receive_reply(read).map_err(|_| unavailable())?
 }
 
 pub(super) fn metadata_ready(
@@ -271,7 +608,7 @@ pub(super) fn metadata_ready(
 ) -> io::Result<trust_resource_controller::ContextReply> {
     let (reply, read) = mpsc::sync_channel(1);
     send(Message::MetadataReady { peer, query, reply })?;
-    read.recv_timeout(RPC).map_err(|_| unavailable())?
+    receive_reply(read).map_err(|_| unavailable())?
 }
 
 pub(super) fn resolver_ready(
@@ -280,7 +617,7 @@ pub(super) fn resolver_ready(
 ) -> io::Result<trust_resource_controller::ContextReply> {
     let (reply, read) = mpsc::sync_channel(1);
     send(Message::ResolverReady { peer, query, reply })?;
-    read.recv_timeout(RPC).map_err(|_| unavailable())?
+    receive_reply(read).map_err(|_| unavailable())?
 }
 
 fn run(receiver: mpsc::Receiver<Message>, mut owner: owner::Owner) {
@@ -297,6 +634,80 @@ fn run(receiver: mpsc::Receiver<Message>, mut owner: owner::Owner) {
         };
         if let Some(message) = message {
             match message {
+                Message::WorkloadOutputLocks {
+                    peer,
+                    session,
+                    request,
+                    descriptions,
+                    reply,
+                } => {
+                    let _ = reply.try_send(owner.workload_output_locks(
+                        peer,
+                        &session,
+                        request,
+                        descriptions,
+                    ));
+                }
+                #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+                Message::TestControlEofBeforeReap { binding, reply } => {
+                    let _ = reply.try_send(owner.control_eof_before_reap_test(&binding));
+                }
+                #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+                Message::TestStop(reply) => {
+                    let idle = owner.idle();
+                    if !idle {
+                        // Fixture unwind requests cancellation through the
+                        // SAME original owners. It never guesses a target PID
+                        // or drops paid custody to make the test finish.
+                        owner.cancel_test();
+                    }
+                    let _ = reply.try_send(idle);
+                    if idle {
+                        break;
+                    }
+                }
+                Message::AuthorizeWorkloadProduced {
+                    peer,
+                    request,
+                    reply,
+                } => {
+                    let _ = reply.try_send(owner.authorize_workload_produced(peer, &request));
+                }
+                Message::SubmitWorkloadProduced { incoming, reply } => {
+                    let _ = reply.try_send(owner.submit_workload_produced(*incoming));
+                }
+                Message::WorkloadRegister {
+                    peer,
+                    session,
+                    request,
+                    original,
+                    reply,
+                } => {
+                    let _ =
+                        reply.try_send(owner.workload_register(peer, &session, request, original));
+                }
+                Message::WorkloadCensus {
+                    peer,
+                    session,
+                    request,
+                    reply,
+                } => {
+                    let _ = reply.try_send(owner.workload_census(peer, &session, &request));
+                }
+                Message::WorkloadPhase {
+                    peer,
+                    session,
+                    request,
+                    descriptions,
+                    reply,
+                } => {
+                    let _ = reply.try_send(owner.workload_phase(
+                        peer,
+                        &session,
+                        &request,
+                        descriptions,
+                    ));
+                }
                 Message::Wake => {}
                 Message::Idle(reply) => {
                     let _ = reply.try_send(owner.idle());
@@ -340,6 +751,8 @@ fn run(receiver: mpsc::Receiver<Message>, mut owner: owner::Owner) {
                 Message::SubmitMember(member) => owner.submit_member(*member),
                 Message::SubmitMetadata(member) => owner.submit_metadata(*member),
                 Message::SubmitResolverQuery(member) => owner.submit_resolver_query(*member),
+                Message::SubmitWorkloadQuery(member) => owner.submit_workload_query(*member),
+                Message::SubmitLinker(member) => owner.submit_linker(*member),
 
                 Message::SubmitProxy(incoming) => owner.submit_proxy(*incoming),
                 Message::ProvisionalProxy {
@@ -357,6 +770,50 @@ fn run(receiver: mpsc::Receiver<Message>, mut owner: owner::Owner) {
                 }
                 Message::ResolverReady { peer, query, reply } => {
                     let _ = reply.try_send(owner.resolver_ready(peer, &query));
+                }
+                Message::WorkloadReady {
+                    peer,
+                    request,
+                    reply,
+                } => {
+                    let _ = reply.try_send(owner.workload_ready(peer, &request));
+                }
+                Message::WorkloadMemberOriginal {
+                    peer,
+                    request,
+                    reply,
+                } => {
+                    let _ = reply.try_send(owner.workload_member_original(peer, &request));
+                }
+                Message::InstallWorkloadControl {
+                    peer,
+                    session,
+                    attempt,
+                    link,
+                    reply,
+                } => {
+                    let _ = reply
+                        .try_send(owner.install_workload_control(peer, &session, attempt, link));
+                }
+                Message::WorkloadWorkerOffer {
+                    peer,
+                    request,
+                    reply,
+                } => {
+                    let _ = reply.try_send(owner.workload_worker_offer(peer, request));
+                }
+                Message::WorkloadWorkerAccept { offer, reply } => {
+                    let _ = reply.try_send(owner.workload_worker_accept(offer));
+                }
+                Message::WorkloadWorkerReturn {
+                    peer,
+                    request,
+                    reply,
+                } => {
+                    let _ = reply.try_send(owner.workload_worker_return(peer, request));
+                }
+                Message::WorkloadWorkerReturned { returned, reply } => {
+                    let _ = reply.try_send(owner.workload_worker_returned(returned));
                 }
                 Message::Inspect {
                     peer,
@@ -423,6 +880,17 @@ pub(crate) fn member_fixture(
 ))]
 mod accounting_routing_tests {
     use super::*;
+    #[test]
+    fn a_valid_owner_reply_survives_scheduling_delay() {
+        for (age, expected) in [(3, Ok(true)), (61, Err(mpsc::RecvTimeoutError::Timeout))] {
+            let (send, read) = mpsc::sync_channel(1);
+            send.send(true).unwrap();
+            assert_eq!(
+                receive_reply_at(read, Instant::now() - Duration::from_secs(age)),
+                expected
+            );
+        }
+    }
     #[test]
     fn accounted_routing_is_exact_and_does_not_relax_legacy_handshake() {
         let hello = aterm_json::json!({"version":3,"role":trust_resource_controller::accounting::PROXY_ROLE,"session":"s-a","attempt":"12121212121212121212121212121212","accounting":trust_resource_controller::accounting::CAPABILITY});

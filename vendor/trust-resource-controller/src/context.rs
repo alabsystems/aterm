@@ -357,7 +357,7 @@ impl Call {
     pub fn decode(bytes: &[u8]) -> io::Result<Self> {
         if header(bytes, 1).is_ok() {
             let request = Request::decode(bytes)?;
-            if matches!(request.role, Role::SealedMetadata | Role::ResolverQuery) {
+            if !request.role.is_proxy_member() {
                 return Err(invalid());
             }
             Ok(Self::Member(request))
@@ -368,7 +368,7 @@ impl Call {
     pub fn encode(&self) -> io::Result<Vec<u8>> {
         match self {
             Self::Member(request)
-                if !matches!(request.role, Role::SealedMetadata | Role::ResolverQuery) =>
+                if request.role.is_proxy_member() =>
             {
                 request.encode()
             }

@@ -79,6 +79,7 @@ fn check(s: &Seen) -> Result<(), String> {
         None,
         &rows,
         Cursor::Unknown,
+        "",
         Instant::now(),
     );
     if (v.word(), v.detail()) != (s.word.as_str(), s.detail.clone()) {

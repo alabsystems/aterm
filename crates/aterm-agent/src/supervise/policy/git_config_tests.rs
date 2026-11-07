@@ -62,6 +62,34 @@ fn reads_in(dir: &Path) -> GitReads {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn a_scheduled_git_read_still_observes_the_workers_config() {
+    let r = repo("scheduled-config");
+    git(r.0.path(), &["config", "probe.fixture", "configured"]);
+    let env = isolated();
+    let probe = Probe {
+        env: &env,
+        program: crate::test_program::git().to_path_buf(),
+    };
+    let mut cmd = probe.git(r.0.path());
+    cmd.args(["config", "--list", "-z", "--show-scope"]);
+    let listed = git_output_after(&mut cmd, std::time::Duration::from_secs(11))
+        .expect("the required config read completes");
+    assert!(listed.status.success());
+    assert!(parse_config_list(&listed.stdout).contains(&(
+        "local".into(),
+        "probe.fixture".into(),
+        Some("configured".into()),
+    )));
+    let mut cmd = probe.git(r.0.path());
+    cmd.args(["config", "--list", "-z", "--show-scope"]);
+    assert!(matches!(
+        git_output_after(&mut cmd, std::time::Duration::from_secs(61)),
+        Err(aterm_uds::deadline::RunError::TimedOut)
+    ));
+}
+
 #[test]
 fn a_line_without_git_has_no_git_reads() {
     for line in ["ls -la", "grep -rn git src", "cat .gitignore"] {

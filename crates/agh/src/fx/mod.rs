@@ -340,42 +340,25 @@ const NONBLOCK_OPEN_FLAG: i32 = 0x0004 | 0x0100_0000;
 const NONBLOCK_OPEN_FLAG: i32 = 0o4000 | 0o2_000_000;
 
 #[cfg(unix)]
-const TAPE_STREAM_BUDGET: Duration = Duration::from_secs(5);
-
-/// The budget a test set for reading a piped tape, in milliseconds (0: none set).
-#[cfg(all(unix, any(test, debug_assertions)))]
-static TAPE_STREAM_BUDGET_FOR_TEST_MS: AtomicU64 = AtomicU64::new(0);
-
-/// Read a piped tape within `budget` instead of `TAPE_STREAM_BUDGET`, for this process.
-///
-/// A test whose own writer must finish the tape sets the hang detector here: a loaded machine
-/// that stalls that writer past the product's 5 s would otherwise read the tape as timed out.
-#[cfg(all(unix, any(test, debug_assertions)))]
-#[doc(hidden)]
-pub fn set_tape_stream_budget_for_test(budget: Duration) {
-    let ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX).max(1);
-    TAPE_STREAM_BUDGET_FOR_TEST_MS.store(ms, Ordering::Relaxed);
-}
-
-/// `TAPE_STREAM_BUDGET`, or the budget a test set with [`set_tape_stream_budget_for_test`].
-#[cfg(unix)]
-fn tape_stream_budget() -> Duration {
-    #[cfg(any(test, debug_assertions))]
-    match TAPE_STREAM_BUDGET_FOR_TEST_MS.load(Ordering::Relaxed) {
-        0 => {}
-        ms => return Duration::from_millis(ms),
-    }
-    TAPE_STREAM_BUDGET
-}
+const TAPE_STREAM_HANG: Duration = Duration::from_secs(60);
 
 #[cfg(unix)]
 fn read_pipe(file: &std::fs::File, budget: Duration) -> std::io::Result<Vec<u8>> {
+    read_pipe_at(file, budget, std::time::Instant::now())
+}
+
+#[cfg(unix)]
+fn read_pipe_at(
+    file: &std::fs::File,
+    budget: Duration,
+    started: std::time::Instant,
+) -> std::io::Result<Vec<u8>> {
     use std::os::fd::AsFd as _;
     use std::time::Instant;
 
     aterm_uds::ready::with_nonblocking(file.as_fd(), || {
         let mut reader = file;
-        let deadline = Instant::now() + budget;
+        let deadline = started + budget;
         let mut bytes = Vec::new();
         let mut chunk = [0; 8192];
         let limit = tape::TAPE_MAX.saturating_add(1);
@@ -405,8 +388,7 @@ fn read_pipe(file: &std::fs::File, budget: Duration) -> std::io::Result<Vec<u8>>
 }
 
 /// The tape at `path`, read whole (at most `tape::TAPE_MAX` bytes) and parsed.
-/// Unix pipes are nonblocking and must finish within five seconds (a test's own bound where it
-/// set one, [`set_tape_stream_budget_for_test`]).
+/// Unix pipes are nonblocking and have a one-minute hang detector for their writer's end.
 /// # Errors
 /// CouldNotRun, `Sub::Local`, why `the tape {path} could not be read: {e}`.
 pub(crate) fn read_tape(path: &Path) -> Result<(tape::TapeHeader, Vec<EffectRecord>)> {
@@ -442,7 +424,7 @@ pub(crate) fn read_tape(path: &Path) -> Result<(tape::TapeHeader, Vec<EffectReco
     let mut bytes = Vec::new();
     #[cfg(unix)]
     if pipe {
-        bytes = read_pipe(&file, tape_stream_budget()).map_err(|e| not_read(path, &e))?;
+        bytes = read_pipe(&file, TAPE_STREAM_HANG).map_err(|e| not_read(path, &e))?;
     }
     if !pipe {
         if meta.len() > tape::TAPE_MAX {
@@ -1649,20 +1631,49 @@ mod tests {
     use crate::wire::Endpoints;
 
     #[cfg(unix)]
+    fn pipe_file(reader: &std::io::PipeReader) -> std::fs::File {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(super::NONBLOCK_OPEN_FLAG)
+            .open(format!("/dev/fd/{}", reader.as_raw_fd()))
+            .expect("nonblocking pipe")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_scheduled_pipe_writer_is_read_to_its_end() {
+        use std::io::Write as _;
+        use std::time::Duration;
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        let file = pipe_file(&reader);
+        writer.write_all(b"fixture tape").expect("whole tape");
+        drop(writer);
+        let got = super::read_pipe_at(
+            &file,
+            super::TAPE_STREAM_HANG,
+            std::time::Instant::now() - Duration::from_secs(6),
+        );
+        assert_eq!(got.expect("the writer's complete answer"), b"fixture tape");
+        let expired = super::read_pipe_at(
+            &file,
+            super::TAPE_STREAM_HANG,
+            std::time::Instant::now() - Duration::from_secs(61),
+        )
+        .expect_err("a whole minute without a completed read ends the wait");
+        assert_eq!(expired.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn a_pipe_writer_that_never_finishes_expires() {
         use std::io::{ErrorKind, Write as _};
-        use std::os::fd::AsRawFd as _;
-        use std::os::unix::fs::OpenOptionsExt as _;
         use std::time::Duration;
 
         let (reader, mut writer) = std::io::pipe().expect("pipe");
         writer.write_all(b"partial tape").expect("partial input");
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(super::NONBLOCK_OPEN_FLAG)
-            .open(format!("/dev/fd/{}", reader.as_raw_fd()))
-            .expect("nonblocking pipe");
+        let file = pipe_file(&reader);
         let error = super::read_pipe(&file, Duration::from_millis(10))
             .expect_err("an open writer cannot hold replay forever");
         assert_eq!(error.kind(), ErrorKind::TimedOut);

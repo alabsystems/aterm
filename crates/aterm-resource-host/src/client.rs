@@ -189,3 +189,19 @@ pub fn submit(submission: AuthorizedSubmission) -> io::Result<()> {
 pub fn submit_accounted(submission: AuthorizedSubmission) -> io::Result<()> {
     existing()?.submit_accounted(submission)
 }
+/// The GUI selects/enrolls its backend independently. The offered directory is
+/// only an expectation on that actual backend, never a discovery locator.
+pub fn matches_original_store_at(
+    endpoint: &Path,
+    expected: &std::os::fd::OwnedFd,
+) -> io::Result<bool> {
+    open(endpoint)?.matches_original_store(expected)
+}
+/// Recheck the original expectation on the SAME enrolled lane before its
+/// actual root admission. A broken lane is never rediscovered or retried.
+pub fn submit_accounted_expected(
+    submission: AuthorizedSubmission,
+    expected: std::os::fd::OwnedFd,
+) -> io::Result<()> {
+    existing()?.submit_accounted_expected(submission, expected)
+}

@@ -5167,6 +5167,9 @@ pub(crate) fn fill_observations(into: &mut Account, from: Account) {
     for (window, fig) in from.windows {
         into.windows.entry(window).or_insert(fig);
     }
+    for (bucket, said) in from.weeks_said {
+        into.weeks_said.entry(bucket).or_insert(said);
+    }
     fill(&mut into.sample, from.sample);
     fill(&mut into.sample_context, from.sample_context);
     fill(&mut into.before, from.before);
@@ -5416,6 +5419,49 @@ impl WindowSaid {
     }
 }
 
+/// A model's week as Claude Code last said it on a session's screen, its wall or its warning
+/// ([`Account::weeks_said`], [`record_usage`]), or a limit reset on that week since: stats only,
+/// read by `accounts stats` and by no decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WeekSaid {
+    /// Whole percent used: 100 at its wall. `None` for a limit reset on the week at [`Self::at`]
+    /// ([`reset_outcome`]): used (with no [`Self::reset`]), or lifted by itself (with the reset of
+    /// the wall it lifted), with no figure since.
+    pub pct: Option<u32>,
+    /// The week's reset, where the notice named it.
+    pub reset: Option<i64>,
+    /// When it was true.
+    pub at: i64,
+    /// The machine that read it.
+    pub by: String,
+    /// It was the model's wall, not its warning.
+    pub wall: bool,
+    /// Where it named no reset: the reset an earlier read of the same week named after it, so the
+    /// week it was read in ends by then ([`note_week`]).
+    pub ends_by: Option<i64>,
+}
+
+/// The bucket id ([`super::profile::Bucket::id`]) of the week a session's screen names for
+/// `model` ([`Account::weeks_said`]): Fable's is `seven_day_overage_included`, the limit type a
+/// Fable 429 names; Sonnet's `seven_day_sonnet`.
+#[must_use]
+pub const fn week_bucket(model: aterm_phase::WeekModel) -> &'static str {
+    match model {
+        aterm_phase::WeekModel::Fable => super::profile::Bucket::Fable.id(),
+        aterm_phase::WeekModel::Sonnet => super::profile::Bucket::SevenDaySonnet.id(),
+    }
+}
+
+/// The model whose week `bucket` is ([`week_bucket`]), or `None` for a bucket no screen names.
+fn week_model(bucket: &str) -> Option<aterm_phase::WeekModel> {
+    [
+        aterm_phase::WeekModel::Fable,
+        aterm_phase::WeekModel::Sonnet,
+    ]
+    .into_iter()
+    .find(|model| week_bucket(*model) == bucket)
+}
+
 /// [`WindowFig::source`] of a usage tap's reading ([`note_reading`]).
 pub const SOURCE_TAP: &str = "tap";
 
@@ -5632,6 +5678,12 @@ pub struct Account {
     pub warned_session: Option<WindowSaid>,
     /// Observation: the same of its week ([`windows_full`], [`Self::week_low_until`]).
     pub warned_week: Option<WindowSaid>,
+    /// Stats only: each model's week as a session's screen last said it, by bucket id
+    /// ([`week_bucket`], [`WeekSaid`]), or a limit reset on that week since ([`reset_outcome`]).
+    /// No decision reads it: it is in neither [`Self::observed`], [`condition`],
+    /// [`Self::limited_until`], [`Self::low`] nor [`windows_full`] (the stats design's §8.2), and
+    /// a change to it alone is [`Recorded::Stats`].
+    pub weeks_said: BTreeMap<String, WeekSaid>,
     /// Observation: the account this label's readings were last read of, by its key.
     pub key: Option<super::profile::AccountKey>,
     /// Machine-local: when a reading under another key than [`Self::key`] held was recorded
@@ -5667,6 +5719,7 @@ impl PartialEq for Account {
             && self.credits_day == other.credits_day
             && self.warned_session == other.warned_session
             && self.warned_week == other.warned_week
+            && self.weeks_said == other.weeks_said
             && self.key == other.key
             && self.keyed_at == other.keyed_at
             && self.windows == other.windows
@@ -6763,6 +6816,17 @@ fn account_json(a: &Account) -> Value {
         "warned_week".to_owned(),
         a.warned_week.as_ref().map_or(Value::Null, window_json),
     );
+    if !a.weeks_said.is_empty() {
+        o.insert(
+            "weeks_said".to_owned(),
+            Value::Object(
+                a.weeks_said
+                    .iter()
+                    .map(|(k, w)| (k.clone(), week_said_json(w)))
+                    .collect(),
+            ),
+        );
+    }
     o.insert("key".to_owned(), Value::from(a.key.map(|k| k.to_string())));
     o.insert("keyed_at".to_owned(), Value::from(a.keyed_at));
     if let Some(pk) = &a.pk {
@@ -6860,6 +6924,34 @@ fn window_of(v: &Value, cap: i64) -> Option<WindowSaid> {
     })
 }
 
+fn week_said_json(w: &WeekSaid) -> Value {
+    let mut m = Map::new();
+    m.insert("pct".to_owned(), Value::from(w.pct));
+    m.insert("reset".to_owned(), Value::from(w.reset));
+    m.insert("at".to_owned(), Value::from(w.at));
+    m.insert("by".to_owned(), Value::from(w.by.as_str()));
+    m.insert("wall".to_owned(), Value::from(w.wall));
+    m.insert("ends_by".to_owned(), Value::from(w.ends_by));
+    Value::Object(m)
+}
+
+/// A [`WeekSaid`] as [`week_said_json`] wrote it; a figure out of range is no entry, where a
+/// `null` one is a limit reset's.
+fn week_said_of(v: &Value, cap: i64) -> Option<WeekSaid> {
+    let pct = match v.get("pct") {
+        None | Some(Value::Null) => None,
+        figure => Some(pct(figure)?),
+    };
+    Some(WeekSaid {
+        pct,
+        reset: int(v.get("reset")),
+        at: stamp(v.get("at"), cap)?,
+        by: word(v.get("by"), WORD_MAX).unwrap_or_default(),
+        wall: v.get("wall").and_then(Value::as_bool).unwrap_or(false),
+        ends_by: int(v.get("ends_by")),
+    })
+}
+
 fn account_of(v: &Value, now: i64) -> Account {
     let cap = stamp_cap(now);
     let mut walls: Vec<(String, Wall)> = v
@@ -6939,6 +7031,14 @@ fn account_of(v: &Value, now: i64) -> Account {
         credits_day: int(v.get("credits_day")),
         warned_session: v.get("warned_session").and_then(|w| window_of(w, cap)),
         warned_week: v.get("warned_week").and_then(|w| window_of(w, cap)),
+        weeks_said: v
+            .get("weeks_said")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+            .filter(|(k, _)| week_model(k).is_some())
+            .filter_map(|(k, w)| Some((k.clone(), week_said_of(w, cap)?)))
+            .collect(),
     }
 }
 
@@ -9507,6 +9607,7 @@ pub fn note_reading_held(
             credits_day,
             warned_session: _,
             warned_week: _,
+            weeks_said: _,
             key: _,
             keyed_at: _,
             windows: _,
@@ -10217,6 +10318,7 @@ pub fn reset_outcome(
     {
         let used = matches!(done, ResetDone::Used { .. });
         let stood = wall.stands_until().is_some_and(|end| claimed < end);
+        let record_by = machine.clone();
         wall.cleared = true;
         wall.at = now;
         wall.by = machine;
@@ -10249,6 +10351,25 @@ pub fn reset_outcome(
             && let Some(fig) = record.windows.get_mut(window.as_str())
         {
             fig.epoch_at = fig.epoch_at.max(Some(now));
+        }
+        if stood
+            && week_model(&window).is_some()
+            && record
+                .weeks_said
+                .get(window.as_str())
+                .is_none_or(|said| said.at <= claimed)
+        {
+            record.weeks_said.insert(
+                window.clone(),
+                WeekSaid {
+                    pct: None,
+                    reset: (!used).then_some(until),
+                    at: now,
+                    by: record_by,
+                    wall: false,
+                    ends_by: None,
+                },
+            );
         }
     }
     vec![Event::new(now, kind, account).with_sid(&sid).because(&why)]
@@ -13168,6 +13289,13 @@ pub enum Recorded {
         account: String,
         events: usize,
     },
+    /// What a session's screen said is on record for the stats alone ([`Account::weeks_said`]):
+    /// nothing a decision reads moved, so no look at the accounts follows it.
+    Stats {
+        /// The account the session runs on ([`Me::label`]).
+        account: String,
+        events: usize,
+    },
     /// Everything this call would write is on record.
     Unchanged,
     /// The state is not this build's to write, or a file could not be locked or written.
@@ -13187,6 +13315,7 @@ impl Recorded {
         match self {
             Recorded::Wall { .. } => "wall",
             Recorded::Usage { .. } => "usage",
+            Recorded::Stats { .. } => "stats",
             Recorded::NotListed => "not-listed",
             Recorded::NotStored => "not-stored",
             Recorded::NotThisProcess => "not-this-process",
@@ -13319,7 +13448,21 @@ pub struct WarningRead {
     pub reset: Option<i64>,
 }
 
-/// Combined screen usage observations (`credits` and `warning`) passed to [`record_usage`].
+/// Screen observation of a model's week, its wall or its warning ([`Account::weeks_said`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WeekRead {
+    /// The week's bucket id ([`week_bucket`]).
+    pub bucket: &'static str,
+    /// Whole percent used: 100 at its wall.
+    pub pct: u32,
+    /// Its reset, placed by the caller, where the notice named one.
+    pub reset: Option<i64>,
+    /// It was the model's wall.
+    pub wall: bool,
+}
+
+/// Combined screen usage observations (`credits`, `warning` and `week`) passed to
+/// [`record_usage`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UsageSaid {
     /// When it was true ([`NOTICES_DRAWN_S`]).
@@ -13330,10 +13473,12 @@ pub struct UsageSaid {
     pub credits: Option<CreditsRead>,
     /// The warning that a window is filling.
     pub warning: Option<WarningRead>,
+    /// A model's week, for the stats alone ([`Account::weeks_said`]).
+    pub week: Option<WeekRead>,
 }
 
-/// Records screen-observed usage credits and quota warnings for a session under a bounded store
-/// lock.
+/// Records screen-observed usage credits, quota warnings and a model's week for a session under a
+/// bounded store lock.
 pub fn record_usage(
     store: &Store,
     captured: &UsageRoster,
@@ -13352,8 +13497,9 @@ pub fn record_usage(
     }
     let at = said.at.min(now);
     let sid = one_line(sid, WORD_MAX);
-    let mut changed = false;
+    let (mut decided, mut stats) = (false, false);
     let done = store.observe_usage_within(store.ladder, now, captured, who, |state| {
+        let by = state.machine.clone();
         let Some(record) = account_mut(state, account) else {
             return Ok(Vec::new());
         };
@@ -13365,7 +13511,11 @@ pub fn record_usage(
         if let Some(warning) = said.warning {
             events.extend(note_warning(record, account, warning, at, now));
         }
-        changed = *record != before;
+        decided = *record != before;
+        if let Some(week) = said.week {
+            events.extend(note_week(record, account, week, at, &by, now));
+        }
+        stats = record.weeks_said != before.weeks_said;
         Ok(events
             .into_iter()
             .map(|event| event.with_sid(&sid))
@@ -13373,11 +13523,15 @@ pub fn record_usage(
     });
     match done {
         Err(why) => Recorded::Refused(why),
-        Ok(_) if !changed => Recorded::Unchanged,
-        Ok(events) => Recorded::Usage {
+        Ok(events) if decided => Recorded::Usage {
             account: account.to_string(),
             events: events.len(),
         },
+        Ok(events) if stats => Recorded::Stats {
+            account: account.to_string(),
+            events: events.len(),
+        },
+        Ok(_) => Recorded::Unchanged,
     }
 }
 
@@ -13437,6 +13591,53 @@ fn note_warning(
         at,
     });
     moved.then(|| Event::new(now, Kind::Warned, account).because(&format!("{window} {pct}%")))
+}
+
+/// Keeps a model's week as a screen said it ([`Account::weeks_said`]): a read older than the one
+/// held is dropped, and so is a warning read at the instant of a wall held (the footer keeps the
+/// warning drawn before the wall, and a local command such as the `/model` the wall suggests ends
+/// the turn with no newer answer); a bucket no screen names ([`week_model`]) is never kept; a read
+/// that names no reset keeps the one an earlier read of the same week named after it
+/// ([`WeekSaid::ends_by`]); and a move of its figure, reset or wall writes one [`Kind::Warned`]
+/// row (`fable week 85%`, `fable wall`). It writes nothing else: the stats alone read it.
+fn note_week(
+    record: &mut Account,
+    account: &str,
+    week: WeekRead,
+    at: i64,
+    by: &str,
+    now: i64,
+) -> Option<Event> {
+    let model = week_model(week.bucket)?;
+    let held = record.weeks_said.get(week.bucket);
+    if held.is_some_and(|held| at < held.at || (at == held.at && held.wall && !week.wall)) {
+        return None;
+    }
+    let pct = week.pct.min(PCT_MAX);
+    let moved = held
+        .is_none_or(|held| (held.pct, held.reset, held.wall) != (Some(pct), week.reset, week.wall));
+    let ends_by = held
+        .filter(|held| week.reset.is_none() && held.pct.is_some())
+        .and_then(|held| held.reset.or(held.ends_by))
+        .filter(|end| *end > at);
+    record.weeks_said.insert(
+        week.bucket.to_owned(),
+        WeekSaid {
+            pct: Some(pct),
+            reset: week.reset,
+            at,
+            by: by.to_owned(),
+            wall: week.wall,
+            ends_by,
+        },
+    );
+    let model = model.name();
+    let why = if week.wall {
+        format!("{model} wall")
+    } else {
+        format!("{model} week {pct}%")
+    };
+    moved.then(|| Event::new(now, Kind::Warned, account).because(&why))
 }
 
 /// Returns the labels in roster order whose active usage-credits episode warrants a digest entry.

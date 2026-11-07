@@ -90,6 +90,22 @@ pub enum Role {
     /// Closed compiler queries under a separately ready resolver root. The
     /// SealedResolverQueryRequest envelope is mandatory; data grants nothing.
     ResolverQuery,
+    /// Closed queries under a separately authenticated cooperative workload
+    /// owner. Only workload::host::CompilerQuery may carry this role.
+    WorkloadQuery,
+    /// A live registered UnitOutput under the original exclusive queue phase.
+    /// Only workload::host::produced::ProducedRequest may carry this role.
+    WorkloadProduced,
+}
+impl Role {
+    /// The original producer-proof proxy has a closed purpose set. New direct
+    /// workload/metadata envelopes cannot enter it by encoding a raw Request.
+    pub fn is_proxy_member(self) -> bool {
+        matches!(
+            self,
+            Self::MetadataVersion | Self::Compile | Self::MetadataProbe | Self::MachOLinker(_)
+        )
+    }
 }
 
 /// One attempt. Unknown delivery must never cause this request to be replayed.

@@ -4323,10 +4323,6 @@ mod tests {
             b"\x1b]7501;state=working:app=codex\x1b\\\x1b]7501;state=blocked:app=codex:kind=permission\x1b\\",
         );
         let cp = t.checkpoint_carry(0).expect("Ground");
-        assert_eq!(
-            cp.output_state.program_state_began,
-            Some(t.program_state().began)
-        );
         #[cfg(feature = "serde")]
         let cp = CheckpointMeta::from_checkpoint(&cp).into_checkpoint(cp.grid.clone(), None);
         let mut adopted = Terminal::new(4, 20);
@@ -4436,7 +4432,6 @@ mod tests {
                 },
             ],
             program_state: Some("state=blocked:app=codex:kind=coffee".into()),
-            program_state_began: None,
         };
         let mut restored = Terminal::new(4, 20);
         restored.process(b"Y\x1b]8;;https://example.com\x07\x1b[#{\x1b[?25s");
@@ -4484,7 +4479,6 @@ mod tests {
             1,
             "the restore assigns its own local episode"
         );
-        cp.output_state.program_state_began = Some(1);
         assert_eq!(restored.capture_output_state_repr(), cp.output_state);
     }
 

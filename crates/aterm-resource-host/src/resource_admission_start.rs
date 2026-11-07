@@ -17,13 +17,31 @@ impl Owner {
             .and_then(|recipe| recipe.metadata_sdk.clone());
         let result: io::Result<(spawnfd::Command, aterm_types::resource_subgroup::JobContext)> =
             (|| {
+                if pending
+                    .workload_deadline()?
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    return Err(refused(
+                        "original workload deadline expired before suspended birth",
+                    ));
+                }
                 let recipe = pending
                     .recipe
                     .as_ref()
                     .ok_or_else(|| refused("missing admitted recipe"))?;
                 let mut command = recipe.command(&pending.submission.request);
                 let resolver = matches!(recipe.kind, recipe::Kind::Resolver);
-                if matches!(recipe.kind, recipe::Kind::Metadata | recipe::Kind::Resolver) {
+                if matches!(recipe.kind, recipe::Kind::Workload) {
+                    let sdk = service_sdk
+                        .as_ref()
+                        .ok_or_else(|| refused("original workload SDK missing"))?;
+                    pending
+                        .primary
+                        .as_ref()
+                        .ok_or_else(|| refused("original workload primary missing"))?
+                        .configure(&mut command, sdk)?;
+                    pending.sdk = Some(sdk.context()?);
+                } else if matches!(recipe.kind, recipe::Kind::Metadata | recipe::Kind::Resolver) {
                     let sdk = service_sdk
                         .as_ref()
                         .ok_or_else(|| refused("metadata service has no original SDK keeper"))?;
@@ -98,6 +116,7 @@ impl Owner {
                     "child preparation refused before launch",
                 );
                 self.failed.push(Failed {
+                    _primary: pending.primary.take(),
                     _compiler: pending.recipe.as_ref().and_then(|r| r.compiler.clone()),
                     binding: pending.submission.request.binding,
                     custody: Some(custody),
@@ -137,6 +156,7 @@ impl Owner {
                 // An unbound or unknown native outcome has no affirmative
                 // Refused/Started fact. Closing yields transport-unknown.
                 self.failed.push(Failed {
+                    _primary: pending.primary.take(),
                     _compiler: pending.recipe.as_ref().and_then(|r| r.compiler.clone()),
                     binding: pending.submission.request.binding,
                     custody: Some(custody),
@@ -153,13 +173,14 @@ impl Owner {
     }
     fn start_bound(
         &mut self,
-        pending: Pending,
+        mut pending: Pending,
         custody: Custody,
         mut child: aterm_capacity::cohort::launch::CohortChild,
         delegation: aterm_types::resource_subgroup::JobContext,
         metadata_gnu: Option<metadata::RootGnu>,
         service_sdk: Option<std::sync::Arc<sdk::Keeper>>,
     ) {
+        let original_deadline = pending.workload_deadline();
         let binding = pending.submission.request.binding;
         let pid = child.child_mut().id();
         let birth = i32::try_from(pid)
@@ -174,10 +195,9 @@ impl Owner {
             .as_ref()
             .map(|recipe| recipe.program.clone())
             .unwrap_or_default();
-        let native_targo = pending
-            .recipe
-            .as_ref()
-            .is_some_and(|recipe| matches!(recipe.kind, recipe::Kind::Targo));
+        let native_targo = pending.recipe.as_ref().is_some_and(|recipe| {
+            matches!(recipe.kind, recipe::Kind::Targo | recipe::Kind::Workload)
+        });
         let metadata_root = pending
             .recipe
             .as_ref()
@@ -188,7 +208,30 @@ impl Owner {
             aterm_json::json!({"root_pid":pid,"root_birth":birth,
             "cohort":child.cohort().record().encode(),"sdk":sdk::json(&pending.sdk)}),
         );
+        let workload = pending.primary.take().and_then(|primary| {
+            pending.recipe.as_ref().map(|recipe| {
+                workload::State::new(primary, recipe, pending.submission.request.cwd.clone())
+            })
+        });
+        let started = Instant::now();
+        let selected_timeout = pending
+            .submission
+            .request
+            .timeout_ms
+            .map(Duration::from_millis);
+        let timeout = match &original_deadline {
+            Ok(Some(deadline)) => remaining_workload_timeout(*deadline, started),
+            _ => selected_timeout,
+        };
+        // Check the SAME start stored in the original owner, after all paid
+        // preparation/durable writes; an earlier now() is not this deadline.
+        let deadline_supported = workload.is_none()
+            || matches!(&original_deadline, Ok(Some(deadline)) if *deadline > started)
+                && timeout.is_some_and(|timeout| started.checked_add(timeout).is_some());
         let mut job = Job {
+            #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+            control_eof_before_reap_test: false,
+            workload,
             binding: binding.clone(),
             delegation,
             program,
@@ -212,14 +255,10 @@ impl Owner {
             memory_limit: pending.submission.request.memory_bytes,
             memory_at: Instant::now(),
             memory_fault: false,
-            started: Instant::now(),
+            started,
             ended: None,
             exit_moment,
-            timeout: pending
-                .submission
-                .request
-                .timeout_ms
-                .map(Duration::from_millis),
+            timeout,
             cause: CompletionCause::Exited,
             cleanup_at: None,
             reaped: false,
@@ -230,6 +269,7 @@ impl Owner {
             settlement_at: None,
         };
         if prepared.is_ok()
+            && deadline_supported
             && birth.is_some()
             && job.exit_moment.is_some()
             && !job.events.cancelled()
@@ -245,6 +285,10 @@ impl Owner {
                 .metadata_gnu
                 .as_mut()
                 .is_none_or(|gnu| gnu.bind_child(pid).is_ok())
+            && job
+                .workload
+                .as_ref()
+                .is_none_or(|owner| owner.primary.bind_child(pid).is_ok())
         {
             // The first hold is the trusted prelude, not the selected resolver.
             // Its owned preparation performs the two-stop transition; only a
@@ -262,9 +306,21 @@ impl Owner {
                 // probe and durable handoff waits have already ended.
                 if let Ok((monotonic_ns, unix_ns)) = clocks() {
                     let started = Instant::now();
+                    let remaining = match &original_deadline {
+                        Ok(Some(deadline)) => remaining_workload_timeout(*deadline, started),
+                        _ => job.timeout,
+                    };
+                    let clock_current = job.workload.is_none()
+                        || matches!(&original_deadline, Ok(Some(deadline)) if *deadline > started)
+                            && remaining
+                                .is_some_and(|timeout| started.checked_add(timeout).is_some());
                     // A durable running write may have waited while the
                     // caller cancelled or disconnected. Recheck at GO.
-                    if !job.events.cancelled() && job.child.child_mut().resume().is_ok() {
+                    if clock_current
+                        && !job.events.cancelled()
+                        && job.child.child_mut().resume().is_ok()
+                    {
+                        job.timeout = remaining;
                         job.started = started;
                         job.launched = true;
                         let _ = job.events.emit(Event::Started {
@@ -287,6 +343,17 @@ impl Owner {
         }
         self.jobs.insert((binding.session, binding.attempt), job);
     }
+}
+
+/// Time-only observation. The SAME stored start/remaining pair must represent
+/// a positive deadline no later than the original queued bound, including any
+/// native clock conversion rounding.
+pub(super) fn remaining_workload_timeout(deadline: Instant, started: Instant) -> Option<Duration> {
+    let remaining = deadline.checked_duration_since(started)?;
+    if remaining.is_zero() || started.checked_add(remaining)? > deadline {
+        return None;
+    }
+    Some(remaining)
 }
 
 pub(super) fn clocks() -> io::Result<(u64, u64)> {

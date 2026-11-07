@@ -137,6 +137,8 @@ impl Request {
             Role::SealedMetadata => METADATA_REQUEST_ROLE,
             Role::MachOLinker(_) => MACHO_LINKER_REQUEST_ROLE,
             Role::ResolverQuery => crate::resolver::RESOLVER_REQUEST_ROLE,
+            Role::WorkloadQuery => crate::workload::host::QUERY_ROLE,
+            Role::WorkloadProduced => crate::workload::host::produced::ROLE,
         });
         if let Role::MachOLinker(loan) = self.role {
             e.0.extend(loan.parent_attempt);
@@ -202,6 +204,8 @@ impl Request {
                 cpu_slot: u32::try_from(d.number()?).map_err(|_| invalid())?,
             }),
             crate::resolver::RESOLVER_REQUEST_ROLE => Role::ResolverQuery,
+            crate::workload::host::QUERY_ROLE => Role::WorkloadQuery,
+            crate::workload::host::produced::ROLE => Role::WorkloadProduced,
             _ => return Err(invalid()),
         };
         let timeout = d.number()?;

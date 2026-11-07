@@ -116,6 +116,19 @@ impl Store {
     pub fn path(&self) -> &Path {
         &self.0.path
     }
+    /// Compare this reader's OWN original directory to an independently held
+    /// descriptor. This is an identity observation, not path validation,
+    /// discovery or a resource grant. No descriptor escapes the reader.
+    pub fn same_original_directory(
+        &self,
+        original: std::os::fd::BorrowedFd<'_>,
+    ) -> io::Result<bool> {
+        let file = File::from(original.try_clone_to_owned()?);
+        if !file.metadata()?.is_dir() {
+            return Ok(false);
+        }
+        same_file(&self.0.root, &file)
+    }
     /// Validate the original structural backing without creating or repairing it.
     pub fn validate(&self) -> io::Result<()> {
         self.check()
@@ -329,6 +342,31 @@ fn validate_native_host(
     expired(deadline)
 }
 impl PinnedHelper {
+    /// Duplicate the SAME retained read-only store directory for this helper's
+    /// child-only handoff. This neither selects another store nor grants any
+    /// resource or execution authority. Every original pin check remains live.
+    pub fn duplicate_original_store(&self, deadline: Instant) -> io::Result<std::os::fd::OwnedFd> {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        self.validate(deadline)?;
+        // SAFETY: duplicate our original held directory to a fresh slot;
+        // stdio and the fixed SDK slot are never replaced or exposed.
+        let raw = unsafe {
+            libc::fcntl(self.instance.store.0.root.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 6)
+        };
+        if raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful F_DUPFD_CLOEXEC transferred this fresh descriptor.
+        let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+        self.validate(deadline)?;
+        Ok(owned)
+    }
+    /// Original independently selected location retained by this helper pin.
+    /// Equality/diagnostic data only; this does not revalidate backing or
+    /// authorize discovery, a different controller, resources or execution.
+    pub fn original_store_path(&self) -> &Path {
+        self.instance.store.path()
+    }
     pub fn helper_path(&self) -> &Path {
         self.instance.helper_path()
     }

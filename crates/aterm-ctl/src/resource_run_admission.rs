@@ -73,6 +73,9 @@ pub(super) fn run(wire: &super::super::ConnWire, sid: &str, args: &Args) -> io::
         value["ready"].as_bool() == Some(true)
             && (!args.accounted
                 || value["accounting"].as_str() == Some("owning-wait-accounting-v1"))
+            && (args.expected_store.is_none()
+                || value["root_store_expectation"].as_str()
+                    == Some(transport::store_expectation::CAPABILITY))
     }) {
         emit(
             &mut status,
@@ -95,7 +98,15 @@ pub(super) fn run(wire: &super::super::ConnWire, sid: &str, args: &Args) -> io::
         stderr: std::io::stderr().as_fd().try_clone_to_owned()?,
         events: host_events.into(),
     };
-    let attached = if args.accounted {
+    let attached = if let Some(expected) = &args.expected_store {
+        transport::store_expectation::attach(
+            &wire.path,
+            &request,
+            fds,
+            expected.as_fd().try_clone_to_owned()?,
+            Instant::now() + HANDOFF,
+        )
+    } else if args.accounted {
         transport::attach_accounted(&wire.path, &request, fds, Instant::now() + HANDOFF)
     } else {
         transport::attach(&wire.path, &request, fds, Instant::now() + HANDOFF)
@@ -169,6 +180,24 @@ fn status_file(fd: i32) -> io::Result<File> {
     // kept_out excludes coordinated spawn activity while it is duplicated.
     let owned = aterm_uds::kept_out(|| unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned())?;
     Ok(File::from(owned))
+}
+pub(super) fn store_file(fd: i32) -> io::Result<File> {
+    if fd < 6 {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    // Capture before resolving a GUI or allocating transport descriptors. The
+    // CLI has started no threads or descriptor-mutating callbacks. This is
+    // solely an expectation; native backend validates readonly original identity.
+    aterm_uds::kept_out(|| {
+        if !aterm_uds::spawnfd::descriptor_metadata(fd)?.is_dir() {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        // SAFETY: the preceding kernel read established this inherited source
+        // is live; no descriptor mutation can intervene in this CLI boundary.
+        unsafe { BorrowedFd::borrow_raw(fd) }
+            .try_clone_to_owned()
+            .map(File::from)
+    })
 }
 
 fn receive_mode(

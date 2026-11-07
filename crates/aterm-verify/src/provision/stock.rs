@@ -9,8 +9,8 @@
 //! compiles for another target rides the one stock toolchain the checkout pins ([`stock_pin`]):
 //! `verify cells` compiles and lints its cells ([`CELL_TARGETS`]) on it, the web modules'
 //! lanes build on it, and `--linux` adds the Linux lane's guest agent's std
-//! ([`LINUX_LANE_TARGETS`]). This row installs that one toolchain, its stds and its clippy, and
-//! beside it the toolchain the release chain still builds its own slices on
+//! ([`LINUX_LANE_TARGETS`]). This row installs that one toolchain, its stds and its components
+//! ([`PIN_COMPONENTS`]), and beside it the toolchain the release chain still builds its own slices on
 //! ([`RELEASE_TOOLCHAIN`], [`RELEASE_TARGETS`]); no dev lane takes anything from that one.
 
 use std::path::{Path, PathBuf};
@@ -56,9 +56,15 @@ pub use crate::rustup::{
     ClauseError, STOCK_PIN, STOCK_PIN_FILE, WasmClause, stock_pin, wasm_clause,
 };
 
-/// The component the pin carries past the minimal profile: `verify cells` lints each foreign
-/// cell with the pin's clippy, and a pin without it is a COULD NOT RUN.
-const CLIPPY: &str = "clippy";
+/// The components the pin carries past the minimal profile: clippy, since `verify cells` lints
+/// each foreign cell with the pin's and a pin without it is a COULD NOT RUN; and off macOS
+/// llvm-tools, whose `llvm-nm` the cells' win32 oracles (`aterm-win32-oracle`) read the Windows
+/// import libraries with: GNU nm reads none of them, and macOS's own nm is LLVM's.
+pub const PIN_COMPONENTS: &[&str] = if cfg!(target_os = "macos") {
+    &["clippy"]
+} else {
+    &["clippy", "llvm-tools"]
+};
 
 /// The file rustup keeps its settings in, which a home rustup never ran in lacks.
 const SETTINGS: &str = "settings.toml";
@@ -95,12 +101,14 @@ pub(crate) struct Seen {
 pub(crate) enum Step {
     /// `rustup set auto-install disable`, first in a home rustup never ran in.
     AutoInstallOff,
-    /// `rustup toolchain install <pin> --profile minimal --component clippy --no-self-update`.
+    /// `rustup toolchain install <pin> --profile minimal --component <c>… --no-self-update`, each
+    /// of [`PIN_COMPONENTS`].
     PinToolchain(String),
     /// `rustup target add --toolchain <pin> <targets>`.
     PinTargets(String, Vec<String>),
-    /// `rustup component add --toolchain <pin> clippy`.
-    PinClippy(String),
+    /// `rustup component add --toolchain <pin> <components>`, those of [`PIN_COMPONENTS`] the pin
+    /// lacks.
+    PinComponents(String, Vec<String>),
     /// `rustup toolchain install stable --profile minimal [--target <t>]… --no-self-update`.
     ReleaseToolchain(Vec<String>),
     /// `rustup target add --toolchain stable <targets>`.
@@ -122,7 +130,7 @@ fn has(listed: &[String], name: &str) -> bool {
 }
 
 /// What a machine that holds `seen` lacks, in order: of the stock pin `pin` with `targets`' stds
-/// and clippy (nothing of it where the checkout's pin could not be read, `None`), then of
+/// and [`PIN_COMPONENTS`] (nothing of it where the checkout's pin could not be read, `None`), then of
 /// [`RELEASE_TOOLCHAIN`] with `release`'s stds.
 pub(crate) fn plan(
     seen: &Seen,
@@ -154,13 +162,15 @@ pub(crate) fn plan(
     steps
 }
 
-/// What `seen` lacks of the pin `pin` with `targets`' stds and clippy, onto `steps`.
+/// What `seen` lacks of the pin `pin` with `targets`' stds and [`PIN_COMPONENTS`], onto `steps`.
 fn pin_plan(seen: &Seen, pin: &str, targets: &[&str], steps: &mut Vec<Step>) {
+    let installed: Vec<String>;
     let (held, components): (&[String], &[String]) = if holds(seen, pin) {
         (&seen.pin_targets, &seen.pin_components)
     } else {
         steps.push(Step::PinToolchain(pin.to_string()));
-        (&[], &[CLIPPY.to_string()])
+        installed = PIN_COMPONENTS.iter().map(|c| (*c).to_string()).collect();
+        (&[], &installed)
     };
     let missing: Vec<String> = targets
         .iter()
@@ -170,8 +180,13 @@ fn pin_plan(seen: &Seen, pin: &str, targets: &[&str], steps: &mut Vec<Step>) {
     if !missing.is_empty() {
         steps.push(Step::PinTargets(pin.to_string(), missing));
     }
-    if !has(components, CLIPPY) {
-        steps.push(Step::PinClippy(pin.to_string()));
+    let lacking: Vec<String> = PIN_COMPONENTS
+        .iter()
+        .filter(|c| !has(components, c))
+        .map(|c| (*c).to_string())
+        .collect();
+    if !lacking.is_empty() {
+        steps.push(Step::PinComponents(pin.to_string(), lacking));
     }
 }
 
@@ -180,23 +195,31 @@ pub(crate) fn argv(step: &Step) -> Vec<String> {
     let v = |a: &[&str]| a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
     match step {
         Step::AutoInstallOff => v(&["rustup", "set", "auto-install", "disable"]),
-        Step::PinToolchain(pin) => v(&[
-            "rustup",
-            "toolchain",
-            "install",
-            pin,
-            "--profile",
-            "minimal",
-            "--component",
-            CLIPPY,
-            NO_SELF_UPDATE,
-        ]),
+        Step::PinToolchain(pin) => {
+            let mut a = v(&[
+                "rustup",
+                "toolchain",
+                "install",
+                pin,
+                "--profile",
+                "minimal",
+            ]);
+            for c in PIN_COMPONENTS {
+                a.extend(["--component".to_string(), (*c).to_string()]);
+            }
+            a.push(NO_SELF_UPDATE.to_string());
+            a
+        }
         Step::PinTargets(pin, ts) => {
             let mut a = v(&["rustup", "target", "add", "--toolchain", pin]);
             a.extend(ts.iter().cloned());
             a
         }
-        Step::PinClippy(pin) => v(&["rustup", "component", "add", "--toolchain", pin, CLIPPY]),
+        Step::PinComponents(pin, cs) => {
+            let mut a = v(&["rustup", "component", "add", "--toolchain", pin]);
+            a.extend(cs.iter().cloned());
+            a
+        }
         Step::ReleaseToolchain(ts) => {
             let mut a = v(&[
                 "rustup",
@@ -443,13 +466,17 @@ mod tests {
             host: HOST.into(),
             toolchains: names(&["stable-aarch64-apple-darwin", "1.97.1-aarch64-apple-darwin"]),
             pin_targets: names(TARGETS),
-            pin_components: names(&["cargo-aarch64-apple-darwin", "clippy-aarch64-apple-darwin"]),
+            pin_components: names(&[
+                "cargo-aarch64-apple-darwin",
+                "clippy-aarch64-apple-darwin",
+                "llvm-tools-aarch64-apple-darwin",
+            ]),
             release_targets: names(&[HOST, "x86_64-apple-darwin"]),
         }
     }
 
     #[test]
-    fn a_missing_target_or_clippy_is_added_to_the_pin() {
+    fn a_missing_target_or_component_is_added_to_the_pin() {
         let mut s = provisioned();
         s.pin_targets = names(&["wasm32-unknown-unknown"]);
         s.pin_components = names(&["cargo-aarch64-apple-darwin"]);
@@ -457,21 +484,39 @@ mod tests {
             plan(&s, Some(PIN), TARGETS, RELEASE),
             [
                 Step::PinTargets(PIN.into(), names(&["x86_64-apple-darwin"])),
-                Step::PinClippy(PIN.into()),
+                Step::PinComponents(PIN.into(), names(PIN_COMPONENTS)),
             ]
         );
         assert_eq!(
-            argv(&Step::PinClippy(PIN.into())).join(" "),
-            "rustup component add --toolchain 1.97.1 clippy"
+            argv(&Step::PinComponents(PIN.into(), names(PIN_COMPONENTS))).join(" "),
+            format!(
+                "rustup component add --toolchain 1.97.1 {}",
+                PIN_COMPONENTS.join(" ")
+            )
+        );
+        s.pin_components = names(&["cargo-aarch64-apple-darwin", "clippy-aarch64-apple-darwin"]);
+        s.pin_targets = names(TARGETS);
+        let lacking: Vec<String> = names(PIN_COMPONENTS)
+            .into_iter()
+            .filter(|c| c != "clippy")
+            .collect();
+        assert_eq!(
+            plan(&s, Some(PIN), TARGETS, RELEASE),
+            if lacking.is_empty() {
+                Vec::new()
+            } else {
+                vec![Step::PinComponents(PIN.into(), lacking)]
+            },
+            "a pin with clippy lacks only what else this host's cells read"
         );
         assert_eq!(plan(&provisioned(), Some(PIN), TARGETS, RELEASE), []);
     }
 
     /// THE PIN IS PROVISIONED WHATEVER STABLE HOLDS: a machine whose floating `stable` carries
-    /// every cell's std and clippy, and which lacks the pin, gets the pin installed with clippy
-    /// and every target; nothing of the pin is asked of `stable`. NEGATIVE CONTROL: a plan that
-    /// counts `stable`'s stds and clippy as the pin's leaves this machine as it is, and the first
-    /// assertion fails.
+    /// every cell's std and clippy, and which lacks the pin, gets the pin installed with its
+    /// components ([`PIN_COMPONENTS`]) and every target; nothing of the pin is asked of `stable`.
+    /// NEGATIVE CONTROL: a plan that counts `stable`'s stds and clippy as the pin's leaves this
+    /// machine as it is, and the first assertion fails.
     #[test]
     fn a_missing_pin_is_installed_with_clippy_and_every_target_whatever_stable_holds() {
         let mut s = provisioned();
@@ -491,7 +536,13 @@ mod tests {
         );
         assert_eq!(
             argv(&steps[0]).join(" "),
-            "rustup toolchain install 1.97.1 --profile minimal --component clippy --no-self-update"
+            format!(
+                "rustup toolchain install 1.97.1 --profile minimal {}--no-self-update",
+                PIN_COMPONENTS
+                    .iter()
+                    .map(|c| format!("--component {c} "))
+                    .collect::<String>()
+            )
         );
         assert!(
             steps
@@ -904,7 +955,7 @@ mod stateful {
             "every call ran the row's copy: {:?}",
             rustup.0.borrow().ran
         );
-        let add = ["component", "add", "--toolchain", &pin, CLIPPY].map(String::from);
+        let add = ["component", "add", "--toolchain", &pin, "clippy"].map(String::from);
         rustup
             .run(&homes, &copy, &add, None)
             .expect("the pin was installed by name");
@@ -1025,7 +1076,7 @@ mod stateful {
 
     /// A PIN MISSING A PIECE GETS IT ON THE PIN ALONE, WHATEVER STABLE HOLDS: where `stable`
     /// carries every cell's std and clippy and the pin only its host's std, the probe and the
-    /// run name the pin's missing stds and its clippy, and nothing of `stable`.
+    /// run name the pin's missing stds and components, and nothing of `stable`.
     #[test]
     fn a_pin_missing_a_piece_gets_it_on_the_pin_alone() {
         let tmp = aterm_tempfile::tempdir().unwrap();
@@ -1037,8 +1088,10 @@ mod stateful {
             let mut s = rustup.0.borrow_mut();
             s.auto_install_off = true;
             s.toolchains.insert(format!("stable-{HOST}"), targets);
-            s.components
-                .insert(format!("stable-{HOST}"), vec![CLIPPY.into()]);
+            s.components.insert(
+                format!("stable-{HOST}"),
+                PIN_COMPONENTS.iter().map(|c| (*c).to_string()).collect(),
+            );
             s.toolchains
                 .insert(format!("{pin}-{HOST}"), vec![HOST.into()]);
         }
@@ -1051,7 +1104,10 @@ mod stateful {
             .filter(|t| *t != HOST)
             .collect();
         let add = format!("rustup target add --toolchain {pin} {}", others.join(" "));
-        let clippy = format!("rustup component add --toolchain {pin} clippy");
+        let clippy = format!(
+            "rustup component add --toolchain {pin} {}",
+            PIN_COMPONENTS.join(" ")
+        );
         assert_eq!(
             missing(&homes, &rustup, Some(&pin), false),
             Ok(vec![add.clone(), clippy.clone()]),

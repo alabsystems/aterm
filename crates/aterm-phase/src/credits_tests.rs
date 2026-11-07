@@ -5,7 +5,10 @@ use super::*;
 use crate::prompt::fixtures::{
     CREDITS_IN_USE_2_1_300, CREDITS_IN_USE_80_2_1_300, CREDITS_IN_USE_FULLSCREEN_2_1_300,
     CREDITS_STARTED_2_1_300, CREDITS_STARTED_80_2_1_300, CREDITS_STARTED_FULLSCREEN_2_1_300,
-    USAGE_WARNING_WEEKLY_2_1_300, WALL_WATCHDOG_SESSION_STATUSLINE_2_1_300, screen,
+    FABLE_WARNING_2_1_301, IDLE_AFTER_LIMIT_AND_MODEL_SWITCH, USAGE_WARNING_WEEKLY_2_1_300,
+    WALL_FABLE_NO_RESET_2_1_301, WALL_FABLE_RESET_2_1_301,
+    WALL_SONNET_BUCKET_AUTO_CONTINUE_ARMED_2_1_300, WALL_WATCHDOG_SESSION_STATUSLINE_2_1_300,
+    screen,
 };
 
 fn with_row(mut rows: Vec<String>, i: usize, row: &str) -> Vec<String> {
@@ -298,5 +301,156 @@ fn the_vendors_usage_warning_is_read_with_its_window_and_figure() {
     assert_eq!(usage_warning(&with_row(bare, reply, &quoted)), None);
     for credits in [CREDITS_STARTED_2_1_300, CREDITS_IN_USE_2_1_300] {
         assert_eq!(usage_warning(&screen(credits)), None);
+    }
+}
+
+fn week(model: WeekModel, pct: u8, reset: Option<&str>, wall: bool) -> Option<ModelWeek> {
+    Some(ModelWeek {
+        model,
+        pct,
+        reset: reset.map(str::to_string),
+        wall,
+    })
+}
+
+#[test]
+fn the_measured_fable_and_sonnet_weeks_read_with_their_figure_and_reset() {
+    assert_eq!(
+        model_week(&screen(FABLE_WARNING_2_1_301)),
+        week(
+            WeekModel::Fable,
+            85,
+            Some("Oct 19 at 11:36pm (America/Los_Angeles)"),
+            false
+        )
+    );
+    assert_eq!(
+        usage_warning(&screen(FABLE_WARNING_2_1_301)),
+        None,
+        "the Fable week is no session or weekly window"
+    );
+    assert_eq!(
+        model_week(&screen(WALL_SONNET_BUCKET_AUTO_CONTINUE_ARMED_2_1_300)).map(|w| (
+            w.model,
+            w.pct,
+            w.wall,
+            w.reset.is_some()
+        )),
+        Some((WeekModel::Sonnet, 100, true, true))
+    );
+    let sonnet = model_week(&screen(WALL_SONNET_BUCKET_AUTO_CONTINUE_ARMED_2_1_300))
+        .and_then(|w| w.reset)
+        .expect("the Sonnet wall's reset");
+    assert!(sonnet.starts_with("Oct 17 at 4:20pm"), "{sonnet}");
+}
+
+#[test]
+fn a_fable_wall_reads_full_over_the_footers_older_warning() {
+    let rows = screen(WALL_FABLE_RESET_2_1_301);
+    assert_eq!(
+        model_week(&rows),
+        week(
+            WeekModel::Fable,
+            100,
+            Some("1:36am (America/Los_Angeles)"),
+            true
+        )
+    );
+    let at = row_of(&rows, "You've hit your Fable limit");
+    let unwalled: Vec<String> = rows
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != at)
+        .map(|(_, r)| r.clone())
+        .collect();
+    assert_eq!(
+        model_week(&unwalled),
+        week(
+            WeekModel::Fable,
+            85,
+            Some("Oct 19 at 11:36pm (America/Los_Angeles)"),
+            false
+        ),
+        "the control: without the wall's row the footer's warning reads"
+    );
+}
+
+/// Both measured walls that name no reset: 2.1.301's `You've hit your Fable limit`, and the
+/// usage-credits form (`You've reached your Fable limit. Run /usage-credits …`) as the screen was
+/// when its turn ended on it, the capture's later `/model` and its answer taken out: a wall is
+/// read where the turn ended on it ([`crate::wall::wall`]).
+#[test]
+fn a_fable_wall_that_names_no_reset_reads_full_with_none() {
+    let measured = screen(IDLE_AFTER_LIMIT_AND_MODEL_SWITCH);
+    let model = row_of(&measured, "❯ /model");
+    let at_turn_end: Vec<String> = measured[..model]
+        .iter()
+        .chain(&measured[model + 2..])
+        .cloned()
+        .collect();
+    for (name, rows) in [
+        ("the 2.1.301 wall", screen(WALL_FABLE_NO_RESET_2_1_301)),
+        ("the usage-credits wall", at_turn_end),
+    ] {
+        assert_eq!(
+            model_week(&rows),
+            week(WeekModel::Fable, 100, None, true),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn no_unmeasured_name_and_no_programs_words_read_as_a_models_week() {
+    let rows = screen(FABLE_WARNING_2_1_301);
+    let at = row_of(&rows, "You've used 85%");
+    for name in ["Opus limit", "Sonnet limit", "usage credits"] {
+        let other = rows[at].replace("Fable limit", name);
+        assert_ne!(other, rows[at], "the warning row");
+        assert_eq!(
+            model_week(&with_row(rows.clone(), at, &other)),
+            None,
+            "{other}"
+        );
+    }
+    let numbered = rows[at].replace("your Fable limit", "your Fable 5 limit");
+    assert_eq!(
+        model_week(&with_row(rows.clone(), at, &numbered)),
+        None,
+        "{numbered}"
+    );
+    assert_eq!(model_week(&screen(USAGE_WARNING_WEEKLY_2_1_300)), None);
+    assert_eq!(model_week(&screen(CREDITS_IN_USE_2_1_300)), None);
+    let walled = screen(WALL_FABLE_RESET_2_1_301);
+    let wall = row_of(&walled, "You've hit your Fable limit");
+    let footer = row_of(&walled, "You've used 85%");
+    let quiet = with_row(walled.clone(), footer, "");
+    assert!(
+        model_week(&quiet).is_some(),
+        "the control: the wall reads with no warning"
+    );
+    let prompt = wall - 1;
+    for (said, quoted) in [
+        (
+            "⏺ Bash(cat notes.txt)",
+            "  ⎿  You've hit your Fable limit · resets 1:36am (America/Los_Angeles)",
+        ),
+        (
+            "⏺ The notes quote Claude Code's wall:",
+            "  You've hit your Fable limit · resets 1:36am (America/Los_Angeles)",
+        ),
+    ] {
+        let rows = with_row(with_row(quiet.clone(), prompt, said), wall, quoted);
+        assert_eq!(model_week(&rows), None, "{said} {quoted}");
+    }
+    for other in [
+        "  ⎿  You've hit your Opus limit · resets 1:36am (America/Los_Angeles)",
+        "  ⎿  You've hit your Fable 5 limit · resets 1:36am (America/Los_Angeles)",
+    ] {
+        assert_eq!(
+            model_week(&with_row(quiet.clone(), wall, other)),
+            None,
+            "{other}"
+        );
     }
 }

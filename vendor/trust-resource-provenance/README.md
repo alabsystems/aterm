@@ -72,3 +72,44 @@ retains the system runtime as a TCB input and assumes no concurrent same-UID
 name writers. Existing custodian discovery and `PinnedProgram` authority checks
 remain unchanged. The maintained module was imported from aterm `77bd657741`
 alongside the canonical metadata controller.
+
+`program::produced::HeldOutputRoot` retains the original output directory before
+compilation. After the custodian has retired active compiler writers, it can
+retain an exact native UnitOutput with `program`, preserving the same original
+SDK and output descriptions through loaded-image validation and retirement.
+This distinct profile supports bound output runtime directories and original
+SDK libraries. It rejects symlink/hard-link aliases, ambiguous libraries, OS
+shadowing, escaping search paths and changed input backing. The existing SDK
+metadata profile retains its original `root/bin` restriction.
+
+`open_with_evidence` additionally prepares create-only raw failure evidence under
+the original output root, after checking the original SDK is disjoint and the
+output is not a source root. Each attempt has a separate namespace. The writer
+enforces per-file and shared aggregate bounds (at most 1 GiB and 4,096 files),
+checks original directory/file identities, and exposes `sync_prefix` before an
+owning-custody Unknown abort. Short writes and quota/IO errors remain explicit
+incomplete evidence. Evidence never overwrites an earlier attempt or establishes
+successful execution, retirement, compilation or proof.
+
+Native qualification at source `d05d1ea123` passed all 30 crate tests, including
+the explicitly selected real SDK compiler/Targo input case and actual loaded
+child identity. Composed source `8f0ac9ea71` passed nine focused produced/evidence
+tests, including exact binary-prefix survival after a real writer exits without
+destructors, shared quota exhaustion, source/SDK write refusal and retargeted
+backing. Both runs had no ignored tests; their exact source/images/logs are under
+`~/.cache/trust/native-reuse-evidence.noindex/native-produced-inputs-881978bf48/`.
+
+Independent review then found a direct-load override gap: the generated
+`DYLD_LIBRARY_PATH` also searches by basename before absolute/loader-relative
+install names, as implemented by [Apple's dyld path overrides](https://github.com/apple-oss-distributions/dyld/blob/main/dyld/DyldProcessConfig.cpp).
+Native source `346ccf4551` reproduced both missing refusals (zero passes, two
+failures). Source `84e16dd01c` checks all possible leaf overrides for direct
+loads too, requires their exact original path, and passes all eleven focused
+produced/evidence controls. Positive direct loads without shadows still bind.
+The failed image/source/log and the exact primary dyld source blob
+`fd2897555ae887e92433aa113bb3a27fc712d8eb` remain in the same evidence root.
+
+These input/evidence APIs supply no CPU/GNU/memory, source or build authority.
+Native workload execution still requires the separate live cooperative-root,
+compiler-quiescence and retained foreign-phase implementation. Its positive
+Ready and produced-member admission remain unavailable until qualified.

@@ -856,9 +856,6 @@ mod tests {
     fn real_tools() -> crate::Toolchain {
         let repo = aterm_tempfile::manifest_dir().join("../..");
         let env = crate::EnvSnapshot::capture();
-        // The host's own drivers must answer the discovery's probes, so they wait on the hang
-        // detector, not the product's 5 s, which a loaded machine outlasts.
-        crate::toolchain::set_probe_bound_for_test(aterm_spec::wait::MUST_HAPPEN);
         let tools = crate::run_toolchain(&env, &repo);
         if tools.trustfmt.is_none() && env.trust_stage2_bin.is_some() {
             let discovered = crate::EnvSnapshot {

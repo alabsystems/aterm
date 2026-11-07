@@ -8,7 +8,7 @@
 //! Preparation never imports the recipient's private identity or supplies Commons admission.
 //!
 //! A lab vault is a file the recipients copy (`prepare-source` alone) or one the source world
-//! serves at a LAN address (`prepare-source --serve <ip:port>`, step E1b of
+//! serves at a LAN address (`prepare-source --serve <ip:port> [--aterm <aterm>]`, step E1b of
 //! `docs/DESIGN-alab-one-mesh-2026-11-05.md` §11): the source world's `node` runs its server
 //! (`aterm secrets serve`) beside its node, the approved recipients join it at its URL, and a Mac
 //! nobody approved is pinned to it (`pin`) and joins by its proof with no question (`home-lan`
@@ -43,7 +43,7 @@ const MAX_RECIPIENTS: usize = 8;
 /// `stop` marker ends it sooner.
 const MAX_RUN_S: u64 = 3600;
 const APPLICATION: &str = "lan-startup-data";
-const USAGE: &str = "commons-lan prepare-recipient <new-world> [--port <lab-fleet-port>] | prepare-source <new-world> [--serve <ip:port>] [--port <lab-fleet-port>] <recipient-key>... | join <world> <capsule-file> | pin <world> <card-file> | home-lan <world> <cidr> | run <aterm> <world> <seconds> | node <aterm> <world> <seconds> | pair <aterm> <world> <seconds> | follow <aterm> <world> <seconds> <owner-pid> | stop <run-directory> | db <aterm> <world> <db-command> [args...] | secrets <aterm> <world> approve <age1…> --name <host>|join <lab-profile>/fixture.vault|join <its-lab-url>#<signer>|status | members <aterm> <world> join --at <ip:port>... | declare <world> | write <world> <key> | read <world> | claim <world> <counter> <since> <until> | release <world> <counter> <until> | claims <world> | emails-fixture <world> <seed> | emails-set <aterm> <world> <seed> <row> <column> <value-or-tag> | emails-wait <aterm> <world> <digest>|!<digest> <seconds> | emails-reveal <aterm> <world> <seed> [<tag>...]";
+const USAGE: &str = "commons-lan prepare-recipient <new-world> [--port <lab-fleet-port>] | prepare-source <new-world> [--serve <ip:port>] [--aterm <aterm>] [--port <lab-fleet-port>] <recipient-key>... | join <world> <capsule-file> [--aterm <aterm>] | pin <world> <card-file> [--aterm <aterm>] | check --aterm <aterm> (debug lab driver and app; URL acceptance and scripted home-LAN guards) | home-lan <world> <cidr> | run <aterm> <world> <seconds> | node <aterm> <world> <seconds> | pair <aterm> <world> <seconds> | follow <aterm> <world> <seconds> <owner-pid> | stop <run-directory> | db <aterm> <world> <db-command> [args...] | secrets <aterm> <world> approve <age1…> --name <host>|join <lab-profile>/fixture.vault|join <its-lab-url>#<signer>|status | members <aterm> <world> join --at <ip:port>... | declare <world> | write <world> <key> | read <world> | claim <world> <counter> <since> <until> | release <world> <counter> <until> | claims <world> | emails-fixture <world> <seed> | emails-set <aterm> <world> <seed> <row> <column> <value-or-tag> | emails-wait <aterm> <world> <digest>|!<digest> <seconds> | emails-reveal <aterm> <world> <seed> [<tag>...]";
 
 /// The port a lab world's node serves the fleet's `ask` on unless `--port` names another.
 const LAB_FLEET_PORT: u16 = 7190;
@@ -184,6 +184,13 @@ fn recipient_key(paths: &Paths) -> Result<String, Fail> {
         .to_bech32())
 }
 
+/// Observe custody the app already applied; never repair or create it during a readback.
+fn local_bootstrap(paths: &Paths) -> Result<Bootstrap, Fail> {
+    let (bootstrap, _journal) =
+        Bootstrap::established_with_journal_until(paths, Instant::now() + HANG).map_err(fail)?;
+    Ok(bootstrap)
+}
+
 fn prepare_recipient(root: &Path, port: u16) -> Result<Value, Fail> {
     let world = prepare(root, "recipient", port)?;
     let paths = Paths::for_home(&world.home);
@@ -194,8 +201,8 @@ fn prepare_recipient(root: &Path, port: u16) -> Result<Value, Fail> {
 }
 
 /// Found the lab's vault in a new source world under `root`, approving `recipients` under `m2`
-/// on. With `serve` it is served at that address: a vault server runs in this process while the
-/// vault is founded (its store the world's [`SERVER_STORE`]), the world records the address
+/// on. With `serve` the actual app creates, approves and seeds it while its owned server runs
+/// at that address (its store the world's [`SERVER_STORE`]); the world records the address
 /// ([`LAB_SERVE`]) for its `node` to serve it again and the vault ([`LAB_VAULT`]), the capsules
 /// carry the URL, and a card ([`LAB_CARD`]) names the URL and signer for a Mac nobody approved.
 /// Without it the vault is a file the capsules carry whole.
@@ -204,6 +211,7 @@ fn prepare_source(
     recipients: &[String],
     serve: Option<std::net::SocketAddr>,
     port: u16,
+    aterm: Option<String>,
 ) -> Result<Value, Fail> {
     if recipients.is_empty() || recipients.len() > MAX_RECIPIENTS {
         return Err(Fail::usage(format!(
@@ -223,66 +231,187 @@ fn prepare_source(
             "--serve takes this Mac's private IPv4 address and a lab port: {addr}"
         )));
     }
+    let aterm = serve
+        .map(|_| crate::instance::resolve_aterm(aterm).map_err(fail))
+        .transpose()?;
     let world = prepare(root, "source", port)?;
     let paths = Paths::for_home(&world.home);
     let vault = world.dir.join("fixture.vault");
     let server = match serve {
         Some(addr) => {
-            let listener = std::net::TcpListener::bind(addr).map_err(fail)?;
-            let listen = listener.local_addr().map_err(fail)?;
-            let running = aterm_secrets::server::start(
-                listener,
-                &aterm_secrets::server::Options {
-                    listen,
-                    store: world.dir.join(SERVER_STORE),
-                    advertise: None,
-                    pins: Vec::new(),
-                    hold: Duration::from_millis(100),
-                    keep_awake: false,
-                },
-            )
-            .map_err(fail)?;
-            Some(running)
+            let aterm = aterm
+                .as_deref()
+                .ok_or_else(|| Fail::die("URL preparation needs the actual aterm"))?;
+            let mut env = world.env();
+            env.retain(|(key, _)| key != "ATERM_STATE_HOME" && key != "CI");
+            Some(app_vault_server(
+                aterm,
+                &world,
+                (addr, &world.dir.join(SERVER_STORE)),
+                env,
+                &world.dir.join("vault-server.log"),
+            )?)
         }
         None => None,
     };
     let url = match &server {
-        Some(running) => {
+        Some((_, listen)) => {
+            if listen.port() == port {
+                return Err(Fail::die(
+                    "the app's vault listener and fleet node need distinct lab ports",
+                ));
+            }
             let nonce = hex::encode_lower(&aterm_db::crypto::random::<4>().map_err(fail)?);
-            Some(format!(
-                "http://{}/v1/{LAB_VAULT_PREFIX}{nonce}",
-                running.addr
-            ))
+            Some(format!("http://{}/v1/{LAB_VAULT_PREFIX}{nonce}", listen))
         }
         None => None,
     };
-    let founded = (|| -> Result<_, Fail> {
-        let source = url
-            .clone()
-            .unwrap_or_else(|| vault.to_string_lossy().into_owned());
-        let created = client::create(&paths, &source, None, Some("m1")).map_err(fail)?;
+    let source = url
+        .clone()
+        .unwrap_or_else(|| vault.to_string_lossy().into_owned());
+    let hosts: Vec<String> = (2..)
+        .take(recipients.len())
+        .map(|n| format!("m{n}"))
+        .collect();
+    let genesis_file = world.dir.join("fixture.genesis");
+    if url.is_some() {
+        let aterm = aterm
+            .as_deref()
+            .ok_or_else(|| Fail::die("URL preparation needs the actual aterm"))?;
+        app_secrets(
+            aterm,
+            &world,
+            "create.log",
+            &[
+                "create".into(),
+                source.clone(),
+                "--name".into(),
+                "m1".into(),
+                "--no-agent".into(),
+            ],
+        )?;
+        for (host, recipient) in hosts.iter().zip(recipients) {
+            app_secrets(
+                aterm,
+                &world,
+                &format!("approve-{host}.log"),
+                &[
+                    "approve".into(),
+                    recipient.clone(),
+                    "--name".into(),
+                    host.clone(),
+                ],
+            )?;
+        }
+        app_secrets(
+            aterm,
+            &world,
+            "genesis.log",
+            &[
+                "genesis".into(),
+                genesis_file.to_string_lossy().into_owned(),
+            ],
+        )?;
+    } else {
+        // File preparation has no network identity: preserve its canonical local APIs.
+        client::create(&paths, &source, None, Some("m1")).map_err(fail)?;
         let admin = client::admin_open(&paths).map_err(fail)?;
         let mut doc = admin.doc.clone();
         // Each recipient takes the next label after the source's `m1`, in the order named.
-        let hosts: Vec<String> = (2..)
-            .take(recipients.len())
-            .map(|n| format!("m{n}"))
-            .collect();
         for (host, recipient) in hosts.iter().zip(recipients) {
             doc.add_machine(host, recipient).map_err(fail)?;
         }
         client::admin_publish_approved(&paths, &admin, &doc, recipients).map_err(fail)?;
-        let genesis =
-            client::seed_vault_genesis(&paths, &world.dir.join("fixture.genesis")).map_err(fail)?;
-        Ok((created, hosts, genesis))
-    })();
-    if let Some(running) = server {
-        running.stop();
+        client::seed_vault_genesis(&paths, &genesis_file).map_err(fail)?;
     }
-    let (created, hosts, genesis) = founded?;
+    // These are local reads only: no labdriver fetch may stand in for an app-owned operation.
+    let status = client::status(&paths).map_err(fail)?;
+    let cfg = status
+        .config
+        .ok_or_else(|| Fail::die("the source wrote no vault configuration"))?;
+    let expected_source = match &url {
+        Some(url) => aterm_secrets::transport::Source::Url(url.clone()),
+        None => aterm_secrets::transport::Source::Path(vault.clone()),
+    };
+    let signer = cfg
+        .signer
+        .ok_or_else(|| Fail::die("the source wrote no signer pin"))?;
+    if cfg.source != expected_source
+        || client::alab_vault(&cfg)
+        || !matches!(status.membership, client::Membership::In { .. })
+    {
+        return Err(Fail::die(
+            "the source has no admitted private vault at its exact address",
+        ));
+    }
+    let admin = client::admin_cached(&paths).map_err(fail)?;
+    let own = status
+        .machine
+        .ok_or_else(|| Fail::die("the source has no local identity"))?
+        .0;
+    let mut expected = vec![("m1".to_owned(), own.to_bech32())];
+    expected.extend(hosts.iter().cloned().zip(recipients.iter().cloned()));
+    expected.sort();
+    let mut actual: Vec<_> = admin
+        .published_document()
+        .machines()
+        .into_iter()
+        .map(|machine| (machine.name, machine.recipient))
+        .collect();
+    actual.sort();
+    if admin.config != cfg
+        || actual != expected
+        || hosts
+            .iter()
+            .any(|host| admin.commons_admission(host).is_none())
+    {
+        return Err(Fail::die(
+            "the cached source does not authenticate exactly the requested recipients",
+        ));
+    }
+    let bytes = aterm_secrets::fsx::read_owned(&genesis_file, CAPSULE_LIMIT)
+        .map_err(fail)?
+        .ok_or_else(|| Fail::die("the source wrote no genesis output"))?;
+    let record = aterm_secrets::membership_log::Record::decode(&bytes).map_err(fail)?;
+    let aterm_secrets::membership_log::Body::Genesis {
+        signer: signed_by,
+        root,
+        founders,
+    } = record.body()
+    else {
+        return Err(Fail::die("the app wrote no Genesis v2 record"));
+    };
+    let bootstrap = local_bootstrap(&paths)?;
+    let trust = bootstrap.trust();
+    let mut listed: Vec<_> = founders
+        .iter()
+        .map(|founder| (founder.name.clone(), founder.recipient.to_bech32()))
+        .collect();
+    listed.sort();
+    let records = client::load_records(&paths).map_err(fail)?;
+    if signed_by != &signer
+        || root.network != trust.network
+        || root.authority != trust.authority
+        || listed != expected
+        || records.log().is_none_or(|log| {
+            log.genesis().id() != record.id()
+                || !log.records().any(|record| {
+                    matches!(
+                        record.body(),
+                        aterm_secrets::membership_log::Body::Epoch { .. }
+                    )
+                })
+        })
+    {
+        return Err(Fail::die(
+            "the source's signed genesis, Commons root or seeded log does not match its vault",
+        ));
+    }
+    let signer = aterm_secrets::b64::encode_padded(&signer);
+    drop(server);
     let (carried_url, vault_hex) = match &url {
         Some(url) => {
-            let pinned = format!("{url}#{}", created.signer);
+            let pinned = format!("{url}#{signer}");
             write_new(&world.dir.join(LAB_VAULT), format!("{pinned}\n").as_bytes())?;
             let listen = url
                 .strip_prefix("http://")
@@ -305,7 +434,7 @@ fn prepare_source(
     };
     let mut capsules = Vec::with_capacity(recipients.len());
     for (host, recipient) in hosts.iter().zip(recipients) {
-        let capsule = json!({"schema":1,"signer":created.signer,"recipient":recipient,
+        let capsule = json!({"schema":1,"signer":signer,"recipient":recipient,
             "host":host,"url":carried_url,"vault_hex":vault_hex});
         if aterm_json::to_vec(&capsule).map_err(fail)?.len() > CAPSULE_LIMIT {
             return Err(Fail::die(
@@ -316,7 +445,7 @@ fn prepare_source(
     }
     let card = url
         .as_ref()
-        .map(|url| json!({"schema":1,"url":url,"signer":created.signer}));
+        .map(|url| json!({"schema":1,"url":url,"signer":signer}));
     if let Some(card) = &card {
         write_new(
             &world.dir.join(LAB_CARD),
@@ -325,7 +454,7 @@ fn prepare_source(
     }
     Ok(
         json!({"schema":1,"role":"source","world":world.dir.display().to_string(),
-        "genesis":hex::encode_lower(&genesis.digest),"genesis_members":genesis.members,
+        "genesis":hex::encode_lower(record.id()),"genesis_members":founders.len(),
         "url":url,"card":card,"capsules":capsules}),
     )
 }
@@ -334,7 +463,7 @@ fn prepare_source(
 /// approved it in: the file the capsule carries, or the vault served at its URL. Either way it
 /// is in the vault with no Commons admission and no tables yet; at a URL it reads the vault's
 /// records (its genesis) as it joins, which a file vault hands no Mac.
-fn join_recipient(root: &Path, capsule: &[u8]) -> Result<Value, Fail> {
+fn join_recipient(root: &Path, capsule: &[u8], aterm: Option<String>) -> Result<Value, Fail> {
     // Never with the live flag: this would point a live member's profile at a synthetic vault.
     let (world, role) = open(root, false)?;
     if role != "recipient" || capsule.len() > CAPSULE_LIMIT {
@@ -381,35 +510,180 @@ fn join_recipient(root: &Path, capsule: &[u8]) -> Result<Value, Fail> {
             format!("{}#{signer}", file.display())
         }
     };
-    client::join(
-        &paths,
-        &JoinOptions {
-            source,
-            host: Some(host.into()),
-            interactive: false,
-            wait: Duration::ZERO,
-            confirm: &|_| false,
-            password: JoinPassword::Given(None),
-            fetched: None,
-            requested: &|| {},
-            say: &|_| {},
-        },
-    )
-    .map_err(fail)?;
-    if let Some(pinned) = &served {
-        write_new(&world.dir.join(LAB_VAULT), format!("{pinned}\n").as_bytes())?;
+    if served.is_some() {
+        let aterm = crate::instance::resolve_aterm(aterm).map_err(fail)?;
+        app_secrets(
+            &aterm,
+            &world,
+            "join.log",
+            &[
+                "join".into(),
+                source,
+                "--name".into(),
+                host.into(),
+                "--no-agent".into(),
+                "--no-wait".into(),
+            ],
+        )?;
+        app_secrets(&aterm, &world, "sync.log", &["sync".into()])?;
+    } else {
+        client::join(
+            &paths,
+            &JoinOptions {
+                source,
+                host: Some(host.into()),
+                interactive: false,
+                wait: Duration::ZERO,
+                confirm: &|_| false,
+                password: JoinPassword::Given(None),
+                fetched: None,
+                requested: &|| {},
+                say: &|_| {},
+            },
+        )
+        .map_err(fail)?;
     }
-    let bootstrap = Bootstrap::required(&paths).map_err(fail)?;
-    if bootstrap.witness().map_err(fail)?.is_some()
-        || bootstrap.log_witness().map_err(fail)?.is_some()
-        || bootstrap.is_log_backed().map_err(fail)?
-        || bootstrap.access().is_ok_and(|access| access.is_some())
-        || (served.is_none() && paths.records_file().exists())
-        || paths.dir.join("commons/tables").exists()
+    let status = client::status(&paths).map_err(fail)?;
+    let cfg = status
+        .config
+        .ok_or_else(|| Fail::die("the join wrote no vault configuration"))?;
+    let expected = match &served {
+        Some(_) => aterm_secrets::transport::Source::Url(capsule["url"].as_str().unwrap().into()),
+        None => aterm_secrets::transport::Source::Path(world.dir.join("fixture.vault")),
+    };
+    if cfg.source != expected
+        || cfg
+            .signer
+            .map(|key| aterm_secrets::b64::encode_padded(&key))
+            .as_deref()
+            != Some(signer)
+        || cfg.host != host
+        || client::alab_vault(&cfg)
+        || !matches!(status.membership, client::Membership::In { .. })
     {
         return Err(Fail::die(
-            "recipient already has Commons admission, records or tables",
+            "the approved recipient did not join its exact pinned lab vault",
         ));
+    }
+    if served.is_some() {
+        // A no-agent join applies its authenticated control, without promising runtime device
+        // custody. Read that control directly; opening a Bootstrap here could create it.
+        let snapshot = match aterm_secrets::commons::observe_until(&paths, Instant::now() + HANG)
+            .map_err(fail)?
+        {
+            aterm_secrets::commons::Observation::Visible(snapshot) => snapshot,
+            aterm_secrets::commons::Observation::Unavailable(reason) => {
+                return Err(Fail::die(format!(
+                    "the app applied no authenticated Commons control: {}",
+                    reason.explanation()
+                )));
+            }
+        };
+        let trust = aterm_secrets::commons::bootstrap::Descriptor::decode(snapshot.control())
+            .map_err(fail)?
+            .trust();
+        let recipient = status
+            .machine
+            .ok_or_else(|| Fail::die("the joined recipient has no identity"))?
+            .0;
+        let records = client::load_records(&paths).map_err(fail)?;
+        let log = records
+            .log()
+            .ok_or_else(|| Fail::die("the app received no lab membership log"))?;
+        let aterm_secrets::membership_log::Body::Genesis {
+            signer: signed_by,
+            root,
+            ..
+        } = log.genesis().body()
+        else {
+            return Err(Fail::die("the joined log holds no Genesis v2"));
+        };
+        if snapshot.vault() != cfg.name
+            || Some(*snapshot.signer()) != cfg.signer
+            || snapshot.recipient() != recipient
+            || signed_by != snapshot.signer()
+            || root.network != trust.network
+            || root.authority != trust.authority
+            || !log
+                .membership_ref()
+                .unproved()
+                .iter()
+                .any(|founder| founder.recipient == recipient)
+        {
+            return Err(Fail::die(
+                "the joined membership log differs from its pinned vault and Commons root",
+            ));
+        }
+        // Empty private directories and observation locks are not custody. A present key,
+        // claim, pin or control history is established or partial custody, never absence.
+        let commons = paths.dir.join("commons");
+        let control = commons.join("control");
+        for dir in [&commons, &control] {
+            match aterm_secrets::fsx::kind(dir).map_err(fail)? {
+                aterm_secrets::fsx::Kind::Missing => {}
+                aterm_secrets::fsx::Kind::Dir => {
+                    private_file::check_private_dir(dir).map_err(fail)?
+                }
+                _ => {
+                    return Err(Fail::die(
+                        "the recipient has unsafe Commons custody directories",
+                    ));
+                }
+            }
+        }
+        for name in ["commons.lock", "commons-device.lock"] {
+            match private_file::open_private(&paths.dir, name) {
+                Ok(_) | Err(private_file::PrivateFileError::Missing) => {}
+                Err(error) => return Err(fail(error)),
+            }
+        }
+        let mut prior_custody = false;
+        for (dir, name) in [
+            (&paths.dir, "commons.claim"),
+            (&commons, "default.pin"),
+            (&commons, "device.age"),
+            (&commons, "device.claim"),
+            (&control, "control.anchor"),
+            (&control, "control.astream"),
+            (&control, "control.checkpoint"),
+        ] {
+            match private_file::open_private(dir, name) {
+                Ok(_) => prior_custody = true,
+                Err(private_file::PrivateFileError::Missing) => {}
+                Err(error) => return Err(fail(error)),
+            }
+        }
+        if prior_custody {
+            let bootstrap = local_bootstrap(&paths)?;
+            if bootstrap.trust() != trust
+                || bootstrap.witness().map_err(fail)?.is_some()
+                || bootstrap.log_witness().map_err(fail)?.is_some()
+                || bootstrap.is_log_backed().map_err(fail)?
+                || bootstrap.access().map_err(fail)?.is_some()
+            {
+                return Err(Fail::die(
+                    "the recipient has foreign or admitted Commons custody",
+                ));
+            }
+        }
+    } else {
+        let bootstrap = Bootstrap::required(&paths).map_err(fail)?;
+        if bootstrap.witness().map_err(fail)?.is_some()
+            || bootstrap.log_witness().map_err(fail)?.is_some()
+            || bootstrap.is_log_backed().map_err(fail)?
+            || bootstrap.access().is_ok_and(|access| access.is_some())
+            || paths.records_file().exists()
+        {
+            return Err(Fail::die(
+                "recipient already has Commons admission or records",
+            ));
+        }
+    }
+    if paths.dir.join("commons/tables").exists() {
+        return Err(Fail::die("recipient already has application tables"));
+    }
+    if let Some(pinned) = &served {
+        write_new(&world.dir.join(LAB_VAULT), format!("{pinned}\n").as_bytes())?;
     }
     Ok(
         json!({"schema":1,"role":"recipient","world":world.dir.display().to_string(),
@@ -423,7 +697,7 @@ fn join_recipient(root: &Path, capsule: &[u8]) -> Result<Value, Fail> {
 /// its signer, and waits there (Pending), so a later proof's bundle is taken only from that very
 /// vault (`aterm members join --at …`, `client::readmit_from_log_bundle`). A world that follows a
 /// vault already, a card that names no lab vault, and one the live ALab vault's are refused.
-fn pin(root: &Path, card: &[u8]) -> Result<Value, Fail> {
+fn pin(root: &Path, card: &[u8], aterm: Option<String>) -> Result<Value, Fail> {
     let (world, role) = open(root, false)?;
     let paths = Paths::for_home(&world.home);
     if role != "recipient" || card.len() > CAPSULE_LIMIT {
@@ -445,36 +719,39 @@ fn pin(root: &Path, card: &[u8]) -> Result<Value, Fail> {
         .filter(|key| signer_word(key) && *key != aterm_secrets::ALAB_SIGNER)
         .ok_or_else(|| Fail::die("the card names no lab vault signer"))?;
     let pinned = format!("{url}#{signer}");
-    let joined = client::join(
-        &paths,
-        &JoinOptions {
-            source: pinned.clone(),
-            host: None,
-            interactive: false,
-            wait: Duration::ZERO,
-            confirm: &|_| false,
-            password: JoinPassword::Given(None),
-            fetched: None,
-            requested: &|| {},
-            say: &|_| {},
-        },
-    )
-    .map_err(fail)?;
-    let configured = client::config(&paths)
-        .map_err(fail)?
+    let aterm = crate::instance::resolve_aterm(aterm).map_err(fail)?;
+    app_secrets(
+        &aterm,
+        &world,
+        "pin.log",
+        &[
+            "join".into(),
+            pinned.clone(),
+            "--no-agent".into(),
+            "--no-wait".into(),
+        ],
+    )?;
+    let status = client::status(&paths).map_err(fail)?;
+    let configured = status
+        .config
         .ok_or_else(|| Fail::die("the pin wrote no vault configuration"))?;
-    if client::alab_vault(&configured) {
-        return Err(Fail::die("the card's vault is the live ALab vault's"));
+    if client::alab_vault(&configured)
+        || configured.source != aterm_secrets::transport::Source::Url(url.into())
+        || configured
+            .signer
+            .map(|key| aterm_secrets::b64::encode_padded(&key))
+            .as_deref()
+            != Some(signer)
+        || !matches!(status.membership, client::Membership::Pending)
+    {
+        return Err(Fail::die(
+            "the fresh recipient is not Pending at its exact pinned private vault",
+        ));
     }
     write_new(&world.dir.join(LAB_VAULT), format!("{pinned}\n").as_bytes())?;
-    let membership = match joined {
-        client::JoinOutcome::Pending { .. } => "pending",
-        client::JoinOutcome::Joined { .. } => "in",
-        _ => "other",
-    };
     Ok(
         json!({"schema":1,"role":"recipient","world":world.dir.display().to_string(),
-        "pinned":true,"membership":membership,"commons_admitted":false}),
+        "pinned":true,"membership":"pending","commons_admitted":false}),
     )
 }
 
@@ -782,7 +1059,7 @@ fn fleet_key(aterm: &Path, world: &World, log: &Path) -> Result<bool, Fail> {
 
 /// Serve a source world's lab vault (its [`LAB_SERVE`] address, its [`SERVER_STORE`] store) with
 /// the shipped `aterm secrets serve`, advertising nothing and holding no keep-awake, as an owned
-/// child logging to `log`, once it accepts a connection within the hang detector.
+/// child logging to `log`, once its own nonce-bound health receipt proves the listener.
 fn vault_server(
     aterm: &Path,
     world: &World,
@@ -790,10 +1067,46 @@ fn vault_server(
     env: Vec<(String, String)>,
     log: &Path,
 ) -> Result<Owned, Fail> {
+    let (owned, actual) = app_vault_server(
+        aterm,
+        world,
+        (std::net::SocketAddr::V4(listen), store),
+        env,
+        log,
+    )?;
+    if actual != listen {
+        return Err(Fail::die(
+            "the app's bound vault address differs from its prepared address",
+        ));
+    }
+    Ok(owned)
+}
+
+/// Start the actual app's server. A port-zero request learns its port only from that owned
+/// process's existing health response; the labdriver never probes the LAN itself.
+fn app_vault_server(
+    aterm: &Path,
+    world: &World,
+    (listen, store): (std::net::SocketAddr, &Path),
+    env: Vec<(String, String)>,
+    log: &Path,
+) -> Result<(Owned, std::net::SocketAddrV4), Fail> {
+    let std::net::SocketAddr::V4(listen) = listen else {
+        return Err(Fail::die("a lab vault listener must be IPv4"));
+    };
+    if !(listen.ip().is_private() || listen.ip().is_loopback())
+        || (listen.port() != 0 && lab_port(&listen.port().to_string()).is_err())
+    {
+        return Err(Fail::die(
+            "the app's vault listener must use a private or loopback lab address",
+        ));
+    }
+    let paths = Paths::for_home(&world.home);
+    let nonce = aterm_secrets::service_health::prepare_server(&paths).map_err(fail)?;
     let out = crate::util::create_new_regular_file(log, 0o600).map_err(fail)?;
     let err = out.try_clone().map_err(fail)?;
     let mut owned = Owned(
-        aterm_uds::spawnfd::command(aterm)
+        aterm_uds::spawnfd::command(std::fs::canonicalize(aterm).map_err(fail)?)
             .env_clear()
             .envs(env)
             .current_dir(&world.home)
@@ -813,18 +1126,31 @@ fn vault_server(
             .spawn()
             .map_err(fail)?,
     );
-    let addr = std::net::SocketAddr::V4(listen);
     let hang = Instant::now() + HANG;
-    while std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_err() {
+    loop {
         if owned.0.try_wait().map_err(fail)?.is_some() || Instant::now() >= hang {
             return Err(Fail::die(format!(
-                "the lab vault server did not listen on {listen} (see {})",
+                "the owned app did not prove its vault listener on {listen} (see {})",
                 log.display()
             )));
         }
+        if let Some(bytes) =
+            aterm_secrets::fsx::read_private(&paths.dir.join("server-health-response.json"), 4096)
+                .map_err(fail)?
+            && let Ok(value) = aterm_json::from_slice::<Value>(bytes.as_slice())
+            && let Some(port) = value["port"]
+                .as_u64()
+                .and_then(|port| u16::try_from(port).ok())
+            && lab_port(&port.to_string()).is_ok()
+            && (listen.port() == 0 || listen.port() == port)
+            && aterm_secrets::service_health::server_process(&paths, &nonce, owned.0.id(), port)
+                .is_ok()
+            && owned.0.try_wait().map_err(fail)?.is_none()
+        {
+            return Ok((owned, std::net::SocketAddrV4::new(*listen.ip(), port)));
+        }
         stop::sleep(Duration::from_millis(100))?;
     }
-    Ok(owned)
 }
 
 /// Run the shipped headless node service (`aterm node serve`) in a prepared profile until
@@ -1096,6 +1422,31 @@ fn world_output(
     aterm_uds::deadline::output_until_from(&mut command, stdin, Instant::now() + HANG).map_err(fail)
 }
 
+/// One ordinary app command with its output retained privately in the prepared world. Local
+/// state readbacks admit the result; this wrapper grants no network or vault authority.
+fn app_secrets(aterm: &Path, world: &World, log: &str, args: &[String]) -> Result<(), Fail> {
+    let output = world_output(
+        aterm,
+        world,
+        "secrets",
+        args,
+        aterm_uds::spawnfd::Stdio::null(),
+    )?;
+    let mut file =
+        crate::util::create_new_regular_file(&world.dir.join(log), 0o600).map_err(fail)?;
+    file.write_all(&output.stdout).map_err(fail)?;
+    file.write_all(&output.stderr).map_err(fail)?;
+    if !output.status.success() {
+        return Err(Fail::die(format!(
+            "the app's secrets {} failed ({}); see {}",
+            args.first().map_or("command", String::as_str),
+            output.status,
+            world.dir.join(log).display()
+        )));
+    }
+    Ok(())
+}
+
 /// The shape of the shipped vault verbs a lab's own membership takes ([`vault_cli`]): an admin's
 /// approval of one `age1…` key under a machine name, a join of a lab profile's own vault file,
 /// pinned to its signer as `<file>#<signer>` or not, a join of a URL-served lab vault pinned to
@@ -1273,12 +1624,207 @@ fn prepare_flags(words: &[String]) -> Result<(Option<std::net::SocketAddr>, u16,
     Ok((serve, port, rest))
 }
 
+/// Explicit artifact-backed acceptance of app-owned URL preparation, approval and Pending
+/// pinning. Home-LAN scope checks use the existing thread-local route fixture; they measure
+/// guard behavior, not discovery or a physical LAN handshake. No ordinary unit run starts an app.
+#[cfg(debug_assertions)]
+fn check(aterm: &Path) -> Result<Value, Fail> {
+    use aterm_netplace::facts::{parse_script, script_here};
+    use aterm_secrets::members::lab_lan;
+    let parent = aterm_tempfile::Builder::new()
+        .prefix("cl")
+        .tempdir_in("/tmp")
+        .map_err(fail)?;
+    let result = (|| -> Result<Value, Fail> {
+        let require = |ok: bool, message: &str| {
+            if ok { Ok(()) } else { Err(Fail::die(message)) }
+        };
+        let aterm = aterm.to_string_lossy().into_owned();
+        let source = parent.path().join("source");
+        let member = parent.path().join("member");
+        let fresh = parent.path().join("fresh");
+        let pending = prepare_recipient(&member, LAB_FLEET_PORT)?;
+        prepare_recipient(&fresh, LAB_FLEET_PORT + 1)?;
+        let recipient = pending["recipient"]
+            .as_str()
+            .ok_or_else(|| Fail::die("no prepared recipient"))?;
+        let prepared = prepare_source(
+            &source,
+            &[recipient.into()],
+            Some("127.0.0.1:0".parse().map_err(fail)?),
+            LAB_FLEET_PORT,
+            Some(aterm.clone()),
+        )?;
+        let source_paths = Paths::for_home(&source.join("home"));
+        require(
+            client::lab_mark(&source_paths).map_err(fail)?.is_some(),
+            "URL acceptance needs the actual debug app's marked source identity",
+        )?;
+        let url = prepared["url"]
+            .as_str()
+            .ok_or_else(|| Fail::die("no prepared URL"))?;
+        let capsule = &prepared["capsules"][0];
+        let signer = capsule["signer"]
+            .as_str()
+            .ok_or_else(|| Fail::die("no prepared signer"))?;
+        let pinned = format!("{url}#{signer}");
+        let card = private_file::read_private(&source, LAB_CARD, CAPSULE_LIMIT).map_err(fail)?;
+        require(
+            lab_url(url)
+                && capsule["url"].as_str() == Some(url)
+                && capsule["vault_hex"].is_null()
+                && aterm_json::from_slice::<Value>(&card).map_err(fail)? == prepared["card"]
+                && lab_vault_of(&World::open_at(&source).map_err(fail)?)?.as_deref()
+                    == Some(pinned.as_str()),
+            "the served capsule, card and source marker must name one URL and signer",
+        )?;
+        let listen =
+            lab_serve_of(&source)?.ok_or_else(|| Fail::die("no prepared server address"))?;
+        let world = World::open_at(&source).map_err(fail)?;
+        let mut env = world.env();
+        env.retain(|(key, _)| key != "ATERM_STATE_HOME" && key != "CI");
+        let server = vault_server(
+            Path::new(&aterm),
+            &world,
+            (listen, &source.join(SERVER_STORE)),
+            env,
+            &source.join("vault-server-again.log"),
+        )?;
+        let joined = join_recipient(
+            &member,
+            &aterm_json::to_vec(capsule).map_err(fail)?,
+            Some(aterm.clone()),
+        )?;
+        require(
+            joined["served"] == json!(true)
+                && joined["commons_admitted"] == json!(false)
+                && lab_vault_of(&World::open_at(&member).map_err(fail)?)?.as_deref()
+                    == Some(pinned.as_str()),
+            "the approved recipient must join the app's exact vault without Commons admission",
+        )?;
+        let waits = pin(&fresh, &card, Some(aterm.clone()))?;
+        require(
+            waits["membership"].as_str() == Some("pending")
+                && lab_vault_of(&World::open_at(&fresh).map_err(fail)?)?.as_deref()
+                    == Some(pinned.as_str())
+                && pin(&fresh, &card, Some(aterm.clone())).is_err(),
+            "a fresh recipient must wait at its exact pin and refuse a second pin",
+        )?;
+        for (n, (refused_url, refused_signer)) in [
+            (aterm_secrets::ALAB_DEFAULT_URL, signer),
+            (url, aterm_secrets::ALAB_SIGNER),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let other = parent.path().join(format!("other-{n}"));
+            prepare_recipient(&other, LAB_FLEET_PORT)?;
+            let card =
+                aterm_json::to_vec(&json!({"schema":1,"url":refused_url,"signer":refused_signer}))
+                    .map_err(fail)?;
+            require(
+                pin(&other, &card, Some(aterm.clone())).is_err()
+                    && client::config(&Paths::for_home(&other.join("home")))
+                        .map_err(fail)?
+                        .is_none()
+                    && !other.join("pin.log").exists(),
+                "a live ALab URL or signer must be refused before any app command",
+            )?;
+        }
+        let release = parent.path().join("release");
+        let unmarked = prepare(&release, "recipient", LAB_FLEET_PORT)?;
+        let unmarked = Paths::for_home(&unmarked.home);
+        client::machine_identity_as(&unmarked, aterm_secrets::Making::default()).map_err(fail)?;
+        require(
+            client::lab_mark(&unmarked).map_err(fail)?.is_none(),
+            "the unmarked identity control must carry no lab mark",
+        )?;
+        pin(&release, &card, Some(aterm))?;
+        drop(server);
+        let file = parent.path().join("file");
+        let file_source = parent.path().join("file-source");
+        let pending = prepare_recipient(&file, LAB_FLEET_PORT)?;
+        let recipient = pending["recipient"]
+            .as_str()
+            .ok_or_else(|| Fail::die("no file recipient"))?;
+        let prepared = prepare_source(
+            &file_source,
+            &[recipient.into()],
+            None,
+            LAB_FLEET_PORT,
+            None,
+        )?;
+        join_recipient(
+            &file,
+            &aterm_json::to_vec(&prepared["capsules"][0]).map_err(fail)?,
+            None,
+        )?;
+        let at_home = || {
+            parse_script(
+                "route en0 192.168.1.20/24 via 192.168.1.1 hw aa:bb:cc:dd:ee:01\npath usable wifi\n",
+            )
+        };
+        let home_of =
+            |root: &Path| lab_lan::read(&Paths::for_home(&root.join("home"))).map_err(fail);
+        require(
+            script_here(at_home(), || home_lan(&member, "192.168.2.0/24")).is_err()
+                && home_of(&member)?.is_none(),
+            "a wrong subnet must write no home-LAN rule",
+        )?;
+        require(
+            script_here(at_home(), || home_lan(&file, "192.168.1.0/24")).is_err()
+                && home_of(&file)?.is_none(),
+            "a file vault must receive no home-LAN rule",
+        )?;
+        require(
+            script_here(at_home(), || home_lan(&release, "192.168.1.0/24")).is_err()
+                && home_of(&release)?.is_none(),
+            "an unmarked identity must receive no home-LAN rule",
+        )?;
+        let named = script_here(at_home(), || home_lan(&member, "192.168.1.0/24"))?;
+        require(
+            named["home_lan"].as_str() == Some("192.168.1.0/24")
+                && named["own"].as_str() == Some("192.168.1.20")
+                && home_of(&member)? == Some(lab_lan::Cidr::parse("192.168.1.0/24").map_err(fail)?),
+            "a marked served world on its scripted subnet must retain the exact home-LAN rule",
+        )?;
+        Ok(
+            json!({"schema":1,"app_owned_url":true,"approved_join":true,"fresh_pin":"pending",
+            "live_vault_refused":true,"home_lan_scope":"scripted-route","component_only":true}),
+        )
+    })();
+    match result {
+        Ok(value) => Ok(value),
+        Err(mut error) => {
+            let retained = parent.keep();
+            error.msg = Some(format!(
+                "{}; private acceptance evidence retained at {}",
+                error
+                    .msg
+                    .as_deref()
+                    .unwrap_or("Commons URL acceptance failed"),
+                retained.display()
+            ));
+            Err(error)
+        }
+    }
+}
+
 /// Prepare and drive preserved private profiles without changing installed state.
 pub fn cmd(args: &[String]) -> Res {
     stop::install();
     let live = args.iter().any(|arg| arg == LIVE);
     let args: Vec<String> = args.iter().filter(|arg| *arg != LIVE).cloned().collect();
     let value = match args.as_slice() {
+        #[cfg(debug_assertions)]
+        [verb, flag, aterm] if verb == "check" && flag == "--aterm" => {
+            let aterm = crate::instance::resolve_aterm(Some(aterm.clone())).map_err(fail)?;
+            check(&aterm)?
+        }
+        #[cfg(not(debug_assertions))]
+        [verb, ..] if verb == "check" => {
+            return Err(Fail::die("commons-lan check needs a debug lab driver"));
+        }
         [verb, root, flags @ ..] if verb == "prepare-recipient" => {
             let (serve, port, rest) = prepare_flags(flags)?;
             if serve.is_some() || !rest.is_empty() {
@@ -1287,20 +1833,32 @@ pub fn cmd(args: &[String]) -> Res {
             prepare_recipient(Path::new(root), port)?
         }
         [verb, root, flags @ ..] if verb == "prepare-source" => {
-            let (serve, port, recipients) = prepare_flags(flags)?;
-            prepare_source(Path::new(root), recipients, serve, port)?
+            let mut flags = flags.to_vec();
+            let aterm = crate::instance::take_value(&mut flags, "--aterm")?;
+            let (serve, port, recipients) = prepare_flags(&flags)?;
+            prepare_source(Path::new(root), recipients, serve, port, aterm)?
         }
-        [verb, root, capsule] if verb == "join" => {
+        [verb, root, rest @ ..] if verb == "join" => {
+            let mut rest = rest.to_vec();
+            let aterm = crate::instance::take_value(&mut rest, "--aterm")?;
+            let [capsule] = rest.as_slice() else {
+                return Err(Fail::usage(USAGE));
+            };
             let bytes = aterm_secrets::fsx::read_private(Path::new(capsule), CAPSULE_LIMIT)
                 .map_err(fail)?
                 .ok_or_else(|| Fail::die("synthetic vault capsule file is missing"))?;
-            join_recipient(Path::new(root), bytes.as_slice())?
+            join_recipient(Path::new(root), bytes.as_slice(), aterm)?
         }
-        [verb, root, card] if verb == "pin" => {
+        [verb, root, rest @ ..] if verb == "pin" => {
+            let mut rest = rest.to_vec();
+            let aterm = crate::instance::take_value(&mut rest, "--aterm")?;
+            let [card] = rest.as_slice() else {
+                return Err(Fail::usage(USAGE));
+            };
             let bytes = aterm_secrets::fsx::read_private(Path::new(card), CAPSULE_LIMIT)
                 .map_err(fail)?
                 .ok_or_else(|| Fail::die("the lab vault card file is missing"))?;
-            pin(Path::new(root), bytes.as_slice())?
+            pin(Path::new(root), bytes.as_slice(), aterm)?
         }
         #[cfg(debug_assertions)]
         [verb, root, cidr] if verb == "home-lan" => home_lan(Path::new(root), cidr)?,
@@ -1917,232 +2475,6 @@ mod tests {
         assert_eq!(kept, Ok(false), "a live world is keyless: {kept:?}");
     }
 
-    /// A served vault's own server, again on the address its source world names ([`LAB_SERVE`])
-    /// over the store the vault was founded into, as the source world's `node` serves it.
-    fn serve_again(source: &Path) -> aterm_secrets::server::Running {
-        let listen = lab_serve_of(source)
-            .expect("readable")
-            .expect("a served source world");
-        aterm_secrets::server::start(
-            std::net::TcpListener::bind(listen).expect("the vault's address is free again"),
-            &aterm_secrets::server::Options {
-                listen: std::net::SocketAddr::V4(listen),
-                store: source.join(SERVER_STORE),
-                advertise: None,
-                pins: Vec::new(),
-                hold: Duration::from_millis(100),
-                keep_awake: false,
-            },
-        )
-        .expect("served")
-    }
-
-    /// A lab vault founded at a URL (`prepare-source --serve`) hands its approved recipients
-    /// capsules that carry the URL and no vault bytes; each joins it there pinned to its signer
-    /// and records it as the vault it follows. Its card pins a fresh Mac nobody approved to that
-    /// same vault, where it waits (Pending); a second pin, and a card that names the live ALab
-    /// vault's URL or signer, are refused.
-    ///
-    /// NEGATIVE CONTROL: with `join_recipient`'s [`LAB_VAULT`] write removed, the recipient
-    /// records no vault it follows: `the recipient follows its lab vault: None`.
-    #[test]
-    fn a_served_lab_vault_lets_its_approved_macs_join_and_pins_one_nobody_approved() {
-        let parent = crate::instance::world_parent();
-        let (recipient, fresh, source) = (
-            parent.path().join("recipient"),
-            parent.path().join("fresh"),
-            parent.path().join("source"),
-        );
-        let pending = prepare_recipient(&recipient, LAB_FLEET_PORT).unwrap();
-        prepare_recipient(&fresh, LAB_FLEET_PORT + 1).unwrap();
-        let prepared = prepare_source(
-            &source,
-            &[pending["recipient"].as_str().unwrap().into()],
-            Some("127.0.0.1:0".parse().unwrap()),
-            LAB_FLEET_PORT,
-        )
-        .unwrap();
-        let url = prepared["url"]
-            .as_str()
-            .expect("a served vault's URL")
-            .to_owned();
-        assert!(lab_url(&url), "{url}");
-        let capsule = &prepared["capsules"][0];
-        assert_eq!(capsule["url"].as_str(), Some(url.as_str()));
-        assert!(
-            capsule["vault_hex"].is_null(),
-            "a served capsule carries no vault bytes"
-        );
-        let signer = capsule["signer"].as_str().unwrap().to_owned();
-        let pinned = format!("{url}#{signer}");
-        assert_eq!(
-            lab_vault_of(&World::open_at(&source).unwrap())
-                .unwrap()
-                .as_deref(),
-            Some(pinned.as_str())
-        );
-        let card = std::fs::read(source.join(LAB_CARD)).unwrap();
-        assert_eq!(
-            aterm_json::from_slice::<Value>(&card).unwrap(),
-            prepared["card"]
-        );
-
-        let server = serve_again(&source);
-        let joined = join_recipient(&recipient, &aterm_json::to_vec(capsule).unwrap()).unwrap();
-        assert_eq!(joined["served"], json!(true));
-        assert_eq!(joined["commons_admitted"], json!(false));
-        let follows = lab_vault_of(&World::open_at(&recipient).unwrap()).unwrap();
-        assert_eq!(
-            follows.as_deref(),
-            Some(pinned.as_str()),
-            "the recipient follows its lab vault: {follows:?}"
-        );
-        let config = client::config(&Paths::for_home(&recipient.join("home")))
-            .unwrap()
-            .expect("configured");
-        assert!(
-            matches!(&config.source, aterm_secrets::transport::Source::Url(at) if *at == url),
-            "{:?}",
-            config.source
-        );
-
-        let waits = pin(&fresh, &card).unwrap();
-        assert_eq!(waits["membership"], json!("pending"), "{waits:?}");
-        assert_eq!(
-            lab_vault_of(&World::open_at(&fresh).unwrap())
-                .unwrap()
-                .as_deref(),
-            Some(pinned.as_str())
-        );
-        let config = client::config(&Paths::for_home(&fresh.join("home")))
-            .unwrap()
-            .expect("pinned");
-        assert!(!client::alab_vault(&config));
-        assert_eq!(
-            config
-                .signer
-                .map(|key| aterm_secrets::b64::encode_padded(&key)),
-            Some(signer.clone())
-        );
-        assert!(
-            pin(&fresh, &card).is_err(),
-            "a pinned world takes no second pin"
-        );
-        for (n, (url, signer)) in [
-            (aterm_secrets::ALAB_DEFAULT_URL, signer.as_str()),
-            (url.as_str(), aterm_secrets::ALAB_SIGNER),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let other = parent.path().join(format!("other-{n}"));
-            prepare_recipient(&other, LAB_FLEET_PORT).unwrap();
-            let card = aterm_json::to_vec(&json!({"schema":1,"url":url,"signer":signer})).unwrap();
-            assert!(pin(&other, &card).is_err(), "{url}#{signer}");
-            assert!(
-                client::config(&Paths::for_home(&other.join("home")))
-                    .unwrap()
-                    .is_none(),
-                "a refused card configures nothing"
-            );
-        }
-        server.stop();
-    }
-
-    /// `home-lan` names a lab's home LAN only on a world that follows its URL-served lab vault
-    /// with a marked identity, and only a network this Mac's default route is on now: a network
-    /// the route is not on, a world whose vault is a file, one whose identity a release build
-    /// made, and the live ALab vault's world are refused, and none of them gets the file.
-    ///
-    /// NEGATIVE CONTROL: with `home_lan`'s lab-mark refusal removed, a release identity's world
-    /// gets a home: `a release identity's world is refused: Some(Object({"home_lan":
-    /// String("192.168.1.0/24"), "own": String("192.168.1.20"), …}))`.
-    #[test]
-    fn home_lan_names_only_a_network_this_mac_is_on_for_a_marked_served_lab_world() {
-        use aterm_netplace::facts::{parse_script, script_here};
-        use aterm_secrets::members::lab_lan;
-        let at_home = || {
-            parse_script(
-                "route en0 192.168.1.20/24 via 192.168.1.1 hw aa:bb:cc:dd:ee:01\npath usable wifi\n",
-            )
-        };
-        let parent = crate::instance::world_parent();
-        let (member, file, release, source) = (
-            parent.path().join("member"),
-            parent.path().join("file"),
-            parent.path().join("release"),
-            parent.path().join("source"),
-        );
-        let pending = prepare_recipient(&member, LAB_FLEET_PORT).unwrap();
-        let prepared = prepare_source(
-            &source,
-            &[pending["recipient"].as_str().unwrap().into()],
-            Some("127.0.0.1:0".parse().unwrap()),
-            LAB_FLEET_PORT,
-        )
-        .unwrap();
-        let server = serve_again(&source);
-        join_recipient(
-            &member,
-            &aterm_json::to_vec(&prepared["capsules"][0]).unwrap(),
-        )
-        .unwrap();
-        let unmarked = prepare(&release, "recipient", LAB_FLEET_PORT).unwrap();
-        let unmarked = Paths::for_home(&unmarked.home);
-        client::machine_identity_as(&unmarked, aterm_secrets::Making::default()).unwrap();
-        assert!(
-            client::lab_mark(&unmarked).unwrap().is_none(),
-            "PRECONDITION"
-        );
-        pin(&release, &std::fs::read(source.join(LAB_CARD)).unwrap()).unwrap();
-        server.stop();
-        let filed = prepare_recipient(&file, LAB_FLEET_PORT).unwrap();
-        let file_source = parent.path().join("file-source");
-        let file_vault = prepare_source(
-            &file_source,
-            &[filed["recipient"].as_str().unwrap().into()],
-            None,
-            LAB_FLEET_PORT,
-        )
-        .unwrap();
-        join_recipient(
-            &file,
-            &aterm_json::to_vec(&file_vault["capsules"][0]).unwrap(),
-        )
-        .unwrap();
-        let home_of =
-            |root: &Path| lab_lan::read(&Paths::for_home(&root.join("home"))).expect("readable");
-
-        let outside = script_here(at_home(), || home_lan(&member, "192.168.2.0/24"));
-        assert!(
-            outside.is_err(),
-            "a network the route is not on: {:?}",
-            outside.ok()
-        );
-        assert_eq!(home_of(&member), None, "nothing written");
-        let filed = script_here(at_home(), || home_lan(&file, "192.168.1.0/24"));
-        assert!(
-            filed.is_err(),
-            "a file vault's world is refused: {:?}",
-            filed.ok()
-        );
-        assert_eq!(home_of(&file), None);
-        let released = script_here(at_home(), || home_lan(&release, "192.168.1.0/24"));
-        assert!(
-            released.is_err(),
-            "a release identity's world is refused: {:?}",
-            released.ok()
-        );
-        assert_eq!(home_of(&release), None);
-        let named = script_here(at_home(), || home_lan(&member, "192.168.1.0/24")).unwrap();
-        assert_eq!(named["home_lan"], json!("192.168.1.0/24"));
-        assert_eq!(named["own"], json!("192.168.1.20"));
-        assert_eq!(
-            home_of(&member),
-            Some(lab_lan::Cidr::parse("192.168.1.0/24").unwrap())
-        );
-    }
-
     #[test]
     fn successive_launches_share_the_profile_without_reusing_app_logs() {
         let parent = crate::instance::world_parent();
@@ -2184,11 +2516,13 @@ mod tests {
             &[pending["recipient"].as_str().unwrap().into()],
             None,
             LAB_FLEET_PORT,
+            None,
         )
         .unwrap();
         join_recipient(
             &synthetic,
             &aterm_json::to_vec(&prepared["capsules"][0]).unwrap(),
+            None,
         )
         .unwrap();
         assert!(
@@ -2256,14 +2590,15 @@ mod tests {
             &[pending["recipient"].as_str().unwrap().into()],
             None,
             LAB_FLEET_PORT,
+            None,
         )
         .unwrap();
         let capsule = aterm_json::to_vec(&prepared["capsules"][0]).unwrap();
         let wrong = parent.path().join("wrong-recipient");
         prepare_recipient(&wrong, LAB_FLEET_PORT).unwrap();
-        assert!(join_recipient(&wrong, &capsule).is_err());
+        assert!(join_recipient(&wrong, &capsule, None).is_err());
         assert!(!wrong.join("fixture.vault").exists());
-        let joined = join_recipient(&recipient, &capsule).unwrap();
+        let joined = join_recipient(&recipient, &capsule, None).unwrap();
         let source_bootstrap = Bootstrap::required(&Paths::for_home(&source.join("home"))).unwrap();
         let recipient_bootstrap =
             Bootstrap::required(&Paths::for_home(&recipient.join("home"))).unwrap();
@@ -2274,7 +2609,7 @@ mod tests {
         assert_eq!(joined["commons_admitted"], json!(false));
         assert_eq!(joined["membership_records"], json!(false));
         assert_eq!(joined["application_tables"], json!(0));
-        assert!(join_recipient(&recipient, &capsule).is_err());
+        assert!(join_recipient(&recipient, &capsule, None).is_err());
         assert_eq!(
             recipient_key(&Paths::for_home(&recipient.join("home"))).unwrap(),
             pending["recipient"].as_str().unwrap()
@@ -2292,6 +2627,7 @@ mod tests {
             &[pending["recipient"].as_str().unwrap().into()],
             None,
             LAB_FLEET_PORT,
+            None,
         )
         .unwrap();
         let paths = Paths::for_home(&source.join("home"));

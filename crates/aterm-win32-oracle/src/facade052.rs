@@ -211,7 +211,8 @@ fn imports(
     )?);
     if refs.is_empty() || refs.iter().any(|s| !defs.contains_key(s)) {
         return Err(format!(
-            "{features} imports could not be completely inspected"
+            "{features} imports could not be completely inspected{}",
+            crate::oracle::nm_hint(tools)
         ));
     }
     Ok(refs

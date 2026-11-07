@@ -705,6 +705,16 @@ pub(crate) fn main() -> ExitCode {
     // First: every entry below, the early helper verbs included, reads the installed identity.
     aterm_stamp::install(&STAMP, COMPILED);
     let mut argv: Vec<OsString> = std::env::args_os().collect();
+    // Capture before ANY descriptor-opening subscriber/window/front-door setup.
+    // SAFETY: stamp installation/args_os above only read in-memory startup data;
+    // this executable has started no threads or descriptor-mutating callbacks.
+    let original_root_store = match unsafe { aterm_ctl::capture_original_root_store(&argv[1..]) } {
+        Ok(original) => original,
+        Err(why) => {
+            eprintln!("aterm resource-run: {why}");
+            return ExitCode::from(75);
+        }
+    };
     #[cfg(target_os = "macos")]
     subscriber_scheduling::enter(&mut argv);
     // The watch-only replacement above does no state, key, network or window work.
@@ -722,7 +732,7 @@ pub(crate) fn main() -> ExitCode {
         eprintln!("aterm: {reason}");
         return ExitCode::FAILURE;
     }
-    let code = front_door_main(argv, lab_window_guard.is_present());
+    let code = front_door_main(argv, lab_window_guard.is_present(), original_root_store);
     // A pass the lab's mailbox discovery started on its own thread finishes before a
     // short-lived invocation returns (a bounded wait; nothing runs in most processes).
     #[cfg(unix)]
@@ -730,7 +740,11 @@ pub(crate) fn main() -> ExitCode {
     code
 }
 
-fn front_door_main(argv: Vec<OsString>, lab_window_guarded: bool) -> ExitCode {
+fn front_door_main(
+    argv: Vec<OsString>,
+    lab_window_guarded: bool,
+    original_root_store: Option<aterm_ctl::OriginalRootStore>,
+) -> ExitCode {
     #[cfg(unix)]
     if let Some(code) = argv.get(1..).and_then(aterm_resource_host::entry) {
         return code;
@@ -990,7 +1004,10 @@ fn front_door_main(argv: Vec<OsString>, lab_window_guarded: bool) -> ExitCode {
         return match verb {
             aterm_cli::Verb::Ctl => aterm_ctl::main_entry_with(forwarded, CTL_LOCAL),
             aterm_cli::Verb::Conn => aterm_ctl::conn_main_entry(forwarded),
-            aterm_cli::Verb::ResourceRun => aterm_ctl::resource_run_main_entry(forwarded),
+            aterm_cli::Verb::ResourceRun => aterm_ctl::resource_run_main_entry_with_original_store(
+                forwarded,
+                original_root_store,
+            ),
             aterm_cli::Verb::ResourceInspect => {
                 #[cfg(unix)]
                 if aterm_ctl::native_resource_inspection::register(

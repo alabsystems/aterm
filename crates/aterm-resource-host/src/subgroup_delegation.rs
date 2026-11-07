@@ -48,6 +48,7 @@ pub struct Prepared {
     _gnu_files: Vec<OwnedFd>,
     mapped: Option<Vec<(OwnedFd, i32)>>,
     flags: Option<std::ffi::OsString>,
+    workload_original: bool,
     phase: Phase,
 }
 impl Prepared {
@@ -112,6 +113,42 @@ impl Prepared {
         rights: &Delegations,
         named_targets: Option<[u32; 2]>,
     ) -> io::Result<Option<Self>> {
+        Self::try_new_inner(debt, global_limit, request, rights, named_targets, None)
+    }
+    /// Borrow an actual original guard retained by the SAME workload host.
+    /// The offered description is equality input only; it never becomes the
+    /// guard, and no native acquire/headroom exception is performed here.
+    pub(crate) fn from_workload_original(
+        debt: &ExternalDebt,
+        request: &Request,
+        rights: &Delegations,
+        named_targets: Option<[u32; 2]>,
+        original: Lease,
+    ) -> io::Result<Self> {
+        let offered = rights
+            .cpu
+            .as_ref()
+            .ok_or_else(|| refused("missing offered workload CPU"))?;
+        let held = File::from(duplicate(original.as_fd())?).metadata()?;
+        let offered = File::from(duplicate(offered.as_fd())?).metadata()?;
+        if !matches!(request.cpu, CpuDelegation::SharedBorrow { .. })
+            || held.dev() != offered.dev()
+            || held.ino() != offered.ino()
+        {
+            return Err(refused("workload CPU differs from actual original guard"));
+        }
+        Self::try_new_inner(debt, 0, request, rights, named_targets, Some(original))?
+            .ok_or_else(|| refused("original workload guard unexpectedly unavailable"))
+    }
+    fn try_new_inner(
+        debt: &ExternalDebt,
+        global_limit: u32,
+        request: &Request,
+        rights: &Delegations,
+        named_targets: Option<[u32; 2]>,
+        original: Option<Lease>,
+    ) -> io::Result<Option<Self>> {
+        let workload_original = original.is_some();
         request.validate()?;
         if let Some(targets) = named_targets
             && (!matches!(request.gnu, GnuTransport::NamedFifo { descriptors: 2, .. })
@@ -131,7 +168,9 @@ impl Prepared {
         {
             return Err(refused("subgroup scheduling descriptor layout differs"));
         }
-        let lease = if matches!(request.cpu, CpuDelegation::SharedBorrow { .. }) {
+        let lease = if let Some(original) = original {
+            Some(original)
+        } else if matches!(request.cpu, CpuDelegation::SharedBorrow { .. }) {
             let source = File::from(duplicate(
                 rights
                     .cpu
@@ -161,18 +200,26 @@ impl Prepared {
             _gnu_files: Vec::new(),
             mapped: Some(Vec::new()),
             flags: None,
+            workload_original,
             phase: Phase::Fresh,
         };
         if let CpuDelegation::SharedBorrow { target_fd } = request.cpu {
             let lease = lease.ok_or_else(|| refused("missing checked CPU adoption"))?;
-            let handoff = ScopedHandoff::cpu_bundle(duplicate(lease.as_fd())?, Vec::new())?;
+            let handoff = if workload_original {
+                None
+            } else {
+                Some(ScopedHandoff::cpu_bundle(
+                    duplicate(lease.as_fd())?,
+                    Vec::new(),
+                )?)
+            };
             prepared
                 .mapped
                 .as_mut()
                 .unwrap()
                 .push((duplicate(lease.as_fd())?, target_fd as i32));
             prepared.previous = Some(lease.owner());
-            prepared.cpu = Some(handoff);
+            prepared.cpu = handoff;
             prepared.lease = Some(lease);
         }
         match &request.gnu {
@@ -243,12 +290,50 @@ impl Prepared {
     pub fn configure(&mut self, command: &mut spawnfd::Command) -> io::Result<()> {
         self.configure_with_extra(command, Vec::new())
     }
+    /// Descriptor TARGET observations for the held one-use mapping. No source
+    /// descriptor, lease constructor or new resource escapes this owner.
+    pub(crate) fn child_targets(&self) -> io::Result<Vec<u32>> {
+        self.mapped
+            .as_ref()
+            .ok_or_else(|| refused("original child mapping already consumed"))?
+            .iter()
+            .map(|(_, target)| {
+                u32::try_from(*target).map_err(|_| refused("invalid original child target"))
+            })
+            .collect()
+    }
     /// One owner-private preparation channel. Extras confer no scheduling
     /// authority and must be removed before the selected image's exec.
     pub(crate) fn configure_with_extra(
         &mut self,
         command: &mut spawnfd::Command,
         extra: Vec<(OwnedFd, i32)>,
+    ) -> io::Result<()> {
+        self.configure_original(command, extra, false)
+    }
+    /// Owner-private original parked compiler continuation. It receives only
+    /// CPU5 and cannot select compiler startup or acquire/delegate more units.
+    pub(crate) fn configure_linker(
+        &mut self,
+        command: &mut spawnfd::Command,
+        extra: Vec<(OwnedFd, i32)>,
+    ) -> io::Result<()> {
+        if !self.workload_original
+            || self.gnu.is_some()
+            || self.named.is_some()
+            || self.flags.is_some()
+        {
+            return Err(refused(
+                "linker does not retain an original CPU-only continuation",
+            ));
+        }
+        self.configure_original(command, extra, true)
+    }
+    fn configure_original(
+        &mut self,
+        command: &mut spawnfd::Command,
+        extra: Vec<(OwnedFd, i32)>,
+        linker: bool,
     ) -> io::Result<()> {
         if self.phase != Phase::Fresh {
             return Err(refused("scheduling setup already consumed"));
@@ -277,6 +362,8 @@ impl Prepared {
             jobserver_utils::CPU_HANDOFF_ENV,
             jobserver_utils::DESCENDANT_HANDOFF_ENV,
             build_cpu::IMPLICIT_FD_ENV,
+            trust_resource_controller::workload::host::CPU_SET_FDS_ENV,
+            trust_resource_controller::workload::host::HOST_STORE_FD_ENV,
             "TRUST_JOBSERVER_HANDOFF",
             "BUILD_SLOT_FENCE_FDS",
             "MAKEFLAGS",
@@ -293,6 +380,19 @@ impl Prepared {
                     .ok_or_else(|| refused("missing CPU child target"))?
                     .to_string(),
             );
+        }
+        if self.workload_original {
+            let target =
+                cpu_target.ok_or_else(|| refused("missing original workload member target"))?;
+            if (linker && target != 5) || (!linker && target < 6) {
+                return Err(refused("unsupported original workload member target"));
+            }
+            if !linker {
+                command.env(
+                    trust_resource_controller::workload::host::CPU_SET_FDS_ENV,
+                    target.to_string(),
+                );
+            }
         }
         if let Some(gnu) = &self.gnu {
             command.env(jobserver_utils::DESCENDANT_HANDOFF_ENV, gnu.advertisement());

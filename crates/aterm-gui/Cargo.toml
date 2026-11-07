@@ -77,6 +77,18 @@ path = "benches/overlay_card_cost.rs"
 harness = false
 required-features = ["bench-support"]
 
+# `image panel`'s frame (A4 §12.3, M-IMG): the deck from the A4 desk's recorded
+# Snapshot laid out, painted and rastered offscreen at Folded and Full, 1039 and
+# 1440 pt, 1x and 2x, both themes, then its PNG encode, each timed (wall, thread
+# and process CPU) with its heap high water: a measurement, not a gate; by hand it is
+# `targo --unverified build -p aterm-gui --profile opt-test --features bench-support --bench deck_image_cost`,
+# then the built binary with the recordings folder and an output folder.
+[[bench]]
+name = "deck_image_cost"
+path = "benches/deck_image_cost.rs"
+harness = false
+required-features = ["bench-support"]
+
 # The byte arm's C cut (card engine §3.6), timed over `verify perf
 # throughput`'s corpus without and with the cut; by hand it is
 # `targo --unverified bench -p aterm-gui --features bench-support --bench c_cut_cost`.

@@ -9658,16 +9658,16 @@ pub(crate) struct GlassShift {
 }
 
 impl GlassShift {
-    /// `None` off this row; `Some(None)` on a cell the rewrite vacated.
+    /// `None` outside this rewrite's span; `Some(None)` on a cell it vacated.
     fn grid_col(&self, row: usize, col: usize) -> Option<Option<usize>> {
         if row != self.term_row || col < self.col_off {
             return None;
         }
         let at = col - self.col_off;
-        Some(match &self.mode {
-            Some(mode) => mode.grid_col(at).map(|c| self.col_off + c),
-            None => (at >= self.blank_to).then_some(col),
-        })
+        match &self.mode {
+            Some(mode) => (at < mode.end).then(|| mode.grid_col(at).map(|c| self.col_off + c)),
+            None => (at < self.blank_to).then_some(None),
+        }
     }
 }
 
@@ -18882,5 +18882,66 @@ mod tests {
         assert_eq!(excerpts.excerpts.doing.as_deref(), Some("run_command"));
         drop(held);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn glass_columns_maps_and_swallows_side_by_side_panes_on_the_same_row() {
+        let rows = [
+            "\u{2500}".repeat(60),
+            "  \u{23F5}\u{23F5} bypass permissions on \u{B7} 14 shells".to_owned(),
+        ];
+        let mode = footer::mode_row_rewrite_under(&rows, 0).expect("mode row");
+        let mut glass = GlassColumns::default();
+        glass.push(GlassShift {
+            term_row: 23,
+            col_off: 0,
+            mode: Some(mode),
+            blank_to: 0,
+        });
+        glass.push(GlassShift {
+            term_row: 23,
+            col_off: 61,
+            mode: Some(mode),
+            blank_to: 0,
+        });
+        glass.push(GlassShift {
+            term_row: 22,
+            col_off: 0,
+            mode: None,
+            blank_to: 20,
+        });
+        glass.push(GlassShift {
+            term_row: 22,
+            col_off: 61,
+            mode: None,
+            blank_to: 20,
+        });
+
+        let kept_start = mode.kept()[0].start as u16;
+        // Left pane (`col_off = 0`) maps its kept item and swallows its vacated tail.
+        assert_eq!(glass.grid_col(23, 0), kept_start);
+        assert!(!glass.swallows(23, 0));
+        assert!(glass.swallows(23, mode.glass_end() as u16));
+        // Unrewritten columns between panes (`mode.end..61`) are untouched.
+        assert!(!glass.swallows(23, mode.end as u16));
+        assert_eq!(glass.grid_col(23, mode.end as u16), mode.end as u16);
+
+        // Right pane (`col_off = 61`) is not shadowed by the left pane's shift.
+        assert_eq!(glass.grid_col(23, 61), 61 + kept_start);
+        assert!(!glass.swallows(23, 61));
+        assert!(glass.swallows(23, 61 + mode.glass_end() as u16));
+        assert!(!glass.swallows(23, 61 + mode.end as u16));
+        assert_eq!(
+            glass.grid_col(23, 61 + mode.end as u16),
+            61 + mode.end as u16
+        );
+
+        // Blanked effort rows (`mode = None`) swallow `< blank_to` in both panes and leave the rest.
+        assert!(glass.swallows(22, 10));
+        assert!(!glass.swallows(22, 20));
+        assert_eq!(glass.grid_col(22, 20), 20);
+        assert!(glass.swallows(22, 61 + 10));
+        assert!(!glass.swallows(22, 61 + 20));
+        assert_eq!(glass.grid_col(22, 61 + 20), 61 + 20);
     }
 }

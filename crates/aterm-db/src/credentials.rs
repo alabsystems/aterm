@@ -33,7 +33,8 @@ use aterm_secrets::{
     client::{self, Paths, custodian::Copied},
     commons::bootstrap::Bootstrap,
     need::{
-        self, Absorb, Decision, Need, Policy, Purpose, Reason, Retirement, State, Want, custody,
+        self, Absorb, Decision, Need, Policy, Purpose, Reason, Retirement, State, Unanswered, Want,
+        custody,
     },
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -263,7 +264,7 @@ fn check_parts(kind: &str, key: &str, body: &Map) -> Result<Vec<u8>> {
         "sweep" => &["covers"],
         "still" => &["at"],
         "published" => &["vault", "seq", "recipient", "contributor", "att"],
-        "needs-person" => &["template", "att"],
+        "needs-person" => &["template", "unanswered", "others", "att"],
         "fulfilled" => &["seq"],
         "retired" => &["reason", "evidence", "note", "att"],
         _ => return Err(Error::new("unsupported credential record kind")),
@@ -334,6 +335,23 @@ fn check_parts(kind: &str, key: &str, body: &Map) -> Result<Vec<u8>> {
             if !matches!(text(body, "template", 32)?, "vault-lacks" | "holder-away") {
                 return Err(Error::new("unknown needs-person template"));
             }
+            if let Some(hosts) = body.get("unanswered") {
+                let hosts = hosts
+                    .as_array()
+                    .filter(|hosts| !hosts.is_empty() && hosts.len() <= need::MAX_UNANSWERED)
+                    .ok_or_else(|| Error::new("needs-person names 1 to 16 unanswered hosts"))?;
+                let mut seen = BTreeSet::new();
+                for host in hosts {
+                    let host = host
+                        .as_str()
+                        .filter(|host| aterm_secrets::text::valid_machine_name(host))
+                        .ok_or_else(|| Error::new("unanswered host is not a machine name"))?;
+                    if !seen.insert(host) {
+                        return Err(Error::new("needs-person names a host twice"));
+                    }
+                }
+            }
+            optional(body, "others", Value::as_u64)?;
             att()?.ok_or_else(|| Error::new("needs-person carries no attestation"))?;
         }
         "fulfilled" => {
@@ -488,6 +506,8 @@ pub struct Thread {
     pub published: Option<(String, u64)>,
     /// The custodian handed it to a person.
     pub needs_person: bool,
+    /// Who that decision names as not having answered, once the want window ended first.
+    pub unanswered: Unanswered,
     /// The requester applied it at this seq.
     pub fulfilled: Option<u64>,
     /// How it was retired, and whether a custodian attested it.
@@ -501,17 +521,84 @@ impl Thread {
         self.fulfilled.is_some() || self.retired.is_some()
     }
 
-    /// Every current member but the requester has swept it (the window's early end, §6.2).
-    #[must_use]
-    pub fn swept_by_all(&self, members: &BTreeSet<Actor>) -> bool {
-        members
+    /// The current members' Macs but the requester's own, each by its original actor, and
+    /// whether one of that Mac's actors swept it.
+    fn others(&self, members: &BTreeSet<Actor>, macs: &Macs) -> BTreeMap<Actor, bool> {
+        let own = macs.of(self.requester);
+        let mut others: BTreeMap<Actor, bool> = members
             .iter()
-            .filter(|member| **member != self.requester)
-            .all(|member| self.swept.contains(member))
+            .map(|member| (macs.of(*member), false))
+            .filter(|(mac, _)| *mac != own)
+            .collect();
+        for actor in &self.swept {
+            if let Some(swept) = others.get_mut(&macs.of(*actor)) {
+                *swept = true;
+            }
+        }
+        others
+    }
+
+    /// How many of the current members' Macs but the requester's swept it, and of how many.
+    #[must_use]
+    pub fn sweeps(&self, members: &BTreeSet<Actor>, macs: &Macs) -> (usize, usize) {
+        let others = self.others(members, macs);
+        (
+            others.values().filter(|swept| **swept).count(),
+            others.len(),
+        )
+    }
+
+    /// Every current member's Mac but the requester's has swept it (the window's early end,
+    /// §6.2).
+    #[must_use]
+    pub fn swept_by_all(&self, members: &BTreeSet<Actor>, macs: &Macs) -> bool {
+        self.others(members, macs).values().all(|swept| *swept)
     }
 
     fn window_ended(&self, now_ms: u64) -> bool {
         now_ms.saturating_sub(self.arrived_ms) >= need::WANT_WINDOW_SECS * MS
+    }
+
+    /// Past [`need::SILENCE_SECS`] since this replica took it in: a custodian that is not silent
+    /// has decided by then, whenever its own replica took it in.
+    fn silence_ended(&self, now_ms: u64) -> bool {
+        now_ms.saturating_sub(self.arrived_ms) >= need::SILENCE_SECS * MS
+    }
+
+    /// The current members' Macs but the requester's with no sweep and no offer on it, each by
+    /// its original actor.
+    fn unheard(&self, members: &BTreeSet<Actor>, macs: &Macs) -> Vec<Actor> {
+        let offered: BTreeSet<Actor> = self.offers.iter().map(|actor| macs.of(*actor)).collect();
+        self.others(members, macs)
+            .into_iter()
+            .filter(|(mac, swept)| !swept && !offered.contains(mac))
+            .map(|(mac, _)| mac)
+            .collect()
+    }
+}
+
+/// Which Mac each actor writes for, as the table shows it. A recovered Writer's successor and
+/// the original Writer whose signature on its delegated request authorizes the delivery (§21)
+/// are one Mac, named by the original actor: that actor stays a current Writer but writes
+/// nothing more, while the successor sweeps and offers for the Mac. Only a delegated request
+/// links the two, so a successor that has posted none reads as a Mac of its own.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Macs(BTreeMap<Actor, Actor>);
+
+impl Macs {
+    fn linked<'a>(threads: impl Iterator<Item = &'a Thread>) -> Self {
+        Self(
+            threads
+                .filter_map(|thread| thread.origin.map(|origin| (thread.requester, origin)))
+                .collect(),
+        )
+    }
+
+    /// The original actor of the Mac `actor` writes for: `actor` itself unless a delegated
+    /// request it signed names another.
+    #[must_use]
+    pub fn of(&self, actor: Actor) -> Actor {
+        self.0.get(&actor).copied().unwrap_or(actor)
     }
 }
 
@@ -522,6 +609,8 @@ pub struct Book {
     pub threads: BTreeMap<[u8; 16], Thread>,
     /// Inert records and why.
     pub inert: Vec<(Digest, String)>,
+    /// Which Mac each actor writes for, from the delegated requests that checked.
+    pub macs: Macs,
 }
 
 impl Book {
@@ -603,11 +692,13 @@ impl Book {
                     swept: BTreeSet::new(),
                     published: None,
                     needs_person: false,
+                    unanswered: Unanswered::default(),
                     fulfilled: None,
                     retired: None,
                 },
             );
         }
+        let macs = Macs::linked(threads.values());
         // What members say first, so a decision is checked against every sweep and Still.
         for entry in entries.iter() {
             let record = &entry.record;
@@ -689,7 +780,24 @@ impl Book {
                     let seq = record.body.get("seq").and_then(Value::as_u64);
                     thread.published = vault.zip(seq).map(|(vault, seq)| (vault.to_owned(), seq));
                 }
-                "needs-person" => thread.needs_person = true,
+                // The first attested decision names who had not answered; a later one changes
+                // nothing.
+                "needs-person" if thread.needs_person => {}
+                "needs-person" => {
+                    let body = &record.body;
+                    thread.needs_person = true;
+                    thread.unanswered = Unanswered {
+                        hosts: body
+                            .get("unanswered")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect(),
+                        others: body.get("others").and_then(Value::as_u64).unwrap_or(0),
+                    };
+                }
                 "retired" => {
                     let body = &record.body;
                     let Some(reason) = body
@@ -721,7 +829,7 @@ impl Book {
                                 != Some(context.policy.generation))
                         .then_some("the cited policy gives this want to the requester"),
                         Reason::NotHeld => (!attested
-                            || !(thread.swept_by_all(&context.members)
+                            || !(thread.swept_by_all(&context.members, &macs)
                                 || thread.window_ended(context.now_ms)))
                         .then_some("not-held needs a custodian and every member's sweep or the window's end"),
                         Reason::Lapsed => (!attested
@@ -784,6 +892,7 @@ impl Book {
             book.inert.push((operation, why.to_owned()));
         }
         book.threads = threads;
+        book.macs = macs;
         book
     }
 
@@ -996,17 +1105,37 @@ pub struct Pass {
     pub inert: Vec<(Digest, String)>,
 }
 
-fn decision_for(thread: &Thread, need: &Need) -> Option<Decision> {
+fn decision_for(
+    thread: &Thread,
+    need: &Need,
+    members: &BTreeSet<Actor>,
+    macs: &Macs,
+) -> Option<Decision> {
     if let Some((retirement, _)) = &thread.retired {
         return Some(Decision::Retired(retirement.clone()));
     }
     if let Some((_, seq)) = &thread.published {
         return Some(Decision::Published { seq: *seq });
     }
-    if thread.needs_person && need.state != State::AwaitingPerson {
-        return Some(Decision::NeedsPerson);
+    let asked = need.state == State::AwaitingPerson;
+    if thread.needs_person && !asked {
+        return Some(Decision::NeedsPerson(thread.unanswered.clone()));
     }
-    (!thread.offers.is_empty() && need.state == State::Open).then_some(Decision::Offered)
+    // An ask that rests on less than the table now shows is restated (`need::decided` takes it
+    // once): the custodian's own decision where this Mac stood in for it, and every member's
+    // sweep where the window's end named some that had not answered and each has since.
+    let rests = |on: fn(&need::Proof) -> bool| need.proof.as_ref().is_some_and(on);
+    if asked && thread.offers.is_empty() {
+        if thread.needs_person && rests(|proof| proof.custodian_silent) {
+            return Some(Decision::NeedsPerson(thread.unanswered.clone()));
+        }
+        if rests(|proof| proof.window_ended) && thread.swept_by_all(members, macs) {
+            return Some(Decision::NeedsPerson(Unanswered::default()));
+        }
+    }
+    let late = asked && !need.late_offer;
+    (!thread.offers.is_empty() && (need.state == State::Open || late))
+        .then(|| Decision::Offered(thread.unanswered.clone()))
 }
 
 /// The holder's probe (§7.3): the one compiled path the want resolves to under this Mac's
@@ -1019,7 +1148,8 @@ fn holds(paths: &Paths, want: &Want) -> bool {
 }
 
 /// One member's pass over `credentials/requests/1` (§9.1, §9.2): post this Mac's needs, take
-/// in what the lab decided about them, and sweep everyone else's.
+/// in what the lab decided about them (or that [`need::SILENCE_SECS`] passed with no custodian
+/// record on one), and sweep everyone else's.
 ///
 /// # Errors
 /// The ledger or the vault state cannot be read, or this Mac has no Commons to open.
@@ -1161,9 +1291,22 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
                     State::Open | State::Offered | State::Published | State::AwaitingPerson,
                     Some(thread),
                 ) => {
-                    if let Some(decision) = decision_for(thread, need) {
+                    if let Some(decision) = decision_for(thread, need, &context.members, &book.macs)
+                    {
                         moves.push((need.id, Absorb::Decided(decision)));
-                    } else if writer
+                    } else if matches!(need.state, State::Open | State::Offered)
+                        && thread.silence_ended(now_ms)
+                    {
+                        // No custodian record, and no offer it could take, past the want window
+                        // and a day: the vault admin's aterm is silent on it (§6.1). Each pass
+                        // reads it again, so what this Mac sees now moves it on.
+                        moves.push((need.id, Absorb::CustodianSilent));
+                    }
+                    // A request a custodian may still lapse hears from its requester weekly,
+                    // whatever this pass took in, so no decision that repeats keeps it quiet.
+                    if writer
+                        && !thread.ended()
+                        && thread.published.is_none()
                         && now_ms.saturating_sub(thread.heard_ms) >= need::STILL_SECS * MS
                     {
                         let mut body = Map::new();
@@ -1440,6 +1583,7 @@ enum Plan {
         offer_window_ended: bool,
         decided: bool,
         asked: bool,
+        unanswered: Unanswered,
     },
     Retire([u8; 16], Reason, String),
 }
@@ -1507,15 +1651,38 @@ pub fn custodian_pass_at(paths: &Paths, now_ms: u64) -> Result<Option<Custodian>
                 continue;
             };
             let offer_window_ended = thread.window_ended(now_ms);
-            let decided = thread.swept_by_all(&context.members) || offer_window_ended;
+            let swept = thread.swept_by_all(&context.members, &book.macs);
+            // A decision the window's end makes names each Mac that had not answered by then,
+            // by the vault host its original actor's binding names, so the requester's words
+            // rest on it.
+            let mut unanswered = Unanswered::default();
+            if !swept && offer_window_ended {
+                let mut hosts = BTreeSet::new();
+                for mac in thread.unheard(&context.members, &book.macs) {
+                    match session
+                        .peer(mac)
+                        .ok()
+                        .and_then(|binding| admin.host_of_recipient(&binding.recipient()))
+                    {
+                        Some(host)
+                            if hosts.contains(&host) || hosts.len() < need::MAX_UNANSWERED =>
+                        {
+                            hosts.insert(host);
+                        }
+                        _ => unanswered.others += 1,
+                    }
+                }
+                unanswered.hosts = hosts.into_iter().collect();
+            }
             plans.push(Plan::Copy {
                 id: thread.id,
                 recipient: binding.recipient(),
                 want: thread.want.clone(),
                 offered: !thread.offers.is_empty(),
                 offer_window_ended,
-                decided,
+                decided: swept || offer_window_ended,
                 asked: thread.needs_person,
+                unanswered,
             });
         }
         Ok((plans, scope.trust().network))
@@ -1537,6 +1704,7 @@ pub fn custodian_pass_at(paths: &Paths, now_ms: u64) -> Result<Option<Custodian>
                 offer_window_ended,
                 decided,
                 asked,
+                unanswered,
             } => {
                 // The first entry answers the want; the others (a mailbox's TOTP) go with it
                 // where the vault holds them, and never without it. A copy the draft refuses
@@ -1594,6 +1762,13 @@ pub fn custodian_pass_at(paths: &Paths, now_ms: u64) -> Result<Option<Custodian>
                     Copied::NotHeld if want.person_sourced() => {
                         let mut body = Map::new();
                         body.insert("template".into(), Value::from(if offered { "holder-away" } else { "vault-lacks" }));
+                        if !unanswered.hosts.is_empty() {
+                            let hosts = unanswered.hosts.into_iter().map(Value::from).collect();
+                            body.insert("unanswered".into(), Value::Array(hosts));
+                        }
+                        if unanswered.others > 0 {
+                            body.insert("others".into(), Value::from(unanswered.others));
+                        }
                         records.push(Record::new("needs-person", &id, body));
                         report.asked.push(id);
                     }

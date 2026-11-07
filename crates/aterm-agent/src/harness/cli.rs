@@ -9604,7 +9604,7 @@ pub fn survey_accounts(
     // The stats series is Claude Code's alone (its footer writes the `plan` rows), and its files
     // are named by label, which another CLI's roster may share.
     let series = if cli == Cli::Claude {
-        super::outlook::series_of(harness, &roster, &state.machine)
+        super::outlook::series_of(harness, &roster, &state.machine, now)
     } else {
         BTreeMap::new()
     };

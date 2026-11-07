@@ -496,7 +496,7 @@ impl Candidate {
 #[path = "codex_renewal_attempts.rs"]
 mod attempts;
 pub use attempts::{
-    Attempt, AttemptRef, Cancellation, CancellationKind, CompletionProgress,
+    Attempt, AttemptRef, Cancellation, CancellationKind, CompletionProgress, IndexKey,
     NativeCancellationProof, ReceiptWriter, RootDriver, advance_root, read_active_attempt,
     read_attempt, read_cancellation, with_receipt_writer,
 };
@@ -761,38 +761,6 @@ pub fn read_receipt(env: &Env, id: &str) -> Option<Receipt> {
         && hex(&receipt.intent.identity.user, 64)
         && receipt.target_identity().is_some())
     .then_some(receipt)
-}
-
-/// Tiny regular index only; unknown/corrupt custody must never mint a second
-/// operation for an existing intent. O_NOFOLLOW closes the symlink read race.
-pub fn read_index(path: &Path) -> Result<Option<String>, &'static str> {
-    use std::io::Read;
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
-    }
-    let mut file = match options.open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err("index-read"),
-    };
-    let metadata = file.metadata().map_err(|_| "index-read")?;
-    if !metadata.is_file() || metadata.len() != 32 {
-        return Err("index-shape");
-    }
-    let mut bytes = Vec::with_capacity(33);
-    file.by_ref()
-        .take(33)
-        .read_to_end(&mut bytes)
-        .map_err(|_| "index-read")?;
-    let id = String::from_utf8(bytes).map_err(|_| "index-shape")?;
-    if !aterm_codec::hex::is_lower(&id, 32) {
-        return Err("index-shape");
-    }
-    Ok(Some(id))
 }
 
 /// Caller holds the Codex store writer guard, also serializing concurrent
@@ -1716,28 +1684,6 @@ mod tests {
         let prose = event(aterm_json::json!({"type":"error", "message":"usage_limit_exceeded"}));
         let untyped = history_lines(format!("{start}{prose}{done}").as_bytes(), &quota).unwrap();
         assert!(!quota.matches_history(&untyped));
-    }
-
-    #[test]
-    fn intent_index_refuses_oversized_malformed_and_symlink_files() {
-        let tmp = aterm_tempfile::tempdir().unwrap();
-        let path = tmp.path().join("index");
-        assert_eq!(read_index(&path), Ok(None));
-        std::fs::write(&path, "ab".repeat(16)).unwrap();
-        assert_eq!(read_index(&path), Ok(Some("ab".repeat(16))));
-        for bad in ["AB".repeat(16), "ab".repeat(17), "z".repeat(32)] {
-            std::fs::write(&path, bad).unwrap();
-            assert!(read_index(&path).is_err());
-        }
-        let directory = tmp.path().join("directory");
-        std::fs::create_dir(&directory).unwrap();
-        assert!(read_index(&directory).is_err());
-        #[cfg(unix)]
-        {
-            let link = tmp.path().join("link");
-            std::os::unix::fs::symlink(&path, &link).unwrap();
-            assert!(read_index(&link).is_err());
-        }
     }
 
     fn auth(home: &Path, workspace: &str, user: Option<&str>, explicit: Option<&str>) {

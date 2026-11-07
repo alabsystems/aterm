@@ -9,6 +9,7 @@ use aterm_types::resource_admission::Submission;
 use aterm_uds::CtlStream;
 use std::{
     io,
+    os::fd::{AsFd as _, OwnedFd},
     sync::{
         Mutex,
         atomic::{AtomicBool, Ordering},
@@ -16,12 +17,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-const DEADLINE: Duration = Duration::from_secs(2);
+const DEADLINE: Duration = Duration::from_secs(60);
 const CAPABILITIES: u8 = 1;
 const AUTHORIZE: u8 = 2;
 const INSPECT: u8 = 3;
 const SUBMIT: u8 = 4;
 const SUBMIT_ACCOUNTED: u8 = 5;
+const EXPECT_STORE: u8 = 6;
+const SUBMIT_ACCOUNTED_EXPECT_STORE: u8 = 7;
 
 fn refused() -> io::Error {
     io::Error::new(
@@ -59,13 +62,20 @@ impl Forwarder {
         })
     }
     fn with<T>(&self, f: impl FnOnce(&CtlStream, Instant) -> io::Result<T>) -> io::Result<T> {
+        self.with_at(Instant::now(), f)
+    }
+    fn with_at<T>(
+        &self,
+        started: Instant,
+        f: impl FnOnce(&CtlStream, Instant) -> io::Result<T>,
+    ) -> io::Result<T> {
         // UI control threads never queue behind an unbounded mutex wait.
         let stream = self.stream.try_lock().map_err(|_| refused())?;
         if self.broken.load(Ordering::Acquire) {
             return Err(refused());
         }
         let result = if current(self.custodian) {
-            f(&stream, Instant::now() + DEADLINE).and_then(|value| {
+            f(&stream, started + DEADLINE).and_then(|value| {
                 if current(self.custodian) {
                     Ok(value)
                 } else {
@@ -117,6 +127,43 @@ impl Forwarder {
     pub(crate) fn submit_accounted(&self, submission: AuthorizedSubmission) -> io::Result<()> {
         self.submit_mode(submission, true)
     }
+    pub(crate) fn matches_original_store(&self, store: &OwnedFd) -> io::Result<bool> {
+        self.with(|stream, deadline| {
+            wire::write_frame(stream, &[EXPECT_STORE], deadline)?;
+            wire::store_expectation::send(stream, store.as_fd(), deadline)?;
+            match wire::read_frame(stream, deadline)?.as_slice() {
+                [0] => Ok(false),
+                [1] => Ok(true),
+                _ => Err(refused()),
+            }
+        })
+    }
+    pub(crate) fn submit_accounted_expected(
+        &self,
+        submission: AuthorizedSubmission,
+        store: OwnedFd,
+    ) -> io::Result<()> {
+        self.with(|stream, deadline| {
+            if !wire::store_expectation::eligible(&submission.request)
+                || submission.request.peer_pid != submission.peer.pid
+                || submission.request.peer_birth != submission.peer.birth
+            {
+                return Err(refused());
+            }
+            let mut frame = vec![SUBMIT_ACCOUNTED_EXPECT_STORE];
+            frame.extend(submission.request.encode()?);
+            wire::write_frame(stream, &frame, deadline)?;
+            wire::store_expectation::send(stream, store.as_fd(), deadline)?;
+            if wire::read_frame(stream, deadline)?.as_slice() != [1] {
+                return Err(refused());
+            }
+            wire::send_attachments(stream, &submission.fds, deadline)?;
+            if wire::read_frame(stream, deadline)?.as_slice() != [1] {
+                return Err(refused());
+            }
+            Ok(())
+        })
+    }
     fn submit_mode(&self, submission: AuthorizedSubmission, accounted: bool) -> io::Result<()> {
         self.with(|stream, deadline| {
             if submission.request.peer_pid != submission.peer.pid
@@ -137,6 +184,7 @@ impl Forwarder {
         })
     }
 }
+
 fn json_reply(stream: &CtlStream, deadline: Instant) -> io::Result<aterm_json::Value> {
     let frame = wire::read_frame(stream, deadline)?;
     if frame.len() > 8192 {
@@ -144,6 +192,10 @@ fn json_reply(stream: &CtlStream, deadline: Instant) -> io::Result<aterm_json::V
     }
     aterm_json::from_slice(&frame).map_err(|_| refused())
 }
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+#[path = "forward_store_tests.rs"]
+mod store_tests;
 fn json_write(stream: &CtlStream, value: &aterm_json::Value, deadline: Instant) -> io::Result<()> {
     let frame = aterm_json::to_vec(value).map_err(|_| refused())?;
     if frame.len() > 8192 {
@@ -182,10 +234,17 @@ pub(crate) fn serve(
         let frame = wire::read_frame(stream, deadline)?;
         let (op, body) = frame.split_first().ok_or_else(refused)?;
         match *op {
+            EXPECT_STORE if body.is_empty() => {
+                let expected = wire::store_expectation::receive(stream, deadline)?;
+                authenticate(original)?;
+                let matches =
+                    crate::runtime::matches_original_store(expected.as_fd()).unwrap_or(false);
+                wire::write_frame(stream, &[u8::from(matches)], deadline)?;
+            }
             CAPABILITIES if body.is_empty() => {
                 json_write(stream, &crate::actor::capabilities(), deadline)?
             }
-            AUTHORIZE | SUBMIT | SUBMIT_ACCOUNTED => {
+            AUTHORIZE | SUBMIT | SUBMIT_ACCOUNTED | SUBMIT_ACCOUNTED_EXPECT_STORE => {
                 let request = Submission::decode(body)?;
                 let peer = Peer {
                     pid: request.peer_pid,
@@ -198,13 +257,31 @@ pub(crate) fn serve(
                     let accepted = crate::actor::authorize(&request, peer);
                     wire::write_frame(stream, &[u8::from(accepted)], deadline)?;
                 } else {
+                    let expectation = if *op == SUBMIT_ACCOUNTED_EXPECT_STORE {
+                        let expected = wire::store_expectation::receive(stream, deadline)?;
+                        let matches = wire::store_expectation::eligible(&request)
+                            && crate::runtime::matches_original_store(expected.as_fd())
+                                .unwrap_or(false);
+                        wire::write_frame(stream, &[u8::from(matches)], deadline)?;
+                        if !matches {
+                            continue;
+                        }
+                        Some(expected)
+                    } else {
+                        None
+                    };
                     let fds = wire::receive_attachments(stream, peer, deadline)?;
                     authenticate(original)?;
                     if wire::local_peer(stream)? != original {
                         return Err(refused());
                     }
                     let submission = AuthorizedSubmission { request, peer, fds };
-                    if *op == SUBMIT_ACCOUNTED {
+                    if let Some(expected) = expectation {
+                        if !crate::runtime::matches_original_store(expected.as_fd())? {
+                            return Err(refused());
+                        }
+                        crate::actor::submit_accounted(submission)?;
+                    } else if *op == SUBMIT_ACCOUNTED {
                         crate::actor::submit_accounted(submission)?;
                     } else {
                         crate::actor::submit(submission)?;
@@ -221,5 +298,42 @@ pub(crate) fn serve(
             }
             _ => return Err(refused()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn a_valid_private_reply_survives_scheduling_delay() {
+        let (client, server) = aterm_uds::kept_out(CtlStream::pair).unwrap();
+        client.set_nonblocking(true).unwrap();
+        server.set_nonblocking(true).unwrap();
+        let custodian = wire::local_peer(&client).unwrap();
+        let forwarder = Forwarder::new(client, custodian).unwrap();
+        let worker = std::thread::spawn(move || {
+            let until = Instant::now() + Duration::from_secs(60);
+            assert_eq!(wire::read_frame(&server, until).unwrap(), [CAPABILITIES]);
+            let _ = json_write(&server, &aterm_json::json!({"ready":true}), until);
+        });
+        let result = forwarder.with_at(
+            Instant::now() - Duration::from_secs(3),
+            |stream, deadline| {
+                wire::write_frame(stream, &[CAPABILITIES], deadline)?;
+                json_reply(stream, deadline)
+            },
+        );
+        worker.join().unwrap();
+        assert_eq!(result.unwrap(), aterm_json::json!({"ready":true}));
+        assert!(!forwarder.is_broken());
+        assert!(
+            forwarder
+                .with_at(
+                    Instant::now() - Duration::from_secs(61),
+                    |stream, deadline| { wire::write_frame(stream, &[CAPABILITIES], deadline) }
+                )
+                .is_err()
+        );
+        assert!(forwarder.is_broken());
     }
 }

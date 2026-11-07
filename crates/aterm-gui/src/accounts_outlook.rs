@@ -285,7 +285,7 @@ impl OutlookMemo {
             && let Ok((state, enrolled)) = &held.read
         {
             self.replayed = Some((now, policy));
-            let series = refresh_series(&mut self.series, &dir, roster, &state.machine);
+            let series = refresh_series(&mut self.series, &dir, roster, &state.machine, now);
             #[cfg(test)]
             {
                 self.replays += 1;
@@ -314,7 +314,8 @@ impl OutlookMemo {
     /// The tier the footer's gated profile read named for `label` (its title, `Max 20x`), as a
     /// `plan` row of that label's series (§4.2), asked once per tier this process learns: a
     /// title it already noted asks nothing, and so does a store not read yet. A row the series'
-    /// lock kept out or that failed is not asked again until the process starts again.
+    /// lock kept out waits in the series' outbox for its next append; one whose write failed is
+    /// not asked again until the process starts again.
     pub(crate) fn note_plan(&mut self, label: &str, title: &str, now: i64) {
         let Some(said) = outlook::plan_of_title(title) else {
             return;
@@ -380,13 +381,15 @@ fn read_held(
     }
 }
 
-/// Each roster label's series rows: a `stat` per file, and only the bytes appended since the
-/// last read (the whole file again after a trim's rename, [`account_series::Tail`]).
+/// Each roster label's series rows as the outlook reads them at `now`: a `stat` per file, and
+/// only the bytes appended since the last read (the whole file again after a compaction's
+/// rename, [`account_series::Tail`]).
 fn refresh_series(
     cache: &mut BTreeMap<String, account_series::Tail>,
     dir: &Path,
     roster: &accounts::Roster,
     machine: &str,
+    now: i64,
 ) -> BTreeMap<String, Vec<SeriesRow>> {
     cache.retain(|label, _| roster.row(label).is_some());
     let mut out = BTreeMap::new();
@@ -405,7 +408,7 @@ fn refresh_series(
             .or_insert_with(|| account_series::Tail::new(path.clone()));
         #[cfg(test)]
         crate::work_counts::outlook_file_look();
-        tail.refresh();
+        tail.refresh(now);
         if !tail.rows().is_empty() {
             out.insert(row.label.clone(), tail.rows().to_vec());
         }

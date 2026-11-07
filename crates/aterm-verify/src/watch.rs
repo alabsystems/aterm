@@ -20,6 +20,60 @@ Samples origin/main in a dedicated persistent clone at Background rank. Claims a
 are appended to refs/aterm/judged (14 days of records). A release ends the sample; an Ordinary\n\
 waiter yields it at the next stage. --once attempts one sample. No hook, gate or publication.\n";
 
+/// Re-run a Background verifier as its own cancellable process group when its launcher did not
+/// give it one. A candidate can be newer than a long-lived watch controller: the invariant
+/// belongs to the candidate that asks for Background claims, not to the route that launched it.
+///
+/// `Some` is the re-run's exit code, or [`crate::exit::COULD_NOT_RUN`] when it could not start or
+/// did not report one. The caller exits with it. `None` means this invocation already owns its
+/// group, or is not a Background run.
+#[must_use]
+pub fn background_entry(args: &[std::ffi::OsString]) -> Option<i32> {
+    background_entry_with(args, background_requested(args), true)
+}
+
+fn background_requested(args: &[std::ffi::OsString]) -> bool {
+    args.iter().any(|arg| {
+        let arg = arg.to_string_lossy();
+        arg.split_once('=').map_or(arg.as_ref(), |(flag, _)| flag) == "--background"
+    })
+}
+
+fn background_entry_with(
+    args: &[std::ffi::OsString],
+    requested: bool,
+    tether: bool,
+) -> Option<i32> {
+    // SAFETY: getpgrp has no pointer arguments and only reads this process's group.
+    if !requested || unsafe { libc::getpgrp() } == std::process::id() as i32 {
+        return None;
+    }
+    let run = || -> std::io::Result<std::process::ExitStatus> {
+        let mut command = aterm_uds::spawnfd::command(std::env::current_exe()?);
+        command.args(args).setsid(true);
+        if tether {
+            command.tether();
+        }
+        command.spawn()?.wait()
+    };
+    Some(match run() {
+        Ok(status) => background_status(status),
+        Err(why) => {
+            eprintln!("verify: --background could not enter its dedicated process group: {why}");
+            crate::exit::COULD_NOT_RUN
+        }
+    })
+}
+
+fn background_status(status: std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt as _;
+    match (status.code(), status.signal()) {
+        (Some(code), _) => code,
+        (None, Some(signal)) if signal == libc::SIGINT || signal == libc::SIGTERM => 75,
+        (None, _) => crate::exit::COULD_NOT_RUN,
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Options {
     workspace: PathBuf,
@@ -1146,6 +1200,84 @@ fn dependency_closure(roots: &BTreeSet<String>, graph: &DependencyGraph) -> BTre
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_rehomed_candidates_signal_remains_a_cancellation() {
+        use std::os::unix::process::ExitStatusExt as _;
+        assert_eq!(
+            background_status(std::process::ExitStatus::from_raw(libc::SIGINT)),
+            75
+        );
+        assert_eq!(
+            background_status(std::process::ExitStatus::from_raw(libc::SIGTERM)),
+            75
+        );
+        assert_eq!(
+            background_status(std::process::ExitStatus::from_raw(7 << 8)),
+            7
+        );
+        assert_eq!(
+            background_status(std::process::ExitStatus::from_raw(libc::SIGKILL)),
+            crate::exit::COULD_NOT_RUN
+        );
+    }
+    #[test]
+    fn a_wrapped_background_candidate_rehomes_before_it_claims() {
+        const CHILD: &str = "ATERM_VERIFY_BACKGROUND_ENTRY_TEST_CHILD";
+        const SCRATCH: &str = "ATERM_VERIFY_BACKGROUND_ENTRY_TEST_SCRATCH";
+        const TEST: &str = "watch::tests::a_wrapped_background_candidate_rehomes_before_it_claims";
+        if std::env::var_os(CHILD).is_none() {
+            let scratch = aterm_tempfile::tempdir().expect("scratch");
+            let mut command = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, "1")
+                .env(SCRATCH, scratch.path());
+            let output = aterm_uds::deadline::output_until(
+                &mut command,
+                Instant::now() + Duration::from_secs(60),
+            )
+            .expect("the wrapped candidate must finish before the hang detector");
+            let text = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(output.status.success(), "{text}");
+            assert!(
+                text.contains("background candidate owns its group"),
+                "{text}"
+            );
+            return;
+        }
+
+        let args = ["--exact", TEST, "--nocapture"].map(std::ffi::OsString::from);
+        let inline_background = [std::ffi::OsString::from("--background=1")];
+        // The production path is tethered. A libtest binary has no tether entry verb, so this
+        // subprocess exercises the same setsid birth without routing it through that verb;
+        // tether's identical setsid composition is covered by `a_sample_has_a_real_session...`.
+        if let Some(code) =
+            background_entry_with(&args, background_requested(&inline_background), false)
+        {
+            std::process::exit(code);
+        }
+        // SAFETY: getpgrp has no pointer arguments and only reads this process's group.
+        assert_eq!(unsafe { libc::getpgrp() }, std::process::id() as i32);
+        let ledger = aterm_capacity::Ledger::at(
+            PathBuf::from(std::env::var_os(SCRATCH).expect("scratch path")).join("ledger"),
+        );
+        let machine = aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(8, 6, 2));
+        let claim = aterm_capacity::admit_with(
+            &ledger,
+            &machine,
+            aterm_capacity::Need::new("background entry control").cores(1),
+            aterm_capacity::Admit::Preemptible,
+            aterm_capacity::Pace::default(),
+            &mut |_| {},
+        )
+        .expect("a self-led candidate can own a Background claim");
+        assert_eq!(claim.record().need.rank, aterm_capacity::Rank::Background);
+        println!("background candidate owns its group");
+    }
     #[test]
     fn a_sample_has_a_real_session_as_well_as_its_own_group() {
         let topology = |mut command: aterm_uds::spawnfd::Command| {

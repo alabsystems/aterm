@@ -15,7 +15,7 @@ use aterm_uds::lan::wire::{Advert, Event, Instance, Request, Target};
 use aterm_uds::lan::{ConnectOptions, LanError, Seam, UdpOptions, Unavailable, broker, seam_here};
 
 use crate::bonjour::{Bonjour, Live};
-use crate::server::{Admission, Failure, Server, prepare};
+use crate::server::{Admission, Failure, MAX_LIVE, Server, not_admitted, prepare};
 
 /// A hang detector, never a latency budget.
 const MUST_HAPPEN: Duration = Duration::from_secs(60);
@@ -308,6 +308,64 @@ fn an_oversized_frame_ends_the_connection_unread() {
         Some(aterm_uds::lan::wire::Frame::Hello { .. })
     ));
     assert_eq!(reader.frame(&raw, deadline).unwrap(), None);
+}
+
+/// A peer the broker did not admit is told whether its code was judged: a refusal stands for that
+/// code, and a check that could not run or did not finish judged nothing.
+#[test]
+fn a_peer_not_admitted_is_told_whether_its_code_was_judged() {
+    use aterm_keeper::identity::CheckError;
+    use aterm_uds::lan::wire::Frame;
+    assert_eq!(
+        not_admitted(CheckError::Refused("not the team's code".into())),
+        Frame::Refused {
+            words: "not the team's code".into()
+        }
+    );
+    for (unjudged, words) in [
+        (
+            CheckError::Unchecked("no audit token".into()),
+            "no audit token",
+        ),
+        (
+            CheckError::Unanswered("trustd did not answer".into()),
+            "trustd did not answer",
+        ),
+    ] {
+        assert_eq!(
+            not_admitted(unjudged),
+            Frame::Unchecked {
+                words: words.into()
+            }
+        );
+    }
+}
+
+/// A broker serving its most connections judges no other: the next is told it was not checked,
+/// which its client reads apart from a refusal of its code.
+#[test]
+fn a_broker_serving_its_most_connections_tells_the_next_it_was_not_checked() {
+    // Each held browse is two sockets here and the fake's pair.
+    let room = aterm_uds::host::raise_open_files(4096);
+    if room < 1024 {
+        aterm_uds::host::could_not_run(format!(
+            "{MAX_LIVE} held connections need about 1024 descriptors; this process has {room}"
+        ));
+    }
+    let (seam, _root, starts) = serve(Seam::default());
+    let held: Vec<_> = (0..MAX_LIVE)
+        .map(|_| seam_here(seam.clone(), || broker::browse("_alab._tcp", "")).unwrap())
+        .collect();
+    // Each browse's operation, kept so that none ends.
+    let started: Vec<_> = (0..MAX_LIVE)
+        .map(|_| starts.recv_timeout(MUST_HAPPEN).unwrap())
+        .collect();
+    let next = seam_here(seam, broker::hello).unwrap_err();
+    assert!(
+        matches!(&next, LanError::Unavailable(Unavailable::Unchecked(why)) if why.contains("serving 128 connections")),
+        "{next:?}"
+    );
+    drop((held, started));
 }
 
 #[test]

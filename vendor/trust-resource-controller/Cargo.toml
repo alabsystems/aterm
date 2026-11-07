@@ -12,14 +12,15 @@ description = "Private native resource member proxy protocol"
 default = ["channel"]
 # DTO/codec consumers disable defaults and retain a std-only leaf.
 channel = ["dep:libc"]
-client = ["channel", "dep:trust-resource-provenance", "dep:jobserver_utils"]
+client = ["channel", "dep:trust-resource-provenance", "dep:jobserver_utils", "dep:sha2"]
 
 [dependencies]
 libc = { path = "../../crates/aterm-libc", optional = true }
 trust-resource-provenance = { path = "../trust-resource-provenance", optional = true }
 jobserver_utils = { path = "../trust-jobserver-utils", default-features = false, optional = true }
+sha2 = { package = "trust-sha2", path = "../trust-sha2", default-features = false, optional = true }
 
 [package.metadata.aterm-vendor]
 upstream = "https://github.com/alabsystems/trust"
-commit = "782983f10ebf8d8c352219dc01ce301ff4d7aab6"
+commit = "8e3adfc1df7bb0fa79b129a9f20df4fadad52143"
 subdir = "crates/trust-resource-controller"

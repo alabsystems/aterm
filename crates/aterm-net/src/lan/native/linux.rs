@@ -6,7 +6,7 @@
 //! this destination, source, uid, protocol and port tuple.
 
 #[cfg(target_os = "linux")]
-use super::{MAX_MESSAGES, MAX_REPLY, Socket, sequence};
+use super::{MAX_REPLY, Socket, sequence};
 use super::{Route, align4, refuse, u16_at, u32_at};
 use std::{
     io,
@@ -204,7 +204,7 @@ pub(super) fn lookup(
         return Err(io::Error::last_os_error());
     }
     let mut buffer = vec![0; MAX_REPLY];
-    for _ in 0..MAX_MESSAGES {
+    super::receive_route(until, || {
         socket.readable(until)?;
         // SAFETY: zero initializes a writable sender address and its padding.
         let mut sender: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
@@ -226,7 +226,7 @@ pub(super) fn lookup(
                 error.kind(),
                 io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
             ) {
-                continue;
+                return Ok(None);
             }
             return Err(error);
         }
@@ -238,11 +238,8 @@ pub(super) fn lookup(
         {
             return Err(refuse("route reply is truncated or not from the kernel"));
         }
-        if let Some(route) = parse(&buffer[..received as usize], sequence, peer)? {
-            return Ok(route);
-        }
-    }
-    Err(refuse("route query reply bound exceeded"))
+        parse(&buffer[..received as usize], sequence, peer)
+    })
 }
 
 #[cfg(target_os = "linux")]

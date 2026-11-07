@@ -13,6 +13,9 @@ use crate::gates::{
 };
 use crate::ledger::{Error, GitRunner, Result, git_ok, rev_parse};
 
+#[path = "fixture_reader_inputs.rs"]
+mod reader_inputs;
+
 /// In-tree handoff fixture generator test module path.
 pub const GENERATOR_SOURCE: &str = "crates/aterm-gui/src/seamless_fixture_generator_tests.rs";
 
@@ -667,6 +670,8 @@ pub struct MainReader {
     scratch: PathBuf,
     _lease: aterm_update_core::FileLock,
     last_binary: Option<PathBuf>,
+    last_reading: Option<(String, Pins, PathBuf, reader_inputs::Inputs, Reading)>,
+    failures: Vec<String>,
 }
 
 impl MainReader {
@@ -694,11 +699,14 @@ impl MainReader {
             scratch,
             _lease: lease,
             last_binary,
+            last_reading: None,
+            failures: Vec::new(),
         })
     }
 
-    /// Compile main, record only the new release's answers, and exercise its desk readers.
-    /// Failures are reported without retrying or preventing producer fixture landing.
+    /// Record main's answers and exercise its desk readers. During this landing,
+    /// reuse a reading only across changes confined to Cargo-unrelated packages.
+    /// Failures remain named even when changed reader inputs require a new judgment.
     #[must_use]
     pub fn read(
         &mut self,
@@ -708,8 +716,44 @@ impl MainReader {
         run: &mut dyn FnMut(&mut Command) -> std::io::Result<Output>,
     ) -> Reading {
         let started = std::time::Instant::now();
+        let git = crate::ledger::GitCli::new(&self.repo);
+        if let Some((previous, identity, compiler, inputs, reading)) = &self.last_reading
+            && identity == pins
+            && compiler == targo
+            && self
+                .last_binary
+                .as_ref()
+                .is_none_or(|binary| check_execution_hold(&self.scratch, binary).is_ok())
+            && git_ok(
+                &git,
+                &[
+                    "diff",
+                    "--no-renames",
+                    "--name-only",
+                    "-z",
+                    previous,
+                    preview,
+                ],
+            )
+            .is_ok_and(|diff| {
+                diff.stdout
+                    .split(|b| *b == 0)
+                    .filter(|p| !p.is_empty())
+                    .all(|path| {
+                        std::str::from_utf8(path).is_ok_and(|path| inputs.ignores(Path::new(path)))
+                    })
+            })
+        {
+            let mut reused = reading.clone();
+            reused.checks.push_str(&format!(
+                "; reused unchanged reader inputs from {previous}, comparison {:.3}s",
+                started.elapsed().as_secs_f64()
+            ));
+            return reused;
+        }
         let mut timings = Vec::new();
         let mut answers = Err("main reader did not record answers".to_string());
+        let mut inputs = None;
         let result = (|| -> Result<String> {
             if let Some(binary) = &self.last_binary {
                 check_execution_hold(&self.scratch, binary)?;
@@ -730,6 +774,27 @@ impl MainReader {
                 &local,
                 &["submodule", "update", "--init", "--recursive", "--force"],
             )?;
+            // Metadata covers normal, build and dev edges, including transitive
+            // dependencies. Failure only disables reuse; it never supplies a verdict.
+            if tree.join("Cargo.toml").is_file() {
+                let mut metadata = aterm_uds::spawnfd::command(targo);
+                metadata
+                    .args(["metadata", "--locked", "--offline", "--format-version", "1"])
+                    .current_dir(&tree)
+                    .env_remove("RUSTFLAGS")
+                    .env_remove("RUSTDOCFLAGS")
+                    .env_remove("CARGO_ENCODED_RUSTFLAGS")
+                    .env_remove("RUSTC")
+                    .env_remove("RUSTC_BOOTSTRAP")
+                    .env_remove("RUSTUP_TOOLCHAIN")
+                    .env_remove("CARGO_TARGET_DIR")
+                    .env_remove("CARGO_BUILD_TARGET");
+                if let Ok(output) = run(&mut metadata)
+                    && output.status.success()
+                {
+                    inputs = reader_inputs::Inputs::from_metadata(&output.stdout, &tree);
+                }
+            }
             // The stable source path keeps its own lane across releases; no live
             // directory is shared with the cut and no cross-root seeding is needed.
             let (target, layout) = crate::release_steps::verify_layout(&self.repo);
@@ -844,7 +909,7 @@ impl MainReader {
             }
             Ok(format!("PASS ({passed} desk-reader tests)"))
         })();
-        Reading {
+        let mut reading = Reading {
             answers,
             checks: format!(
                 "{}; {}; {:.3}s after-cut",
@@ -852,7 +917,27 @@ impl MainReader {
                 timings.join(", "),
                 started.elapsed().as_secs_f64()
             ),
+        };
+        if !reading.checks.starts_with("PASS") && !self.failures.contains(&reading.checks) {
+            self.failures.push(reading.checks.clone());
         }
+        for failure in &self.failures {
+            if failure != &reading.checks {
+                reading
+                    .checks
+                    .push_str(&format!("; earlier main reader: {failure}"));
+            }
+        }
+        self.last_reading = inputs.map(|inputs| {
+            (
+                preview.to_string(),
+                pins.clone(),
+                targo.to_path_buf(),
+                inputs,
+                reading.clone(),
+            )
+        });
+        reading
     }
 }
 

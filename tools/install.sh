@@ -2569,9 +2569,9 @@ cargo_build_pinned() { # <root>
 		genv=("${ROOT_BUILD_ENV[@]}")
 	fi
 	if [[ "${CARGO_LANE:-}" == store ]]; then
-		(cd "$1" && env -u CARGO_BUILD_TARGET -u RUSTUP_TOOLCHAIN -u RUSTC -u CARGO_BUILD_RUSTC ${genv[@]+"${genv[@]}"} PATH="$(build_path_lead)$rest" "$CARGO_BIN" --unverified build --release -p aterm --target-dir "$1/target")
+		(cd "$1" && env -u CARGO_BUILD_TARGET -u RUSTUP_TOOLCHAIN -u RUSTC -u CARGO_BUILD_RUSTC ${genv[@]+"${genv[@]}"} PATH="$(build_path_lead)$rest" "$CARGO_BIN" --unverified build --release -p aterm --bin aterm --target-dir "$1/target")
 	else
-		(cd "$1" && env -u CARGO_BUILD_TARGET -u RUSTUP_TOOLCHAIN ${genv[@]+"${genv[@]}"} PATH="$(build_path_lead)$rest" "$CARGO_BIN" build --release -p aterm --target-dir "$1/target" --config "$CARGO_UNVERIFIED_LANE")
+		(cd "$1" && env -u CARGO_BUILD_TARGET -u RUSTUP_TOOLCHAIN ${genv[@]+"${genv[@]}"} PATH="$(build_path_lead)$rest" "$CARGO_BIN" build --release -p aterm --bin aterm --target-dir "$1/target" --config "$CARGO_UNVERIFIED_LANE")
 	fi
 }
 # The rustup lane in the block above serves a tree whose pin names a stock channel,

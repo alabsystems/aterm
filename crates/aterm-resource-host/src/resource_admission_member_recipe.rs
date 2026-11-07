@@ -40,6 +40,13 @@ pub(super) fn command(
         words => words,
     };
     no_early_execution(words)?;
+    if job.workload.is_some()
+        && trust_resource_controller::resolver::classify_resolver_query(words).is_ok()
+    {
+        return Err(refused(
+            "workload compiler queries require their distinct authenticated owner",
+        ));
+    }
     let metadata = metadata(words, &input.gnu, timeout)?;
     if !metadata && matches!(input.gnu, GnuTransport::None) {
         return Err(refused(

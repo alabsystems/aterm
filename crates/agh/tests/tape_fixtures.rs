@@ -160,9 +160,6 @@ fn a_fixture_replays_from_a_pipe_with_a_bare_replay() {
     let (_, records) = parsed(name, text);
     let stdout = emitted(&records, DOOR_STDOUT);
     let root = scratch("fixture-pipe");
-    // The tape's writer is this test's own thread and must finish, so the replay reads the pipe
-    // within the hang detector, not the product's 5 s, and the wait for its end outlasts that.
-    agh::fx::set_tape_stream_budget_for_test(common::HANG);
     let (reader, mut writer) = std::io::pipe().expect("a pipe");
     std::thread::spawn(move || {
         writer.write_all(text.as_bytes()).expect("the tape");

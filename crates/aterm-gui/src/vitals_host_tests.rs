@@ -4440,7 +4440,10 @@ fn job_at_rest_leader() {
     if program == "/bin/sleep" {
         cmd.arg(aterm_spec::wait::PARKED_SECS.to_string());
     }
+    // The job starts stopped at its exec and runs only once it leads the foreground: a job that
+    // read the terminal from behind would be stopped by SIGTTIN, and stay stopped in front.
     cmd.process_group(0)
+        .start_suspended(true)
         .stdin(slave.try_clone_to_owned().expect("dup slave"))
         .stdout(slave.try_clone_to_owned().expect("dup slave"))
         .stderr(slave.try_clone_to_owned().expect("dup slave"));
@@ -4467,10 +4470,11 @@ fn job_at_rest_leader() {
             }
         }
     }
-    let job = Job(cmd.spawn().expect("spawn the owned job"));
+    let mut job = Job(cmd.spawn().expect("spawn the owned job"));
     let pid = i32::try_from(job.0.id()).expect("pid");
     // SAFETY: This session owns the live slave and its own child group.
     assert_eq!(unsafe { libc::tcsetpgrp(0, pid) }, 0, "foreground job");
+    job.0.resume().expect("run the job in front");
     println!("\nVITALS_JOB_READY {pid}");
     std::io::stdout().flush().expect("ready written");
     let mut p = libc::pollfd {

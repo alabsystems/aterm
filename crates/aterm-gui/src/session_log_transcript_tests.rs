@@ -687,6 +687,7 @@ fn a_turn_that_ends_under_its_own_background_work_closes_and_so_does_its_wake() 
         None,
         &rows,
         Cursor::At(caret),
+        "",
         std::time::Instant::now(),
     );
     let rest = verdict.word();

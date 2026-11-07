@@ -1813,17 +1813,35 @@ impl App {
         y: f64,
     ) -> (u16, u16) {
         let (row, col) = self.pixel_to_glass_cell_with(wid, geom, x, y);
-        let col = self
-            .windows
-            .get(&wid)
-            .map_or(col, |ws| ws.claude_footer_undo.grid_col(row, col));
+        let col = if self.laid_terminal_cell_at(wid, x, y) == Some((row, col)) {
+            self.windows
+                .get(&wid)
+                .map_or(col, |ws| ws.claude_footer_undo.grid_col(row, col))
+        } else {
+            col
+        };
         (row, col)
+    }
+
+    /// The terminal cell `(row, col)` on the laid glass grid under window pixel `(x, y)`, when
+    /// the grid stands as [`Self::splice_claude_footer`] laid it and no chrome owns that row.
+    fn laid_terminal_cell_at(&self, wid: WindowId, x: f64, y: f64) -> Option<(u16, u16)> {
+        let (frame_row, col) = self.glass_cell_at(wid, x, y)?;
+        let term_row = frame_row.checked_sub(usize::from(self.chrome_rows(wid)))?;
+        if self.chrome_owns_terminal_row(wid, term_row) {
+            return None;
+        }
+        let row = u16::try_from(term_row).ok()?;
+        let col = u16::try_from(col).ok()?;
+        (row < self.windows.get(&wid)?.rows).then_some((row, col))
     }
 
     /// Whether a press at window pixel `(x, y)` lands on a cell the glass's rewrite of a row
     /// vacated (`claude_footer::FooterUndo::swallows`): it lands on nothing.
     pub(crate) fn glass_swallows_at(&self, wid: WindowId, x: f64, y: f64) -> bool {
-        let (row, col) = self.pixel_to_glass_cell_with(wid, self.pointer_geometry(wid), x, y);
+        let Some((row, col)) = self.laid_terminal_cell_at(wid, x, y) else {
+            return false;
+        };
         self.windows
             .get(&wid)
             .is_some_and(|ws| ws.claude_footer_undo.swallows(row, col))

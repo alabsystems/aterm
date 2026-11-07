@@ -47,6 +47,7 @@ fn a_late_program_answer_owns_one_observation_wake() {
         Some("claude".into()),
         pgid,
         false,
+        "",
         t0,
     );
     observer.sessions.get_mut(&id).unwrap().next_due = t0 + floor * 2;
@@ -58,6 +59,7 @@ fn a_late_program_answer_owns_one_observation_wake() {
         Some("claude".into()),
         pgid,
         false,
+        "",
         t0 + floor,
     );
     assert_eq!(observer.next_wake(), None, "the ordinary follow-up retired");
@@ -70,6 +72,7 @@ fn a_late_program_answer_owns_one_observation_wake() {
         generation,
         Cursor::Unknown,
         &Some("codex".into()),
+        false,
         t0 + floor * 2,
     ));
     observer.agent_observe(
@@ -80,6 +83,7 @@ fn a_late_program_answer_owns_one_observation_wake() {
         Some("codex".into()),
         pgid,
         false,
+        "",
         t0 + floor * 2,
     );
     assert_eq!(observer.next_wake(), None);
@@ -325,25 +329,36 @@ fn the_rate_floor_defers_a_read_and_arms_a_followup() {
     let mut obs =
         super::StatusObserver::new(super::StatusPolicy::default(), Duration::from_millis(50));
     let t0 = Instant::now();
-    assert!(obs.agent_zone_wanted(1, g(1), Cursor::Unknown, &None, t0));
+    assert!(obs.agent_zone_wanted(1, g(1), Cursor::Unknown, &None, false, t0));
     let rows = vec!["$ ls".to_string()];
-    let _ = obs.agent_observe(1, g(1), Some(rows), Cursor::Unknown, None, -1, false, t0);
+    let _ = obs.agent_observe(
+        1,
+        g(1),
+        Some(rows),
+        Cursor::Unknown,
+        None,
+        -1,
+        false,
+        "",
+        t0,
+    );
     assert!(
-        !obs.agent_zone_wanted(1, g(1), Cursor::Unknown, &None, t0),
+        !obs.agent_zone_wanted(1, g(1), Cursor::Unknown, &None, false, t0),
         "nothing moved"
     );
     let t1 = t0 + Duration::from_millis(100);
     assert!(
-        !obs.agent_zone_wanted(1, g(2), Cursor::Unknown, &None, t1),
+        !obs.agent_zone_wanted(1, g(2), Cursor::Unknown, &None, false, t1),
         "a read 100 ms after the last is deferred"
     );
-    let _ = obs.agent_observe(1, g(2), None, Cursor::Unknown, None, -1, false, t1);
+    let _ = obs.agent_observe(1, g(2), None, Cursor::Unknown, None, -1, false, "", t1);
     assert!(obs.agents[&1].followup, "and a follow-up is armed");
     assert!(obs.agent_zone_wanted(
         1,
         g(2),
         Cursor::Unknown,
         &None,
+        false,
         t0 + super::AGENT_MIN_INTERVAL
     ));
     let t2 = t0 + super::AGENT_MIN_INTERVAL;
@@ -355,6 +370,7 @@ fn the_rate_floor_defers_a_read_and_arms_a_followup() {
         None,
         7,
         true,
+        "",
         t2,
     );
     assert!(obs.agents[&1].followup);
@@ -364,6 +380,7 @@ fn the_rate_floor_defers_a_read_and_arms_a_followup() {
             g(2),
             Cursor::Unknown,
             &Some("sleep".into()),
+            false,
             t2 + super::AGENT_MIN_INTERVAL
         ),
         "the resolved program re-reads an unchanged zone"
@@ -386,7 +403,7 @@ fn unchanged_zone_reads_charge_the_agent_rate_floor() {
         super::StatusObserver::new(super::StatusPolicy::default(), Duration::from_millis(50));
     let g = |seq| crate::control::ScreenGen { epoch: 0, seq };
     let t0 = Instant::now();
-    assert!(obs.agent_zone_wanted(1, g(1), Cursor::Unknown, &claude, t0));
+    assert!(obs.agent_zone_wanted(1, g(1), Cursor::Unknown, &claude, false, t0));
     let first = obs.agent_observe(
         1,
         g(1),
@@ -395,12 +412,13 @@ fn unchanged_zone_reads_charge_the_agent_rate_floor() {
         claude.clone(),
         100,
         false,
+        "",
         t0,
     );
     assert_eq!(first.publish.map(|p| p.0), Some("busy"));
 
     let redrawn_at = t0 + super::AGENT_MIN_INTERVAL;
-    assert!(obs.agent_zone_wanted(1, g(2), Cursor::Unknown, &claude, redrawn_at));
+    assert!(obs.agent_zone_wanted(1, g(2), Cursor::Unknown, &claude, false, redrawn_at));
     let same = obs.agent_observe(
         1,
         g(2),
@@ -409,13 +427,14 @@ fn unchanged_zone_reads_charge_the_agent_rate_floor() {
         claude.clone(),
         100,
         false,
+        "",
         redrawn_at,
     );
     assert!(same.publish.is_none(), "same zone needs no new verdict");
 
     let early = redrawn_at + Duration::from_millis(50);
     assert!(
-        !obs.agent_zone_wanted(1, g(3), Cursor::Unknown, &claude, early),
+        !obs.agent_zone_wanted(1, g(3), Cursor::Unknown, &claude, false, early),
         "a second full-screen read 50 ms after an unchanged read is too soon"
     );
     let deferred = obs.agent_observe(
@@ -426,13 +445,14 @@ fn unchanged_zone_reads_charge_the_agent_rate_floor() {
         claude.clone(),
         100,
         false,
+        "",
         early,
     );
     assert!(deferred.publish.is_none());
     assert!(obs.agents[&1].followup, "the changed frame remains owed");
 
     let due = redrawn_at + super::AGENT_MIN_INTERVAL;
-    assert!(obs.agent_zone_wanted(1, g(3), Cursor::Unknown, &claude, due));
+    assert!(obs.agent_zone_wanted(1, g(3), Cursor::Unknown, &claude, false, due));
     let changed = obs.agent_observe(
         1,
         g(3),
@@ -441,6 +461,7 @@ fn unchanged_zone_reads_charge_the_agent_rate_floor() {
         claude,
         100,
         false,
+        "",
         due,
     );
     assert_eq!(changed.publish.map(|p| p.0), Some("idle"));
@@ -456,7 +477,7 @@ fn a_program_change_is_not_delayed_by_an_unchanged_zone_read() {
     let new = Some("codex".to_string());
     let rows = vec!["$ ls".to_string()];
     let t0 = Instant::now();
-    assert!(obs.agent_zone_wanted(1, g(1), Cursor::Unknown, &old, t0));
+    assert!(obs.agent_zone_wanted(1, g(1), Cursor::Unknown, &old, false, t0));
     let _ = obs.agent_observe(
         1,
         g(1),
@@ -465,10 +486,11 @@ fn a_program_change_is_not_delayed_by_an_unchanged_zone_read() {
         old.clone(),
         100,
         false,
+        "",
         t0,
     );
     let redrawn_at = t0 + super::AGENT_MIN_INTERVAL;
-    assert!(obs.agent_zone_wanted(1, g(2), Cursor::Unknown, &old, redrawn_at));
+    assert!(obs.agent_zone_wanted(1, g(2), Cursor::Unknown, &old, false, redrawn_at));
     let same = obs.agent_observe(
         1,
         g(2),
@@ -477,12 +499,13 @@ fn a_program_change_is_not_delayed_by_an_unchanged_zone_read() {
         old,
         100,
         false,
+        "",
         redrawn_at,
     );
     assert!(same.publish.is_none());
     let transitioned_at = redrawn_at + Duration::from_millis(50);
     assert!(
-        obs.agent_zone_wanted(1, g(2), Cursor::Unknown, &new, transitioned_at),
+        obs.agent_zone_wanted(1, g(2), Cursor::Unknown, &new, false, transitioned_at),
         "the new program may be classified despite the recent same-zone read"
     );
     let _ = obs.agent_observe(
@@ -493,6 +516,7 @@ fn a_program_change_is_not_delayed_by_an_unchanged_zone_read() {
         new.clone(),
         100,
         false,
+        "",
         transitioned_at,
     );
     assert_eq!(obs.agents[&1].program_seen, Some(new));
@@ -521,7 +545,7 @@ fn group_change_after_unchanged_read_gets_immediate_followup() {
     };
     let t0 = Instant::now();
     let _ = obs.observe(1, &evidence, t0);
-    assert!(obs.agent_zone_wanted(1, g(1), Cursor::Unknown, &claude, t0));
+    assert!(obs.agent_zone_wanted(1, g(1), Cursor::Unknown, &claude, false, t0));
     let first = obs.agent_observe(
         1,
         g(1),
@@ -530,6 +554,7 @@ fn group_change_after_unchanged_read_gets_immediate_followup() {
         claude.clone(),
         100,
         false,
+        "",
         t0,
     );
     assert_eq!(
@@ -539,7 +564,7 @@ fn group_change_after_unchanged_read_gets_immediate_followup() {
 
     let redrawn_at = t0 + super::AGENT_MIN_INTERVAL;
     let _ = obs.observe(1, &evidence, redrawn_at);
-    assert!(obs.agent_zone_wanted(1, g(2), Cursor::Unknown, &claude, redrawn_at));
+    assert!(obs.agent_zone_wanted(1, g(2), Cursor::Unknown, &claude, false, redrawn_at));
     let same = obs.agent_observe(
         1,
         g(2),
@@ -548,6 +573,7 @@ fn group_change_after_unchanged_read_gets_immediate_followup() {
         claude.clone(),
         100,
         false,
+        "",
         redrawn_at,
     );
     assert!(same.publish.is_none());
@@ -555,7 +581,7 @@ fn group_change_after_unchanged_read_gets_immediate_followup() {
     let group_moved_at = redrawn_at + Duration::from_millis(50);
     obs.note_output(1, group_moved_at);
     let _ = obs.observe(1, &evidence, group_moved_at);
-    assert!(!obs.agent_zone_wanted(1, g(3), Cursor::Unknown, &claude, group_moved_at));
+    assert!(!obs.agent_zone_wanted(1, g(3), Cursor::Unknown, &claude, false, group_moved_at));
     let deferred = obs.agent_observe(
         1,
         g(3),
@@ -564,13 +590,14 @@ fn group_change_after_unchanged_read_gets_immediate_followup() {
         claude,
         200,
         false,
+        "",
         group_moved_at,
     );
     assert!(deferred.publish.is_none());
     assert!(obs.due(1, group_moved_at), "the new group is due now");
     assert_eq!(obs.next_wake(), Some(group_moved_at));
 
-    assert!(obs.agent_zone_wanted(1, g(3), Cursor::Unknown, &None, group_moved_at));
+    assert!(obs.agent_zone_wanted(1, g(3), Cursor::Unknown, &None, false, group_moved_at));
     let handback = obs.agent_observe(
         1,
         g(3),
@@ -579,6 +606,7 @@ fn group_change_after_unchanged_read_gets_immediate_followup() {
         None,
         200,
         false,
+        "",
         group_moved_at,
     );
     assert_eq!(handback.publish.map(|p| p.0), Some("-"));
@@ -606,7 +634,7 @@ fn a_capped_block_read_owes_a_look_without_delaying_a_handback() {
         };
         let t0 = Instant::now();
         let _ = obs.observe(1, &evidence, t0);
-        assert!(obs.agent_zone_wanted(1, g(1), Cursor::Unknown, &claude, t0));
+        assert!(obs.agent_zone_wanted(1, g(1), Cursor::Unknown, &claude, false, t0));
         let _ = obs.agent_observe(
             1,
             g(1),
@@ -615,11 +643,12 @@ fn a_capped_block_read_owes_a_look_without_delaying_a_handback() {
             claude.clone(),
             100,
             false,
+            "",
             t0,
         );
         let redrawn_at = t0 + super::AGENT_MIN_INTERVAL;
         let _ = obs.observe(1, &evidence, redrawn_at);
-        assert!(obs.agent_zone_wanted(1, g(2), Cursor::Unknown, &claude, redrawn_at));
+        assert!(obs.agent_zone_wanted(1, g(2), Cursor::Unknown, &claude, false, redrawn_at));
         let _ = obs.agent_observe(
             1,
             g(2),
@@ -628,12 +657,23 @@ fn a_capped_block_read_owes_a_look_without_delaying_a_handback() {
             claude.clone(),
             100,
             false,
+            "",
             redrawn_at,
         );
         let moved_at = redrawn_at + interval;
         let _ = obs.observe(1, &evidence, moved_at);
-        let _ = obs.agent_zone_wanted(1, g(3), Cursor::Unknown, &claude, moved_at);
-        let _ = obs.agent_observe(1, g(3), None, Cursor::Unknown, claude, 200, false, moved_at);
+        let _ = obs.agent_zone_wanted(1, g(3), Cursor::Unknown, &claude, false, moved_at);
+        let _ = obs.agent_observe(
+            1,
+            g(3),
+            None,
+            Cursor::Unknown,
+            claude,
+            200,
+            false,
+            "",
+            moved_at,
+        );
         owe(&mut obs, moved_at);
         obs.next_wake()
             .map(|w| w.saturating_duration_since(moved_at))
@@ -784,12 +824,22 @@ fn output_between_looks_is_owed_a_look_within_one_interval_of_it() {
     let rows = vec!["$ ls".to_string()];
     let t0 = Instant::now();
     let _ = obs.observe(1, &ev, t0);
-    assert!(obs.agent_zone_wanted(1, g(1), Cursor::Unknown, &None, t0));
-    let _ = obs.agent_observe(1, g(1), Some(rows), Cursor::Unknown, None, -1, false, t0);
+    assert!(obs.agent_zone_wanted(1, g(1), Cursor::Unknown, &None, false, t0));
+    let _ = obs.agent_observe(
+        1,
+        g(1),
+        Some(rows),
+        Cursor::Unknown,
+        None,
+        -1,
+        false,
+        "",
+        t0,
+    );
     let t1 = t0 + interval;
     let _ = obs.observe(1, &ev, t1);
-    assert!(!obs.agent_zone_wanted(1, g(1), Cursor::Unknown, &None, t1));
-    let _ = obs.agent_observe(1, g(1), None, Cursor::Unknown, None, -1, false, t1);
+    assert!(!obs.agent_zone_wanted(1, g(1), Cursor::Unknown, &None, false, t1));
+    let _ = obs.agent_observe(1, g(1), None, Cursor::Unknown, None, -1, false, "", t1);
     let due = obs.sessions[&1].next_due;
     assert!(
         obs.next_wake().is_none_or(|w| w > due),
@@ -805,7 +855,7 @@ fn output_between_looks_is_owed_a_look_within_one_interval_of_it() {
     assert_eq!(obs.next_wake(), Some(owed), "a look once the burst paused");
     let t2 = owed;
     let _ = obs.observe(1, &ev, t2);
-    assert!(obs.agent_zone_wanted(1, g(2), Cursor::Unknown, &None, t2));
+    assert!(obs.agent_zone_wanted(1, g(2), Cursor::Unknown, &None, false, t2));
     let _ = obs.agent_observe(
         1,
         g(2),
@@ -814,11 +864,12 @@ fn output_between_looks_is_owed_a_look_within_one_interval_of_it() {
         None,
         -1,
         false,
+        "",
         t2,
     );
     let t3 = t2 + interval;
     let _ = obs.observe(1, &ev, t3);
-    let _ = obs.agent_observe(1, g(2), None, Cursor::Unknown, None, -1, false, t3);
+    let _ = obs.agent_observe(1, g(2), None, Cursor::Unknown, None, -1, false, "", t3);
     let due = obs.sessions[&1].next_due;
     assert!(obs.next_wake().is_none_or(|w| w > due), "settled again");
     obs.note_skipped(1, t3);
@@ -853,11 +904,12 @@ fn output_that_keeps_arriving_owes_no_look_before_it_pauses() {
         None,
         -1,
         false,
+        "",
         start,
     );
     let t0 = start + Duration::from_secs(5);
     let _ = obs.observe(1, &ev, t0);
-    let _ = obs.agent_observe(1, g(1), None, Cursor::Unknown, None, -1, false, t0);
+    let _ = obs.agent_observe(1, g(1), None, Cursor::Unknown, None, -1, false, "", t0);
     assert_eq!(
         obs.next_wake(),
         None,
@@ -870,7 +922,7 @@ fn output_that_keeps_arriving_owes_no_look_before_it_pauses() {
         obs.note_output(1, at);
         if obs.sessions[&1].next_due <= at {
             let _ = obs.observe(1, &ev, at);
-            let _ = obs.agent_observe(1, g(1), None, Cursor::Unknown, None, -1, false, at);
+            let _ = obs.agent_observe(1, g(1), None, Cursor::Unknown, None, -1, false, "", at);
             looks += 1;
         }
         let next_burst = at + gap;
@@ -914,7 +966,7 @@ fn a_change_above_the_last_40_rows_of_an_inline_repl_is_classified() {
     let mut look = |seq: u64, rows: &[String], after: u64| {
         let at = t0 + Duration::from_secs(after);
         let generation = crate::control::ScreenGen { epoch: 0, seq };
-        assert!(obs.agent_zone_wanted(1, generation, Cursor::Unknown, &claude, at));
+        assert!(obs.agent_zone_wanted(1, generation, Cursor::Unknown, &claude, false, at));
         obs.agent_observe(
             1,
             generation,
@@ -923,6 +975,7 @@ fn a_change_above_the_last_40_rows_of_an_inline_repl_is_classified() {
             claude.clone(),
             100,
             false,
+            "",
             at,
         )
         .publish
@@ -946,7 +999,7 @@ fn a_cursor_that_steps_into_the_box_is_read() {
     let generation = crate::control::ScreenGen { epoch: 0, seq: 7 };
     let mut look = |cursor: Cursor, after: u64| {
         let at = t0 + Duration::from_secs(after);
-        obs.agent_zone_wanted(1, generation, cursor, &claude, at)
+        obs.agent_zone_wanted(1, generation, cursor, &claude, false, at)
             .then(|| {
                 obs.agent_observe(
                     1,
@@ -956,6 +1009,7 @@ fn a_cursor_that_steps_into_the_box_is_read() {
                     claude.clone(),
                     100,
                     false,
+                    "",
                     at,
                 )
                 .publish
@@ -1012,7 +1066,7 @@ fn claude_is_published_idle_exactly_where_the_model_types() {
             super::StatusObserver::new(super::StatusPolicy::default(), Duration::from_millis(50));
         let t0 = Instant::now();
         let generation = crate::control::ScreenGen { epoch: 0, seq: 1 };
-        assert!(obs.agent_zone_wanted(1, generation, cursor, &claude, t0));
+        assert!(obs.agent_zone_wanted(1, generation, cursor, &claude, false, t0));
         let step = obs.agent_observe(
             1,
             generation,
@@ -1021,6 +1075,7 @@ fn claude_is_published_idle_exactly_where_the_model_types() {
             claude.clone(),
             100,
             false,
+            "",
             t0,
         );
         step.publish.expect("the zone was classified").0
@@ -1107,7 +1162,7 @@ fn a_group_that_left_is_never_judged_under_its_name() {
         let mut obs =
             super::StatusObserver::new(super::StatusPolicy::default(), Duration::from_millis(50));
         let t0 = Instant::now();
-        assert!(obs.agent_zone_wanted(1, g(1), Cursor::Unknown, &claude, t0));
+        assert!(obs.agent_zone_wanted(1, g(1), Cursor::Unknown, &claude, false, t0));
         let step = obs.agent_observe(
             1,
             g(1),
@@ -1116,6 +1171,7 @@ fn a_group_that_left_is_never_judged_under_its_name() {
             claude.clone(),
             100,
             true,
+            "",
             t0,
         );
         assert_eq!(
@@ -1124,7 +1180,7 @@ fn a_group_that_left_is_never_judged_under_its_name() {
             "the agent, named"
         );
         let t1 = t0 + super::AGENT_MIN_INTERVAL;
-        assert!(obs.agent_zone_wanted(1, g(2), Cursor::Unknown, &claude, t1));
+        assert!(obs.agent_zone_wanted(1, g(2), Cursor::Unknown, &claude, false, t1));
         let step = obs.agent_observe(
             1,
             g(2),
@@ -1133,6 +1189,7 @@ fn a_group_that_left_is_never_judged_under_its_name() {
             claude.clone(),
             group_after,
             true,
+            "",
             t1,
         );
         let got = reader(&step);
@@ -1171,7 +1228,17 @@ fn a_dialog_above_a_blank_foot_passes_the_classifier_gate() {
     let caret = Cursor::At(idle.iter().position(|r| r.starts_with('❯')));
     let focus = Cursor::At(trust.iter().position(|r| r == " ❯ No, exit"));
     assert_eq!(focus, Cursor::At(Some(17)), "the measured cursor");
-    let step = obs.agent_observe(1, g(1), Some(idle), caret, claude.clone(), 100, false, t0);
+    let step = obs.agent_observe(
+        1,
+        g(1),
+        Some(idle),
+        caret,
+        claude.clone(),
+        100,
+        false,
+        "",
+        t0,
+    );
     assert_eq!(word(&step), Some(("idle", None)));
     let t1 = t0 + super::AGENT_MIN_INTERVAL;
     let step = obs.agent_observe(
@@ -1182,12 +1249,13 @@ fn a_dialog_above_a_blank_foot_passes_the_classifier_gate() {
         claude.clone(),
         100,
         false,
+        "",
         t1,
     );
     assert!(step.reading_changed, "{:?}", word(&step));
     assert_eq!(word(&step), Some(("prompt", Some("trust".to_string()))));
     let t2 = t1 + super::AGENT_MIN_INTERVAL;
-    let step = obs.agent_observe(1, g(3), Some(trust), focus, claude, 100, false, t2);
+    let step = obs.agent_observe(1, g(3), Some(trust), focus, claude, 100, false, "", t2);
     assert_eq!(word(&step), None, "the zone did not move");
 }
 
@@ -1348,6 +1416,7 @@ fn an_unnamed_static_group_retries_promptly_then_backs_off_without_spinning() {
         None,
         pgid,
         true,
+        "",
         t0,
     );
     assert_eq!(observer.next_wake(), Some(t0 + floor));
@@ -1361,6 +1430,7 @@ fn an_unnamed_static_group_retries_promptly_then_backs_off_without_spinning() {
         None,
         pgid,
         false,
+        "",
         t0 + floor,
     );
     assert_eq!(observer.next_wake(), Some(t0 + Duration::from_millis(250)));
@@ -1392,6 +1462,7 @@ fn an_unnamed_static_group_retries_promptly_then_backs_off_without_spinning() {
         None,
         pgid,
         true,
+        "",
         first_retry,
     );
     assert_eq!(observer.next_wake(), Some(first_retry + floor));
@@ -1404,6 +1475,7 @@ fn an_unnamed_static_group_retries_promptly_then_backs_off_without_spinning() {
         None,
         pgid,
         false,
+        "",
         first_retry + floor,
     );
     let second_retry = first_retry + Duration::from_secs(1);
@@ -1433,6 +1505,7 @@ fn an_unnamed_static_group_retries_promptly_then_backs_off_without_spinning() {
         None,
         pgid,
         true,
+        "",
         second_retry,
     );
     observer.sessions.get_mut(&id).unwrap().next_due = second_retry + floor * 2;
@@ -1444,6 +1517,7 @@ fn an_unnamed_static_group_retries_promptly_then_backs_off_without_spinning() {
         None,
         pgid,
         false,
+        "",
         second_retry + floor,
     );
     assert_eq!(observer.next_wake(), Some(second_retry + PROGRAM_RECHECK));
@@ -1461,6 +1535,7 @@ fn an_unnamed_static_group_retries_promptly_then_backs_off_without_spinning() {
         Some("claude".into()),
         pgid,
         false,
+        "",
         named_at,
     );
     assert_eq!(
@@ -1493,6 +1568,7 @@ fn an_unnamed_static_group_retries_promptly_then_backs_off_without_spinning() {
         Some("claude".into()),
         pgid,
         true,
+        "",
         exec_at,
     );
     observer.agent_observe(
@@ -1503,6 +1579,7 @@ fn an_unnamed_static_group_retries_promptly_then_backs_off_without_spinning() {
         None,
         pgid,
         false,
+        "",
         exec_at,
     );
     observer.sessions.get_mut(&id).unwrap().next_due = exec_at + floor;
@@ -1518,6 +1595,7 @@ fn an_unnamed_static_group_retries_promptly_then_backs_off_without_spinning() {
         None,
         -1,
         false,
+        "",
         exec_at + floor,
     );
     assert_eq!(observer.next_wake(), None);
@@ -1556,6 +1634,7 @@ fn a_named_shell_rechecks_once_after_a_later_static_claude_frame() {
         Some("claude".into()),
         pgid,
         true,
+        "",
         t0,
     );
     assert!(
@@ -1571,6 +1650,7 @@ fn a_named_shell_rechecks_once_after_a_later_static_claude_frame() {
         Some("sh".into()),
         pgid,
         false,
+        "",
         shell_at,
     );
     assert!(model.fire("ResolveShell", &mut modeled));
@@ -1599,6 +1679,7 @@ fn a_named_shell_rechecks_once_after_a_later_static_claude_frame() {
         Some("sh".into()),
         pgid,
         true,
+        "",
         first_confirm,
     );
     observer.sessions.get_mut(&id).unwrap().next_due = first_confirm + floor;
@@ -1610,6 +1691,7 @@ fn a_named_shell_rechecks_once_after_a_later_static_claude_frame() {
         Some("sh".into()),
         pgid,
         false,
+        "",
         first_confirm + floor,
     );
     assert_eq!(modeled["confirm_armed"], 0);
@@ -1625,6 +1707,7 @@ fn a_named_shell_rechecks_once_after_a_later_static_claude_frame() {
         Some("sh".into()),
         pgid,
         false,
+        "",
         moved_at,
     );
     let before_move = modeled.clone();
@@ -1643,6 +1726,7 @@ fn a_named_shell_rechecks_once_after_a_later_static_claude_frame() {
         Some("sh".into()),
         pgid,
         false,
+        "",
         moved_at + floor,
     );
     let later_confirm = first_confirm + PROGRAM_NAMED_RECHECK_FLOOR;
@@ -1671,6 +1755,7 @@ fn a_named_shell_rechecks_once_after_a_later_static_claude_frame() {
         Some("sh".into()),
         pgid,
         true,
+        "",
         later_confirm,
     );
     observer.sessions.get_mut(&id).unwrap().next_due = later_confirm + floor;
@@ -1683,6 +1768,7 @@ fn a_named_shell_rechecks_once_after_a_later_static_claude_frame() {
         Some("claude".into()),
         pgid,
         false,
+        "",
         later_confirm + floor,
     );
     assert_eq!(
@@ -1702,6 +1788,7 @@ fn a_named_shell_rechecks_once_after_a_later_static_claude_frame() {
         Some("sh".into()),
         pgid,
         false,
+        "",
         later_confirm + PROGRAM_RECHECK,
     );
     assert!(model.fire("AgentLeaves", &mut modeled));
@@ -1715,6 +1802,7 @@ fn a_named_shell_rechecks_once_after_a_later_static_claude_frame() {
         None,
         -1,
         false,
+        "",
         later_confirm + PROGRAM_RECHECK + floor,
     );
     assert!(model.fire("GroupLeaves", &mut modeled));
@@ -2639,6 +2727,7 @@ fn a_waiting_fronts_wait_is_read_again_on_a_still_screen() {
             Some("targo".into()),
             pgid,
             resolving,
+            "",
             at,
         );
     }
@@ -2653,6 +2742,7 @@ fn a_waiting_fronts_wait_is_read_again_on_a_still_screen() {
         Some("targo".into()),
         pgid,
         false,
+        "",
         confirm,
     );
     let later = confirm + PROGRAM_RECHECK;
@@ -2681,4 +2771,291 @@ fn a_waiting_fronts_wait_is_read_again_on_a_still_screen() {
     observer.note_build_wait(id, false);
     assert!(!observer.program_due(id, false, Some("targo"), still, later));
     assert_eq!(observer.next_wake(), quiet);
+}
+
+/// The 2.1.311 lab frames of a reply drawn under a status line (aterm-phase's fixtures): mid-reply,
+/// the last line held back, and the finished reply under its done row.
+fn statusline_frames() -> [Vec<String>; 3] {
+    use aterm_phase::prompt::fixtures::{
+        STATUSLINE_LAST_LINE_HELD_2_1_311, STATUSLINE_MIDREPLY_2_1_311,
+        STATUSLINE_REPLY_DONE_2_1_311, screen,
+    };
+    [
+        screen(STATUSLINE_MIDREPLY_2_1_311),
+        screen(STATUSLINE_LAST_LINE_HELD_2_1_311),
+        screen(STATUSLINE_REPLY_DONE_2_1_311),
+    ]
+}
+
+/// Claude Code's composer caret row, where it holds the cursor at rest.
+fn caret_of(rows: &[String]) -> Cursor {
+    Cursor::At(rows.iter().rposition(|r| r.starts_with('\u{276f}')))
+}
+
+/// One read of `rows` under `title` at `at`, as session 1 of `obs` under `program`: the word it
+/// publishes, `None` where it publishes nothing.
+fn read_titled(
+    obs: &mut StatusObserver,
+    seq: u64,
+    rows: &[String],
+    program: &str,
+    title: &str,
+    at: Instant,
+) -> Option<&'static str> {
+    let generation = crate::control::ScreenGen { epoch: 0, seq };
+    obs.agent_observe(
+        1,
+        generation,
+        Some(rows.to_vec()),
+        caret_of(rows),
+        Some(program.into()),
+        42,
+        false,
+        title,
+        at,
+    )
+    .publish
+    .map(|(word, ..)| word)
+}
+
+/// Under a status line Claude Code draws its reply with no busy sign on the screen; its window
+/// title (`◐`/`◑ Claude Code`) is what the verdict reads it busy by (ATERM-KI-1027-3). The title
+/// rests about 23 ms before the frame that draws the last line: a read between the two publishes
+/// nothing, and the finished frame, its done row drawn, publishes idle at once. The control: with
+/// no title (`""`, one never set) or one with no glyph the same frames publish idle mid-reply,
+/// the misread a status line causes.
+#[test]
+fn a_reply_drawn_under_a_status_line_is_published_busy_while_its_title_runs() {
+    let [mid, held, done] = statusline_frames();
+    let step = super::AGENT_MIN_INTERVAL + Duration::from_millis(50);
+    let t0 = Instant::now();
+    for (rows, title) in [(&mid, ""), (&held, "Claude Code")] {
+        let mut obs = StatusObserver::new(StatusPolicy::default(), Duration::from_millis(50));
+        assert_eq!(
+            read_titled(&mut obs, 1, rows, "claude", title, t0),
+            Some("idle"),
+            "CONTROL: {title:?} says nothing"
+        );
+    }
+    let mut obs = StatusObserver::new(StatusPolicy::default(), Duration::from_millis(50));
+    assert_eq!(
+        read_titled(&mut obs, 1, &mid, "claude", "◐ Claude Code", t0),
+        Some("busy")
+    );
+    assert_eq!(
+        read_titled(&mut obs, 2, &held, "claude", "◑ Claude Code", t0 + step),
+        Some("busy")
+    );
+    let rest = t0 + step * 2;
+    assert_eq!(
+        read_titled(&mut obs, 2, &held, "claude", "✳ Claude Code", rest),
+        None,
+        "a read just after the title rests, its last line not yet drawn, publishes nothing"
+    );
+    assert_eq!(
+        read_titled(
+            &mut obs,
+            3,
+            &done,
+            "claude",
+            "✳ Claude Code",
+            rest + Duration::from_millis(23)
+        ),
+        Some("idle"),
+        "the finished frame publishes at once: its done row is the end drawn"
+    );
+    assert!(obs.agents[&1].rest_at.is_none(), "the settle is over");
+}
+
+/// Never stuck busy: a title that rests with no later frame publishes the screen's idle once the
+/// settle is spent, and the watch owes the read that does it: a title-only move and the settle's
+/// instant each want a read though neither the screen nor the cursor moved.
+#[test]
+fn a_title_at_rest_with_no_later_frame_is_published_idle_by_the_settle() {
+    let [_, held, _] = statusline_frames();
+    let step = super::AGENT_MIN_INTERVAL + Duration::from_millis(50);
+    let mut obs = StatusObserver::new(StatusPolicy::default(), Duration::from_millis(50));
+    let g = crate::control::ScreenGen { epoch: 0, seq: 2 };
+    let program = Some("claude".to_string());
+    let t0 = Instant::now();
+    obs.sessions
+        .insert(1, SessionSlot::new(StatusPolicy::default(), t0));
+    assert_eq!(
+        read_titled(&mut obs, 2, &held, "claude", "◑ Claude Code", t0),
+        Some("busy")
+    );
+    let rest = t0 + step;
+    assert!(
+        obs.agent_zone_wanted(1, g, caret_of(&held), &program, false, rest),
+        "the title alone moved"
+    );
+    assert!(
+        !obs.agent_zone_wanted(1, g, caret_of(&held), &program, true, rest),
+        "the control: nothing moved"
+    );
+    assert_eq!(
+        read_titled(&mut obs, 2, &held, "claude", "✳ Claude Code", rest),
+        None
+    );
+    let due = rest + super::AGENT_MIN_INTERVAL;
+    assert!(
+        obs.next_wake().is_some_and(|w| w <= due),
+        "the settle owns a wake: {:?}",
+        obs.next_wake()
+    );
+    assert!(
+        !obs.agent_zone_wanted(
+            1,
+            g,
+            caret_of(&held),
+            &program,
+            false,
+            rest + Duration::from_millis(100)
+        ),
+        "not before the settle is spent"
+    );
+    assert!(
+        obs.agent_zone_wanted(1, g, caret_of(&held), &program, false, due),
+        "the settle's instant wants a read of the unmoved screen"
+    );
+    assert_eq!(
+        read_titled(&mut obs, 2, &held, "claude", "✳ Claude Code", due),
+        Some("idle")
+    );
+    assert!(obs.agents[&1].rest_at.is_none());
+}
+
+/// Muse Code takes the same rule from its own spinner's title: its idle composer under the
+/// spinner publishes busy, and under its title at rest idle once the settle is spent.
+#[test]
+fn muse_codes_idle_under_its_spinner_title_is_published_busy() {
+    use aterm_phase::muse::fixtures::IDLE;
+    let idle = aterm_phase::prompt::fixtures::screen(IDLE);
+    let step = super::AGENT_MIN_INTERVAL + Duration::from_millis(50);
+    let mut obs = StatusObserver::new(StatusPolicy::default(), Duration::from_millis(50));
+    let t0 = Instant::now();
+    assert_eq!(
+        read_titled(&mut obs, 1, &idle, "muse", "proj", t0),
+        Some("idle")
+    );
+    assert_eq!(
+        read_titled(&mut obs, 1, &idle, "muse", "⠙ proj", t0 + step),
+        Some("busy")
+    );
+    assert_eq!(
+        read_titled(&mut obs, 1, &idle, "muse", "⠹ proj", t0 + step * 2),
+        None,
+        "a spinner frame flipping moves nothing"
+    );
+    assert_eq!(
+        read_titled(&mut obs, 1, &idle, "muse", "proj", t0 + step * 3),
+        None
+    );
+    assert_eq!(
+        read_titled(&mut obs, 1, &idle, "muse", "proj", t0 + step * 4),
+        Some("idle")
+    );
+}
+
+/// `rows` painted on a 50x144 pane under the window title `title` (none where it is empty), the
+/// cursor at `cursor` (1-based row and column).
+fn paint_titled(app: &App, sid: u64, rows: &[String], title: &str, cursor: (usize, usize)) {
+    let pooled = app.pool.get(sid).expect("pooled");
+    let mut t = crate::term_lock(&pooled.term);
+    if t.cols() != 144 {
+        t.resize(50, 144);
+    }
+    let mut bytes = String::from("\x1b[H\x1b[2J");
+    if !title.is_empty() {
+        bytes.push_str(&format!("\x1b]2;{title}\x07"));
+    }
+    for (i, row) in rows.iter().enumerate() {
+        bytes.push_str(&format!("\x1b[{};1H{row}", i + 1));
+    }
+    bytes.push_str(&format!("\x1b[{};{}H", cursor.0, cursor.1));
+    t.process(bytes.as_bytes());
+}
+
+/// The sweep reads the program's title from the terminal, in the hold it reads the rows in: a
+/// reply mid-draw under `◐ Claude Code` (OSC 2) publishes busy, and with no title idle.
+#[test]
+fn the_sweep_reads_the_title_with_the_rows() {
+    let [mid, ..] = statusline_frames();
+    let caret = mid
+        .iter()
+        .rposition(|r| r.starts_with('\u{276f}'))
+        .expect("the composer");
+    for (title, word) in [("◐ Claude Code", "busy"), ("", "idle")] {
+        let (mut app, sid) = app_with_stub();
+        paint_titled(&app, sid, &mid, title, (caret + 1, 3));
+        let _ = app.observe_session_statuses(Instant::now());
+        assert_eq!(published(&app, sid).word, word, "under {title:?}");
+    }
+}
+
+/// A read the rest settle withholds moves no stamp: the published word is still the one read from
+/// the screen before it, so `agent_gen=`/`agent_fp=` keep naming that screen (agent-verdict-gate)
+/// and an `if-gen=` fence on them still holds. Once the settle is spent the screen's own word is
+/// published with its stamp. The control: the busy read and the settled read each carry the
+/// stamp of the screen they read.
+#[test]
+fn a_read_the_rest_settle_withholds_moves_no_stamp() {
+    let field = |record: &str, key: &str| {
+        record
+            .split(' ')
+            .find_map(|kv| kv.strip_prefix(key))
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("{key} in {record}"))
+    };
+    let stamped = |record: &str| {
+        (field(record, "agent_gen="), field(record, "agent_fp="))
+            == (field(record, "gen="), field(record, "hash="))
+    };
+    let [mid, held, _] = statusline_frames();
+    let caret = |rows: &[String]| {
+        rows.iter()
+            .rposition(|r| r.starts_with('\u{276f}'))
+            .expect("the composer")
+            + 1
+    };
+    let (mut app, sid) = app_with_stub();
+    let step = super::AGENT_MIN_INTERVAL + Duration::from_millis(50);
+    let t0 = Instant::now();
+    paint_titled(&app, sid, &mid, "◐ Claude Code", (caret(&mid), 3));
+    let _ = app.observe_session_statuses(t0);
+    let busy = app.session_status_record(sid).expect("live");
+    assert!(busy.contains(" agent=busy "), "{busy}");
+    assert!(
+        stamped(&busy),
+        "CONTROL: the busy read stamps its screen: {busy}"
+    );
+
+    paint_titled(&app, sid, &held, "✳ Claude Code", (caret(&held), 3));
+    let _ = app.observe_session_statuses(t0 + step);
+    let held_record = app.session_status_record(sid).expect("live");
+    assert!(
+        held_record.contains(" agent=busy "),
+        "the settle withholds the read: {held_record}"
+    );
+    assert_ne!(
+        field(&held_record, "gen="),
+        field(&busy, "gen="),
+        "the screen moved: {held_record}"
+    );
+    assert_eq!(
+        (
+            field(&held_record, "agent_gen="),
+            field(&held_record, "agent_fp=")
+        ),
+        (field(&busy, "agent_gen="), field(&busy, "agent_fp=")),
+        "the withheld read leaves the stamp on the screen busy was read from: {held_record}"
+    );
+
+    let _ = app.observe_session_statuses(t0 + step * 2);
+    let idle = app.session_status_record(sid).expect("live");
+    assert!(idle.contains(" agent=idle "), "the settle is spent: {idle}");
+    assert!(
+        stamped(&idle),
+        "CONTROL: the settled read stamps its screen: {idle}"
+    );
 }

@@ -908,7 +908,7 @@ pub(crate) fn encode_frame_png(frame: &Frame) -> CapturePng {
         .expect("a fixture frame encodes")
 }
 
-fn encode_srgb_rgba8(
+pub(crate) fn encode_srgb_rgba8(
     width: u32,
     height: u32,
     write: impl FnOnce(&mut aterm_png::Writer<&mut Vec<u8>>) -> Result<(), aterm_png::EncodingError>,

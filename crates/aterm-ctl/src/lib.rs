@@ -39,6 +39,9 @@ mod sudo_run;
 pub use conn::conn_main_entry;
 pub use conn::resource_inspect_main_entry;
 pub use conn::resource_run_main_entry;
+pub use conn::{
+    OriginalRootStore, capture_original_root_store, resource_run_main_entry_with_original_store,
+};
 mod await_legs;
 mod await_task;
 pub mod board;
@@ -126,7 +129,11 @@ OPTIONS:
                   75 where the peer served none of its last legs, the one
                   this cuts in flight among them; 1, its rows first, where
                   no grant on the peer admits this Mac since its baseline:
-                  EXIT CODES).
+                  EXIT CODES). On this Mac, an `await task`, `agent`,
+                  `inbox` or `edit` asks again in legs of at most 600 s
+                  until its timeout= (any length), or with none until an
+                  explicit --timeout (0: no end), else for an hour (`aterm
+                  ctl await --help`).
                   A fleet survey (`survey --fleet`, `--host`) takes
                   it the same way: each peer's read (3 s, or survey's own
                   --timeout) is cut to a shorter one. On `subscribe`, an
@@ -201,6 +208,12 @@ EXIT CODES:
          an update is not \"session over\".
 
 OUTPUT:
+    A one-line reply prints on stdout, and an ERR line on stderr (exit 1). A
+    reply of `OK <n>` and <n> rows prints the rows on stdout and its `OK`
+    line on stderr only where that says more than the count (`log`, `inbox`,
+    `result`, `sys`, `search`, `brief`, …) or the count is 0; `turn` prints
+    its verdict (`turn submitted=… status=…`) on stderr, and `await task`
+    prints its rows, then `OK timeout` on stderr when its time ran out.
     To a pipe or a file, stdout carries the server's bytes exactly; on stderr,
     the server's status line and this client's notes start `aterm-ctl: `.
     To a terminal, every character a terminal acts on or reorders text around
@@ -282,7 +295,9 @@ CROSS-TERMINAL DRIVING:
     session on another instance is relayed to it (owner connections only).
     `ls` lists the sids. @self (alias @env) expands here to
     @$ATERM_PARENT_SESSION_ID — your own session, whichever tab is in front —
-    and fails outside an aterm session. No selector, or @., targets the
+    and fails outside an aterm session. $ATERM_SESSION_ID is not it: that is
+    the identity kept for an aterm started inside the tab, which no instance
+    lists until one runs there. No selector, or @., targets the
     instance's active tab, which changes with every tab switch.
     A read the server answers at once (text, screen, status, search, log,
     inbox, result, …; not a wait such as await or ready, nor subscribe, a
@@ -356,13 +371,16 @@ PUSH FRAMES (subscribe):
                                  records between the two were not delivered;
                                  re-read `screen`).
 
-VERBS (the protocol verb table; `<verb> --help` prints one verb's entry):
+VERBS (the protocol verb table; `<verb> --help [<section>]` prints one verb's entry or a part):
 ";
 
 fn help_text() -> String {
+    const INDENT: usize = 4;
     let mut s = String::from(HELP_PROSE);
-    for line in aterm_types::control_verbs::catalog_lines() {
-        s.push_str("    ");
+    for line in aterm_types::control_verbs::catalog_lines_wrapped_within(
+        aterm_types::control_verbs::ENTRY_WRAP_COLUMNS - INDENT,
+    ) {
+        s.push_str(&" ".repeat(INDENT));
         s.push_str(&line);
         s.push('\n');
     }
@@ -3778,13 +3796,17 @@ enum HelpAsked {
 }
 
 fn client_help_reply(parts: &[String], asked: HelpAsked) -> Option<String> {
-    let [verb, name] = parts else {
-        return None;
+    let (verb, name, section) = match parts {
+        [verb, name] => (verb, name, None),
+        [verb, name, section] if asked == HelpAsked::ByFlag => (verb, name, Some(section)),
+        _ => return None,
     };
     if verb != "help" {
         return None;
     }
-    let lines = if CLIENT_HELP_VERBS.contains(&name.as_str()) {
+    let lines = if let Some(section) = section {
+        aterm_types::control_verbs::spec(name)?.section_lines(section)?
+    } else if CLIENT_HELP_VERBS.contains(&name.as_str()) {
         client_verb_entry(name)?
     } else if asked == HelpAsked::ByFlag {
         aterm_types::control_verbs::spec(name)?.entry_lines()
@@ -3797,6 +3819,17 @@ fn client_help_reply(parts: &[String], asked: HelpAsked) -> Option<String> {
         reply.push('\n');
     }
     Some(reply)
+}
+
+/// This client's own answer to `help <name>`: a verb's (or a listed sub-form's) entry, or one
+/// section of a long entry when `name` is `<verb> <section>`.
+fn local_help_lines(name: &str) -> Option<Vec<String>> {
+    use aterm_types::control_verbs::spec;
+    if let Some(s) = spec(name) {
+        return Some(s.entry_lines());
+    }
+    let (verb, section) = name.split_once(' ')?;
+    spec(verb)?.section_lines(section)
 }
 
 fn help_with_fallback(
@@ -3827,21 +3860,35 @@ fn help_on(stream: CtlStream, name: &str, local: &LocalVerbs) -> io::Result<Exit
     let status = status.trim_end_matches(['\r', '\n']);
     let Some(tail) = status.strip_prefix("OK ") else {
         drain_refusal_tail(&mut reader)?;
-        if status.starts_with("ERR unknown verb")
-            && let Some(spec) = aterm_types::control_verbs::spec(name)
-        {
-            let rows = spec.entry_lines();
+        let section = aterm_types::control_verbs::spec(name)
+            .is_none()
+            .then(|| name.split_once(' '))
+            .flatten();
+        let refused = match section {
+            None => status.starts_with("ERR unknown verb"),
+            Some(_) => {
+                status.starts_with("ERR usage: help") || status.starts_with("ERR unknown section")
+            }
+        };
+        if refused && let Some(rows) = local_help_lines(name) {
             let mut reply = format!("OK {}\n", rows.len());
             for row in rows {
                 reply.push_str(&row);
                 reply.push('\n');
             }
             print_framed_lines(&reply)?;
-            stderr_line(&format!(
-                "the aterm that answered predates `{name}` ({status}); the entry above is this \
-                 client's (aterm {}), and that aterm will refuse the verb",
-                aterm_stamp::app_version()
-            ))?;
+            let version = aterm_stamp::app_version();
+            stderr_line(&match section {
+                None => format!(
+                    "the aterm that answered predates `{name}` ({status}); the entry above is \
+                     this client's (aterm {version}), and that aterm will refuse the verb"
+                ),
+                Some((verb, _)) => format!(
+                    "the aterm that answered has no `help {name}` ({status}); the section above \
+                     is this client's (aterm {version}), and `aterm ctl help {verb}` is that \
+                     aterm's own entry"
+                ),
+            })?;
             return Ok(ExitCode::SUCCESS);
         }
         stderr_line(status)?;
@@ -3862,7 +3909,7 @@ fn help_on(stream: CtlStream, name: &str, local: &LocalVerbs) -> io::Result<Exit
         stderr_line(
             "the aterm that answered predates `cast drift`; this client computes it itself \
              (`aterm ctl cast drift`, its header ending computed=client) — this client's entry \
-             is in `aterm help introspection`",
+             is `aterm ctl cast --help`",
         )?;
     }
     Ok(ExitCode::SUCCESS)
@@ -4233,6 +4280,15 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
         && aterm_types::control_verbs::spec(name).is_some()
     {
         return targets.run(|t| help_with_fallback(&t.path, t.origin, name, deadline, &local));
+    }
+    if let [help, verb, section] = request_parts.as_slice()
+        && help == "help"
+        && aterm_types::control_verbs::spec(&format!("{verb} {section}")).is_none()
+        && aterm_types::control_verbs::spec(verb)
+            .is_some_and(|s| s.section_lines(section).is_some())
+    {
+        let name = format!("{verb} {section}");
+        return targets.run(|t| help_with_fallback(&t.path, t.origin, &name, deadline, &local));
     }
 
     if let Some(note) = split_pattern_note(&request_parts) {
@@ -5126,11 +5182,26 @@ fn help_request_rewrite(parts: &[String]) -> Option<Vec<String>> {
         return matches!(tail.as_slice(), ["-h"] | ["--help"])
             .then(|| vec![String::from("help"), String::from("help")]);
     }
-    parts
+    let at = parts
         .iter()
         .skip(1)
-        .any(|a| a == "-h" || a == "--help")
-        .then(|| vec![String::from("help"), verb])
+        .position(|a| a == "-h" || a == "--help")?
+        + 1;
+    let section = match &parts[at + 1..] {
+        [word]
+            if aterm_types::control_verbs::spec(&verb)
+                .is_some_and(|s| s.section_lines(word).is_some()) =>
+        {
+            Some(word.clone())
+        }
+        _ => None,
+    };
+    Some(
+        [String::from("help"), verb]
+            .into_iter()
+            .chain(section)
+            .collect(),
+    )
 }
 
 fn stream_count(tail: &str) -> Option<usize> {

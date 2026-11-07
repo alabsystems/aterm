@@ -16,10 +16,23 @@ impl Owner {
         submission: AuthorizedSubmission,
         accounted: bool,
     ) -> Result<(), Box<(AuthorizedSubmission, io::Error)>> {
+        let queued_at = Instant::now();
         if accounted && !crate::resource_accounting::supported() {
             return Err(Box::new((
                 submission,
                 refused("owning-wait accounting unavailable"),
+            )));
+        }
+        if workload::purpose(&submission.request)
+            && (!accounted
+                || !workload::closed_request(&submission.request)
+                || submission.request.cpu_units != self.pool.slots().get()
+                || self.pool.slots().get() as usize
+                    > trust_resource_controller::workload::host::MAX_CPU_SET)
+        {
+            return Err(Box::new((
+                submission,
+                refused("workload root requires its closed accounted cooperative request"),
             )));
         }
         if recipe::metadata_purpose(&submission.request)
@@ -50,12 +63,14 @@ impl Owner {
         }
         let _ = events.emit(Event::Queued);
         self.pending.push_back(Pending {
+            queued_at,
             resolver: None,
             submission,
             events,
             recipe: None,
             sdk: None,
             probe: None,
+            primary: None,
             waiter: None,
             claim: None,
             recovery: None,
@@ -70,7 +85,10 @@ impl Owner {
             return;
         };
         pending.cancelled |= pending.events.cancelled();
-        if pending.cancelled {
+        let expired = pending
+            .workload_deadline()
+            .is_ok_and(|deadline| deadline.is_some_and(|deadline| Instant::now() >= deadline));
+        if pending.cancelled || expired {
             // Preparation may still hold and inspect original images. Its
             // paid CPU and memory remain occupied until the worker joins.
             if pending
@@ -85,7 +103,14 @@ impl Owner {
                 let _ = probe.poll();
             }
             if pending.events.requires_accounting() {
-                self.defer_accounted_refusal(pending, "cancelled before native launch");
+                self.defer_accounted_refusal(
+                    pending,
+                    if expired {
+                        "original workload deadline expired before native launch"
+                    } else {
+                        "cancelled before native launch"
+                    },
+                );
                 return;
             }
             let retained = self.retain_unlaunched(&mut pending);
@@ -118,19 +143,25 @@ impl Owner {
                 drop(pending.claim.take());
                 self.faulted = true;
             }
-            Err(_) => {
+            Err(error) => {
+                let reason = if workload::purpose(&pending.submission.request) {
+                    let detail: String = error
+                        .to_string()
+                        .chars()
+                        .filter(|ch| !ch.is_control())
+                        .take(512)
+                        .collect();
+                    format!("native workload admission refused before launch: {detail}")
+                } else {
+                    "resource admission refused before launch".into()
+                };
                 if pending.events.requires_accounting() {
-                    self.defer_accounted_refusal(
-                        pending,
-                        "resource admission refused before launch",
-                    );
+                    self.defer_accounted_refusal(pending, &reason);
                     return;
                 }
                 // No CPU grant or ARM occurred on this branch. An exact
                 // prepared intent can remain private and unused after refusal.
-                let _ = pending.events.emit(Event::Refused {
-                    reason: "resource admission refused before launch".into(),
-                });
+                let _ = pending.events.emit(Event::Refused { reason });
                 drop(pending.claim.take());
                 drop(pending.waiter.take());
                 let retained = self.retain_unlaunched(&mut pending);
@@ -146,14 +177,51 @@ impl Owner {
         }
     }
     fn advance(&mut self, pending: &mut Pending) -> io::Result<Advance> {
+        self.advance_inspected(pending, Instant::now() + Duration::from_millis(250))
+    }
+    fn advance_inspected(
+        &mut self,
+        pending: &mut Pending,
+        inspection_deadline: Instant,
+    ) -> io::Result<Advance> {
         let metadata = recipe::metadata_request(&pending.submission.request);
-        if metadata {
+        let workload = workload::closed_request(&pending.submission.request);
+        let root_deadline = pending.workload_deadline()?;
+        if root_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "original workload admission deadline expired",
+            ));
+        }
+        if metadata || workload {
             if let Some(claim) = &pending.claim {
                 pending.scope_reference = Some(claim.cohort_closure_ref()?);
             }
-            self.check_fresh_metadata_ancestry(pending)?;
+            let inspection = if metadata {
+                self.check_fresh_metadata_ancestry_at(pending, Instant::now())
+            } else {
+                self.check_fresh_metadata_ancestry_until(
+                    pending,
+                    root_deadline.map_or(inspection_deadline, |deadline| {
+                        deadline.min(inspection_deadline)
+                    }),
+                )
+            };
+            match inspection {
+                Err(error)
+                    if workload
+                        && error.kind() == io::ErrorKind::TimedOut
+                        && root_deadline.is_some_and(|deadline| Instant::now() < deadline) =>
+                {
+                    // This is an incomplete READ-ONLY inspection, never an
+                    // execution/delivery outcome. Keep the SAME queued owners;
+                    // every later admission still needs a fresh complete look.
+                    return Ok(Advance::Wait);
+                }
+                result => result?,
+            }
         }
-        if !metadata && pending.recipe.is_none() && !self.poll_recipe(pending)? {
+        if !metadata && !workload && pending.recipe.is_none() && !self.poll_recipe(pending)? {
             return Ok(Advance::Wait);
         }
         if pending.admitted.is_some() {
@@ -173,6 +241,51 @@ impl Owner {
                 return Ok(Advance::Wait);
             }
         }
+        if workload {
+            if pending.submission.request.cpu_units != self.pool.slots().get()
+                || self.pool.slots().get() as usize
+                    > trust_resource_controller::workload::host::MAX_CPU_SET
+            {
+                return Err(refused(
+                    "workload requires explicit complete canonical CPU-domain ceiling",
+                ));
+            }
+            if pending.primary.is_none() {
+                if pending.recovery.is_none() {
+                    let claim = pending
+                        .claim
+                        .as_ref()
+                        .ok_or_else(|| refused("original workload memory unavailable"))?;
+                    let reference = claim.cohort_closure_ref()?;
+                    let request = &pending.submission.request;
+                    let width = self.pool.slots();
+                    let context = recovery::context(
+                        &request.binding,
+                        &reference,
+                        request.memory_bytes,
+                        width.get(),
+                    );
+                    let material =
+                        self.debt
+                            .prepare_recoverable(CpuOwner::current(None), width, context)?;
+                    let (parent, leaf) = self.journal.authority(&request.binding)?;
+                    pending.recovery = Some(material.persist(&parent, &leaf)?);
+                    self.journal.update(&request.binding,"prepared",aterm_json::json!({"cpu_mode":"workload_reserved",
+                        "cpu_units":width.get(),"memory_bytes":request.memory_bytes,"memory":reference.to_json()}))?;
+                }
+                let prepared = pending
+                    .recovery
+                    .as_mut()
+                    .ok_or_else(|| refused("original workload recovery missing"))?;
+                let Some(reservation) = self.debt.try_acquire_all_recoverable(prepared)? else {
+                    return Ok(Advance::Wait);
+                };
+                pending.primary = Some(workload::Primary::new(reservation));
+            }
+            if !self.poll_recipe(pending)? {
+                return Ok(Advance::Wait);
+            }
+        }
         let prepared = self.prepare(pending)?;
         if metadata && let Advance::Launch(custody) = prepared {
             pending.admitted = Some(*custody);
@@ -180,19 +293,23 @@ impl Owner {
         }
         Ok(prepared)
     }
-    fn check_fresh_metadata_ancestry(&self, pending: &Pending) -> io::Result<()> {
-        self.check_fresh_metadata_ancestry_at(pending, Instant::now())
-    }
     pub(super) fn check_fresh_metadata_ancestry_at(
         &self,
         pending: &Pending,
         started: Instant,
     ) -> io::Result<()> {
-        use aterm_capacity::FundedMembership;
         // Inventory and native rereads establish membership; elapsed wall time
         // is only a hang detector. A loaded host can spend over 250 ms reading
         // an unchanged funded inventory before the final ancestry reread.
         let deadline = started + Duration::from_secs(60);
+        self.check_fresh_metadata_ancestry_until(pending, deadline)
+    }
+    fn check_fresh_metadata_ancestry_until(
+        &self,
+        pending: &Pending,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        use aterm_capacity::FundedMembership;
         let peer = pending.submission.peer;
         let ancestry = aterm_uds::process::Ancestry::capture(
             peer.pid,
@@ -218,6 +335,15 @@ impl Owner {
             }
         }
         ancestry.check_current(deadline)
+    }
+    #[cfg(test)]
+    pub(super) fn workload_inspection_wait_test(
+        &mut self,
+        pending: &mut Pending,
+        deadline: Instant,
+    ) -> io::Result<bool> {
+        self.advance_inspected(pending, deadline)
+            .map(|state| matches!(state, Advance::Wait))
     }
     fn poll_recipe(&mut self, pending: &mut Pending) -> io::Result<bool> {
         if pending.recipe.is_none() {
@@ -311,6 +437,7 @@ impl Owner {
             .take()
             .or_else(|| pending.claim.take().map(Custody::Cooperative));
         self.failed.push(Failed {
+            _primary: pending.primary.take(),
             _compiler: pending
                 .recipe
                 .as_ref()
@@ -331,6 +458,7 @@ impl Owner {
     fn retain_unlaunched(&mut self, pending: &mut Pending) -> bool {
         if let Some(custody) = pending.admitted.take() {
             self.failed.push(Failed {
+                _primary: pending.primary.take(),
                 _compiler: pending
                     .recipe
                     .as_ref()
@@ -388,12 +516,16 @@ impl Owner {
         let reference = claim.cohort_closure_ref()?;
         let request = &pending.submission.request;
         let cooperative = !metadata
-            && pending
-                .recipe
-                .as_ref()
-                .is_some_and(|recipe| matches!(recipe.kind, recipe::Kind::Targo));
+            && pending.recipe.as_ref().is_some_and(|recipe| {
+                matches!(recipe.kind, recipe::Kind::Targo | recipe::Kind::Workload)
+            });
         if cooperative {
-            self.journal.update(&request.binding,"prepared",aterm_json::json!({"cpu_mode":"cooperative_shared",
+            let mode = if workload::closed_request(request) {
+                "workload_reserved"
+            } else {
+                "cooperative_shared"
+            };
+            self.journal.update(&request.binding,"prepared",aterm_json::json!({"cpu_mode":mode,
                 "cpu_units":width,"memory_bytes":request.memory_bytes,"memory":reference.to_json()}))?;
             let claim = pending
                 .claim

@@ -4,6 +4,7 @@
 
 //! Lazy match iterators for forward and reverse search navigation.
 
+use std::borrow::Cow;
 use std::ops::Range;
 
 use crate::bitmap::{PostingCursor, SparseBitmap};
@@ -193,15 +194,21 @@ pub(crate) type SearchMatchIterator<'a> = LiteralMatchIterator<'a, false>;
 /// Lazy descending iterator over search matches.
 pub(crate) type SearchMatchReverseIterator<'a> = LiteralMatchIterator<'a, true>;
 
+/// The borrowed match walk and its columns always describe the same candidate line.
+struct LiteralLine<'a, const REV: bool> {
+    line: usize,
+    columns: Cow<'a, ColumnMap>,
+    matches: Matches<'a, 'a, REV>,
+    offset: usize,
+}
+
 /// Lazy literal matches over candidate lines, with resumable byte walks in either direction.
 pub(crate) struct LiteralMatchIterator<'a, const REV: bool> {
     index: &'a SearchIndex,
     searcher: Searcher<'a>,
     candidates: CandidateSource<'a>,
-    current_line: Option<usize>,
-    current_matches: Option<Matches<'a, 'a, REV>>,
+    current: Option<LiteralLine<'a, REV>>,
     anchor: Option<(usize, usize, bool)>,
-    current_offset: usize,
 }
 
 impl<'a, const REV: bool> LiteralMatchIterator<'a, REV> {
@@ -215,10 +222,8 @@ impl<'a, const REV: bool> LiteralMatchIterator<'a, REV> {
             index,
             searcher: Searcher::new(query.as_bytes()),
             candidates,
-            current_line: None,
-            current_matches: None,
+            current: None,
             anchor: None,
-            current_offset: 0,
         }
     }
 
@@ -235,56 +240,63 @@ impl<const REV: bool> Iterator for LiteralMatchIterator<'_, REV> {
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if let Some(line_num) = self.current_line
-                && let Some(text) = self.index.lines.get(&line_num)
-            {
-                let fallback;
-                let col_map = match self.index.column_maps.get(&line_num) {
-                    Some(map) => map,
-                    None => {
-                        fallback = ColumnMap::new(text, self.index.ambiguous_width);
-                        &fallback
-                    }
-                };
-                if let Some(matches) = &mut self.current_matches {
-                    for at in matches.by_ref() {
-                        let found = literal_occurrence(
-                            line_num,
-                            self.current_offset.saturating_add(at),
-                            self.searcher.needle().len(),
-                            col_map,
-                        );
-                        if found.start_col != found.end_col {
-                            return Some(found);
-                        }
+            if let Some(current) = &mut self.current {
+                for at in current.matches.by_ref() {
+                    let found = literal_occurrence(
+                        current.line,
+                        current.offset.saturating_add(at),
+                        self.searcher.needle().len(),
+                        &current.columns,
+                    );
+                    if found.start_col != found.end_col {
+                        return Some(found);
                     }
                 }
             }
-            self.current_line = self.candidates.next_candidate();
-            self.current_line?;
-            self.current_matches = self
-                .current_line
-                .and_then(|line| self.index.lines.get(&line))
-                .map(|text| {
-                    let mut first = 0;
-                    let mut end = text.len();
-                    if let Some((line, col, inclusive)) = self.anchor
-                        && self.current_line == Some(line)
-                        && let Some(map) = self.index.column_maps.get(&line)
-                        && let Some(window) = map.identity_match_window::<REV>(
-                            text.len(),
-                            col,
-                            inclusive,
-                            self.searcher.needle().len(),
-                        )
-                    {
-                        first = window.start;
-                        end = window.end;
-                    }
-                    self.current_offset = first;
-                    self.searcher
-                        .matches_in::<REV>(&text.as_bytes()[first..end])
-                });
+            let Some(line_num) = self.candidates.next_candidate() else {
+                self.current = None;
+                return None;
+            };
+            if let Some(text) = self.index.lines.get(&line_num) {
+                // The index is immutably borrowed for the iterator's lifetime. Retain its
+                // map while walking this line, including across yielded occurrences.
+                let map = self.index.column_maps.get(&line_num).map_or_else(
+                    || Cow::Owned(ColumnMap::new(text, self.index.ambiguous_width)),
+                    Cow::Borrowed,
+                );
+                let mut first = 0;
+                let mut end = text.len();
+                if let Some((line, col, inclusive)) = self.anchor
+                    && line_num == line
+                    && let Some(window) = map.identity_match_window::<REV>(
+                        text.len(),
+                        col,
+                        inclusive,
+                        self.searcher.needle().len(),
+                    )
+                {
+                    first = window.start;
+                    end = window.end;
+                }
+                let matches = self
+                    .searcher
+                    .matches_in::<REV>(&text.as_bytes()[first..end]);
+                if let Some(current) = &mut self.current {
+                    current.line = line_num;
+                    current.columns = map;
+                    current.matches = matches;
+                    current.offset = first;
+                } else {
+                    self.current = Some(LiteralLine {
+                        line: line_num,
+                        columns: map,
+                        matches,
+                        offset: first,
+                    });
+                }
+            } else {
+                self.current = None;
+            }
             #[cfg(test)]
             super::index::count_search_from_line_candidate();
         }
@@ -294,6 +306,47 @@ impl<const REV: bool> Iterator for LiteralMatchIterator<'_, REV> {
 #[cfg(test)]
 mod memmem_forward_tests {
     use crate::SearchIndex;
+
+    #[test]
+    fn resumed_literal_lines_match_scalar_reference_in_both_directions() {
+        use crate::grapheme::byte_to_column;
+
+        let lines = ["日x x", "x\u{301}x x", "xx", "no hit", "日", "x日xx", ""];
+        for cached_maps in [true, false] {
+            let mut index = SearchIndex::new();
+            for (line, text) in lines.iter().enumerate() {
+                index.index_line(line, text);
+            }
+            if !cached_maps {
+                index.column_maps.clear();
+            }
+            for needle in ["x", "xx", "日", "x\u{301}", "absent"] {
+                let mut expected = Vec::new();
+                for (line, text) in lines.iter().enumerate() {
+                    for (at, _) in text.char_indices() {
+                        if text[at..].starts_with(needle) {
+                            expected.push((
+                                line,
+                                byte_to_column(text, at),
+                                byte_to_column(text, at + needle.len()),
+                            ));
+                        }
+                    }
+                }
+                let forward: Vec<_> = index
+                    .search_from_line(needle, 0)
+                    .map(|m| (m.line, m.start_col, m.end_col))
+                    .collect();
+                assert_eq!(forward, expected, "cached={cached_maps} needle={needle:?}");
+                expected.reverse();
+                let reverse: Vec<_> = index
+                    .search_before_line(needle, index.len())
+                    .map(|m| (m.line, m.start_col, m.end_col))
+                    .collect();
+                assert_eq!(reverse, expected, "cached={cached_maps} needle={needle:?}");
+            }
+        }
+    }
 
     #[test]
     fn compressed_intersections_match_set_reference_at_every_boundary() {

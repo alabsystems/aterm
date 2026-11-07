@@ -145,11 +145,15 @@ fn need_of(s: &ModelState) -> Option<Need> {
             every_locker_open: true,
             before_commons: true,
             swept_unheld: false,
+            window_ended: false,
+            custodian_silent: false,
         }),
         got: s["got"] == 1,
         got_authorized: s["pa"] == 1,
         raised_again_on_change: (s["raises"] == 2).then_some(s["okr"] == 1),
         posted: s["posted"] == 1,
+        custodian_silent: false,
+        late_offer: false,
         record: None,
         line: String::new(),
         seq: Some(SEQ),
@@ -455,7 +459,26 @@ fn the_hold_probe_names_only_the_catalog_path_whatever_the_environment_says() {
 
 #[test]
 fn every_ask_passes_the_exceptions_entrys_own_rules() {
-    for (want, purpose, host) in [
+    let named = Unanswered {
+        hosts: vec![
+            "m3".into(),
+            "a-very-long-vault-host-name-for-another-mac".into(),
+        ],
+        others: 2,
+    };
+    let unnamed = Unanswered {
+        hosts: Vec::new(),
+        others: 1,
+    };
+    let nobody = Unanswered::default();
+    let heard = [
+        Heard::Nothing,
+        Heard::Unanswered(&named),
+        Heard::Unanswered(&unnamed),
+        Heard::Offered(&nobody),
+        Heard::Offered(&named),
+    ];
+    for ((want, purpose, host), heard) in [
         (Want::Mailbox("m29".into()), Purpose::HarnessSignIn, HOST),
         (
             Want::Mailbox("m29-2".into()),
@@ -469,8 +492,13 @@ fn every_ask_passes_the_exceptions_entrys_own_rules() {
             Purpose::ByHand,
             "a-very-long-vault-host-name-for-a-mac",
         ),
-    ] {
-        let ask = ask_for(&want, purpose, host).unwrap();
+        (Want::Notary, Purpose::ReleaseNotary, HOST),
+        (Want::SiteDeployerKey, Purpose::ReleaseSiteKey, HOST),
+    ]
+    .into_iter()
+    .flat_map(|case| heard.iter().map(move |heard| (case.clone(), *heard)))
+    {
+        let ask = ask_on(&want, purpose, host, heard).unwrap();
         let mut need = fresh([3; 16], want, purpose, &bare_facts());
         need.state = State::AwaitingPerson;
         need.asking = true;
@@ -494,9 +522,22 @@ fn every_ask_passes_the_exceptions_entrys_own_rules() {
             aterm_messages::need::Reason::new(&ask.reason)
                 .fault()
                 .is_none()
+                && ask.reason.chars().count() <= aterm_messages::need::REASON_CAP,
+            "{}",
+            ask.reason
         );
         assert!(ask.needs_you.starts_with("NEEDS YOU: ") && !ask.needs_you.contains('\n'));
         assert!(entry.key().starts_with("secrets.need."), "{}", entry.key());
+        // The fact keeps three detail lines: every line the ask has reaches it, the source last.
+        assert!(
+            ask.more.len() <= aterm_messages::exceptions::MORE_LINES
+                && ask
+                    .more
+                    .last()
+                    .is_some_and(|line| line.starts_with("it comes from:")),
+            "{heard:?}: {:?}",
+            ask.more
+        );
     }
     // The line names the one command that works today, for this Mac's vault host, with the
     // value from a file and never an argument.
@@ -583,9 +624,23 @@ fn decided_checks_policy_and_refuses_asking_when_already_held_and_absorb_settles
     };
     let mut unauthorized = facts.clone();
     unauthorized.policy = Policy::compiled(false);
-    assert!(decided(&open, &unauthorized, &Decision::Offered).is_none());
+    assert!(
+        decided(
+            &open,
+            &unauthorized,
+            &Decision::Offered(Unanswered::default())
+        )
+        .is_none()
+    );
     assert!(decided(&open, &unauthorized, &Decision::Published { seq: 9 }).is_none());
-    assert!(decided(&open, &unauthorized, &Decision::NeedsPerson).is_none());
+    assert!(
+        decided(
+            &open,
+            &unauthorized,
+            &Decision::NeedsPerson(Unanswered::default())
+        )
+        .is_none()
+    );
 
     let mut held_facts = facts_of(&model_state(&[("kind", 3)]));
     if let Some(sight) = held_facts.sight.as_mut() {
@@ -603,7 +658,12 @@ fn decided_checks_policy_and_refuses_asking_when_already_held_and_absorb_settles
         )
     };
     assert!(
-        decided(&mailbox_open, &held_facts, &Decision::NeedsPerson).is_none(),
+        decided(
+            &mailbox_open,
+            &held_facts,
+            &Decision::NeedsPerson(Unanswered::default())
+        )
+        .is_none(),
         "never raises NEEDS YOU when the entry is already held"
     );
 
@@ -614,6 +674,329 @@ fn decided_checks_policy_and_refuses_asking_when_already_held_and_absorb_settles
     }
     let published = decided(&open, &facts, &Decision::Published { seq: SEQ }).unwrap();
     assert_eq!(settle(&published, &facts).state, State::Fulfilled);
+}
+
+/// A decision the want window's end made rests on fewer sweeps than every member's, so its proof
+/// says so and, for a want a member can hold, the ask names who did not answer; a want no member
+/// can hold keeps the words every member's sweep gives. A late offer moves an ask to the holder's
+/// copy once, naming who the window's end named, and keeps it up.
+/// NEGATIVE CONTROL: a decision every member's sweep made keeps the words it had; a refusing
+/// policy takes no late offer; an offer on an open request is the plain offer.
+#[test]
+fn a_window_decision_and_a_late_offer_say_what_the_lab_heard() {
+    let facts = facts_of(&model_state(&[("kind", 0), ("commons", 1)]));
+    let open = |want: Want| Need {
+        state: State::Open,
+        wait: Wait::Holders,
+        posted: true,
+        ..fresh([14; 16], want, Purpose::ByHand, &facts)
+    };
+    let window = Decision::NeedsPerson(Unanswered {
+        hosts: vec!["m3".into(), "m4".into()],
+        others: 2,
+    });
+    let notary = decided(&open(Want::Notary), &facts, &window).unwrap();
+    let proof = notary.proof.unwrap();
+    assert!(
+        proof.window_ended && !proof.swept_unheld && proof.warrants_asking(),
+        "{proof:?}"
+    );
+    assert!(
+        notary
+            .line
+            .contains("m3, m4 and 2 other Macs did not answer"),
+        "{}",
+        notary.line
+    );
+    let gh = Want::Gh(GhProfile::Dev);
+    let token = decided(&open(gh.clone()), &facts, &window).unwrap();
+    assert!(token.proof.is_some_and(|proof| proof.window_ended));
+    assert_eq!(
+        token.ask,
+        ask_for(&gh, Purpose::ByHand, HOST),
+        "no member's sweep can offer a token"
+    );
+    let every = Decision::NeedsPerson(Unanswered::default());
+    let swept = decided(&open(Want::Notary), &facts, &every).unwrap();
+    assert!(
+        swept
+            .proof
+            .is_some_and(|proof| proof.swept_unheld && !proof.window_ended)
+    );
+    assert_eq!(swept.ask, ask_for(&Want::Notary, Purpose::ByHand, HOST));
+
+    let late = Decision::Offered(Unanswered {
+        hosts: vec!["m3".into()],
+        others: 0,
+    });
+    let moved = decided(&notary, &facts, &late).unwrap();
+    assert_eq!(
+        (moved.state, moved.wait, moved.asking, moved.late_offer),
+        (State::AwaitingPerson, Wait::Person, true, true)
+    );
+    assert!(
+        moved
+            .line
+            .contains("offered it (m3 had not answered when the window ended)")
+            && moved
+                .line
+                .contains("the vault custodian's running aterm takes"),
+        "the window named who it is, and the runtime takes the copy: {}",
+        moved.line
+    );
+    assert_eq!(moved.proof, notary.proof, "the ask's warrant stands");
+    assert!(decided(&moved, &facts, &late).is_none(), "once");
+    let mut refused = facts.clone();
+    refused.policy = Policy::compiled(false);
+    assert!(decided(&notary, &refused, &late).is_none());
+    let offered = decided(&open(Want::Notary), &facts, &late).unwrap();
+    assert_eq!((offered.state, offered.asking), (State::Offered, false));
+}
+
+/// Past the silence with no custodian record, a posted person-sourced vault-only want goes to a
+/// person only on this Mac's absence proof (every locker but `admin` open, the entry in none, the
+/// policy giving it); any other open request stays open, says the admin's aterm is silent and
+/// files the one fact for later. Each pass reads it again: a sight that comes back, or a locker
+/// that opens, moves an open one on to the person, and a value that reaches this Mac's own
+/// section (the hand route, run on the admin Mac) delivers it, so a need no consumer checks is
+/// fulfilled and the fact comes down. A pass that sees what the last one saw moves nothing.
+/// NEGATIVE CONTROL: a hidden locker, a missing sight, a refusing policy and a copyable want stay
+/// open; a value the consumer refused at the version this Mac holds is not a delivery; a need
+/// not open or offered on the table moves nothing.
+#[test]
+fn a_silent_custodian_hands_over_only_what_the_absence_proof_covers() {
+    let facts = facts_of(&model_state(&[("kind", 3), ("commons", 1)]));
+    let posted = |want: Want, purpose| Need {
+        state: State::Open,
+        wait: Wait::Holders,
+        posted: true,
+        ..fresh([12; 16], want, purpose, &facts)
+    };
+    let mailbox = posted(Want::Mailbox("m29".into()), Purpose::HarnessSignIn);
+    let asked = silent(&mailbox, &facts).unwrap();
+    assert_eq!(
+        (asked.state, asked.wait),
+        (State::AwaitingPerson, Wait::Person)
+    );
+    assert!(asked.asking && asked.proof.is_some_and(|proof| proof.warrants_asking()));
+    assert_eq!(exceptions(std::slice::from_ref(&asked)).len(), 1);
+    assert!(silent(&asked, &facts).is_none(), "asked once");
+
+    let mut hidden = facts.clone();
+    if let Some(sight) = hidden.sight.as_mut() {
+        sight.hidden = true;
+    }
+    let mut blind = facts.clone();
+    blind.sight = None;
+    let mut refused = facts.clone();
+    refused.policy = Policy::compiled(false);
+    let notary = posted(Want::Notary, Purpose::ByHand);
+    for (need, facts) in [
+        (&mailbox, &hidden),
+        (&mailbox, &blind),
+        (&mailbox, &refused),
+        (&notary, &facts),
+    ] {
+        let said = silent(need, facts).unwrap();
+        assert_eq!((said.state, said.wait), (State::Open, Wait::Custodian));
+        assert!(!said.asking && said.proof.is_none(), "{said:?}");
+        assert!(said.line.contains("96 hours"), "{}", said.line);
+        let filed = exceptions(std::slice::from_ref(&said));
+        assert_eq!(filed.len(), 1);
+        assert_eq!(filed[0].key(), "secrets.need.custodian.silent");
+        filed[0].message().unwrap();
+        assert!(silent(&said, facts).is_none(), "said once");
+    }
+    for unsighted in [&hidden, &blind] {
+        let said = silent(&mailbox, unsighted).unwrap();
+        let later = silent(&said, &facts).unwrap();
+        assert_eq!(
+            (later.state, later.wait),
+            (State::AwaitingPerson, Wait::Person),
+            "a later pass that sees the whole vault asks: {}",
+            later.line
+        );
+    }
+
+    let mut held = facts.clone();
+    if let Some(sight) = held.sight.as_mut() {
+        sight.held.insert(catalog::NOTARY_ENTRY.to_owned());
+    }
+    let said = silent(&notary, &facts).unwrap();
+    let delivered = settle(&silent(&said, &held).unwrap(), &held);
+    assert_eq!(delivered.state, State::Fulfilled, "{}", delivered.line);
+    assert!(exceptions(std::slice::from_ref(&delivered)).is_empty());
+    let offered = Need {
+        state: State::Offered,
+        ..notary.clone()
+    };
+    assert_eq!(
+        silent(&offered, &held).map(|need| need.state),
+        Some(State::Published)
+    );
+    assert!(
+        silent(&offered, &facts).is_none(),
+        "an offer is its own line"
+    );
+    let at_refused = Need {
+        refused: Some(SEQ),
+        ..notary.clone()
+    };
+    assert_eq!(
+        silent(&at_refused, &held).map(|need| need.state),
+        Some(State::Open),
+        "the refused value is no delivery"
+    );
+
+    let local = fresh([13; 16], Want::Notary, Purpose::ByHand, &facts);
+    let unposted = Need {
+        posted: false,
+        ..notary.clone()
+    };
+    assert!(silent(&local, &facts).is_none());
+    assert!(silent(&unposted, &facts).is_none());
+}
+
+/// The silent custodian's fact keeps three detail lines: past two requests it names the first
+/// and counts the rest, so none is cut without a word.
+#[test]
+fn the_silent_custodians_fact_counts_what_its_lines_cannot_hold() {
+    let mut facts = facts_of(&model_state(&[("kind", 3), ("commons", 1)]));
+    if let Some(sight) = facts.sight.as_mut() {
+        sight.hidden = true;
+    }
+    let said = |id: u8, want: Want| {
+        let need = Need {
+            state: State::Open,
+            posted: true,
+            ..fresh([id; 16], want, Purpose::ByHand, &facts)
+        };
+        silent(&need, &facts).unwrap()
+    };
+    let two = [said(1, Want::Notary), said(2, Want::SiteDeployerKey)];
+    let three = [
+        said(1, Want::Notary),
+        said(2, Want::SiteDeployerKey),
+        said(3, Want::Mailbox("m29".into())),
+    ];
+    let lines = |needs: &[Need]| {
+        let filed = exceptions(needs);
+        assert_eq!(filed.len(), 1);
+        format!("{:?}", filed[0].message().unwrap())
+    };
+    let shown = lines(&two);
+    assert!(
+        shown.contains("notary: ") && shown.contains("site-deployer-key: "),
+        "{shown}"
+    );
+    let counted = lines(&three);
+    assert!(
+        counted.contains("notary: ")
+            && counted.contains("2 more: aterm secrets need ls names each"),
+        "{counted}"
+    );
+}
+
+/// Of a want's rows that ask, the person sees the one whose ask rests on the most the lab heard:
+/// a copy a Mac offered, then who did not answer, before an ask that says no Mac holds it,
+/// whichever row came first.
+/// NEGATIVE CONTROL: rows that heard the same keep the oldest, and another want's row is its own.
+#[test]
+fn a_wants_ask_is_the_one_that_heard_the_most() {
+    let facts = facts_of(&model_state(&[("kind", 0), ("commons", 1)]));
+    let open = |id: u8, purpose| Need {
+        state: State::Open,
+        wait: Wait::Holders,
+        posted: true,
+        ..fresh([id; 16], Want::Notary, purpose, &facts)
+    };
+    let every = Decision::NeedsPerson(Unanswered::default());
+    let window = Decision::NeedsPerson(Unanswered {
+        hosts: vec!["m3".into()],
+        others: 0,
+    });
+    let swept = decided(&open(1, Purpose::ReleaseNotary), &facts, &every).unwrap();
+    let unheard = decided(&open(2, Purpose::ByHand), &facts, &window).unwrap();
+    let late = Decision::Offered(Unanswered::default());
+    let copy = decided(&unheard, &facts, &late).unwrap();
+    let said = |rows: &[Need]| needs_you(rows).join("\n");
+    assert!(said(&[swept.clone(), unheard.clone()]).contains("m3 did not answer"));
+    assert!(said(&[swept.clone(), copy.clone()]).contains("offered it"));
+    assert!(said(&[unheard.clone(), copy.clone()]).contains("offered it"));
+    assert_eq!(exceptions(&[swept.clone(), copy.clone()]).len(), 1);
+    let same = Need {
+        id: [3; 16],
+        purpose: Purpose::AghDev,
+        ..swept.clone()
+    };
+    assert_eq!(
+        needs_you(&[swept.clone(), same]),
+        needs_you(std::slice::from_ref(&swept))
+    );
+    let other = Need {
+        want: Want::SiteDeployerKey,
+        ..swept.clone()
+    };
+    assert_eq!(needs_you(&[copy, other]).len(), 2);
+}
+
+/// An ask that rests on less than the lab now says is restated, once: one this Mac made standing
+/// in for a silent custodian takes the custodian's own decision when it comes (with who did not
+/// answer), and one the window's end made takes every member's sweep once each has answered.
+/// NEGATIVE CONTROL: an ask the custodian made on every member's sweep, and one a late offer
+/// moved, keep their words.
+#[test]
+fn a_custodians_later_decision_restates_an_ask_that_rested_on_less() {
+    let facts = facts_of(&model_state(&[("kind", 3), ("commons", 1)]));
+    let open = Need {
+        state: State::Open,
+        wait: Wait::Holders,
+        posted: true,
+        ..fresh(
+            [5; 16],
+            Want::Mailbox("m29".into()),
+            Purpose::HarnessSignIn,
+            &facts,
+        )
+    };
+    let stood_in = silent(&open, &facts).unwrap();
+    let window = Decision::NeedsPerson(Unanswered {
+        hosts: vec!["m3".into()],
+        others: 0,
+    });
+    let every = Decision::NeedsPerson(Unanswered::default());
+    let custodians = decided(&stood_in, &facts, &window).unwrap();
+    let proof = custodians.proof.unwrap();
+    assert!(proof.window_ended && !proof.custodian_silent, "{proof:?}");
+    assert!(
+        custodians.line.contains("m3 did not answer"),
+        "{}",
+        custodians.line
+    );
+    assert!(decided(&custodians, &facts, &window).is_none(), "once");
+    let answered = decided(&custodians, &facts, &every).unwrap();
+    assert!(
+        answered
+            .proof
+            .is_some_and(|proof| proof.swept_unheld && !proof.window_ended)
+    );
+    assert!(
+        answered.line.contains("is on no Mac the lab can reach"),
+        "{}",
+        answered.line
+    );
+    assert!(decided(&answered, &facts, &every).is_none());
+    assert!(decided(&answered, &facts, &window).is_none());
+    let late = decided(
+        &custodians,
+        &facts,
+        &Decision::Offered(Unanswered::default()),
+    )
+    .unwrap();
+    assert!(
+        decided(&late, &facts, &every).is_none(),
+        "the offer's words stand"
+    );
 }
 
 fn bare_facts() -> Facts {
@@ -1157,9 +1540,33 @@ fn the_ledger_reads_back_every_field_it_writes() {
     declined.refused = Some(3);
     declined.record = Some(vec![1, 2, 3]);
     declined.raised_again_on_change = Some(true);
+    let open = Need {
+        id: [11; 16],
+        state: State::Open,
+        posted: true,
+        asking: false,
+        ask: None,
+        proof: None,
+        ..need.clone()
+    };
+    let stood_in = silent(&open, &facts).unwrap();
+    assert!(stood_in.custodian_silent && stood_in.proof.is_some_and(|p| p.custodian_silent));
+    let window = Decision::NeedsPerson(Unanswered {
+        hosts: vec!["m3".into()],
+        others: 1,
+    });
+    let posted = Need {
+        id: [12; 16],
+        want: Want::Notary,
+        purpose: Purpose::ByHand,
+        ..open.clone()
+    };
+    let asked = decided(&posted, &facts, &window).unwrap();
+    let offered = decided(&asked, &facts, &Decision::Offered(Unanswered::default())).unwrap();
+    assert!(offered.late_offer && offered.proof.is_some_and(|p| p.window_ended));
     let root = aterm_tempfile::tempdir().unwrap();
     let paths = Paths::for_home(root.path());
-    let mut rows = vec![need, declined];
+    let mut rows = vec![need, declined, stood_in, offered];
     ledger::save(&paths, &mut rows).unwrap();
     assert_eq!(ledger::load(&paths).unwrap(), rows);
 }

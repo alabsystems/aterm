@@ -616,6 +616,11 @@ pub fn overlay_card_cost(frames: usize) -> Vec<(String, f64, f64, f64)> {
         })
         .collect()
 }
+/// What the `deck_image_cost` bench measures (M-IMG): the deck from a recorded Snapshot, laid
+/// out, painted and rastered offscreen, then encoded as a capture, as `image panel` will.
+#[cfg(all(unix, feature = "bench-support"))]
+#[doc(hidden)]
+pub mod deck_image_probe;
 /// What the `c_cut_cost` bench measures.
 #[cfg(feature = "bench-support")]
 #[doc(hidden)]

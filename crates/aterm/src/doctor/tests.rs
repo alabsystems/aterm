@@ -1772,6 +1772,52 @@ fn base_clt_waits_out_a_first_compile_slower_than_a_status_read() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn base_clt_has_private_probe_space_despite_a_missing_project_tmpdir() {
+    use atpkg::prereq::{CcHost, CcVerdict};
+    use std::os::unix::fs::PermissionsExt as _;
+    const CHILD: &str = "ATERM_BASE_CLT_TEMP_CHILD";
+    if let Some(root) = std::env::var_os(CHILD).map(PathBuf::from) {
+        let path = Some(root.as_os_str());
+        assert!(matches!(
+            atpkg::prereq::probe_with(path, &CcHost::waited_on()),
+            CcVerdict::Unproven { .. }
+        ));
+        assert_eq!(
+            super::base_clt_probe(path),
+            CcVerdict::Ready {
+                driver: root.join("cc")
+            }
+        );
+        std::fs::write(root.join("checked"), b"yes").unwrap();
+        return;
+    }
+    let root = aterm_tempfile::tempdir().unwrap();
+    let cc = root.path().join("cc");
+    std::fs::write(&cc, "#!/bin/sh\n[ \"$1\" = --version ] && { echo cc; exit 0; }\nprintf x > \"$2\"\n/bin/chmod +x \"$2\"\n").unwrap();
+    std::fs::set_permissions(&cc, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+    cmd.args([
+        "--exact",
+        "doctor::tests::base_clt_has_private_probe_space_despite_a_missing_project_tmpdir",
+        "--nocapture",
+    ])
+    .env(CHILD, root.path())
+    .env("TMPDIR", root.path().join("missing temporary directory"));
+    let output = aterm_uds::deadline::output_until(
+        &mut cmd,
+        std::time::Instant::now() + std::time::Duration::from_secs(60),
+    )
+    .unwrap();
+    assert!(
+        output.status.success() && root.path().join("checked").is_file(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn base_clt_checks_the_system_selection_despite_a_builds_developer_override() {
     use atpkg::prereq::{CcHost, CcVerdict};
     use std::os::unix::fs::PermissionsExt as _;

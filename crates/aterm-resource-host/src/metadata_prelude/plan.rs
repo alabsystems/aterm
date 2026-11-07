@@ -4,8 +4,10 @@
 //! Private exec data, deliberately containing no admission binding or budget.
 use super::*;
 use trust_resource_controller::CommandSpec;
-const MAGIC: &[u8; 8] = b"AMEX0001";
+const MAGIC: &[u8; 8] = b"AMEX0002";
 const MAX_ITEMS: usize = 4096;
+// One compiler CPU, its original GNU pair, SDK keeper and read-only locator.
+const MAX_TARGETS: usize = 5;
 pub(super) struct ExecPlan {
     pub parent: transport::Peer,
     pub command: CommandSpec,
@@ -15,12 +17,11 @@ impl ExecPlan {
     fn validate(&self) -> io::Result<()> {
         if self.parent.pid <= 1
             || self.parent.birth == 0
-            || self.command.arg0.is_some()
             || self.command.program.first() != Some(&b'/')
             || self.command.cwd.first() != Some(&b'/')
             || self.command.args.len() > MAX_ITEMS
             || self.command.environment.len() > MAX_ITEMS
-            || self.targets.len() > 3
+            || self.targets.len() > MAX_TARGETS
         {
             return Err(refused());
         }
@@ -57,6 +58,13 @@ impl ExecPlan {
             Ok(())
         }
         field(&mut bytes, &self.command.program)?;
+        match &self.command.arg0 {
+            None => bytes.push(0),
+            Some(value) => {
+                bytes.push(1);
+                field(&mut bytes, value)?;
+            }
+        }
         field(&mut bytes, &self.command.cwd)?;
         bytes.extend((self.command.args.len() as u32).to_be_bytes());
         for argument in &self.command.args {
@@ -118,6 +126,11 @@ impl ExecPlan {
             birth: u64::from_be_bytes(read.take(8)?.try_into().map_err(|_| refused())?),
         };
         let program = read.field()?;
+        let arg0 = match read.take(1)?[0] {
+            0 => None,
+            1 => Some(read.field()?),
+            _ => return Err(refused()),
+        };
         let cwd = read.field()?;
         let mut args = Vec::new();
         for _ in 0..read.count(MAX_ITEMS)? {
@@ -128,7 +141,7 @@ impl ExecPlan {
             environment.push((read.field()?, read.field()?));
         }
         let mut targets = Vec::new();
-        for _ in 0..read.count(3)? {
+        for _ in 0..read.count(MAX_TARGETS)? {
             targets.push(i32::try_from(read.number()?).map_err(|_| refused())?);
         }
         if !read.0.is_empty() {
@@ -138,7 +151,7 @@ impl ExecPlan {
             parent,
             command: CommandSpec {
                 program,
-                arg0: None,
+                arg0,
                 args,
                 environment,
                 cwd,
@@ -159,10 +172,10 @@ mod tests {
                 pid: 123,
                 birth: 456,
             },
-            targets: vec![3, 4],
+            targets: vec![3, 4, 5, 6, 7],
             command: CommandSpec {
                 program: b"/native/bin/query".to_vec(),
-                arg0: None,
+                arg0: Some(vec![b'x', 0xff]),
                 args: vec![vec![b'-', 0xff]],
                 environment: vec![(b"LANG".to_vec(), b"C".to_vec())],
                 cwd: b"/private/work".to_vec(),
@@ -180,7 +193,16 @@ mod tests {
         extra.push(0);
         assert!(ExecPlan::decode(&extra).is_err());
         assert!(aterm_types::resource_admission::Submission::decode(&bytes).is_err());
+        let mut old = bytes.clone();
+        old[..8].copy_from_slice(b"AMEX0001");
+        assert!(ExecPlan::decode(&old).is_err());
         let mut changed = decoded;
+        changed.targets.push(8);
+        assert!(changed.encode().is_err());
+        changed.targets.pop();
+        changed.command.arg0.as_mut().unwrap().push(0);
+        assert!(changed.encode().is_err());
+        changed.command.arg0.as_mut().unwrap().pop();
         changed.command.environment[0].1.push(0);
         assert!(changed.encode().is_err());
         changed.command.environment[0].1 = vec![b'x'; MAX_PLAN + 1];

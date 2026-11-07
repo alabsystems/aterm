@@ -65,7 +65,7 @@ fn path(bytes: &[u8], root: &[u8]) -> bool {
         && bytes.get(root.len()) == Some(&b'/')
 }
 impl MetadataFile {
-    pub(super) fn validate(&self, root: &[u8]) -> io::Result<()> {
+    pub(crate) fn validate(&self, root: &[u8]) -> io::Result<()> {
         if !path(&self.path, root)
             || self.bytes == 0
             || self.bytes > MAX_IMAGE_BYTES
@@ -75,7 +75,7 @@ impl MetadataFile {
         }
         Ok(())
     }
-    pub(super) fn encode(&self, e: &mut Encoder) -> io::Result<()> {
+    pub(crate) fn encode(&self, e: &mut Encoder) -> io::Result<()> {
         e.bytes(&self.path)?;
         e.0.extend(self.sha256);
         e.number(self.bytes);
@@ -83,7 +83,7 @@ impl MetadataFile {
         e.number(self.inode);
         Ok(())
     }
-    pub(super) fn decode(d: &mut crate::wire::Decoder<'_>) -> io::Result<Self> {
+    pub(crate) fn decode(d: &mut crate::wire::Decoder<'_>) -> io::Result<Self> {
         Ok(Self {
             path: d.bytes()?,
             sha256: d.array()?,
@@ -152,6 +152,22 @@ impl MetadataPrepared {
     pub fn validate_for_resolver(
         &self,
         request: &crate::resolver::SealedResolverQueryRequest,
+    ) -> io::Result<()> {
+        self.validate()?;
+        request.validate()?;
+        if self.root_attempt != request.member.binding.root_attempt
+            || self.member_attempt != request.member.member_attempt
+            || self.root != request.root
+            || self.executable.path != request.member.command.program
+            || self.executable.sha256 != request.program_sha256
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+    pub fn validate_for_workload_query(
+        &self,
+        request: &crate::workload::host::CompilerQuery,
     ) -> io::Result<()> {
         self.validate()?;
         request.validate()?;

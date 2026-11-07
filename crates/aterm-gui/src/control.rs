@@ -743,23 +743,33 @@ fn cmd_help(rest: &str) -> String {
         "--json" => return HELP_JSON.to_string(),
         _ => {}
     }
-    let usage = || "ERR usage: help [<verb> | --full | --json]\n".to_string();
+    let usage = || "ERR usage: help [<verb> [<section>] | --full | --json]\n".to_string();
     if tail.starts_with('-') {
         return usage();
     }
-    let words: Vec<&str> = tail.split_whitespace().collect();
-    match spec(&words.join(" ")) {
-        Some(s) => {
-            let lines = s.entry_lines();
-            let mut body = format!("OK {}\n", lines.len());
-            for line in lines {
-                body.push_str(&line);
-                body.push('\n');
-            }
-            body
+    let framed = |lines: Vec<String>| {
+        let mut body = format!("OK {}\n", lines.len());
+        for line in lines {
+            body.push_str(&line);
+            body.push('\n');
         }
-        None if words.len() > 1 => usage(),
-        None => format!("ERR unknown verb '{tail}' (help lists them)\n"),
+        body
+    };
+    let words: Vec<&str> = tail.split_whitespace().collect();
+    if let Some(s) = spec(&words.join(" ")) {
+        return framed(s.entry_lines());
+    }
+    match words.as_slice() {
+        [verb, section] if spec(verb).is_some_and(|s| s.page.is_some()) => {
+            match spec(verb).and_then(|s| s.section_lines(section)) {
+                Some(lines) => framed(lines),
+                None => {
+                    format!("ERR unknown section '{section}' of {verb} (help {verb} lists them)\n")
+                }
+            }
+        }
+        [_] => format!("ERR unknown verb '{tail}' (help lists them)\n"),
+        _ => usage(),
     }
 }
 
@@ -777,8 +787,8 @@ fn help_short_catalog() -> String {
          # --json on {json_verbs} = structured output · \"@<sid> <verb>\" = aim it at that session \
          (an app-level verb: its instance's front window; an @ that names nothing, as \"@$W\" with \
          $W empty, is refused; `aterm ctl` also takes a read's \"<verb> @<sid>\")\n\
-         # help <verb> = the full entry · help --full = the complete catalog · help --json = the \
-         catalog as JSON\n"
+         # help <verb> = its entry · help <verb> <section> = one part of a long entry · help \
+         --full = every entry whole · help --json = the catalog as JSON\n"
     );
     for line in catalog_lines() {
         body.push_str(&line);
@@ -969,10 +979,38 @@ mod help_tests {
         ] {
             assert_eq!(
                 super::cmd_help(tail),
-                "ERR usage: help [<verb> | --full | --json]\n",
+                "ERR usage: help [<verb> [<section>] | --full | --json]\n",
                 "tail {tail:?}"
             );
         }
+    }
+
+    /// `help <verb> <section>` answers that part of a long entry, framed as an entry is; a word
+    /// the verb's page has no section for is refused by name.
+    #[test]
+    fn help_verb_section_is_one_part_of_a_long_entry() {
+        let turn = spec("turn").expect("turn ships");
+        let page = turn.page.expect("turn's entry is a page");
+        assert!(!page.sections.is_empty());
+        for section in page.sections {
+            let h = super::cmd_help(&format!(" turn \t{} ", section.name));
+            let mut lines = h.lines();
+            let status = lines.next().unwrap();
+            let rows: Vec<&str> = lines.collect();
+            assert_eq!(status, format!("OK {}", rows.len()));
+            assert_eq!(rows, turn.section_lines(section.name).expect("listed"));
+        }
+        assert_eq!(
+            super::cmd_help("turn nope"),
+            "ERR unknown section 'nope' of turn (help turn lists them)\n"
+        );
+        let first = super::cmd_help("turn");
+        let named = page.sections.iter().all(|section| {
+            first
+                .lines()
+                .any(|l| l.trim_start().starts_with(&format!("{} ", section.name)))
+        });
+        assert!(named, "help turn lists its sections: {first}");
     }
 
     #[test]

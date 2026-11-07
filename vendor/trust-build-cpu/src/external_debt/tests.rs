@@ -10,6 +10,134 @@ fn owner() -> Owner {
     Owner::current(Some(77))
 }
 
+#[cfg(feature = "native-host")]
+#[test]
+fn original_workload_continuation_keeps_shared_cursor_and_never_reacquires_at_zero_headroom() {
+    use std::os::fd::AsFd as _;
+    let Some((root, native, debt)) = setup() else { return };
+    let store = root.path().join("continuation");
+    std::fs::create_dir(&store).unwrap();
+    std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let store = store.canonicalize().unwrap();
+    let mut prepared = debt
+        .prepare_recoverable(owner(), width(4), [15; 32])
+        .unwrap()
+        .persist(&store, "original")
+        .unwrap();
+    let mut active = debt.try_acquire_all_recoverable(&mut prepared).unwrap().unwrap();
+    let original = &active.native_leases()[0];
+    let mut source = File::from(original.as_fd().try_clone_to_owned().unwrap());
+    source.seek(SeekFrom::Start(13)).unwrap();
+    // The private leaf is reached in production ONLY by the opaque live
+    // receiver. This exact-source test supplies the actual typed original.
+    let continuation =
+        native.continue_workload_original(original.slot(), source.try_clone().unwrap()).unwrap();
+    assert_eq!(source.stream_position().unwrap(), 13);
+    assert_eq!(debt.reserved().unwrap(), 4);
+    assert!(debt.try_acquire_native(owner(), 4).unwrap().is_none());
+    drop(continuation);
+    assert!(native.snapshot().unwrap().iter().all(|slot| matches!(slot, SlotState::Held { .. })));
+    drop(source);
+    active.settle_exclusion().unwrap();
+}
+
+#[test]
+fn all_domain_waiters_keep_no_partial_primaries_and_original_debt_survives_fd_loss() {
+    let Some((root, native, debt)) = setup() else { return };
+    let first_store = root.path().join("first-root");
+    let second_store = root.path().join("second-root");
+    for path in [&first_store, &second_store] {
+        std::fs::create_dir(path).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let first_store = first_store.canonicalize().unwrap();
+    let second_store = second_store.canonicalize().unwrap();
+    let mut first = debt
+        .prepare_recoverable(owner(), width(4), [11; 32])
+        .unwrap()
+        .persist(&first_store, "original")
+        .unwrap();
+    let mut second = debt
+        .prepare_recoverable(owner(), width(4), [12; 32])
+        .unwrap()
+        .persist(&second_store, "original")
+        .unwrap();
+    let old = debt.try_acquire_native(owner(), 4).unwrap().unwrap();
+    let nonces = first.nonces().unwrap();
+    for pending in [&mut first, &mut second] {
+        assert!(debt.try_acquire_all_recoverable(pending).unwrap().is_none());
+        assert_eq!(
+            native
+                .snapshot()
+                .unwrap()
+                .iter()
+                .filter(|slot| matches!(slot, SlotState::Held { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(debt.reserved().unwrap(), 0);
+    }
+    assert_eq!(first.nonces().unwrap(), nonces);
+    drop(old);
+    let active = debt.try_acquire_all_recoverable(&mut first).unwrap().unwrap();
+    assert_eq!(active.native_leases().len(), 4);
+    let slots =
+        active.native_leases().iter().map(Lease::slot).collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(slots.len(), 4);
+    assert_eq!(debt.reserved().unwrap(), 4);
+    assert!(debt.try_acquire_all_recoverable(&mut second).unwrap().is_none());
+    assert!(debt.try_acquire_native(owner(), 4).unwrap().is_none());
+    // No target was ever dispatched in this primitive fixture. Deliberately
+    // lose every live FD: that is NOT a positive-retirement observation.
+    drop(active);
+    drop(first);
+    assert!(
+        native.snapshot().unwrap().iter().all(|slot| matches!(slot, SlotState::Available { .. }))
+    );
+    assert_eq!(debt.reserved().unwrap(), 4);
+    assert!(debt.try_acquire_all_recoverable(&mut second).unwrap().is_none());
+    assert!(debt.try_acquire_native(owner(), 4).unwrap().is_none());
+    let original = debt.restore_recovery(&first_store, "original").unwrap();
+    assert_eq!(original.context(), [11; 32]);
+    original.settle().unwrap(); // This fixture positively never launched work.
+    let mut resumed = debt.try_acquire_all_recoverable(&mut second).unwrap().unwrap();
+    assert_eq!(resumed.native_leases().len(), 4);
+    resumed.settle_exclusion().unwrap();
+    assert!(resumed.exclusion_settled());
+    drop(resumed);
+    assert_eq!(debt.reserved().unwrap(), 0);
+    assert!(
+        native.snapshot().unwrap().iter().all(|slot| matches!(slot, SlotState::Available { .. }))
+    );
+}
+
+#[test]
+fn all_domain_reservation_rejects_narrow_or_changed_original_preparation_without_acquiring() {
+    let Some((root, native, debt)) = setup() else { return };
+    let store = root.path().join("material");
+    std::fs::create_dir(&store).unwrap();
+    std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let store = store.canonicalize().unwrap();
+    let mut narrow = debt
+        .prepare_recoverable(owner(), width(1), [13; 32])
+        .unwrap()
+        .persist(&store, "narrow")
+        .unwrap();
+    assert!(debt.try_acquire_all_recoverable(&mut narrow).is_err());
+    let mut changed = debt
+        .prepare_recoverable(owner(), width(4), [14; 32])
+        .unwrap()
+        .persist(&store, "changed")
+        .unwrap();
+    std::fs::write(store.join("changed"), b"incomplete original authority").unwrap();
+    assert!(debt.try_acquire_all_recoverable(&mut changed).is_err());
+    assert_eq!(std::fs::read(store.join("changed")).unwrap(), b"incomplete original authority");
+    assert_eq!(debt.reserved().unwrap(), 0);
+    assert!(
+        native.snapshot().unwrap().iter().all(|slot| matches!(slot, SlotState::Available { .. }))
+    );
+}
+
 #[test]
 fn observation_absence_is_read_only_and_busy_has_no_counts() {
     let root = tempfile::tempdir().unwrap();
@@ -434,11 +562,21 @@ fn shared_worker_returns_local_tokens_and_counts_crash_retained_debt() {
     assert_eq!(local.available().unwrap(), 3);
     external.pop().unwrap().settle().unwrap();
     drop(external); // two units remain durable debt, not newly free capacity
+    let pause = client.try_pause_extras().unwrap().unwrap();
+    assert!(!client.extra_admission_running());
+    assert!(client.try_acquire().unwrap().is_none());
+    assert_eq!(local.available().unwrap(), 3);
+    pause.resume().unwrap();
     let credit = client.try_acquire().unwrap().unwrap();
+    assert!(client.try_pause_extras().unwrap().is_none());
     assert_eq!(local.available().unwrap(), 2);
     assert!(client.try_acquire().unwrap().is_none());
     assert_eq!(local.available().unwrap(), 2);
     drop(credit);
+    assert_eq!(local.available().unwrap(), 3);
+    drop(client.try_pause_extras().unwrap().unwrap());
+    assert!(!client.extra_admission_running());
+    assert_eq!(client.try_acquire().err().unwrap().kind(), io::ErrorKind::PermissionDenied);
     assert_eq!(local.available().unwrap(), 3);
     assert_eq!(
         native

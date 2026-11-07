@@ -1,34 +1,62 @@
-//! Resolver support declaration read from the original held image description.
+//! Closed native protocol support declaration read from the original held image description.
 //! This is a pre-GO protocol predicate, never custody, readiness or authority.
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 use std::os::unix::fs::FileExt as _;
 
 use super::*;
 
-const SECTION: &[u8; 16] = b"__trust_resolve\0";
+#[derive(Clone, Copy)]
+pub(super) enum Profile {
+    Resolver,
+    Workload,
+    WorkloadMember,
+}
+impl Profile {
+    fn section(self) -> &'static [u8; 16] {
+        match self {
+            Self::Resolver => b"__trust_resolve\0",
+            Self::Workload => b"__trust_workload",
+            Self::WorkloadMember => b"__trust_member\0\0",
+        }
+    }
+    fn magic(self) -> &'static [u8; 16] {
+        match self {
+            Self::Resolver => b"TRUSTRESOLVER001",
+            Self::Workload => b"TRUSTWORKLOAD001",
+            Self::WorkloadMember => b"TRUSTMEMBER00002",
+        }
+    }
+    fn fields(self) -> [u64; 6] {
+        match self {
+            Self::Resolver => [3, 5, 32, 33, 34, 1],
+            Self::Workload => [3, 6, 7, 40, 48, 1],
+            Self::WorkloadMember => [3, 2, 50, 56, 57, 58],
+        }
+    }
+}
 const TEXT: &[u8; 16] = b"__TEXT\0\0\0\0\0\0\0\0\0\0";
 fn word(bytes: &[u8], offset: usize) -> io::Result<u32> {
     Ok(u32::from_le_bytes(
         bytes
             .get(offset..offset + 4)
-            .ok_or_else(|| refused("truncated resolver Mach-O word"))?
+            .ok_or_else(|| refused("truncated protocol Mach-O word"))?
             .try_into()
-            .map_err(|_| refused("resolver Mach-O word differs"))?,
+            .map_err(|_| refused("protocol Mach-O word differs"))?,
     ))
 }
 fn wide(bytes: &[u8], offset: usize) -> io::Result<u64> {
     Ok(u64::from_le_bytes(
         bytes
             .get(offset..offset + 8)
-            .ok_or_else(|| refused("truncated resolver Mach-O address"))?
+            .ok_or_else(|| refused("truncated protocol Mach-O address"))?
             .try_into()
-            .map_err(|_| refused("resolver Mach-O address differs"))?,
+            .map_err(|_| refused("protocol Mach-O address differs"))?,
     ))
 }
 fn range(start: u64, length: u64, bound: u64) -> io::Result<std::ops::Range<u64>> {
-    let end = start.checked_add(length).ok_or_else(|| refused("resolver Mach-O range overflow"))?;
+    let end = start.checked_add(length).ok_or_else(|| refused("protocol Mach-O range overflow"))?;
     if end > bound {
-        return Err(refused("resolver Mach-O range exceeds original image"));
+        return Err(refused("protocol Mach-O range exceeds original image"));
     }
     Ok(start..end)
 }
@@ -41,7 +69,7 @@ fn read(file: &File, output: &mut [u8], offset: u64, deadline: Instant) -> io::R
         time(deadline)?;
         let count = file.read_at(&mut output[cursor..], offset + cursor as u64)?;
         if count == 0 {
-            return Err(refused("truncated original resolver image"));
+            return Err(refused("truncated original protocol image"));
         }
         cursor += count;
     }
@@ -49,10 +77,10 @@ fn read(file: &File, output: &mut [u8], offset: u64, deadline: Instant) -> io::R
 }
 
 /// All image/section arithmetic is checked before reading the declaration.
-fn marker_offset(header: &[u8], file_length: u64) -> io::Result<u64> {
+fn marker_offset(header: &[u8], file_length: u64, profile: Profile) -> io::Result<u64> {
     if word(header, 0)? != 0xfeed_facf || word(header, 4)? != 0x0100_000c || word(header, 12)? != 2
     {
-        return Err(refused("resolver marker requires a thin arm64 Mach-O executable"));
+        return Err(refused("protocol marker requires a thin arm64 Mach-O executable"));
     }
     let count = word(header, 16)? as usize;
     let bytes = word(header, 20)? as usize;
@@ -63,7 +91,7 @@ fn marker_offset(header: &[u8], file_length: u64) -> io::Result<u64> {
         || header.len() != 32 + bytes
         || header.len() as u64 > file_length
     {
-        return Err(refused("resolver Mach-O commands exceed bound"));
+        return Err(refused("protocol Mach-O commands exceed bound"));
     }
     let mut cursor = 32usize;
     let mut marker = None;
@@ -74,29 +102,29 @@ fn marker_offset(header: &[u8], file_length: u64) -> io::Result<u64> {
         let kind = word(header, cursor)?;
         let length = word(header, cursor + 4)? as usize;
         if length < 8 || length % 8 != 0 {
-            return Err(refused("invalid resolver Mach-O command size"));
+            return Err(refused("invalid protocol Mach-O command size"));
         }
         let next =
-            cursor.checked_add(length).ok_or_else(|| refused("resolver command overflow"))?;
+            cursor.checked_add(length).ok_or_else(|| refused("protocol command overflow"))?;
         let command = header
             .get(cursor..next)
-            .ok_or_else(|| refused("resolver command extends beyond header"))?;
+            .ok_or_else(|| refused("protocol command extends beyond header"))?;
         if kind == 0x19 {
             if length < 72 {
-                return Err(refused("truncated resolver segment"));
+                return Err(refused("truncated protocol segment"));
             }
             let nsects = word(command, 64)? as usize;
             if nsects > MAX_COMMANDS
                 || nsects.checked_mul(80).and_then(|n| n.checked_add(72)) != Some(length)
             {
-                return Err(refused("resolver segment section census differs"));
+                return Err(refused("protocol segment section census differs"));
             }
             let vm = wide(command, 24)?;
             let vmsize = wide(command, 32)?;
             let fileoff = wide(command, 40)?;
             let filesize = wide(command, 48)?;
             let vmend =
-                vm.checked_add(vmsize).ok_or_else(|| refused("resolver VM range overflow"))?;
+                vm.checked_add(vmsize).ok_or_else(|| refused("protocol VM range overflow"))?;
             let file = range(fileoff, filesize, file_length)?;
             if !file.is_empty() {
                 segments.push(file.clone());
@@ -110,7 +138,7 @@ fn marker_offset(header: &[u8], file_length: u64) -> io::Result<u64> {
                     || word(command, 60)? != 5
                 {
                     return Err(refused(
-                        "resolver declaration segment is not original read-only text",
+                        "protocol declaration segment is not original read-only text",
                     ));
                 }
             }
@@ -125,11 +153,11 @@ fn marker_offset(header: &[u8], file_length: u64) -> io::Result<u64> {
                 if backed && size != 0 {
                     let section_file = range(offset, size, file_length)?;
                     if section_file.start < file.start || section_file.end > file.end {
-                        return Err(refused("resolver section is outside its original segment"));
+                        return Err(refused("protocol section is outside its original segment"));
                     }
                     sections.push(section_file);
                 }
-                if section.get(..16) == Some(SECTION.as_slice()) {
+                if section.get(..16) == Some(profile.section().as_slice()) {
                     if marker.is_some()
                         || !text
                         || section.get(16..32) != Some(TEXT.as_slice())
@@ -149,7 +177,7 @@ fn marker_offset(header: &[u8], file_length: u64) -> io::Result<u64> {
                         || address.checked_add(size).is_none_or(|end| end > vmend)
                         || address - vm != offset - fileoff
                     {
-                        return Err(refused("resolver marker section has unsupported layout"));
+                        return Err(refused("protocol marker section has unsupported layout"));
                     }
                     marker = Some(offset);
                 }
@@ -158,41 +186,48 @@ fn marker_offset(header: &[u8], file_length: u64) -> io::Result<u64> {
         cursor = next;
     }
     if cursor != header.len() || texts != 1 {
-        return Err(refused("resolver text/command census differs"));
+        return Err(refused("protocol text/command census differs"));
     }
     for ranges in [&segments, &sections] {
         for (index, left) in ranges.iter().enumerate() {
             if ranges[index + 1..].iter().any(|right| overlaps(left, right)) {
-                return Err(refused("resolver image ranges overlap"));
+                return Err(refused("protocol image ranges overlap"));
             }
         }
     }
-    marker.ok_or_else(|| refused("original executable does not declare native resolver support"))
+    marker.ok_or_else(|| {
+        refused("original executable does not declare native selected native protocol support")
+    })
 }
 
-pub(super) fn require(file: &File, expected: &[u8; 64], deadline: Instant) -> io::Result<()> {
+pub(super) fn require(
+    file: &File,
+    profile: Profile,
+    expected: &[u8; 64],
+    deadline: Instant,
+) -> io::Result<()> {
     time(deadline)?;
-    if &expected[..16] != b"TRUSTRESOLVER001"
+    if &expected[..16] != profile.magic()
         || expected[16..]
             .chunks_exact(8)
             .map(|v| u64::from_be_bytes(v.try_into().unwrap()))
-            .ne([3, 5, 32, 33, 34, 1])
+            .ne(profile.fields())
     {
-        return Err(refused("unsupported resolver protocol marker format"));
+        return Err(refused("unsupported native protocol marker format"));
     }
     let mut initial = [0u8; 32];
     read(file, &mut initial, 0, deadline)?;
     let size = word(&initial, 20)? as usize;
     if size > MAX_COMMAND_BYTES {
-        return Err(refused("resolver command bytes exceed bound"));
+        return Err(refused("protocol command bytes exceed bound"));
     }
     let mut header = vec![0u8; 32 + size];
     read(file, &mut header, 0, deadline)?;
-    let offset = marker_offset(&header, file.metadata()?.len())?;
+    let offset = marker_offset(&header, file.metadata()?.len(), profile)?;
     let mut observed = [0u8; 64];
     read(file, &mut observed, offset, deadline)?;
     if &observed != expected {
-        return Err(refused("original resolver protocol declaration differs"));
+        return Err(refused("original native protocol declaration differs"));
     }
     time(deadline)
 }
@@ -200,21 +235,95 @@ pub(super) fn require(file: &File, expected: &[u8; 64], deadline: Instant) -> io
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn direct_linker_member_rejects_the_legacy_helper_only_declaration() {
+        use std::io::Write as _;
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        let mut bytes = image(Profile::WorkloadMember);
+        bytes[256..272].copy_from_slice(b"TRUSTMEMBER00001");
+        for (index, value) in [3u64, 1, 50, 2, 3, 4].into_iter().enumerate() {
+            bytes[272 + index * 8..280 + index * 8].copy_from_slice(&value.to_be_bytes());
+        }
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&bytes).unwrap();
+        assert!(
+            require(&file, Profile::WorkloadMember, &expected(Profile::WorkloadMember), deadline)
+                .is_err()
+        );
+    }
+    #[test]
+    fn compiler_member_declaration_cannot_be_an_old_root_or_resolver_protocol() {
+        use std::io::Write as _;
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        for profile in [Profile::Resolver, Profile::Workload, Profile::WorkloadMember] {
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(&image(profile)).unwrap();
+            let observed = require(
+                &file,
+                Profile::WorkloadMember,
+                &expected(Profile::WorkloadMember),
+                deadline,
+            );
+            assert_eq!(observed.is_ok(), matches!(profile, Profile::WorkloadMember));
+        }
+        for index in 0..64 {
+            let mut bytes = image(Profile::WorkloadMember);
+            bytes[256 + index] ^= 1;
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(&bytes).unwrap();
+            assert!(
+                require(
+                    &file,
+                    Profile::WorkloadMember,
+                    &expected(Profile::WorkloadMember),
+                    deadline
+                )
+                .is_err()
+            );
+        }
+    }
+    #[test]
+    fn distinct_workload_section_and_closed_fields_never_reinterpret_a_resolver_image() {
+        use std::io::Write as _;
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&image(Profile::Workload)).unwrap();
+        assert!(require(&file, Profile::Workload, &expected(Profile::Workload), deadline).is_ok());
+        assert!(require(&file, Profile::Resolver, &expected(Profile::Resolver), deadline).is_err());
+        let mut wrong = expected(Profile::Workload);
+        wrong[31] = 5;
+        assert!(require(&file, Profile::Workload, &wrong, deadline).is_err());
+        let mut resolver = tempfile::tempfile().unwrap();
+        resolver.write_all(&image(Profile::Resolver)).unwrap();
+        assert!(
+            require(&resolver, Profile::Workload, &expected(Profile::Workload), deadline).is_err()
+        );
+        for offset in [88, 92, 152, 156, 160, 164, 168, 176] {
+            let mut altered = image(Profile::Workload);
+            put(&mut altered, offset, if offset == 88 || offset == 92 { 7 } else { 1 });
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(&altered).unwrap();
+            assert!(
+                require(&file, Profile::Workload, &expected(Profile::Workload), deadline).is_err(),
+                "offset {offset}"
+            );
+        }
+    }
     fn put(bytes: &mut [u8], offset: usize, value: u32) {
         bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
     fn put64(bytes: &mut [u8], offset: usize, value: u64) {
         bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
     }
-    fn expected() -> [u8; 64] {
+    fn expected(profile: Profile) -> [u8; 64] {
         let mut out = [0; 64];
-        out[..16].copy_from_slice(b"TRUSTRESOLVER001");
-        for (index, value) in [3u64, 5, 32, 33, 34, 1].iter().enumerate() {
+        out[..16].copy_from_slice(profile.magic());
+        for (index, value) in profile.fields().iter().enumerate() {
             out[16 + index * 8..24 + index * 8].copy_from_slice(&value.to_be_bytes());
         }
         out
     }
-    fn image() -> Vec<u8> {
+    fn image(profile: Profile) -> Vec<u8> {
         let mut bytes = vec![0u8; 320];
         put(&mut bytes, 0, 0xfeed_facf);
         put(&mut bytes, 4, 0x0100_000c);
@@ -230,24 +339,29 @@ mod tests {
         put(&mut bytes, 88, 5);
         put(&mut bytes, 92, 5);
         put(&mut bytes, 96, 1);
-        bytes[104..120].copy_from_slice(SECTION);
+        bytes[104..120].copy_from_slice(profile.section());
         bytes[120..136].copy_from_slice(TEXT);
         put64(&mut bytes, 136, 0x100000100);
         put64(&mut bytes, 144, 64);
         put(&mut bytes, 152, 256);
         put(&mut bytes, 156, 3);
-        bytes[256..320].copy_from_slice(&expected());
+        bytes[256..320].copy_from_slice(&expected(profile));
         bytes
     }
     fn check(bytes: &[u8]) -> io::Result<()> {
         use std::io::Write as _;
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(bytes).unwrap();
-        require(&file, &expected(), Instant::now() + std::time::Duration::from_secs(2))
+        require(
+            &file,
+            Profile::Resolver,
+            &expected(Profile::Resolver),
+            Instant::now() + std::time::Duration::from_secs(2),
+        )
     }
     #[test]
     fn original_fd_marker_accepts_only_closed_native_section_and_exact_protocol() {
-        assert!(check(&image()).is_ok());
+        assert!(check(&image(Profile::Resolver)).is_ok());
         for (offset, value) in [
             (4, 0x01000007),
             (12, 6),
@@ -260,26 +374,26 @@ mod tests {
             (168, 1),
             (176, 1),
         ] {
-            let mut bytes = image();
+            let mut bytes = image(Profile::Resolver);
             put(&mut bytes, offset, value);
             assert!(check(&bytes).is_err(), "offset {offset}");
         }
-        let mut bytes = image();
+        let mut bytes = image(Profile::Resolver);
         bytes[300] ^= 1;
         assert!(check(&bytes).is_err());
     }
     #[test]
     fn same_magic_in_arbitrary_bytes_or_mutable_data_is_no_support_declaration() {
-        let mut bytes = image();
+        let mut bytes = image(Profile::Resolver);
         bytes[104] = b'X';
         assert!(check(&bytes).is_err());
-        let mut bytes = image();
+        let mut bytes = image(Profile::Resolver);
         bytes[40] = b'X';
         assert!(check(&bytes).is_err());
-        let mut bytes = image();
+        let mut bytes = image(Profile::Resolver);
         put64(&mut bytes, 144, 65);
         assert!(check(&bytes).is_err());
-        let mut bytes = image();
+        let mut bytes = image(Profile::Resolver);
         put64(&mut bytes, 136, u64::MAX);
         assert!(check(&bytes).is_err());
     }
@@ -288,18 +402,24 @@ mod tests {
         use std::io::Write as _;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("targo");
-        std::fs::write(&path, image()).unwrap();
+        std::fs::write(&path, image(Profile::Resolver)).unwrap();
         let original = File::open(&path).unwrap();
         std::fs::rename(&path, dir.path().join("held")).unwrap();
         File::create(&path).unwrap().write_all(b"replacement").unwrap();
         assert!(
-            require(&original, &expected(), Instant::now() + std::time::Duration::from_secs(2))
-                .is_ok()
+            require(
+                &original,
+                Profile::Resolver,
+                &expected(Profile::Resolver),
+                Instant::now() + std::time::Duration::from_secs(2)
+            )
+            .is_ok()
         );
         assert!(
             require(
                 &File::open(&path).unwrap(),
-                &expected(),
+                Profile::Resolver,
+                &expected(Profile::Resolver),
                 Instant::now() + std::time::Duration::from_secs(2)
             )
             .is_err()

@@ -131,6 +131,9 @@ pub(super) fn receive_rights(
     shared_cpu: bool,
     authorize: impl FnOnce(&local::Request, transport::Peer) -> bool,
 ) -> io::Result<AuthorizedSubgroup> {
+    if shared_cpu != matches!(request.cpu, local::CpuDelegation::SharedBorrow { .. }) {
+        return Err(invalid());
+    }
     if &request.job != job || !authorize(&request, peer) || transport::local_peer(stream)? != peer {
         transport::write_frame(stream, &[0], deadline)?;
         return Err(invalid());
@@ -173,7 +176,8 @@ pub(super) fn receive_rights(
             Err(error) => return Err(error),
         }
     };
-    if transport::local_peer(stream)? != peer || rights.delegated.gnu.len() != 2 {
+    let gnu_count = count - 4 - usize::from(shared_cpu);
+    if transport::local_peer(stream)? != peer || rights.delegated.gnu.len() != gnu_count {
         return Err(invalid());
     }
     let events = CtlStream::from(rights.events);

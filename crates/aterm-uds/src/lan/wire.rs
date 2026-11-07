@@ -8,8 +8,9 @@
 //! client's one [`Request`], then the broker's answer: a [`Frame::Socket`] carrying the made
 //! socket as its one passed descriptor, [`Frame::Addresses`], a stream of [`Frame::Event`]s until
 //! either side closes, or a [`Frame::Error`]. A broker that refuses the client's code sends
-//! [`Frame::Refused`] instead of its hello. A frame is a big-endian `u32` body length (at most
-//! [`MAX_FRAME`]) and the body: a tag byte and the frame's fields.
+//! [`Frame::Refused`] instead of its hello, and one that did not judge it [`Frame::Unchecked`]. A
+//! frame is a big-endian `u32` body length (at most [`MAX_FRAME`]) and the body: a tag byte and
+//! the frame's fields.
 
 use std::io::{self, Write as _};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -197,6 +198,14 @@ pub enum Frame {
         /// Why.
         words: String,
     },
+    /// The broker did not judge the client's code (instead of its hello): its check could not
+    /// run or did not finish, or it was serving its most connections. A client of a wire that
+    /// predates it reads the unknown tag as a failed exchange (`LanError::Io`): its watchers ask
+    /// again, and a one-shot use fails as that act's own I/O error.
+    Unchecked {
+        /// Why.
+        words: String,
+    },
     /// The client's request.
     Request(Request),
     /// The made socket, passed beside this frame, and the address a connect reached.
@@ -220,6 +229,7 @@ pub enum Frame {
 
 const HELLO: u8 = 1;
 const REFUSED: u8 = 2;
+const UNCHECKED: u8 = 3;
 const CONNECT: u8 = 10;
 const UDP: u8 = 11;
 const RESOLVE: u8 = 12;
@@ -521,6 +531,10 @@ fn frame_body<B: WireBuffer>(out: &mut Out<B>, frame: &Frame) {
             out.u8(REFUSED);
             out.text(words);
         }
+        Frame::Unchecked { words } => {
+            out.u8(UNCHECKED);
+            out.text(words);
+        }
         Frame::Request(request) => request_body(out, request),
         Frame::Socket { reached } => {
             out.u8(SOCKET);
@@ -702,6 +716,7 @@ fn decode_by<const OWN: bool>(body: &[u8]) -> io::Result<Frame> {
             build: at.text()?,
         },
         REFUSED => Frame::Refused { words: at.text()? },
+        UNCHECKED => Frame::Unchecked { words: at.text()? },
         CONNECT => {
             let target = match at.u8()? {
                 HOST => Target::Host(at.text()?),
@@ -1057,6 +1072,9 @@ mod tests {
             },
             Frame::Refused {
                 words: "not aterm".into(),
+            },
+            Frame::Unchecked {
+                words: "trustd did not answer".into(),
             },
             Frame::Request(Request::Connect {
                 target: Target::Host("m11.local".into()),

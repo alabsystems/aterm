@@ -1929,6 +1929,7 @@ fn a_dial_failure_names_a_held_lan_apart_from_an_unreachable_peer() {
         Unavailable::NotInstalled,
         Unavailable::Outdated { ours: 1, theirs: 2 },
         Unavailable::Refused("fixture".into()),
+        Unavailable::Unchecked("fixture".into()),
     ] {
         assert_eq!(
             cause(LanError::Unavailable(why).into_io()),

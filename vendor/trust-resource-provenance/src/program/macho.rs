@@ -2,6 +2,7 @@ use super::*;
 
 pub(super) struct Commands {
     pub loads: Vec<String>,
+    pub rpaths: Vec<String>,
 }
 
 fn word(bytes: &[u8], offset: usize) -> io::Result<u32> {
@@ -39,6 +40,16 @@ pub(super) fn system(path: &str) -> bool {
 }
 
 pub(super) fn commands(bytes: &[u8], executable: bool) -> io::Result<Commands> {
+    parse_commands(bytes, executable, false)
+}
+
+// Only the produced-input owner may use this parser. It must bind every
+// expanded search root to its original SDK/output descriptions before use.
+pub(super) fn produced_commands(bytes: &[u8], executable: bool) -> io::Result<Commands> {
+    parse_commands(bytes, executable, true)
+}
+
+fn parse_commands(bytes: &[u8], executable: bool, produced: bool) -> io::Result<Commands> {
     if word(bytes, 0)? != 0xfeed_facf
         || word(bytes, 4)? != 0x0100_000c
         || word(bytes, 12)? != if executable { 2 } else { 6 }
@@ -55,6 +66,7 @@ pub(super) fn commands(bytes: &[u8], executable: bool) -> io::Result<Commands> {
     let bytes = bytes.get(..end).ok_or_else(|| refused("truncated native Mach-O commands"))?;
     let mut offset = 32;
     let mut loads = Vec::new();
+    let mut rpaths = Vec::new();
     let mut loader = 0;
     for _ in 0..count {
         let kind = word(bytes, offset)?;
@@ -87,12 +99,15 @@ pub(super) fn commands(bytes: &[u8], executable: bool) -> io::Result<Commands> {
             }
             0x8000_001c => {
                 let path = text(command, 8, 12)?;
-                if !matches!(
-                    path.as_str(),
-                    "@loader_path" | "@loader_path/../lib" | "@executable_path/../lib"
-                ) {
+                if !produced
+                    && !matches!(
+                        path.as_str(),
+                        "@loader_path" | "@loader_path/../lib" | "@executable_path/../lib"
+                    )
+                {
                     return Err(refused("native Mach-O has an unsupported runtime search path"));
                 }
+                rpaths.push(path);
             }
             // Header, address, symbol, signature, platform and link-edit data.
             // Unknown commands are not assumed harmless. Environment, legacy
@@ -109,7 +124,7 @@ pub(super) fn commands(bytes: &[u8], executable: bool) -> io::Result<Commands> {
     if offset != end || loader != usize::from(executable) {
         return Err(refused("native Mach-O command census or loader cardinality differs"));
     }
-    Ok(Commands { loads })
+    Ok(Commands { loads, rpaths })
 }
 
 #[cfg(test)]
@@ -149,6 +164,19 @@ mod tests {
             cmds.push(command(kind, "@rpath/runtime.dylib", 24));
         }
         assert_eq!(commands(&image(&cmds), true).unwrap().loads, vec!["@rpath/runtime.dylib"; 5]);
+    }
+    #[test]
+    fn produced_paths_require_the_separate_bound_root_profile() {
+        let cmds =
+            [command(0xe, "/usr/lib/dyld", 12), command(0x8000_001c, "/original/output/deps", 12)];
+        let bytes = image(&cmds);
+        assert!(commands(&bytes, true).is_err(), "metadata keeps its original closed profile");
+        assert_eq!(produced_commands(&bytes, true).unwrap().rpaths, ["/original/output/deps"]);
+        for extra in
+            [command(0x27, "DYLD_INSERT_LIBRARIES=/foreign", 12), command(0x35, "unknown", 12)]
+        {
+            assert!(produced_commands(&image(&[cmds[0].clone(), extra]), true).is_err());
+        }
     }
     #[test]
     fn malformed_or_unadmitted_native_loader_inputs_refuse() {

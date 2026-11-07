@@ -5,7 +5,6 @@
 //! DECRQSS (Request Selection or Setting) query handler and DECRPSS response builders.
 
 use crate::grid::{CellFlags, PackedColor};
-use std::fmt::Write as _;
 
 use super::CursorStyle;
 use super::handler::TerminalHandler;
@@ -25,16 +24,25 @@ enum DecrqssPayload {
 fn push_color_sgr(params: &mut String, color: PackedColor, base: u8) {
     if color.is_indexed() {
         let idx = color.index();
+        params.push(';');
         if idx < 8 {
-            let _ = write!(params, ";{}", base + idx);
+            aterm_grid::push_sgr_byte(params, base + idx);
         } else if idx < 16 {
-            let _ = write!(params, ";{}", base + 60 + idx - 8);
+            aterm_grid::push_sgr_byte(params, base + 60 + idx - 8);
         } else {
-            let _ = write!(params, ";{}:5:{idx}", base + 8);
+            aterm_grid::push_sgr_byte(params, base + 8);
+            params.push_str(":5:");
+            aterm_grid::push_sgr_byte(params, idx);
         }
     } else if color.is_rgb() {
         let (r, g, b) = color.rgb_components();
-        let _ = write!(params, ";{}:2::{r}:{g}:{b}", base + 8);
+        params.push(';');
+        aterm_grid::push_sgr_byte(params, base + 8);
+        params.push_str(":2:");
+        for value in [r, g, b] {
+            params.push(':');
+            aterm_grid::push_sgr_byte(params, value);
+        }
     }
 }
 

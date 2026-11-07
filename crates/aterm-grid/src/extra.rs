@@ -4,7 +4,6 @@
 //! Cell extras: rare attributes kept in a side table (`CellExtras`) keyed by cell position.
 
 use aterm_alloc::SmallVec;
-use std::fmt::Write as _;
 use std::sync::Arc;
 
 pub use crate::extra_collection::CellExtras;
@@ -599,15 +598,53 @@ pub struct UniformExtras<'a> {
     pub hyperlink: Option<&'a Arc<HyperlinkData>>,
 }
 
+/// Append one byte's decimal SGR parameter without general formatting dispatch.
+// Keep scalar expansion out of the row emitter; RGB uses its own frame below.
+#[inline(never)]
+pub fn push_sgr_byte(out: &mut String, value: u8) {
+    push_sgr_byte_digits(out, value);
+}
+
+#[expect(
+    clippy::inline_always,
+    reason = "inline digit expansion inside the outlined RGB writer; forcing the public writer into row emission regressed plain controls"
+)]
+#[inline(always)]
+fn push_sgr_byte_digits(out: &mut String, value: u8) {
+    if value >= 100 {
+        out.push(char::from(b'0' + value / 100));
+        let rest = value % 100;
+        out.push(char::from(b'0' + rest / 10));
+        out.push(char::from(b'0' + rest % 10));
+    } else {
+        if value >= 10 {
+            out.push(char::from(b'0' + value / 10));
+        }
+        out.push(char::from(b'0' + value % 10));
+    }
+}
+
+/// Append three RGB bytes, each preceded by `separator`.
+// Keep expanded numeric writes outside the large per-cell row emitter.
+#[inline(never)]
+pub(crate) fn push_sgr_rgb(out: &mut String, rgb: [u8; 3], separator: char) {
+    for value in rgb {
+        out.push(separator);
+        push_sgr_byte_digits(out, value);
+    }
+}
+
 /// Append a packed `0xTT_XXXXXX` underline colour as an SGR 58/59 parameter.
 pub fn push_underline_color_sgr(out: &mut String, packed: u32) {
-    match (packed >> 24) & 0xFF {
+    let [tag, r, g, b] = packed.to_be_bytes();
+    match tag {
         0x00 | 0x02 => {
-            let _ = write!(out, "58:5:{}", packed & 0xFF);
+            out.push_str("58:5:");
+            push_sgr_byte(out, b);
         }
         0x01 => {
-            let (r, g, b) = ((packed >> 16) & 0xFF, (packed >> 8) & 0xFF, packed & 0xFF);
-            let _ = write!(out, "58:2::{r}:{g}:{b}");
+            out.push_str("58:2:");
+            push_sgr_rgb(out, [r, g, b], ':');
         }
         _ => out.push_str("59"),
     }

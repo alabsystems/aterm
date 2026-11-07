@@ -58,7 +58,7 @@ pub struct SealedMetadataRequest {
     pub program_sha256: [u8; 32],
 }
 
-fn canonical_absolute(bytes: &[u8]) -> bool {
+pub(crate) fn canonical_absolute(bytes: &[u8]) -> bool {
     bytes.len() <= MAX_FIELD
         && bytes.starts_with(b"/")
         && !bytes.contains(&0)
@@ -221,16 +221,13 @@ mod tests {
         let member = metadata.member.encode().unwrap();
         assert!(Request::decode(&member).unwrap().role == Role::SealedMetadata);
         let mut linker = metadata.member.clone();
-        linker.role = Role::MachOLinker(crate::Loan {
-            parent_attempt: [9; 16],
-            nonce: [8; 16],
-            cpu_slot: 0,
-        });
+        linker.role =
+            Role::MachOLinker(crate::Loan { parent_attempt: [9; 16], nonce: [8; 16], cpu_slot: 0 });
         linker.delegations.gnu = GnuTransport::None;
-        linker.command.args = [
-            "-flavor", "darwin", "input.o", "--threads=1", "--thinlto-jobs=1",
-            "--read-workers=0",
-        ].map(|word| word.as_bytes().to_vec()).to_vec();
+        linker.command.args =
+            ["-flavor", "darwin", "input.o", "--threads=1", "--thinlto-jobs=1", "--read-workers=0"]
+                .map(|word| word.as_bytes().to_vec())
+                .to_vec();
         let encoded = linker.encode().unwrap();
         assert!(Request::decode(&encoded).unwrap() == linker);
         assert!(SealedMetadataRequest::decode(&encoded).is_err());

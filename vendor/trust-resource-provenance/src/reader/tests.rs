@@ -74,6 +74,39 @@ fn existing_store_is_read_only_and_replaced_backing_refuses() {
     assert!(store.instances().is_err());
 }
 
+#[test]
+fn pinned_directory_comparison_refuses_a_store_opened_during_actual_path_aba() {
+    use std::os::fd::AsFd as _;
+    let first = Fixture::new();
+    let second = Fixture::new();
+    let original = private::directory(first.root.path()).unwrap();
+    let expected = identity(&original.metadata().unwrap());
+    let held = Store::open_at(first.root.path()).unwrap();
+    assert!(held.same_original_directory(original.as_fd()).unwrap());
+    let saved = first.root.path().with_extension("saved-original");
+    fs::rename(first.root.path(), &saved).unwrap();
+    fs::rename(second.root.path(), first.root.path()).unwrap();
+    let foreign = Store::open_at(first.root.path()).unwrap();
+    fs::rename(first.root.path(), second.root.path()).unwrap();
+    fs::rename(&saved, first.root.path()).unwrap();
+    assert_eq!(
+        identity(&fs::symlink_metadata(first.root.path()).unwrap()),
+        expected,
+        "original path pre/post checks see A again"
+    );
+    assert!(
+        !foreign.same_original_directory(original.as_fd()).unwrap(),
+        "the reader retained B while the independently held locator retained A"
+    );
+    let second_original = private::directory(second.root.path()).unwrap();
+    assert!(
+        foreign.same_original_directory(second_original.as_fd()).unwrap(),
+        "comparison uses actual held descriptions, not the reader's now-stale pathname"
+    );
+    assert!(foreign.validate().is_err(), "all ordinary named backing validation remains intact");
+    assert!(held.same_original_directory(original.as_fd()).unwrap());
+}
+
 fn run_cached_host(tamper: bool) {
     let mut fixture = Fixture::new();
     let helper = fixture.cache();
@@ -259,6 +292,20 @@ fn client_role(root: &Path, tamper: bool) {
     }
     if std::env::var_os("PROVENANCE_FIXTURE_PINNED").is_some() {
         let pinned = host.into_helper(deadline).unwrap();
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+        let original = pinned.duplicate_original_store(deadline).unwrap();
+        let store = Store::open_at(root).unwrap();
+        assert!(store.same_original_directory(original.as_fd()).unwrap());
+        assert!(original.as_raw_fd() >= 6);
+        assert_ne!(
+            unsafe { libc::fcntl(original.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        assert_eq!(
+            unsafe { libc::fcntl(original.as_raw_fd(), libc::F_GETFL) } & libc::O_ACCMODE,
+            libc::O_RDONLY
+        );
+        assert!(pinned.duplicate_original_store(Instant::now()).is_err());
         let mut helper = Command::new(pinned.helper_path())
             .args(["--exact", "reader::tests::fixture_role", "--nocapture"])
             .env("PROVENANCE_FIXTURE_ROLE", "helper")

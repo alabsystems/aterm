@@ -43,6 +43,8 @@ fn fixture() -> (tempfile::TempDir, Pool, jobserver::Client, WorkerClient, Arc<A
 fn global_refusal_returns_the_local_token_and_growth_is_observed() {
     let _fixture = crate::tests::kernel_fixture();
     let (_dir, _pool, local, client, limit) = fixture();
+    assert_eq!(client.try_pause_extras().err().unwrap().kind(), io::ErrorKind::Unsupported);
+    assert!(client.extra_admission_running());
     assert!(client.try_acquire().unwrap().is_none());
     assert_eq!(local.available().unwrap(), 2);
     limit.store(3, Ordering::Release);

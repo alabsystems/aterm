@@ -40,7 +40,7 @@ use crate::grid::{CellFlags, MAX_GRID_COLS, MAX_GRID_ROWS, PackedColor};
 use crate::scrollback::{deserialize_lines_strict, max_linked_record_bytes};
 
 /// The version [`TerminalCheckpoint::canonical`] writes after its magic.
-pub const CHECKPOINT_CANON_VERSION: u32 = 2;
+pub const CHECKPOINT_CANON_VERSION: u32 = 3;
 
 /// The version [`TerminalConfig::canonical`] writes after its magic.
 pub const CONFIG_CANON_VERSION: u32 = 1;
@@ -1288,7 +1288,6 @@ fn enc_output(w: &mut W, o: &OutputStateRepr) {
         sgr_stack,
         saved_modes,
         program_state,
-        program_state_began,
     } = o;
     w.opt(*rep, |w, c| w.u32(u32::from(c)));
     w.opt(*underline_color, W::u32);
@@ -1325,7 +1324,6 @@ fn enc_output(w: &mut W, o: &OutputStateRepr) {
         w.bool(*set);
     }
     w.opt_str(program_state.as_deref());
-    w.opt_u64(*program_state_began);
 }
 
 fn dec_output(d: &mut R<'_>) -> Result<OutputStateRepr, CanonFault> {
@@ -1364,7 +1362,6 @@ fn dec_output(d: &mut R<'_>) -> Result<OutputStateRepr, CanonFault> {
             })
         })?,
         program_state: d.opt_string(f)?,
-        program_state_began: d.opt_u64(f)?,
     })
 }
 
@@ -3859,6 +3856,45 @@ mod tests {
         let mut grid = c.clone();
         grid.grid.truncate(grid.grid.len() / 2);
         assert_eq!(refused(&grid.canonical()).field, "grid");
+    }
+
+    /// A STREAM VERSION 2 WROTE IS REFUSED AT ITS VERSION, NOT READ ASKEW: version 2 wrote the
+    /// retired `program_state_began` (an optional u64) after the program's report, and this
+    /// version writes nothing there. A version-2 stream with a report standing, laid out here as
+    /// version 2 wrote it, is refused at the magic's version word. The same bytes under this
+    /// build's version word are read past the magic into the holder, which the version keeps
+    /// from happening.
+    #[test]
+    fn a_version_2_stream_is_refused_at_its_version() {
+        let mut t = Terminal::new(4, 20);
+        t.process(b"\x1b]7501;state=blocked:app=codex:kind=permission\x1b\\");
+        let c = t.checkpoint();
+        assert!(
+            c.output_state.program_state.is_some(),
+            "precondition: version 2 wrote the field while a report stood"
+        );
+        let bytes = c.canonical();
+        let mut holder = W(Vec::new());
+        enc_holder(&mut holder, &c.holder);
+        let (head, tail) = bytes.split_at(bytes.len() - holder.0.len());
+        let laid_out_as_v2 = |version: u32| {
+            let mut w = W(head.to_vec());
+            w.0[CHECKPOINT_MAGIC.len()..CHECKPOINT_MAGIC.len() + 4]
+                .copy_from_slice(&version.to_le_bytes());
+            w.opt_u64(Some(t.program_state().began));
+            w.raw(tail);
+            w.0
+        };
+        assert_eq!(
+            TerminalCheckpoint::from_canonical(&laid_out_as_v2(2)),
+            Err(fault("magic", "a version this build does not read"))
+        );
+        let askew = TerminalCheckpoint::from_canonical(&laid_out_as_v2(CHECKPOINT_CANON_VERSION));
+        assert!(
+            askew.as_ref().is_err_and(|f| f.field != "magic"),
+            "under this build's version word the decode reads on past the magic: {:?}",
+            askew.map(drop)
+        );
     }
 
     #[test]

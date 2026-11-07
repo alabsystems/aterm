@@ -697,7 +697,8 @@ mod sec {
         owned(code, "SecStaticCodeCreateWithPath")
     }
 
-    /// Whether the process `token` names runs code satisfying `req`.
+    /// Whether the process `token` names runs code satisfying `req`, its status classed by
+    /// [`guest_validity`].
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn check_guest(
         token: &aterm_uds::peer::AuditToken,
@@ -705,11 +706,7 @@ mod sec {
     ) -> Result<(), super::CheckError> {
         let guest = copy_guest(token).map_err(super::CheckError::Unchecked)?;
         // SAFETY: both objects are live.
-        status(
-            unsafe { SecCodeCheckValidity(guest.0, 0, req.0) },
-            "the peer's code does not satisfy the requirement in force",
-        )
-        .map_err(super::CheckError::Refused)
+        guest_validity(unsafe { SecCodeCheckValidity(guest.0, 0, req.0) })
     }
 
     /// Whether the code on disk at `path` (an executable or a bundle) is intact and satisfies
@@ -737,6 +734,22 @@ mod sec {
     /// Classify only definite code refusals; unknown framework and operational
     /// failures remain unchecked, including unreadable or incomplete resources.
     pub(super) fn static_validity(rc: OSStatus) -> Result<(), super::CheckError> {
+        validity(rc, "the code", &[])
+    }
+
+    /// [`static_validity`]'s classes for a running guest, which also refuses one whose dynamic
+    /// validity is lost (errSecCSGuestInvalid) or whose code on disk changed since it started
+    /// (errSecCSStaticCodeChanged): neither comes back for that process. Any other failure, a
+    /// framework or trust service one among them, judged nothing and remains unchecked.
+    pub(super) fn guest_validity(rc: OSStatus) -> Result<(), super::CheckError> {
+        const GUEST_INVALID: OSStatus = -67063;
+        const STATIC_CODE_CHANGED: OSStatus = -67034;
+        validity(rc, "the peer's code", &[GUEST_INVALID, STATIC_CODE_CHANGED])
+    }
+
+    /// A validity check's status `rc` for `what`: refused for a definite code refusal or one of
+    /// `also`, unchecked for any other failure.
+    fn validity(rc: OSStatus, what: &str, also: &[OSStatus]) -> Result<(), super::CheckError> {
         // Security.framework/Headers/CSCommon.h: errSecCSUnsigned,
         // errSecCSSignatureFailed, errSecCSReqFailed. Unsupported signature
         // formats (including errSecCSSignatureInvalid) remain unchecked.
@@ -746,11 +759,15 @@ mod sec {
         if rc == 0 {
             return Ok(());
         }
-        let why = format!("the code does not satisfy the requirement in force: OSStatus {rc}");
-        Err(match rc {
-            UNSIGNED | SIGNATURE_FAILED | REQUIREMENT_FAILED => super::CheckError::Refused(why),
-            _ => super::CheckError::Unchecked(why),
-        })
+        if matches!(rc, UNSIGNED | SIGNATURE_FAILED | REQUIREMENT_FAILED) || also.contains(&rc) {
+            Err(super::CheckError::Refused(format!(
+                "{what} does not satisfy the requirement in force: OSStatus {rc}"
+            )))
+        } else {
+            Err(super::CheckError::Unchecked(format!(
+                "{what} could not be checked against the requirement in force: OSStatus {rc}"
+            )))
+        }
     }
 
     /// The team identifier this process's code is signed by, or `None` (ad hoc, or unsigned).
@@ -928,6 +945,33 @@ mod tests {
             CheckError::from(GateRefusal::Failed("could not run".into())),
             CheckError::Unchecked(_)
         ));
+    }
+
+    /// A running guest's status is refused only where it is a definite refusal, as a static
+    /// check's is, or the guest's validity is gone for good; an operational failure is unchecked.
+    #[test]
+    fn a_guest_status_is_refused_only_where_its_code_was_judged() {
+        assert_eq!(sec::guest_validity(0), Ok(()));
+        for status in [-67062, -67061, -67050, -67063, -67034] {
+            assert!(
+                matches!(sec::guest_validity(status), Err(CheckError::Refused(_))),
+                "a definite refusal of a running guest: {status}"
+            );
+        }
+        for status in [
+            -67060, -67068, -67048, -67032, -67033, -67056, -67054, -67045, -1,
+        ] {
+            assert!(
+                matches!(sec::guest_validity(status), Err(CheckError::Unchecked(_))),
+                "an operational or unknown result is not a refusal: {status}"
+            );
+        }
+        for status in [-67063, -67034] {
+            assert!(
+                matches!(sec::static_validity(status), Err(CheckError::Unchecked(_))),
+                "only a running guest's validity is gone for good: {status}"
+            );
+        }
     }
 
     #[test]

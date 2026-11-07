@@ -62,7 +62,7 @@ impl Owner {
                         continue;
                     }
                     match record["cpu_mode"].as_str() {
-                        Some("retained_fixed") => {
+                        Some("retained_fixed" | "workload_reserved") => {
                             let bytes = record["memory_bytes"]
                                 .as_u64()
                                 .filter(|n| *n > 0)

@@ -19,40 +19,50 @@ use trust_resource_provenance::program::HeldProgram;
 pub(super) enum Purpose {
     Metadata(SealedMetadataRequest),
     Resolver(trust_resource_controller::resolver::SealedResolverQueryRequest),
+    WorkloadQuery(trust_resource_controller::workload::host::CompilerQuery),
 }
 impl Purpose {
     pub(super) fn authorize(&self, check: &mut members::Authorization) {
         check.metadata = matches!(self, Self::Metadata(_));
         check.resolver = matches!(self, Self::Resolver(_));
+        check.workload_query = match self {
+            Self::WorkloadQuery(query) => Some(query.clone()),
+            _ => None,
+        };
     }
     pub(super) fn member(&self) -> &trust_resource_controller::Request {
         match self {
             Self::Metadata(request) => &request.member,
             Self::Resolver(request) => &request.member,
+            Self::WorkloadQuery(request) => &request.member,
         }
     }
     fn root(&self) -> &[u8] {
         match self {
             Self::Metadata(request) => &request.root,
             Self::Resolver(request) => &request.root,
+            Self::WorkloadQuery(request) => &request.root,
         }
     }
     fn digest(&self) -> &[u8; 32] {
         match self {
             Self::Metadata(request) => &request.program_sha256,
             Self::Resolver(request) => &request.program_sha256,
+            Self::WorkloadQuery(request) => &request.program_sha256,
         }
     }
     fn validate(&self) -> io::Result<()> {
         match self {
             Self::Metadata(request) => request.validate(),
             Self::Resolver(request) => request.validate(),
+            Self::WorkloadQuery(request) => request.validate(),
         }
     }
     fn validate_prepared(&self, prepared: &MetadataPrepared) -> io::Result<()> {
         match self {
             Self::Metadata(request) => prepared.validate_for(request),
             Self::Resolver(request) => request.validate_prepared(prepared),
+            Self::WorkloadQuery(request) => request.validate_prepared(prepared),
         }
     }
 }
@@ -158,13 +168,50 @@ impl RootGnu {
 }
 
 pub(super) struct Inputs {
-    held: HeldProgram,
-    pub(super) inventory: MetadataPrepared,
+    held: std::sync::Arc<HeldProgram>,
+    pub(super) inventory: Option<MetadataPrepared>,
     prelude: crate::metadata_prelude::Owner,
+    host_store: bool,
+    linker: Option<trust_resource_controller::linker::Request>,
 }
 pub(super) struct Command {
     pub(super) command: spawnfd::Command,
     pub(super) inputs: Inputs,
+}
+pub(super) enum Preparation {
+    Metadata {
+        purpose: Purpose,
+        held: Option<std::sync::Arc<HeldProgram>>,
+    },
+    Native {
+        command: spawnfd::Command,
+        held: std::sync::Arc<HeldProgram>,
+        targets: Vec<u32>,
+    },
+    Linker {
+        request: trust_resource_controller::linker::Request,
+        held: std::sync::Arc<HeldProgram>,
+    },
+}
+impl Preparation {
+    pub(super) fn run(self, deadline: Instant) -> io::Result<Command> {
+        match self {
+            Self::Metadata {
+                purpose,
+                held: Some(held),
+            } => prepare_with_held(purpose, held, deadline),
+            Self::Metadata {
+                purpose,
+                held: None,
+            } => prepare(purpose, deadline),
+            Self::Native {
+                command,
+                held,
+                targets,
+            } => prepare_native(command, held, targets, deadline),
+            Self::Linker { request, held } => prepare_linker(request, held, deadline),
+        }
+    }
 }
 pub(super) fn prepare(purpose: Purpose, deadline: Instant) -> io::Result<Command> {
     purpose.validate()?;
@@ -172,6 +219,32 @@ pub(super) fn prepare(purpose: Purpose, deadline: Instant) -> io::Result<Command
     let program = PathBuf::from(OsStr::from_bytes(&request.command.program));
     let root = PathBuf::from(OsStr::from_bytes(purpose.root()));
     let held = HeldProgram::open(&root, &program, purpose.digest(), deadline)?;
+    prepare_with_held(purpose, std::sync::Arc::new(held), deadline)
+}
+pub(super) fn prepare_with_held(
+    purpose: Purpose,
+    held: std::sync::Arc<HeldProgram>,
+    deadline: Instant,
+) -> io::Result<Command> {
+    purpose.validate()?;
+    let request = purpose.member();
+    if held.program().as_os_str().as_bytes() != request.command.program
+        || held.root().as_os_str().as_bytes() != purpose.root()
+    {
+        return Err(refused(
+            "metadata request differs from its original held SDK inputs",
+        ));
+    }
+    let mut digest = [0; 32];
+    if !aterm_codec::hex::decode_into(held.observation().executable.sha256.as_bytes(), &mut digest)
+        || &digest != purpose.digest()
+    {
+        return Err(refused(
+            "metadata digest differs from its original held SDK inputs",
+        ));
+    }
+    held.validate(deadline)?;
+    let program = held.program();
     let observed = held.observation();
     let file =
         |item: &trust_resource_provenance::program::FileObservation| -> io::Result<MetadataFile> {
@@ -209,7 +282,7 @@ pub(super) fn prepare(purpose: Purpose, deadline: Instant) -> io::Result<Command
         boot: observed.boot.clone(),
     };
     purpose.validate_prepared(&inventory)?;
-    let mut command = spawnfd::command(&program);
+    let mut command = spawnfd::command(program);
     command
         .env_clear()
         .envs(
@@ -238,6 +311,11 @@ pub(super) fn prepare(purpose: Purpose, deadline: Instant) -> io::Result<Command
             trust_resource_controller::GnuTransport::NumericPipe { read, write } => {
                 vec![read.target, write.target]
             }
+            trust_resource_controller::GnuTransport::None
+                if matches!(purpose, Purpose::WorkloadQuery(_)) =>
+            {
+                Vec::new()
+            }
             _ => return Err(refused("metadata requires its original numeric GNU pair")),
         })
         .collect::<Vec<_>>();
@@ -246,8 +324,94 @@ pub(super) fn prepare(purpose: Purpose, deadline: Instant) -> io::Result<Command
         command,
         inputs: Inputs {
             held,
-            inventory,
+            inventory: Some(inventory),
             prelude,
+            host_store: false,
+            linker: None,
+        },
+    })
+}
+/// Original compiler input custody. The marker was checked on this SAME held
+/// image in paid root preparation; current validation reuses that fact. This
+/// emits no metadata Prepared frame on the unchanged compiler/linker protocol.
+pub(super) fn prepare_native(
+    mut command: spawnfd::Command,
+    held: std::sync::Arc<HeldProgram>,
+    mut targets: Vec<u32>,
+    deadline: Instant,
+) -> io::Result<Command> {
+    if command.get_program() != held.program().as_os_str() {
+        return Err(refused("native command differs from original SDK image"));
+    }
+    held.validate(deadline)?;
+    command.envs(held.runtime_environment()?);
+    targets.extend([sdk::TARGET as u32, 7]);
+    let (prelude, command) = crate::metadata_prelude::Owner::new(&command, &targets, deadline)?;
+    Ok(Command {
+        command,
+        inputs: Inputs {
+            held,
+            inventory: None,
+            prelude,
+            host_store: true,
+            linker: None,
+        },
+    })
+}
+fn prepare_linker(
+    request: trust_resource_controller::linker::Request,
+    held: std::sync::Arc<HeldProgram>,
+    deadline: Instant,
+) -> io::Result<Command> {
+    request.validate()?;
+    if request.root != held.root().as_os_str().as_bytes()
+        || request.member.command.program != held.program().as_os_str().as_bytes()
+        || request.member.command.environment.iter().any(|(key, _)| {
+            trust_resource_controller::workload::host::produced::protected_environment_name(key)
+                || trust_resource_controller::workload::host::produced::loader_override_name(key)
+        })
+    {
+        return Err(refused(
+            "linker inputs or environment differ from nondelegating SDK profile",
+        ));
+    }
+    held.validate(deadline)?;
+    let mut command = spawnfd::command(held.program());
+    command
+        .env_clear()
+        .envs(
+            request
+                .member
+                .command
+                .environment
+                .iter()
+                .map(|(key, value)| (OsStr::from_bytes(key), OsStr::from_bytes(value))),
+        )
+        .envs(held.runtime_environment()?)
+        .args(
+            request
+                .member
+                .command
+                .args
+                .iter()
+                .map(|arg| OsStr::from_bytes(arg)),
+        )
+        .current_dir(OsStr::from_bytes(&request.member.command.cwd));
+    let cpu = request
+        .member
+        .delegations
+        .cpu
+        .ok_or(io::ErrorKind::InvalidData)?
+        .target;
+    let (prelude, command) = crate::metadata_prelude::Owner::new(&command, &[cpu], deadline)?;
+    Ok(Command {
+        command,
+        inputs: Inputs {
+            held,
+            inventory: None,
+            prelude,
+            host_store: false,
+            linker: Some(request),
         },
     })
 }
@@ -258,12 +422,27 @@ pub(super) struct Resources {
     // of Resources when actual native retirement cannot be established.
     pub(super) _sdk: Option<std::sync::Arc<sdk::Keeper>>,
     pub(super) _compiler: Option<compiler::Selection>,
+    pub(super) _primary: Option<std::sync::Arc<workload::Primary>>,
+    pub(super) _output: Option<std::sync::Arc<workload::OutputLocks>>,
 }
 impl member::MemberResources for Resources {
     fn configure(&mut self, command: &mut spawnfd::Command) -> io::Result<()> {
         if let Some(inputs) = &mut self.inputs {
-            self.scheduling
-                .configure_with_extra(command, vec![inputs.prelude.extra()?])?;
+            let mut extra = vec![inputs.prelude.extra()?];
+            if inputs.host_store {
+                extra.push((crate::runtime::workload_store_description()?, 7));
+            }
+            if inputs.linker.is_some() {
+                self.scheduling.configure_linker(command, extra)?;
+            } else {
+                self.scheduling.configure_with_extra(command, extra)?;
+            }
+            if inputs.host_store {
+                command.env(
+                    trust_resource_controller::workload::host::HOST_STORE_FD_ENV,
+                    "7",
+                );
+            }
             inputs.prelude.configured(command)
         } else {
             self.scheduling.configure(command)
@@ -290,6 +469,60 @@ impl member::MemberResources for Resources {
             native_inputs::validate_loaded(&inputs.held, child, Instant::now())?;
         }
         Ok(())
+    }
+    fn publish_prepared(
+        &mut self,
+        (pid, birth): (u32, u64),
+        events: &mut job::Events,
+    ) -> io::Result<()> {
+        let Some(inputs) = &self.inputs else {
+            return Ok(());
+        };
+        let Some(request) = &inputs.linker else {
+            return Ok(());
+        };
+        inputs
+            .held
+            .validate(Instant::now() + Duration::from_secs(2))?;
+        let observed = inputs.held.observation();
+        let file=|file:&trust_resource_provenance::program::FileObservation|->io::Result<MetadataFile>{
+            let mut sha256=[0;32];
+            if !aterm_codec::hex::decode_into(file.sha256.as_bytes(),&mut sha256){return Err(refused("linker input digest malformed"));}
+            Ok(MetadataFile{path:file.path.as_os_str().as_bytes().to_vec(),sha256,bytes:file.bytes,device:file.device,inode:file.inode})
+        };
+        let prepared = trust_resource_controller::linker::Prepared {
+            root_attempt: request.member.binding.root_attempt,
+            member_attempt: request.member.member_attempt,
+            loan: request.loan()?,
+            identity: trust_resource_controller::Identity {
+                pid,
+                birth,
+                birth_kind: if cfg!(target_os = "macos") {
+                    trust_resource_controller::BirthKind::MacosWallMicroseconds
+                } else {
+                    trust_resource_controller::BirthKind::LinuxStartTicks
+                },
+            },
+            root: request.root.clone(),
+            policy: observed.policy.into(),
+            scope: observed.scope.into(),
+            executable: file(&observed.executable)?,
+            runtime: observed
+                .runtime
+                .iter()
+                .map(file)
+                .collect::<io::Result<_>>()?,
+            loader_paths: observed
+                .loader_paths
+                .iter()
+                .map(|path| path.as_os_str().as_bytes().to_vec())
+                .collect(),
+            system_dependencies: observed.system_dependencies.clone(),
+            host: observed.host.clone(),
+            boot: observed.boot.clone(),
+        };
+        prepared.validate_for(request)?;
+        events.linker_prepared(&prepared)
     }
     fn finish_inputs(&mut self) -> Option<Result<(), String>> {
         self.inputs.as_ref().map(|inputs| {

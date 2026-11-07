@@ -416,6 +416,48 @@ fn a_witness_inside_a_sequence_no_checkpoint_carries_is_refused_by_the_contract(
     }
 }
 
+/// A program's OSC 7501 report that moved from one state to another replays faithfully: the live engine numbers the standing report from its second report, while a step restores it from the checkpoint as its first, and the witness covers the report's body, not that number, so every witness matches.
+#[test]
+fn a_programs_report_that_moved_matches_every_witness() {
+    let (rec, live) = record(
+        origin(),
+        &[
+            Live::Out(b"\x1b]7501;state=working:app=codex\x1b\\", 0),
+            Live::Witness,
+            Live::Out(
+                b"\x1b]7501;state=blocked:app=codex:kind=permission\x1b\\",
+                40,
+            ),
+            Live::Witness,
+        ],
+    );
+    let here = live.program_state();
+    assert_eq!(
+        here.began, 2,
+        "precondition: the live report began at the second report"
+    );
+    let restored = PaneState::from_live(&live, rec.schema(), env())
+        .expect("at ground")
+        .engine_on(rec.schema())
+        .program_state();
+    assert_eq!(
+        (restored.state, restored.began),
+        (here.state, 1),
+        "precondition: a step restores the same report as its first"
+    );
+    let check = rec.check(PaneCode::ThisBuild, BUILD);
+    assert_eq!(check.verdict, Verdict::Pass, "{check:?}");
+    assert_eq!(
+        check.counts,
+        PaneCounts {
+            bytes: 2,
+            resizes: 0,
+            witnesses: 2,
+            matched: 2
+        }
+    );
+}
+
 #[test]
 fn the_schema_reads_back_every_input_it_writes() {
     let schema = PaneSchema::new(origin());

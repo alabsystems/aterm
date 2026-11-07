@@ -105,6 +105,7 @@ dependencies = [
  "jobserver_utils",
  "libc",
  "trust-resource-provenance",
+ "trust-sha2",
 ]
 
 [[package]]

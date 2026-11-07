@@ -20,6 +20,7 @@ pub mod blockio;
 #[cfg(target_os = "macos")]
 mod blockio_macos;
 pub mod caps;
+pub mod coalition_heat;
 pub mod coalitions;
 pub mod cpu_hardware;
 pub mod cpu_policy;

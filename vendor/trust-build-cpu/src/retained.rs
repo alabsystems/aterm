@@ -326,6 +326,7 @@ impl RetainedPool {
                             nonce,
                             recovery,
                             file,
+                            settlement_attempted: false,
                         }));
                     }
                     State::Retained { .. } => {
@@ -437,6 +438,7 @@ pub struct RetainedLease {
     nonce: [u8; 16],
     recovery: Option<[u8; 32]>,
     file: File,
+    settlement_attempted: bool,
 }
 
 /// Persistable identity of one original retained debt generation.
@@ -508,17 +510,28 @@ impl RetainedLease {
     /// the slot can already be free, or remain debt/damaged state. The caller
     /// must therefore establish closure BEFORE calling, including on errors.
     pub fn settle(mut self) -> io::Result<()> {
+        self.settle_held()
+    }
+    /// Retry using the SAME still-held original capability after an uncertain
+    /// own settlement write. No record/path can construct this capability and
+    /// its lock prevents any replacement generation while retry is possible.
+    /// The caller must establish actual scope closure before the FIRST call.
+    pub(crate) fn settle_held(&mut self) -> io::Result<()> {
         self.pool.validate()?;
         let current = self.pool.open_slot(self.slot, false)?;
         if Identity::of(&self.file)? != Identity::of(&current)? {
             return Err(invalid("retained CPU capability identity changed"));
         }
         check_private(&self.file, false)?;
-        match read_record(&mut self.file, self.slot)? {
-            State::Retained { owner, nonce, recovery }
+        match read_record(&mut self.file, self.slot) {
+            Ok(State::Retained { owner, nonce, recovery })
                 if owner == self.owner && nonce == self.nonce && recovery == self.recovery => {}
+            Ok(State::Free) if self.settlement_attempted => {}
+            Err(error)
+                if self.settlement_attempted && error.kind() == io::ErrorKind::InvalidData => {}
             _ => return Err(invalid("retained CPU claim does not match settlement capability")),
         }
+        self.settlement_attempted = true;
         write_record(&mut self.file, &State::Free.encode(self.slot))
     }
 }

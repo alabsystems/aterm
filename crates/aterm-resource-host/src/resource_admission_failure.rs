@@ -74,13 +74,20 @@ impl Owner {
                 Some(Custody::Cooperative(claim)) => claim.finish_cohort(),
                 None => Ok(()), // Lexical no-ARM with no admitted custody.
             };
-            if finished.is_err() || self.journal.settle(&failed.binding).is_err() {
+            if finished.is_err()
+                || failed
+                    ._primary
+                    .as_ref()
+                    .is_some_and(|primary| primary.settle().is_err())
+                || self.journal.settle(&failed.binding).is_err()
+            {
                 return true;
             }
             failed.settled = true;
             failed.custody.take();
             failed._compiler.take();
             failed._sdk.take();
+            failed._primary.take();
             if let Some((events, reason)) = failed.refusal.as_mut() {
                 let _ = events.emit(aterm_types::resource_admission::Event::Refused {
                     reason: std::mem::take(reason),

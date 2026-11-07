@@ -478,7 +478,32 @@ pub(crate) fn composed_templates() -> Vec<(&'static str, Vec<String>)> {
         anchor("box.ide_diff"),
         js_escaped(anchor("box.ide_diff.mark")),
     );
+    // A model's wall: the head, then the limit type's name from the table it is looked up in
+    // (`You've hit your ${…}`, `seven_day_overage_included:"Fable limit"`).
+    let hit_name = |id: &str| {
+        let (fable, sonnet) = (anchor("wall.fable_hit"), anchor("wall.sonnet_hit"));
+        let wall_head = fable
+            .split(" Fable")
+            .next()
+            .filter(|wall_head| sonnet.starts_with(wall_head))
+            .expect("one head opens both model walls");
+        anchor(id)
+            .strip_prefix(wall_head)
+            .map(|name| (wall_head, name.trim_start()))
+            .expect("the wall opens with its head")
+    };
+    let (wall_head, fable) = hit_name("wall.fable_hit");
+    let (_, sonnet) = hit_name("wall.sonnet_hit");
     vec![
+        ("model wall head", vec![format!("{wall_head} ${{{JS_NAME}")]),
+        (
+            "Fable wall name",
+            vec![format!("seven_day_overage_included:\"{fable}\"")],
+        ),
+        (
+            "Sonnet wall name",
+            vec![format!("seven_day_sonnet:\"{sonnet}\"")],
+        ),
         (
             "effort auto notice",
             vec![whole.to_string(), format!("{head}${{{JS_NAME}()}}")],

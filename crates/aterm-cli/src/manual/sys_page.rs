@@ -317,13 +317,16 @@ THE OVERVIEW'S LINES
            for a core (your processes): cores' worth of your processes' threads that were ready
            to run with no core free, summed over threads, so it can pass the core count (other
            users' threads are not read, hence ≥); GPU <n>% busy device-wide · its name · its
-           cores · renderer and tiler busy percents; memory, swap, disk and network
+           cores · renderer and tiler busy percents; memory (used is app, wired and compressed
+           memory), swap, disk and network
   aterm    this instance's CPU, its share of the busy CPU, its footprint and processes
   tab <n>  this tab (its place in its window's tab bar, from 1): its program, CPU, footprint,
            and, from 25%, the share of its demand spent waiting for a core
   rest     the machine's CPU in parts: this tab, the rest of aterm, others (your other
            processes), macOS services (by subtraction: ≈, work no other part reads included)
   more=    the other views, and where this help is
+  A footprint is the sum of what macOS charges each process: shares, not a split of RAM, so
+  aterm's or a tab's can pass the machine's used memory (`sys mem` names the processes).
   `sys tab` heads its lines `tab <n> <sid> · window <id>`: the window's id is `aterm ctl
   sessions`' window=, not a place.
 
@@ -424,8 +427,10 @@ REPLIES (stdout; an ERR on stderr after `aterm-ctl: `)
 
 VOLUME — aterm ctl @self await sys <term> [and <term>] [vol=<path>] [timeout=<ms>]
   free>=<size|room>, free><size|room>
-      enough free space. room is `status disk_room_mb=`: what one round of this machine's
-      builds takes. For an owner caller, an unmet one first frees build caches no build holds
+      enough free space. room is `status disk_room_mb=` (MiB, as `disk_free_mb=` is): what
+      one round of this machine's builds takes, the second-largest of the last 7 days' largest
+      two-hour falls in free space, held between the volume's bounds (its lower bound until 2
+      days are read). For an owner caller, an unmet one first frees build caches no build holds
       and no process uses, never source; `aterm harness ledger disk` records each removal.
   free<<size>, free<=<size>
       watch for low space: a whole size with units, never room, and never any cleanup. It may

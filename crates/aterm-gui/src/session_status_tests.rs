@@ -3963,42 +3963,6 @@ fn a_carried_box_needs_you_in_the_successor() {
     );
 }
 
-/// A CARRIED BOX'S EPISODE THAT DOES NOT READ CARRIES THE BOX ALL THE SAME: a carried output
-/// state whose `program_state_began` is no positive number (a negative, zero, a boolean, a
-/// word, a list, a table or null) reads as none, never as a refused output state, and the
-/// program's `blocked` report it carries still restores.
-#[test]
-fn an_unreadable_optional_episode_keeps_the_carried_program_report() {
-    const BODY: &str = "state=blocked:app=codex:kind=permission";
-    for identity in [
-        aterm_json::json!(-1),
-        aterm_json::json!(0),
-        aterm_json::json!(true),
-        aterm_json::json!("wrong"),
-        aterm_json::json!([]),
-        aterm_json::json!({}),
-        aterm_json::Value::Null,
-    ] {
-        let read: aterm_core::terminal::OutputStateRepr =
-            aterm_json::from_value(aterm_json::json!({
-                "program_state": BODY,
-                "program_state_began": identity,
-            }))
-            .expect("the optional identity never refuses the output state");
-        assert_eq!(read.program_state.as_deref(), Some(BODY));
-        assert_eq!(read.program_state_began, None);
-        let mut checkpoint = aterm_core::terminal::Terminal::new(4, 20)
-            .checkpoint_carry(0)
-            .expect("Ground");
-        checkpoint.output_state = read;
-        let report = aterm_core::terminal::Terminal::from_checkpoint(&checkpoint).program_state();
-        assert!(
-            report.state.is_some(),
-            "the program's blocked report still restores"
-        );
-    }
-}
-
 /// The home a `~/` names in the gate's tests.
 const GATE_HOME: &str = "/u/jsmith";
 /// The working directory of every block in the gate's tests.
@@ -5299,4 +5263,36 @@ fn a_front_waiting_for_memory_reads_as_its_build_on_status_and_the_survey() {
         None,
     );
     settled(&app, "targo - - -");
+}
+
+/// Every field `status` writes is named on `help status`'s first screen, in the order the record
+/// writes it ([`aterm_types::control_verbs::status_fields`]); a debug build's own fields, which no
+/// release writes, are named in a section instead. A field the record moves, or a new one the
+/// page leaves out, fails it.
+#[test]
+fn help_status_names_every_field_the_record_writes_in_its_order() {
+    let app = crate::App::headless_for_test();
+    let record = app.session_status_record(0).expect("live session");
+    let listed: Vec<&str> = aterm_types::control_verbs::status_fields().collect();
+    let help = aterm_types::control_verbs::spec("status")
+        .expect("the status verb")
+        .help_line();
+    let mut at = 0;
+    let keys = record
+        .trim_start_matches("OK ")
+        .split_whitespace()
+        .filter_map(|word| word.split_once('=').map(|(key, _)| key));
+    let mut seen = 0;
+    for key in keys {
+        seen += 1;
+        match listed[at..].iter().position(|field| *field == key) {
+            Some(i) => at += i + 1,
+            None => assert!(
+                !listed.contains(&key)
+                    && (help.contains(&format!("`{key}=")) || help.contains(&format!(" {key}="))),
+                "status writes {key}= out of `help status`'s order, or unnamed: {record}"
+            ),
+        }
+    }
+    assert!(seen > 100, "{record}");
 }

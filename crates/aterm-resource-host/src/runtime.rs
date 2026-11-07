@@ -11,7 +11,7 @@ use std::{
     io,
     os::unix::{
         ffi::{OsStrExt as _, OsStringExt as _},
-        fs::PermissionsExt as _,
+        fs::{OpenOptionsExt as _, PermissionsExt as _},
     },
     path::PathBuf,
     process::ExitCode,
@@ -28,6 +28,7 @@ struct Endpoint {
     program: PathBuf,
     native: Option<Arc<trust_resource_provenance::PinnedProgram>>,
     telemetry: Option<Arc<crate::resource_telemetry::Telemetry>>,
+    store: Option<std::fs::File>,
 }
 static ENDPOINT: OnceLock<Endpoint> = OnceLock::new();
 #[cfg(all(test, target_os = "macos"))]
@@ -37,6 +38,7 @@ pub(crate) fn test_endpoint() -> io::Result<()> {
         program: program.clone(),
         native: None,
         telemetry: None,
+        store: None,
     });
     if existing.program == program {
         Ok(())
@@ -44,6 +46,82 @@ pub(crate) fn test_endpoint() -> io::Result<()> {
         Err(refused())
     }
 }
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn test_endpoint_with_store(path: &std::path::Path) -> io::Result<()> {
+    let store = open_store_description(path)?;
+    let program = std::env::current_exe()?.canonicalize()?;
+    ENDPOINT
+        .set(Endpoint {
+            program,
+            native: None,
+            telemetry: None,
+            store: Some(store),
+        })
+        .map_err(|_| refused())
+}
+fn open_store_description(path: &std::path::Path) -> io::Result<std::fs::File> {
+    let store = trust_resource_provenance::Store::open_at(path)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(store.path())?;
+    use std::os::fd::AsFd as _;
+    if !store.same_original_directory(file.as_fd())? {
+        return Err(refused());
+    }
+    store.validate()?;
+    Ok(file)
+}
+pub(crate) fn workload_store_description() -> io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::AsFd as _;
+    aterm_uds::kept_out(|| {
+        ENDPOINT
+            .get()
+            .and_then(|endpoint| endpoint.store.as_ref())
+            .ok_or_else(refused)?
+            .as_fd()
+            .try_clone_to_owned()
+    })
+}
+pub(crate) fn store_expectation_supported() -> bool {
+    ENDPOINT
+        .get()
+        .is_some_and(|endpoint| endpoint.store.is_some())
+}
+/// Compare only the actual backend's retained original directory. No pathname,
+/// record, caller label or reopened directory can select or establish it.
+pub(crate) fn matches_original_store(expected: std::os::fd::BorrowedFd<'_>) -> io::Result<bool> {
+    let original = ENDPOINT
+        .get()
+        .and_then(|endpoint| endpoint.store.as_ref())
+        .ok_or_else(refused)?;
+    same_store_description(original, expected)
+}
+fn same_store_description(
+    original: &std::fs::File,
+    expected: std::os::fd::BorrowedFd<'_>,
+) -> io::Result<bool> {
+    use std::os::{fd::AsRawFd as _, unix::fs::MetadataExt as _};
+    let flags = unsafe { libc::fcntl(expected.as_raw_fd(), libc::F_GETFL) };
+    let fdflags = unsafe { libc::fcntl(expected.as_raw_fd(), libc::F_GETFD) };
+    if flags < 0
+        || fdflags < 0
+        || flags & libc::O_ACCMODE != libc::O_RDONLY
+        || fdflags & libc::FD_CLOEXEC == 0
+    {
+        return Err(refused());
+    }
+    let expected = aterm_uds::spawnfd::descriptor_metadata(expected.as_raw_fd())?;
+    let actual = original.metadata()?;
+    if !expected.is_dir() || expected.uid() != unsafe { libc::geteuid() } {
+        return Err(refused());
+    }
+    trust_resource_provenance::require_no_acl_grants(original)?;
+    Ok(actual.is_dir()
+        && actual.uid() == expected.uid()
+        && (actual.dev(), actual.ino()) == (expected.dev(), expected.ino()))
+}
+
 pub(super) fn inspector_program() -> io::Result<&'static std::path::Path> {
     ENDPOINT
         .get()
@@ -127,7 +205,8 @@ pub fn entry(args: &[OsString]) -> Option<ExitCode> {
 }
 
 fn run(control: CtlStream, status: CtlStream) -> io::Result<()> {
-    let store = Store::open_at(&Store::account_path()?)?;
+    let store_path = Store::account_path()?;
+    let store = Store::open_at(&store_path)?;
     let program = store.cache_current()?;
     let pid = std::process::id();
     let birth = aterm_uds::process::read_birth(i32::try_from(pid).map_err(|_| refused())?)
@@ -162,6 +241,7 @@ fn run(control: CtlStream, status: CtlStream) -> io::Result<()> {
             program: program.path().to_owned(),
             native: Some(Arc::new(native)),
             telemetry: Some(Arc::new(crate::resource_telemetry::Telemetry::new()?)),
+            store: Some(open_store_description(&store_path)?),
         })
         .map_err(|_| refused())?;
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -336,6 +416,30 @@ fn serve_one(stream: &CtlStream, program: &Program, guis: Arc<AtomicUsize>) -> i
                 crate::actor::resolver_ready,
             )
         }
+        Some("native-workload-ready-v1") if hello["version"].as_u64() == Some(3) => {
+            crate::workload_transport::ready(
+                stream,
+                peer,
+                &hello,
+                deadline,
+                crate::actor::workload_ready,
+            )
+        }
+        Some("native-workload-member-original-v1") if hello["version"].as_u64() == Some(3) => {
+            crate::workload_transport::member_original(
+                stream,
+                peer,
+                &hello,
+                deadline,
+                crate::actor::workload_member_original,
+            )
+        }
+        Some("native-workload-worker-v1") if hello["version"].as_u64() == Some(3) => {
+            crate::workload_transport::worker(stream, peer, &hello, deadline)
+        }
+        Some("native-workload-worker-return-v1") if hello["version"].as_u64() == Some(3) => {
+            crate::workload_transport::worker_return(stream, peer, &hello, deadline)
+        }
         Some("inspect") if hello["version"].as_u64() == Some(3) => {
             let session = hello["session"].as_str().ok_or_else(refused)?;
             let observed = crate::actor::inspect(peer, session)?.json()?;
@@ -369,6 +473,44 @@ fn serve_one(stream: &CtlStream, program: &Program, guis: Arc<AtomicUsize>) -> i
             wire::write_frame(stream, aterm_types::resource_subgroup::PREPARE, deadline)?;
             let member = crate::resolver_transport::receive(stream, &job, deadline)?;
             crate::actor::submit_resolver_query(member)?;
+            aterm_ctl::resource_subgroup_client::acknowledge(stream, deadline)
+        }
+        Some("sealed-workload-query-v1") => {
+            let job = crate::actor::workload_binding(&hello)?;
+            if wire::local_peer(stream)? != peer {
+                return Err(refused());
+            }
+            wire::write_frame(stream, &[0x50], deadline)?;
+            let incoming = crate::workload_transport::receive(stream, &job, deadline)?;
+            crate::actor::submit_workload_query(incoming)?;
+            aterm_ctl::resource_subgroup_client::acknowledge(stream, deadline)
+        }
+        Some("native-linker-loan-v1") => {
+            let fields = ["version", "role", "session"];
+            if hello.as_object().is_none_or(|map| {
+                map.len() != fields.len() || fields.iter().any(|name| !map.contains_key(*name))
+            }) || hello["version"].as_u64() != Some(3)
+                || wire::local_peer(stream)? != peer
+            {
+                return Err(refused());
+            }
+            let session = hello["session"].as_str().ok_or_else(refused)?;
+            wire::write_frame(stream, &[0x50], deadline)?;
+            let incoming = crate::linker_transport::receive(stream, session, deadline)?;
+            crate::actor::submit_linker(incoming)?;
+            aterm_ctl::resource_subgroup_client::acknowledge(stream, deadline)
+        }
+        Some("sealed-workload-member-v1") => {
+            let job = crate::actor::member_binding_role(
+                &hello,
+                trust_resource_controller::workload::host::produced::PURPOSE,
+            )?;
+            if wire::local_peer(stream)? != peer {
+                return Err(refused());
+            }
+            wire::write_frame(stream, &[0x50], deadline)?;
+            let incoming = crate::workload_transport::receive_produced(stream, &job, deadline)?;
+            crate::actor::submit_workload_produced(incoming)?;
             aterm_ctl::resource_subgroup_client::acknowledge(stream, deadline)
         }
         Some(role)
@@ -430,3 +572,10 @@ fn serve_one(stream: &CtlStream, program: &Program, guis: Arc<AtomicUsize>) -> i
         _ => Err(refused()),
     }
 }
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn serve_test(stream: &CtlStream, program: &Program) -> io::Result<()> {
+    serve_one(stream, program, Arc::new(AtomicUsize::new(0)))
+}
+#[cfg(all(test, unix))]
+#[path = "runtime_store_tests.rs"]
+mod original_store_tests;

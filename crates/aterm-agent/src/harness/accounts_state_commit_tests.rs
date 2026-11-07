@@ -25,6 +25,7 @@ fn observe(store: &Store, usage: bool) -> Recorded {
                 day: NOW.div_euclid(DAY),
                 credits: Some(CreditsRead { until: None }),
                 warning: None,
+                week: None,
             },
             NOW,
         )

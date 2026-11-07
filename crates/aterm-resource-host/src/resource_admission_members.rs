@@ -5,6 +5,7 @@
 //! Routing bytes and an inherited capability never authorize a new root.
 use super::*;
 use aterm_types::resource_subgroup::{Capability, CpuDelegation, Request};
+use std::os::unix::ffi::OsStrExt as _;
 
 pub(in super::super) fn binding(value: &aterm_json::Value) -> io::Result<Binding> {
     binding_role(value, "member")
@@ -46,6 +47,8 @@ pub(in super::super) fn binding_role(value: &aterm_json::Value, role: &str) -> i
 pub(in super::super) struct Authorization {
     pub metadata: bool,
     pub resolver: bool,
+    pub workload_query: Option<trust_resource_controller::workload::host::CompilerQuery>,
+    pub linker: Option<trust_resource_controller::linker::Request>,
     pub program: Vec<u8>,
     pub environment: Vec<(Vec<u8>, Vec<u8>)>,
     pub job: Binding,
@@ -73,6 +76,8 @@ impl Authorization {
         Ok(Self {
             metadata: false,
             resolver: false,
+            workload_query: None,
+            linker: None,
             program: request.member.argv[0].clone(),
             environment: request.member.env.clone(),
             job: request.job.clone(),
@@ -148,6 +153,13 @@ impl Owner {
         {
             return false;
         }
+        if request.workload_query.is_some()
+            && job.workload.as_ref().is_none_or(|state| {
+                state.queries >= trust_resource_controller::workload::host::MAX_QUERIES
+            })
+        {
+            return false;
+        }
         live(&self.fence, &self.debt, job, request)
     }
 }
@@ -174,11 +186,55 @@ pub(super) fn live(
     // A metadata root cannot authorize compiler/foreign work. Conversely the
     // metadata route requires the actual original fixed-one and GNU owners;
     // an unsupported ancestor route refuses rather than minting a shadow root.
-    if request.metadata && request.resolver {
+    if usize::from(request.metadata)
+        + usize::from(request.resolver)
+        + usize::from(request.workload_query.is_some())
+        + usize::from(request.linker.is_some())
+        > 1
+    {
         return false;
     }
-    if request.resolver {
-        use std::os::unix::ffi::OsStrExt as _;
+    if let Some(linker) = &request.linker {
+        let Ok(loan) = linker.loan() else {
+            return false;
+        };
+        let edge = parent_loan::Edge::of(loan, request.member.attempt);
+        if linker.validate().is_err()
+            || linker.member.binding.root_attempt != job.binding.attempt
+            || linker.member.member_attempt != request.member.attempt
+            || linker.member.command.program != request.program
+            || !job
+                .workload
+                .as_ref()
+                .is_some_and(|state| state.linker_parent(edge.parent, edge.cpu))
+            || !parent_loan::matches_parent(job, request.peer, edge)
+            || !job.metadata_sdk.as_ref().is_some_and(|sdk| {
+                sdk.execution().as_os_str().as_bytes() == linker.root
+                    && sdk
+                        .workload_linker(Instant::now() + Duration::from_secs(2))
+                        .is_ok()
+            })
+        {
+            return false;
+        }
+    } else if let Some(query) = &request.workload_query {
+        if job.metadata_root
+            || job.resolver.is_some()
+            || !job
+                .workload
+                .as_ref()
+                .is_some_and(|state| state.authorizes_query(query))
+            || request.peer.pid != job.child.child_mut().id()
+            || request.peer.birth != job.root_birth
+            || !matches!(job.custody, Custody::Cooperative(_))
+            || !job
+                .metadata_sdk
+                .as_ref()
+                .is_some_and(|sdk| sdk.validate_loaded(request.peer.pid).is_ok())
+        {
+            return false;
+        }
+    } else if request.resolver {
         if job.metadata_root
             || !job.resolver_ready
             || !job
@@ -209,7 +265,13 @@ pub(super) fn live(
         {
             return false;
         }
-    } else if job.metadata_root || job.resolver.is_some() {
+    } else if job.metadata_root
+        || job.resolver.is_some()
+        || job
+            .workload
+            .as_ref()
+            .is_some_and(|state| !state.compiler_dispatch())
+    {
         return false;
     }
     let mode_matches = matches!(

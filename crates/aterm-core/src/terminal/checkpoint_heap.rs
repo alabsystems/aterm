@@ -486,7 +486,6 @@ impl Heap for OutputStateRepr {
             sgr_stack,
             saved_modes,
             program_state,
-            program_state_began: _,
         } = self;
         [
             hyperlink.heap(),

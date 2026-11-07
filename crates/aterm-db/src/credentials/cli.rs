@@ -269,8 +269,10 @@ fn thread_row(thread: &Thread) -> String {
         "fulfilled".to_owned()
     } else if let Some((vault, seq)) = &thread.published {
         format!("published {vault} seq {seq}")
+    } else if thread.needs_person && thread.offers.is_empty() {
+        format!("awaiting-person, swept by {}", thread.swept.len())
     } else if thread.needs_person {
-        "awaiting-person".to_owned()
+        format!("awaiting-person, offered by {}", thread.offers.len())
     } else if thread.offers.is_empty() {
         format!("open, swept by {}", thread.swept.len())
     } else {
@@ -345,12 +347,9 @@ fn observation_json(table: &Result<Observation, String>) -> Value {
         .values()
         .map(|thread| {
             let requester_current = observed.members.contains(&thread.requester);
-            let required_sweeps = observed.members.len() - usize::from(requester_current);
-            let swept_current = observed
-                .members
-                .iter()
-                .filter(|member| **member != thread.requester && thread.swept.contains(*member))
-                .count();
+            // Counted by Mac: a recovered Writer's original actor and its successor are one.
+            let (swept_current, required_sweeps) =
+                thread.sweeps(&observed.members, &observed.book.macs);
             aterm_json::json!({
                 "id": hex::encode_lower(&thread.id),
                 "want": thread.want.key(),
@@ -362,7 +361,7 @@ fn observation_json(table: &Result<Observation, String>) -> Value {
                 "offers": thread.offers.len(),
                 "swept_current": swept_current,
                 "required_sweeps": required_sweeps,
-                "sweeps_complete": thread.swept_by_all(&observed.members),
+                "sweeps_complete": swept_current == required_sweeps,
                 "want_window_ended": thread.window_ended(observed.at_ms),
                 "needs_person": thread.needs_person,
                 "published_seq": thread.published.as_ref().map(|(_, seq)| *seq),

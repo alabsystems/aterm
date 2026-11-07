@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Copyright 2026 Andrew Yates
 
-//! Read-only provenance for the canonical native retained custodian.
+//! Native provenance for the canonical retained custodian.
 //! Discovery never creates account state or grants resources. A selected live
 //! process, immutable image, original socket and actual native ancestry remain
 //! checked through the caller's bounded exchange; JSON and paths alone confer
 //! no authority.
+//! Explicit produced-output owners can additionally create bounded new failure
+//! evidence beneath their original output directory. Discovery and SDK/source
+//! inputs remain read-only; evidence bytes establish no execution or proof.
 
 #[cfg(unix)]
 mod connection;

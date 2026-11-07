@@ -2,7 +2,7 @@ use std::fs;
 use std::io::{BufRead as _, Read as _, Write as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::*;
@@ -351,4 +351,371 @@ fn real_sdk_held_program_profile() {
             held.observation().policy
         );
     }
+}
+
+fn write_output(path: &Path, bytes: &[u8], executable: bool) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, bytes).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(if executable { 0o555 } else { 0o444 }))
+        .unwrap();
+}
+
+#[test]
+fn produced_inputs_keep_original_output_root_across_compilation_and_hold_both_runtime_roots() {
+    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let fixture = Fixture::new(&["/usr/lib/libSystem.B.dylib"]);
+    fixture.runtime("sdk.dylib", &["/usr/lib/libSystem.B.dylib"]);
+    let sdk = Arc::new(fixture.open().unwrap());
+    let output = fixture.directory.path().join("outputs");
+    fs::create_dir(&output).unwrap();
+    let (original, mut evidence) =
+        produced::HeldOutputRoot::open_with_evidence(&output, &sdk, [1; 16], 64, 2, deadline())
+            .unwrap();
+    // Inputs appear after the original root was captured, as compiler output.
+    let program = output.join("debug/build/package/hash/out/test-program");
+    let deps = output.join("debug/deps");
+    write_output(
+        &program,
+        &image(
+            true,
+            &["@rpath/local.dylib", "/usr/lib/libSystem.B.dylib"],
+            vec![command(0x8000_001c, deps.to_str().unwrap(), 12)],
+        ),
+        true,
+    );
+    write_output(
+        &deps.join("local.dylib"),
+        &image(false, &["@rpath/sdk.dylib"], vec![command(0x8000_001c, "@loader_path", 12)]),
+        false,
+    );
+    let digest = Sha256::digest(fs::read(&program).unwrap()).into();
+    let held =
+        original.program(Arc::clone(&sdk), &program, &digest, &[deps.clone()], deadline()).unwrap();
+    assert_eq!(held.program(), program);
+    assert_eq!(held.output_root(), output);
+    assert_eq!(held.observation().policy, produced::RUNTIME_POLICY);
+    assert_eq!(held.observation().runtime.len(), 2);
+    let mut prefix = evidence.create(OsStr::new("action.stderr"), 64, deadline()).unwrap();
+    assert_eq!(prefix.append(b"raw\0\xff", deadline()).unwrap(), 5);
+    prefix.sync_prefix(deadline()).unwrap();
+    held.validate(deadline()).unwrap();
+    assert!(HeldProgram::open(&output, &program, &digest, deadline()).is_err());
+    let moved = output.with_extension("moved");
+    fs::rename(&output, &moved).unwrap();
+    fs::create_dir(&output).unwrap();
+    assert!(original.validate(deadline()).is_err());
+    assert!(held.validate(deadline()).is_err());
+    assert!(held.executable_descriptor(deadline()).is_err());
+}
+
+#[test]
+fn produced_inputs_refuse_aliased_ambiguous_shadowed_or_escaping_loader_inputs() {
+    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    for altered in 0..7 {
+        let fixture = Fixture::new(&["/usr/lib/libSystem.B.dylib"]);
+        if altered == 3 {
+            fixture.runtime("runtime.dylib", &["/usr/lib/libSystem.B.dylib"]);
+        }
+        let sdk = Arc::new(fixture.open().unwrap());
+        let output = fixture.directory.path().join("outputs");
+        fs::create_dir(&output).unwrap();
+        let original = produced::HeldOutputRoot::open(&output, deadline()).unwrap();
+        let program = output.join("unit/out/test-program");
+        let deps = output.join("deps");
+        fs::create_dir(&deps).unwrap();
+        let mut extra = Vec::new();
+        if altered == 4 {
+            extra.push(command(0x8000_001c, "/foreign", 12));
+        }
+        let load = if altered == 6 { "/usr/lib/libSystem.B.dylib" } else { "@rpath/runtime.dylib" };
+        write_output(&program, &image(true, &[load], extra), true);
+        let runtime = deps.join(if altered == 6 { "libSystem.B.dylib" } else { "runtime.dylib" });
+        write_output(&runtime, &image(false, &["/usr/lib/libSystem.B.dylib"], Vec::new()), false);
+        match altered {
+            0 => {
+                fs::hard_link(&program, output.join("program-alias")).unwrap();
+            }
+            1 => {
+                fs::hard_link(&runtime, output.join("runtime-alias")).unwrap();
+            }
+            2 => {
+                fs::rename(&runtime, output.join("runtime-moved")).unwrap();
+                std::os::unix::fs::symlink(output.join("runtime-moved"), &runtime).unwrap();
+            }
+            3 | 4 | 6 => {}
+            5 => {}
+            _ => unreachable!(),
+        }
+        let digest = Sha256::digest(fs::read(&program).unwrap()).into();
+        let roots = if altered == 5 { vec![fixture.root.join("lib")] } else { vec![deps] };
+        assert!(
+            original.program(sdk, &program, &digest, &roots, deadline()).is_err(),
+            "altered {altered}"
+        );
+    }
+}
+
+#[test]
+fn produced_inputs_match_the_actual_original_child_image_and_reject_later_byte_changes() {
+    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut fixture = Fixture::new(&["/usr/lib/libSystem.B.dylib"]);
+    let sdk = Arc::new(fixture.open().unwrap());
+    let output = fixture.directory.path().join("outputs");
+    fs::create_dir(&output).unwrap();
+    let original = produced::HeldOutputRoot::open(&output, deadline()).unwrap();
+    let program = output.join("unit/out/test-program");
+    fs::create_dir_all(program.parent().unwrap()).unwrap();
+    fs::copy(std::env::current_exe().unwrap(), &program).unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o555)).unwrap();
+    fixture.program = program.clone();
+    finish(actor(&mut fixture));
+    let digest = fixture.digest();
+    let held = original.program(sdk, &program, &digest, &[], deadline()).unwrap();
+    let child = actor(&mut fixture);
+    held.validate_loaded(process::read_identity(child.0.id()).unwrap(), deadline()).unwrap();
+    finish(child);
+    // Actual native image, borrowed from its original input owner after child
+    // retirement. This descriptor observation is not another execution grant.
+    let borrowed = held.executable_descriptor(deadline()).unwrap();
+    let actual = fs::File::from(borrowed.try_clone_to_owned().unwrap()).metadata().unwrap();
+    assert_eq!(actual.dev(), held.observation().executable.device);
+    assert_eq!(actual.ino(), held.observation().executable.inode);
+    // SAFETY: these commands only observe flags on the live borrowed original.
+    let flags = unsafe { libc::fcntl(borrowed.as_raw_fd(), libc::F_GETFL) };
+    assert!(flags >= 0);
+    assert_eq!(flags & libc::O_ACCMODE, libc::O_RDONLY);
+    // SAFETY: same live borrowed description, no descriptor or flag mutation.
+    let descriptor_flags = unsafe { libc::fcntl(borrowed.as_raw_fd(), libc::F_GETFD) };
+    assert!(descriptor_flags >= 0);
+    assert_ne!(descriptor_flags & libc::FD_CLOEXEC, 0);
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(&program, b"different bytes after actual retirement").unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o555)).unwrap();
+    assert!(held.validate(deadline()).is_err());
+    assert!(held.executable_descriptor(deadline()).is_err());
+}
+
+#[test]
+fn produced_descriptor_refuses_path_replacement_and_sdk_runtime_drift_before_borrow() {
+    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    for replaced_path in [true, false] {
+        let fixture = Fixture::new(&["/usr/lib/libSystem.B.dylib"]);
+        fixture.runtime("sdk.dylib", &["/usr/lib/libSystem.B.dylib"]);
+        let sdk = Arc::new(fixture.open().unwrap());
+        let output = fixture.directory.path().join("outputs");
+        fs::create_dir(&output).unwrap();
+        let original = produced::HeldOutputRoot::open(&output, deadline()).unwrap();
+        let program = output.join("debug/test-program");
+        let bytes = image(true, &["@rpath/sdk.dylib"], Vec::new());
+        write_output(&program, &bytes, true);
+        let digest = Sha256::digest(&bytes).into();
+        let held = original.program(sdk, &program, &digest, &[], deadline()).unwrap();
+        assert_eq!(held.observation().runtime.len(), 1);
+        assert!(held.executable_descriptor(deadline()).is_ok());
+        assert_eq!(
+            held.executable_descriptor(Instant::now()).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        if replaced_path {
+            // Matching saved bytes at the path cannot replace the retained FD.
+            fs::rename(&program, program.with_extension("old")).unwrap();
+            write_output(&program, &bytes, true);
+        } else {
+            let runtime = fixture.root.join("lib/sdk.dylib");
+            fs::set_permissions(&runtime, fs::Permissions::from_mode(0o644)).unwrap();
+            fs::write(&runtime, b"changed original SDK runtime").unwrap();
+            fs::set_permissions(&runtime, fs::Permissions::from_mode(0o444)).unwrap();
+        }
+        assert!(held.executable_descriptor(deadline()).is_err());
+    }
+}
+
+#[test]
+fn produced_evidence_preserves_binary_prefixes_and_enforces_shared_bounds_without_reuse() {
+    let fixture = Fixture::new(&[]);
+    let sdk = fixture.open().unwrap();
+    let root = fixture.directory.path().join("output");
+    fs::create_dir(&root).unwrap();
+    let (output, mut evidence) =
+        produced::HeldOutputRoot::open_with_evidence(&root, &sdk, [2; 16], 6, 2, deadline())
+            .unwrap();
+    let mut first = evidence.create(OsStr::new("first"), 4, deadline()).unwrap();
+    assert_eq!(first.append(b"\0\xffabcd", deadline()).unwrap(), 4);
+    assert_eq!(first.bytes_written(), 4);
+    assert_eq!(first.append(b"z", deadline()).unwrap_err().kind(), io::ErrorKind::StorageFull);
+    let mut second = evidence.create(OsStr::new("second"), 4, deadline()).unwrap();
+    assert_eq!(second.append(b"xyz", deadline()).unwrap(), 2);
+    assert_eq!(second.append(b"z", deadline()).unwrap_err().kind(), io::ErrorKind::StorageFull);
+    assert!(evidence.create(OsStr::new("third"), 1, deadline()).is_err());
+    first.sync_prefix(deadline()).unwrap();
+    second.sync_prefix(deadline()).unwrap();
+    assert_eq!(fs::read(evidence.path().join("first")).unwrap(), b"\0\xffab");
+    assert_eq!(fs::read(evidence.path().join("second")).unwrap(), b"xy");
+    assert!(
+        produced::HeldOutputRoot::open_with_evidence(&root, &sdk, [2; 16], 6, 2, deadline())
+            .is_err()
+    );
+    let (_, new_attempt) =
+        produced::HeldOutputRoot::open_with_evidence(&root, &sdk, [3; 16], 6, 2, deadline())
+            .unwrap();
+    assert_ne!(new_attempt.path(), evidence.path());
+    output.validate(deadline()).unwrap();
+}
+
+#[test]
+fn produced_evidence_rejects_path_escapes_replaced_names_and_retargeted_directories() {
+    let fixture = Fixture::new(&[]);
+    let sdk = fixture.open().unwrap();
+    let root = fixture.directory.path().join("output");
+    fs::create_dir(&root).unwrap();
+    let (_, mut evidence) =
+        produced::HeldOutputRoot::open_with_evidence(&root, &sdk, [4; 16], 64, 8, deadline())
+            .unwrap();
+    for name in ["", ".", "..", "../outside", "/absolute", "nul\0name"] {
+        assert!(evidence.create(OsStr::new(name), 8, deadline()).is_err());
+    }
+    let mut prefix = evidence.create(OsStr::new("prefix"), 8, deadline()).unwrap();
+    prefix.append(b"actual", deadline()).unwrap();
+    fs::rename(evidence.path().join("prefix"), evidence.path().join("original")).unwrap();
+    fs::write(evidence.path().join("prefix"), b"forged").unwrap();
+    assert!(prefix.append(b"x", deadline()).is_err());
+    assert!(prefix.sync_prefix(deadline()).is_err());
+    let original = evidence.path().with_extension("moved");
+    fs::rename(evidence.path(), &original).unwrap();
+    fs::create_dir(evidence.path()).unwrap();
+    assert!(evidence.create(OsStr::new("later"), 1, deadline()).is_err());
+    assert_eq!(fs::read(original.join("original")).unwrap(), b"actual");
+}
+
+#[test]
+fn produced_evidence_exit_actor() {
+    let Some(root) = std::env::var_os("TRUST_EVIDENCE_EXIT_ACTOR") else {
+        return;
+    };
+    let sdk_root = PathBuf::from(std::env::var_os("TRUST_EVIDENCE_EXIT_SDK_ROOT").unwrap());
+    let program = sdk_root.join("bin/program");
+    let digest = Sha256::digest(fs::read(&program).unwrap()).into();
+    let sdk = HeldProgram::open(&sdk_root, &program, &digest, deadline()).unwrap();
+    let (_, mut evidence) = produced::HeldOutputRoot::open_with_evidence(
+        Path::new(&root),
+        &sdk,
+        [5; 16],
+        64,
+        1,
+        deadline(),
+    )
+    .unwrap();
+    let mut prefix = evidence.create(OsStr::new("raw-prefix"), 64, deadline()).unwrap();
+    prefix.append(b"received\0\xff-before-unknown", deadline()).unwrap();
+    prefix.sync_prefix(deadline()).unwrap();
+    // Deliberately bypass every Rust destructor, as an owning-custody failure
+    // can do. No successful-execution or retirement fact is written.
+    std::process::exit(7);
+}
+
+#[test]
+fn produced_evidence_survives_actual_writer_exit_without_destructors() {
+    let mut fixture = Fixture::new(&[]);
+    let root = fixture.directory.path().join("output");
+    fs::create_dir(&root).unwrap();
+    let original = produced::HeldOutputRoot::open(&root, deadline()).unwrap();
+    fixture.execution_attempted = true;
+    let mut child = OwnedChild(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "program::tests::produced_evidence_exit_actor", "--nocapture"])
+            .env_clear()
+            .env("TRUST_EVIDENCE_EXIT_ACTOR", &root)
+            .env("TRUST_EVIDENCE_EXIT_SDK_ROOT", &fixture.root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+        None,
+    );
+    let until = deadline();
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert_eq!(status.code(), Some(7));
+            break;
+        }
+        assert!(Instant::now() < until, "owned evidence writer did not exit");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    original.validate(deadline()).unwrap();
+    let prefix = root
+        .join(".trust-workload-evidence.noindex")
+        .join(crate::schema::hex(&[5; 16]))
+        .join("raw-prefix");
+    assert_eq!(fs::read(prefix).unwrap(), b"received\0\xff-before-unknown");
+    fixture.execution_proved = true;
+}
+
+#[test]
+fn produced_evidence_cannot_write_into_sdk_or_reclassify_source_roots() {
+    let fixture = Fixture::new(&[]);
+    let sdk = fixture.open().unwrap();
+    assert!(
+        produced::HeldOutputRoot::open_with_evidence(
+            &fixture.root,
+            &sdk,
+            [6; 16],
+            64,
+            1,
+            deadline()
+        )
+        .is_err()
+    );
+    assert!(!fixture.root.join(".trust-workload-evidence.noindex").exists());
+    let source = fixture.directory.path().join("source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("Cargo.toml"), b"original source marker").unwrap();
+    assert!(
+        produced::HeldOutputRoot::open_with_evidence(&source, &sdk, [6; 16], 64, 1, deadline())
+            .is_err()
+    );
+    assert_eq!(fs::read(source.join("Cargo.toml")).unwrap(), b"original source marker");
+    assert!(!source.join(".trust-workload-evidence.noindex").exists());
+}
+
+fn direct_load_override_is_refused(relative: bool) {
+    let fixture = Fixture::new(&["/usr/lib/libSystem.B.dylib"]);
+    let sdk = Arc::new(fixture.open().unwrap());
+    let root = fixture.directory.path().join("output");
+    fs::create_dir(&root).unwrap();
+    let output = produced::HeldOutputRoot::open(&root, deadline()).unwrap();
+    let program = root.join("unit/out/test-program");
+    let deps = root.join("deps");
+    let library = deps.join("runtime.dylib");
+    let load = if relative {
+        "@loader_path/../../deps/runtime.dylib".to_owned()
+    } else {
+        library.to_str().unwrap().to_owned()
+    };
+    write_output(&program, &image(true, &[&load], Vec::new()), true);
+    write_output(&library, &image(false, &["/usr/lib/libSystem.B.dylib"], Vec::new()), false);
+    let digest = Sha256::digest(fs::read(&program).unwrap()).into();
+    let clean =
+        output.program(Arc::clone(&sdk), &program, &digest, &[deps.clone()], deadline()).unwrap();
+    assert_eq!(clean.observation().runtime.len(), 1);
+    assert_eq!(clean.observation().runtime[0].path, library);
+    drop(clean);
+    // The emitted DYLD_LIBRARY_PATH starts with this program's parent.
+    // Its same-leaf image must not override the recorded direct dependency.
+    write_output(
+        &program.parent().unwrap().join("runtime.dylib"),
+        &image(false, &["/usr/lib/libc++.1.dylib"], Vec::new()),
+        false,
+    );
+    assert!(output.program(sdk, &program, &digest, &[deps], deadline()).is_err());
+}
+
+#[test]
+fn produced_inputs_refuse_direct_absolute_loader_overrides() {
+    direct_load_override_is_refused(false);
+}
+
+#[test]
+fn produced_inputs_refuse_direct_relative_loader_overrides() {
+    direct_load_override_is_refused(true);
 }

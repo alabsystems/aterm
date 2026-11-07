@@ -797,6 +797,7 @@ fn a_superseded_logins_usage_is_recorded_for_its_rows_account() {
             pct: 92,
             reset: None,
         }),
+        week: None,
     };
     let old = on(&work_2);
     let me = old.me(&b);

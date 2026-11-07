@@ -110,7 +110,7 @@ Line Tools:
 
 ```sh
 git clone https://github.com/alabsystems/aterm.git && cd aterm
-targo --unverified build --locked -p aterm
+targo --unverified build --locked -p aterm --bin aterm
 ./target/debug/aterm --window
 ```
 

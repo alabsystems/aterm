@@ -1933,6 +1933,53 @@ fn a_selection_whose_paths_are_not_utf8_reads_back_as_the_same_paths() {
     }
 }
 
+/// After m1's writer succession its requests are delegated: the successor signs them and the
+/// original Writer authorizes delivery to its own recipient (§21). The original actor stays a
+/// current Writer but writes nothing more, so the window decision on m1's own request names m3,
+/// the one Mac that did not answer, and never m1 itself.
+/// NEGATIVE CONTROL: m3, which never swept it, is named.
+#[test]
+fn a_window_decision_after_succession_never_names_the_requesters_own_mac() {
+    use aterm_secrets::need::{self, Purpose, Unanswered, Want};
+    let mut lab = Lab::new(&[Role::Writer, Role::Writer, Role::Writer]);
+    for paths in &lab.paths {
+        need::test_alab_policy(paths);
+    }
+    let original = lab.paths[0].clone();
+    data(&lab);
+    changed_device(&lab);
+    let mut selection = reserved(&lab);
+    let next = move_admitted_candidate(&mut lab);
+    need::test_alab_policy(&next);
+    import(&mut selection).unwrap();
+    assert_eq!(crate::application_paths(&original).unwrap(), next);
+    need::raise(&original, Want::Mailbox("absent".into()), Purpose::ByHand).unwrap();
+    let now = aterm_time::unix_millis().unwrap();
+    assert_eq!(
+        crate::credentials::pass_at(&original, now).unwrap().posted,
+        1
+    );
+    // A minute past the window, so the request's own receipt, later than `now`, is inside it.
+    let window_end = now + need::WANT_WINDOW_SECS * 1000 + 60_000;
+    let decided = crate::credentials::custodian_pass_at(&original, window_end)
+        .unwrap()
+        .unwrap();
+    assert_eq!(decided.asked.len(), 1, "{decided:?}");
+    let heard = crate::credentials::pass_at(&original, window_end).unwrap();
+    let thread = &heard.threads[0];
+    assert!(thread.origin.is_some(), "a delegated request");
+    assert_eq!(
+        thread.unanswered,
+        Unanswered {
+            hosts: vec!["m3".into()],
+            others: 0
+        }
+    );
+    let rows = need::list(&original).unwrap();
+    let line = &rows[0].line;
+    assert!(line.contains(", and m3 did not answer:"), "{line}");
+}
+
 /// A successor home's table read observes its predecessor once, after it has opened the
 /// selected home's custody: the session keeps that observation ([`Session::observe_selected`]),
 /// and its generation checks take none of the predecessor's custody. So a holder of the

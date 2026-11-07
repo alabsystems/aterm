@@ -112,6 +112,8 @@ fn row_of(t: &aterm_toml::Table) -> Option<Need> {
             every_locker_open: b("proof_every_locker_open")?,
             before_commons: b("proof_before_commons")?,
             swept_unheld: b("proof_swept_unheld")?,
+            window_ended: b("proof_window_ended").unwrap_or(false),
+            custodian_silent: b("proof_custodian_silent").unwrap_or(false),
         }),
         None => None,
     };
@@ -154,6 +156,8 @@ fn row_of(t: &aterm_toml::Table) -> Option<Need> {
         got_authorized: b("got_authorized")?,
         raised_again_on_change: b("raised_again_on_change"),
         posted: b("posted")?,
+        custodian_silent: b("custodian_silent").unwrap_or(false),
+        late_offer: b("late_offer").unwrap_or(false),
         record: match s("record") {
             Some(text) => Some(unhex(text)?),
             None => None,
@@ -201,6 +205,12 @@ fn render(rows: &[Need]) -> String {
         if let Some(record) = &need.record {
             put("record", toml_str(&hex(record)));
         }
+        if need.custodian_silent {
+            put("custodian_silent", "true".to_owned());
+        }
+        if need.late_offer {
+            put("late_offer", "true".to_owned());
+        }
         if let Some(retired) = &need.retired {
             put("reason", toml_str(retired.reason.word()));
             put("evidence", toml_str(&retired.evidence));
@@ -218,6 +228,12 @@ fn render(rows: &[Need]) -> String {
             );
             put("proof_before_commons", proof.before_commons.to_string());
             put("proof_swept_unheld", proof.swept_unheld.to_string());
+            if proof.window_ended {
+                put("proof_window_ended", "true".to_owned());
+            }
+            if proof.custodian_silent {
+                put("proof_custodian_silent", "true".to_owned());
+            }
         }
         if let Some(ask) = &need.ask {
             put("ask_what", toml_str(&ask.what));
@@ -427,8 +443,9 @@ pub fn retire(
 }
 
 /// Take in what reached the lab's table, or was read off it, for this Mac's needs: a flush
-/// the table now holds, and each decision whose writer and evidence checked. A move that does
-/// not apply where the need stands changes nothing. A lab retirement whose reason has already
+/// the table now holds, each decision whose writer and evidence checked, and a silence past
+/// [`super::SILENCE_SECS`] with no custodian record. A move that does not apply where the need
+/// stands changes nothing. A lab retirement whose reason has already
 /// changed (a lapse: this Mac is taking it in, so it is back) raises the need again at once, as
 /// the line it ends with says, since a need raised by hand has no consumer to raise it (§6.2).
 /// Each need moved comes back with the request id its move named.
@@ -471,6 +488,9 @@ pub fn absorb(
                     Some(next) => Some(settle(&reraise(&next, facts)?.unwrap_or(next), facts)),
                     None => None,
                 },
+                Absorb::CustodianSilent => {
+                    super::silent(need, facts).map(|next| settle(&next, facts))
+                }
             };
             if let Some(next) = next {
                 *need = next.clone();

@@ -5,6 +5,41 @@
 use super::*;
 
 #[test]
+fn sgr_byte_matches_decimal_display_for_every_value_and_keeps_prefixes() {
+    for value in 0..=u8::MAX {
+        for prefix in ["", "prefix  ", "日🦀"] {
+            for capacity in [0, 1, 3, 8] {
+                let mut actual = String::with_capacity(capacity);
+                actual.push_str(prefix);
+                push_sgr_byte(&mut actual, value);
+                assert_eq!(actual, format!("{prefix}{value}"));
+            }
+        }
+    }
+}
+
+#[test]
+fn sgr_rgb_matches_display_in_each_component_and_both_separators() {
+    for value in 0..=u8::MAX {
+        for channel in 0..3 {
+            let mut rgb = [0, 99, 255];
+            rgb[channel] = value;
+            for separator in [';', ':'] {
+                let mut actual = String::from("日prefix");
+                push_sgr_rgb(&mut actual, rgb, separator);
+                assert_eq!(
+                    actual,
+                    format!(
+                        "日prefix{separator}{}{separator}{}{separator}{}",
+                        rgb[0], rgb[1], rgb[2]
+                    )
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn image_ref_clone_from_copies_placement_and_releases_replaced_payloads() {
     let mut source = ImageRef {
         image: Arc::new(ImageData {

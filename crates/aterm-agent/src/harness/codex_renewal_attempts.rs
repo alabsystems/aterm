@@ -17,6 +17,10 @@ mod tests;
 mod completion;
 pub use completion::{CompletionProgress, RootDriver, advance_root};
 
+#[path = "codex_renewal_index.rs"]
+mod index;
+pub use index::IndexKey;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AttemptRef {
@@ -763,7 +767,7 @@ fn write_immutable<T: Serialize>(path: &Path, value: &T) -> Result<(), &'static 
             crate::durable::sync_all(&file).map_err(|_| "journal-file-flush")?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let (file, bytes) = read_retained(path)?.ok_or("journal-existing-missing")?;
+            let (file, bytes) = read_retained(path, true)?.ok_or("journal-existing-missing")?;
             if bytes.as_slice() != text.as_bytes() {
                 return Err("journal-immutable-conflict");
             }
@@ -783,12 +787,17 @@ fn read_record<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>, &
 }
 
 fn read_bytes(path: &Path) -> Result<Option<Vec<u8>>, &'static str> {
-    Ok(read_retained(path)?.map(|(_, bytes)| bytes))
+    Ok(read_retained(path, false)?.map(|(_, bytes)| bytes))
 }
 
-fn read_retained(path: &Path) -> Result<Option<(std::fs::File, Vec<u8>)>, &'static str> {
+fn read_retained(
+    path: &Path,
+    acknowledge: bool,
+) -> Result<Option<(std::fs::File, Vec<u8>)>, &'static str> {
     let mut open = std::fs::OpenOptions::new();
-    open.read(true);
+    // Windows FlushFileBuffers requires GENERIC_WRITE. No read opens with
+    // create or truncate, and an observation needs only read access.
+    open.read(true).write(acknowledge && cfg!(windows));
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;

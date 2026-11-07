@@ -101,6 +101,19 @@ impl Owner {
         let journal = &self.journal;
         let faulted = &mut self.faulted;
         self.jobs.retain(|_, job| {
+            if job.cleanup_at.is_none()
+                && job
+                    .workload
+                    .as_ref()
+                    .and_then(|state| state.control.as_ref())
+                    .is_some_and(|link| link.closed() && !link.drained())
+            {
+                // EOF caused by our existing cancellation/timeout is not a
+                // second resource failure. Preserve the original accepted
+                // cause through the same owning wait and settlement.
+                job.cause = CompletionCause::ResourceLimit;
+                job.cleanup_at.get_or_insert_with(Instant::now);
+            }
             // This is sampled governance over actual owned groups, not a hard
             // kernel quota or evidence of closure. Unknown coverage is never
             // treated as zero. Original custody remains held during cleanup.
@@ -206,6 +219,16 @@ impl Owner {
                 // be finishing when the independent exited probe first sees
                 // the zombie; retain original control until it is available.
                 if (!job.launched || job.ended.is_some()) && drained {
+                    #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+                    if job.control_eof_before_reap_test
+                        && job
+                            .workload
+                            .as_ref()
+                            .and_then(|state| state.control.as_ref())
+                            .is_some_and(|control| !control.closed())
+                    {
+                        return true;
+                    }
                     let _ = job.child.request_group(CohortSignal::Kill);
                     if let Ok(Some((status, observation))) = crate::resource_accounting::try_reap(
                         job.child.child_mut(),
@@ -263,6 +286,10 @@ impl Owner {
                 && !job.settled
                 && job.members.is_empty()
                 && job
+                    .workload
+                    .as_ref()
+                    .is_none_or(|state| !state.registration_preparing())
+                && job
                     .settlement_at
                     .is_none_or(|at| at.elapsed() >= Duration::from_secs(1))
             {
@@ -271,7 +298,13 @@ impl Owner {
                     Custody::Fixed(custody) => custody.try_finish(fence),
                     Custody::Cooperative(claim) => claim.finish_cohort(),
                 };
-                if closed.is_ok() && journal.settle(&job.binding).is_ok() {
+                if closed.is_ok()
+                    && job
+                        .workload
+                        .as_ref()
+                        .is_none_or(|state| state.primary.settle().is_ok())
+                    && journal.settle(&job.binding).is_ok()
+                {
                     job.settled = true;
                 }
             }
@@ -286,6 +319,7 @@ impl Owner {
                 job.metadata_sdk.take();
                 job.metadata_gnu.take();
                 job.compiler.take();
+                job.workload.take();
                 let _ = job.events.emit_terminal(event, observation);
                 job.terminal_sent = true;
             }

@@ -112,7 +112,7 @@ fn open_at(
             .into());
         }
         None => {
-            return Err(Unavailable::Refused(format!(
+            return Err(Unavailable::Unchecked(format!(
                 "the kernel did not name the uid serving {}",
                 path.display()
             ))
@@ -146,6 +146,9 @@ fn exchange(
         (Ok(Some(Frame::Refused { words })), _) => {
             return Err(Unavailable::Refused(words).into());
         }
+        (Ok(Some(Frame::Unchecked { words })), _) => {
+            return Err(Unavailable::Unchecked(words).into());
+        }
         (_, Err(error)) => return Err(error.into()),
         (first, Ok(())) => first?,
     };
@@ -157,7 +160,7 @@ fn exchange(
         },
         Some(other) => return Err(unexpected(&other).into()),
         None => {
-            return Err(Unavailable::Refused(
+            return Err(Unavailable::Unchecked(
                 "the broker closed the connection before its hello".to_owned(),
             )
             .into());

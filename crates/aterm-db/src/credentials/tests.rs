@@ -569,6 +569,120 @@ fn the_schema_is_closed_and_a_retry_identity_is_its_records() {
         .is_err(),
         "a policy record is step 5's"
     );
+    // A window decision names machines, each once, at most 16, and nothing else.
+    let named = |hosts: Vec<String>| {
+        let mut body = Map::new();
+        body.insert("template".into(), Value::from("vault-lacks"));
+        body.insert(
+            "unanswered".into(),
+            Value::Array(hosts.into_iter().map(Value::from).collect()),
+        );
+        body.insert("others".into(), Value::from(2_u64));
+        let record = attested(Record::new("needs-person", &key, body));
+        decode(&record.command().unwrap().encode().unwrap()).is_ok()
+    };
+    let hosts = |n: usize| (0..n).map(|n| format!("m{n}")).collect::<Vec<_>>();
+    assert!(named(hosts(need::MAX_UNANSWERED)));
+    assert!(!named(hosts(need::MAX_UNANSWERED + 1)));
+    assert!(!named(Vec::new()));
+    assert!(!named(vec!["m3".into(), "m3".into()]));
+    assert!(!named(vec!["m3; rm".into()]), "a host is a machine name");
+}
+
+/// What a requester takes off its own request's thread beside the custodian's first decision:
+/// a `NeedsPerson` on an ask it made standing in for a silent custodian replaces that ask, a
+/// window decision whose unanswered members have each swept since restates as every member's
+/// sweep, and a late offer moves an ask once, naming who the window's end named.
+/// NEGATIVE CONTROL: an ask every member's sweep made takes nothing, nor one a member has still
+/// not answered, nor one a late offer already moved.
+#[test]
+fn a_requester_restates_an_ask_its_thread_shows_rested_on_less() {
+    let facts = need::Facts {
+        sight: None,
+        commons: need::Commons::Writer,
+        policy: need::Policy::compiled(true),
+        offered: false,
+        now: 0,
+    };
+    let asked = |proof: need::Proof, late_offer| Need {
+        state: State::AwaitingPerson,
+        asking: true,
+        posted: true,
+        proof: Some(proof),
+        late_offer,
+        ..need::fresh([1; 16], Want::Notary, Purpose::ByHand, &facts)
+    };
+    let proof = need::Proof {
+        seq: 1,
+        absent: true,
+        every_locker_open: true,
+        before_commons: false,
+        swept_unheld: false,
+        window_ended: false,
+        custodian_silent: false,
+    };
+    let window = need::Proof {
+        window_ended: true,
+        ..proof
+    };
+    let stood_in = need::Proof {
+        custodian_silent: true,
+        ..proof
+    };
+    let every = need::Proof {
+        swept_unheld: true,
+        ..proof
+    };
+    let mut feed = Feed::new();
+    let id = feed.request(A, 1, "notary");
+    let mut sweep = Map::new();
+    sweep.insert(
+        "covers".into(),
+        Value::Array(vec![Value::from(hex::encode_lower(&id))]),
+    );
+    feed.put(B, Record::new("sweep", &[8; 16], sweep.clone()));
+    let members = context(0).members;
+    let decide = |feed: &Feed, need: &Need| {
+        let book = feed.book(0);
+        decision_for(&book.threads[&id], need, &members, &book.macs)
+    };
+    assert_eq!(
+        decide(&feed, &asked(window, false)),
+        None,
+        "C has not answered"
+    );
+    assert_eq!(
+        decide(&feed, &asked(stood_in, false)),
+        None,
+        "no custodian record"
+    );
+    feed.put(C, Record::new("sweep", &[9; 16], sweep));
+    assert_eq!(
+        decide(&feed, &asked(window, false)),
+        Some(Decision::NeedsPerson(Unanswered::default())),
+        "every member has answered since"
+    );
+    assert_eq!(decide(&feed, &asked(every, false)), None);
+    let named = Unanswered {
+        hosts: vec!["m3".into()],
+        others: 0,
+    };
+    let mut body = Map::new();
+    body.insert("template".into(), Value::from("vault-lacks"));
+    body.insert("unanswered".into(), Value::Array(vec![Value::from("m3")]));
+    feed.put(C, attested(Record::new("needs-person", &id, body)));
+    assert_eq!(
+        decide(&feed, &asked(stood_in, false)),
+        Some(Decision::NeedsPerson(named.clone())),
+        "the custodian's own decision replaces the stand-in"
+    );
+    feed.put(B, Record::new("offer", &id, Map::new()));
+    assert_eq!(
+        decide(&feed, &asked(window, false)),
+        Some(Decision::Offered(named)),
+        "a late offer names who the window named"
+    );
+    assert_eq!(decide(&feed, &asked(window, true)), None, "once");
 }
 
 /// A custodian's attested decision counts only for the request it names: a member that copies
@@ -1406,4 +1520,329 @@ fn a_lapsed_request_is_raised_again_at_once_while_its_need_holds() {
         assert_eq!(need.raises, 2);
     }
     assert_eq!(pass_at(requester, lapse).unwrap().posted, 0);
+}
+
+/// A private holder file at `path`, as a holder's copy is kept: the hold probe takes no other.
+fn hold(path: &std::path::Path, bytes: &[u8]) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    aterm_secrets::fsx::write_atomic(path, bytes, 0o600).unwrap();
+}
+
+/// A posted request the vault admin's aterm writes nothing on (its Mac off, or on a build with
+/// no custodian pass) does not wait on it for good: past the silence (the want window and a day,
+/// so a live custodian, whose own window starts when its replica took the request in, decides
+/// first) a person-sourced vault-only want whose absence proof holds here goes to a person, as
+/// before Commons, and any other names the silent admin Mac in its line and files one fact for
+/// later. A request a Mac offered on is its offer's, never silent. Running the hand route the
+/// line names, on the admin Mac, delivers the value into this Mac's own section, which ends the
+/// request and takes the fact down. Inside the silence nothing is said.
+/// NEGATIVE CONTROL: at the want window's end alone, nothing calls the custodian silent; a
+/// pass that read silence before an offer would call the offered request silent.
+#[test]
+fn a_request_no_custodian_answers_reaches_a_person_after_the_want_window() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    for paths in &lab.paths {
+        need::test_alab_policy(paths);
+    }
+    let (custodian, requester) = (&lab.paths[0], &lab.paths[1]);
+    let mailbox = Want::parse("mailbox:m29").unwrap();
+    need::raise(requester, mailbox.clone(), Purpose::HarnessSignIn).unwrap();
+    need::raise(requester, Want::Notary, Purpose::ByHand).unwrap();
+    need::raise(requester, Want::SiteDeployerKey, Purpose::ByHand).unwrap();
+    let before = aterm_time::unix_millis().unwrap();
+    assert_eq!(pass_at(requester, before).unwrap().posted, 3);
+    let after = aterm_time::unix_millis().unwrap();
+    let window = need::WANT_WINDOW_SECS * MS;
+    let silence = need::SILENCE_SECS * MS;
+    let quiet = |now: u64| {
+        pass_at(requester, now).unwrap();
+        let needs = need::list(requester).unwrap();
+        for need in &needs {
+            assert_eq!(need.state, State::Open, "{}", need.line);
+            assert!(need.line.starts_with("posted to the lab"), "{}", need.line);
+        }
+        assert!(need::exceptions(&needs).is_empty(), "{needs:?}");
+    };
+    quiet(before + window - MS);
+    quiet(after + window);
+    hold(
+        &Want::SiteDeployerKey.hold_path(&custodian.home).unwrap(),
+        b"key",
+    );
+    repair_commons(&lab, 3);
+    assert_eq!(pass_at(custodian, before).unwrap().offered, 1);
+    repair_commons(&lab, 3);
+    pass_at(requester, after + silence).unwrap();
+    let needs = need::list(requester).unwrap();
+    let find = |needs: &[Need], want: &Want| {
+        needs
+            .iter()
+            .find(|need| need.want == *want)
+            .cloned()
+            .unwrap()
+    };
+    let asked = find(&needs, &mailbox);
+    assert_eq!(asked.state, State::AwaitingPerson, "{}", asked.line);
+    assert!(
+        asked
+            .ask
+            .as_ref()
+            .is_some_and(|ask| ask.needs_you.starts_with("NEEDS YOU:")),
+        "{asked:?}"
+    );
+    let proof = asked.proof.unwrap();
+    assert!(
+        proof.warrants_asking()
+            && proof.custodian_silent
+            && !proof.before_commons
+            && !proof.swept_unheld,
+        "{proof:?}"
+    );
+    let offered = find(&needs, &Want::SiteDeployerKey);
+    assert_eq!(
+        (offered.state, offered.custodian_silent),
+        (State::Offered, false),
+        "{}",
+        offered.line
+    );
+    let notary = find(&needs, &Want::Notary);
+    assert_eq!(notary.state, State::Open, "{}", notary.line);
+    for words in [
+        "the vault's admin Mac",
+        "96 hours",
+        "aterm secrets set release-notary --for m2 --file <file>",
+    ] {
+        assert!(notary.line.contains(words), "{words}: {}", notary.line);
+    }
+    let filed = need::exceptions(&needs);
+    assert_eq!(filed.len(), 2, "{filed:?}");
+    assert!(
+        filed
+            .iter()
+            .any(|entry| entry.key() == "secrets.need.custodian.silent"),
+        "{filed:?}"
+    );
+    for entry in &filed {
+        entry
+            .message()
+            .unwrap_or_else(|fault| panic!("{entry:?}: {fault:?}"));
+    }
+    let admin = client::admin_open(custodian).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.set_entry(
+        &Audience::Hosts(vec!["m2".into()]),
+        "release-notary",
+        b"apple",
+    )
+    .unwrap();
+    client::admin_publish(custodian, &admin, &doc).unwrap();
+    client::sync(requester, None).unwrap();
+    pass_at(requester, after + silence).unwrap();
+    let needs = need::list(requester).unwrap();
+    let given = find(&needs, &Want::Notary);
+    assert_eq!(
+        given.state,
+        State::Fulfilled,
+        "the hand route ends it: {}",
+        given.line
+    );
+    let filed = need::exceptions(&needs);
+    assert!(
+        filed
+            .iter()
+            .all(|entry| entry.key() != "secrets.need.custodian.silent"),
+        "{filed:?}"
+    );
+}
+
+/// A custodian that answers inside the window decides as before (its `NeedsPerson`, resting on
+/// every member's sweep), and nothing past the silence calls it silent.
+#[test]
+fn a_custodian_that_answers_in_the_window_is_never_called_silent() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    for paths in &lab.paths {
+        need::test_alab_policy(paths);
+    }
+    let mailbox = Want::parse("mailbox:m29").unwrap();
+    need::raise(&lab.paths[1], mailbox, Purpose::HarnessSignIn).unwrap();
+    let now = aterm_time::unix_millis().unwrap();
+    assert_eq!(pass_at(&lab.paths[1], now).unwrap().posted, 1);
+    repair_commons(&lab, 3);
+    pass_at(&lab.paths[0], now).unwrap();
+    let custodian = custodian_pass_at(&lab.paths[0], now).unwrap().unwrap();
+    assert_eq!(custodian.asked.len(), 1, "{custodian:?}");
+    repair_commons(&lab, 3);
+    let late = aterm_time::unix_millis().unwrap() + need::SILENCE_SECS * MS;
+    pass_at(&lab.paths[1], late).unwrap();
+    let needs = need::list(&lab.paths[1]).unwrap();
+    let asked = &needs[0];
+    assert_eq!(asked.state, State::AwaitingPerson, "{}", asked.line);
+    assert!(
+        asked
+            .proof
+            .is_some_and(|proof| proof.swept_unheld && !proof.custodian_silent)
+    );
+    assert!(!asked.line.contains("96 hours"), "{}", asked.line);
+    let filed = need::exceptions(&needs);
+    assert_eq!(filed.len(), 1, "{filed:?}");
+    assert_ne!(filed[0].key(), "secrets.need.custodian.silent");
+}
+
+/// The want window's end decides a request some member never answered, and the decision says
+/// so: the person is asked, but the proof does not claim every member swept, and the ask names
+/// the Mac that did not answer, so a copy it holds is looked for before a new value is made. A
+/// holder that answers late and offers moves the ask to that copy, which the custodian's runtime
+/// takes, and `need ls --all` shows the offer. A request every member swept keeps its words, and
+/// an offer on another request leaves them. A week on, each request awaiting a person still
+/// hears from its requester.
+/// NEGATIVE CONTROL: the request m3 swept reads as every member's sweep and names nobody; the
+/// late offer moves the ask once.
+#[test]
+fn a_window_decision_names_who_did_not_answer_and_a_late_offer_moves_the_ask() {
+    use crate::table::tests::repair_between;
+    let lab = Lab::new(&[Role::Writer; 3]);
+    for paths in &lab.paths {
+        need::test_alab_policy(paths);
+    }
+    let (custodian, requester, late) = (&lab.paths[0], &lab.paths[1], &lab.paths[2]);
+    let now = aterm_time::unix_millis().unwrap();
+    need::raise(requester, Want::Notary, Purpose::ReleaseNotary).unwrap();
+    assert_eq!(pass_at(requester, now).unwrap().posted, 1);
+    repair_between(&lab, 1, 0, 3);
+    repair_between(&lab, 0, 2, 3);
+    assert_eq!(pass_at(late, now).unwrap().swept, 1, "m3 sweeps the first");
+    need::raise(requester, Want::Notary, Purpose::ByHand).unwrap();
+    assert_eq!(pass_at(requester, now).unwrap().posted, 1);
+    repair_between(&lab, 1, 0, 3);
+    repair_between(&lab, 0, 2, 3);
+    assert_eq!(pass_at(custodian, now).unwrap().swept, 2);
+    let window_end = aterm_time::unix_millis().unwrap() + need::WANT_WINDOW_SECS * MS;
+    let decided = custodian_pass_at(custodian, window_end).unwrap().unwrap();
+    assert_eq!(decided.asked.len(), 2, "{decided:?}");
+    repair_between(&lab, 1, 0, 3);
+    let heard = pass_at(requester, window_end).unwrap();
+    let named = |purpose| {
+        let thread = heard
+            .threads
+            .iter()
+            .find(|thread| thread.purpose == purpose);
+        thread.map(|thread| (thread.needs_person, thread.unanswered.clone()))
+    };
+    assert_eq!(
+        named(Purpose::ReleaseNotary),
+        Some((true, Unanswered::default()))
+    );
+    assert_eq!(
+        named(Purpose::ByHand),
+        Some((
+            true,
+            Unanswered {
+                hosts: vec!["m3".into()],
+                others: 0
+            }
+        )),
+        "the requester itself is never one that did not answer"
+    );
+    let asks = |purpose| {
+        let needs = need::list(requester).unwrap();
+        let need = needs.iter().find(|need| need.purpose == purpose).unwrap();
+        assert_eq!(need.state, State::AwaitingPerson, "{}", need.line);
+        (need.proof.unwrap(), need.ask.clone().unwrap())
+    };
+    let (swept, every) = asks(Purpose::ReleaseNotary);
+    assert!(swept.swept_unheld && swept.warrants_asking(), "{swept:?}");
+    assert!(
+        every.needs_you.contains("is on no Mac the lab can reach")
+            && !every.needs_you.contains("m3"),
+        "{}",
+        every.needs_you
+    );
+    let (window, unanswered) = asks(Purpose::ByHand);
+    assert!(
+        !window.swept_unheld && window.window_ended && window.warrants_asking(),
+        "m3 never swept it: {window:?}"
+    );
+    assert!(
+        unanswered.needs_you.contains("m3 did not answer")
+            && !unanswered
+                .needs_you
+                .contains("is on no Mac the lab can reach"),
+        "{}",
+        unanswered.needs_you
+    );
+    let copy = unanswered.more.iter().position(|line| {
+        line.starts_with(
+            "m3 did not answer: where one holds ~/.secrets/release-notary, that copy is the <file>",
+        )
+    });
+    let source = unanswered
+        .more
+        .iter()
+        .position(|line| line.starts_with("it comes from:"));
+    assert!(copy.is_some() && copy < source, "{:?}", unanswered.more);
+    assert!(
+        !format!("{unanswered:?}").contains("offers it at its next pass"),
+        "a Mac that did not answer may have no sweep: {unanswered:?}"
+    );
+    hold(&Want::Notary.hold_path(&late.home).unwrap(), b"apple");
+    repair_between(&lab, 0, 2, 3);
+    assert_eq!(
+        pass_at(late, window_end).unwrap().offered,
+        1,
+        "the second alone"
+    );
+    repair_between(&lab, 2, 0, 3);
+    repair_between(&lab, 1, 0, 3);
+    assert_eq!(pass_at(requester, window_end).unwrap().decided, 1);
+    let (_, offered) = asks(Purpose::ByHand);
+    assert!(
+        offered
+            .needs_you
+            .contains("offered it (m3 had not answered when the window ended)")
+            && offered.needs_you.contains(
+                "the vault custodian's running aterm takes over the authenticated LAN connection"
+            )
+            && !offered.needs_you.contains("did not answer"),
+        "{}",
+        offered.needs_you
+    );
+    assert!(
+        offered
+            .more
+            .iter()
+            .any(|line| line.contains("~/.secrets/release-notary")),
+        "{:?}",
+        offered.more
+    );
+    assert_eq!(
+        asks(Purpose::ReleaseNotary).1,
+        every,
+        "no offer on the first"
+    );
+    assert_eq!(
+        pass_at(requester, window_end).unwrap().decided,
+        0,
+        "an offer moves the ask once"
+    );
+    let listed = cli::run(requester, &["ls".to_owned(), "--all".to_owned()]).unwrap();
+    assert!(listed.contains("awaiting-person, offered by 1"), "{listed}");
+    assert!(listed.contains("awaiting-person, swept by 2"), "{listed}");
+    assert_eq!(
+        need::needs_you(&need::list(requester).unwrap())
+            .into_iter()
+            .filter(|line| line.contains("offered it"))
+            .count(),
+        1,
+        "the person sees the ask that names the copy"
+    );
+    // A week on, each request awaiting a person still hears from this Mac, whatever its pass
+    // takes in, so none lapses while it waits.
+    let week = window_end + need::STILL_SECS * MS;
+    assert_eq!(pass_at(requester, week).unwrap().answered, 2);
+    for need in need::list(requester).unwrap() {
+        need::exception(&need)
+            .unwrap()
+            .message()
+            .unwrap_or_else(|fault| panic!("{need:?}: {fault:?}"));
+    }
 }

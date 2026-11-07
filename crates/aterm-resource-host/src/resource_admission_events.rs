@@ -25,6 +25,13 @@ pub(in super::super) struct Events {
     prepared: bool,
     inputs_unchanged: Option<Result<(), String>>,
     accounted: bool,
+    observe_accounting: bool,
+    workload: bool,
+    linker: Option<trust_resource_controller::Loan>,
+    produced: Option<(
+        trust_resource_controller::workload::host::produced::Key,
+        trust_resource_controller::workload::host::MemberKind,
+    )>,
     #[cfg(all(test, target_os = "macos"))]
     sent_frames: Vec<Vec<u8>>,
     #[cfg(all(test, target_os = "macos"))]
@@ -46,6 +53,10 @@ impl Events {
             prepared: false,
             inputs_unchanged: None,
             accounted: false,
+            observe_accounting: false,
+            workload: false,
+            linker: None,
+            produced: None,
             #[cfg(all(test, target_os = "macos"))]
             sent_frames: Vec::new(),
             #[cfg(all(test, target_os = "macos"))]
@@ -101,6 +112,12 @@ impl Events {
     pub(in super::super) fn requires_accounting(&self) -> bool {
         self.accounted
     }
+    pub(in super::super) fn observe_accounting(&mut self) {
+        self.observe_accounting = true;
+    }
+    pub(in super::super) fn collect_accounting(&self) -> bool {
+        self.accounted || self.observe_accounting
+    }
     pub(in super::super) fn emit_terminal(
         &mut self,
         event: Event,
@@ -111,6 +128,43 @@ impl Events {
         }
         if self.output.len() >= 4 || self.failed {
             return Err(io::Error::other("private lifecycle unavailable"));
+        }
+        if self.workload || self.linker.is_some() {
+            let root = self
+                .metadata_root
+                .ok_or_else(|| io::Error::other("workload root binding missing"))?;
+            let bytes = self.metadata_event(root, event)?;
+            let event = trust_resource_controller::MetadataEvent::decode(
+                &bytes,
+                root,
+                self.binding.attempt,
+            )?;
+            let bytes = match event {
+                trust_resource_controller::MetadataEvent::Completed(completed) => {
+                    if let Some(loan) = self.linker {
+                        return self.enqueue(
+                            trust_resource_controller::linker::Completion {
+                                loan,
+                                completed,
+                                observation,
+                            }
+                            .encode()?,
+                        );
+                    }
+                    trust_resource_controller::workload::host::Completion {
+                        phase: self.produced.as_ref().map_or(0, |(key, _)| key.ordinal),
+                        kind: self.produced.as_ref().map_or(
+                            trust_resource_controller::workload::host::MemberKind::CompilerQuery,
+                            |(_, kind)| *kind,
+                        ),
+                        completed,
+                        observation,
+                    }
+                    .encode()?
+                }
+                _ => bytes,
+            };
+            return self.enqueue(bytes);
         }
         let bytes = AccountedEventFrame {
             finished: EventFrame {
@@ -125,6 +179,38 @@ impl Events {
     pub(in super::super) fn metadata(&mut self, root: [u8; 16]) {
         self.metadata_root = Some(root);
     }
+    pub(in super::super) fn workload(&mut self, root: [u8; 16]) -> io::Result<()> {
+        self.account()?;
+        self.metadata_root = Some(root);
+        self.workload = true;
+        Ok(())
+    }
+    pub(in super::super) fn linker(
+        &mut self,
+        request: &trust_resource_controller::linker::Request,
+    ) -> io::Result<()> {
+        self.account()?;
+        self.metadata_root = Some(request.member.binding.root_attempt);
+        self.linker = Some(request.loan()?);
+        Ok(())
+    }
+    pub(in super::super) fn linker_prepared(
+        &mut self,
+        prepared: &trust_resource_controller::linker::Prepared,
+    ) -> io::Result<()> {
+        if self.prepared
+            || self.metadata_root != Some(prepared.root_attempt)
+            || self.binding.attempt != prepared.member_attempt
+            || self.linker != Some(prepared.loan)
+        {
+            return Err(io::Error::other(
+                "linker inventory binding or phase differs",
+            ));
+        }
+        self.enqueue(prepared.encode()?)?;
+        self.prepared = true;
+        Ok(())
+    }
     pub(in super::super) fn prepared(
         &mut self,
         inventory: &trust_resource_controller::MetadataPrepared,
@@ -135,6 +221,35 @@ impl Events {
         {
             return Err(io::Error::other(
                 "metadata inventory binding or phase differs",
+            ));
+        }
+        self.enqueue(inventory.encode()?)?;
+        self.prepared = true;
+        Ok(())
+    }
+    pub(in super::super) fn produced(
+        &mut self,
+        key: trust_resource_controller::workload::host::produced::Key,
+        kind: trust_resource_controller::workload::host::MemberKind,
+    ) -> io::Result<()> {
+        key.validate()?;
+        self.workload(key.root_attempt)?;
+        self.produced = Some((key, kind));
+        Ok(())
+    }
+    pub(in super::super) fn produced_prepared(
+        &mut self,
+        inventory: &trust_resource_controller::workload::host::produced::ProducedPrepared,
+    ) -> io::Result<()> {
+        if self.prepared
+            || self.binding.attempt != inventory.member_attempt
+            || self
+                .produced
+                .as_ref()
+                .is_none_or(|(key, _)| key != &inventory.key)
+        {
+            return Err(io::Error::other(
+                "produced preparation binding or phase differs",
             ));
         }
         self.enqueue(inventory.encode()?)?;

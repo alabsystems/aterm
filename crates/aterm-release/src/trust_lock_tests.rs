@@ -68,7 +68,6 @@ fn never(_: &Path, _: &TrustLock) -> Result<(), String> {
 /// unlocked resolution a cut used before (discovery with no lock) follows the flip.
 #[test]
 fn flipping_current_between_steps_leaves_the_prover_unchanged() {
-    atpkg::toolchain::set_probe_bound_for_test(aterm_spec::wait::MUST_HAPPEN);
     let scratch = aterm_tempfile::tempdir().unwrap();
     let prefix = scratch.path().canonicalize().unwrap().join("pkg");
     let root = store_build(&prefix, 16387, COMMIT);
@@ -112,7 +111,6 @@ fn flipping_current_between_steps_leaves_the_prover_unchanged() {
 /// the lock's tree proves; one that stages another tree, or fails, refuses.
 #[test]
 fn an_absent_locked_build_is_installed_and_held_to_its_tree() {
-    atpkg::toolchain::set_probe_bound_for_test(aterm_spec::wait::MUST_HAPPEN);
     let scratch = aterm_tempfile::tempdir().unwrap();
     let staging = scratch.path().canonicalize().unwrap().join("staging");
     let root = store_build(&staging, 16387, COMMIT);
@@ -153,7 +151,6 @@ fn an_absent_locked_build_is_installed_and_held_to_its_tree() {
 /// nothing is installed over it; a compiler of another commit refuses too.
 #[test]
 fn a_store_build_of_another_tree_or_compiler_refuses() {
-    atpkg::toolchain::set_probe_bound_for_test(aterm_spec::wait::MUST_HAPPEN);
     let scratch = aterm_tempfile::tempdir().unwrap();
     let prefix = scratch.path().canonicalize().unwrap().join("pkg");
     let root = store_build(&prefix, 16387, COMMIT);
@@ -184,7 +181,6 @@ fn a_store_build_of_another_tree_or_compiler_refuses() {
 /// build proves in a cut.
 #[test]
 fn an_override_of_another_tree_is_refused_in_a_cut_and_taken_otherwise() {
-    atpkg::toolchain::set_probe_bound_for_test(aterm_spec::wait::MUST_HAPPEN);
     let scratch = aterm_tempfile::tempdir().unwrap();
     let prefix = scratch.path().canonicalize().unwrap().join("pkg");
     let root = store_build(&prefix, 16387, COMMIT);
@@ -238,7 +234,6 @@ fn an_override_of_another_tree_is_refused_in_a_cut_and_taken_otherwise() {
 #[test]
 fn lock_at_reads_the_lock_a_commit_carries() {
     use crate::ledger::testing::{Git, git, init};
-    atpkg::toolchain::set_probe_bound_for_test(aterm_spec::wait::MUST_HAPPEN);
     let scratch = aterm_tempfile::tempdir().unwrap();
     let repo = scratch.path().canonicalize().unwrap();
     init(

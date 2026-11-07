@@ -838,15 +838,18 @@ fn spread(us: &mut [u128]) -> String {
     )
 }
 
-/// Grow each roster row's series under `dir` to a full one: [`account_series::KEEP_ROWS`] figure
-/// rows over the eight days a series keeps, before the rows the seed wrote, each in its own week.
+/// Grow each roster row's series under `dir` to a full one, as a compaction leaves a busy
+/// account's near [`account_series::BOUND_BYTES`], before the rows the seed wrote: a `day` row a
+/// day over the daily tier ([`account_series::HOURLY_S`] to [`account_series::DAILY_S`]), one
+/// `fig` row an hour over the hourly tier ([`account_series::RAW_S`] to `HOURLY_S`), and raw
+/// `fig` rows over the week before the seed's last day to fill the rest, each in its own week.
 fn full_series(
     dir: &Path,
     roster: &accounts::Roster,
     state: &accounts::State,
     now: i64,
 ) -> Result<(), Fail> {
-    let keep = i64::try_from(account_series::KEEP_ROWS).unwrap_or(i64::MAX);
+    use account_series::{BOUND_BYTES, DAILY_S, HOURLY_S, RAW_S};
     for row in &roster.rows {
         let path = account_series::path_of(dir, &row.label, &state.machine)
             .ok_or_else(|| Fail::die(format!("{}: no series path", row.label)))?;
@@ -855,33 +858,90 @@ fn full_series(
             .get(&row.label)
             .and_then(|a| a.windows.get(accounts::WEEK_LIMIT))
             .map_or(now + 5 * D, |w| w.reset);
-        let (from, to) = (now - account_series::KEEP_S + H, now - 25 * H);
-        let mut text = String::new();
-        for i in 0..keep {
-            let t = from + (to - from) * i / keep;
+        // The week `t` falls in, and how far into it `t` is, in tenths of a percent.
+        let week = |t: i64| {
             let behind = (reset - t).div_euclid(7 * D);
             let window_reset = reset - 7 * D * behind;
             let into = 7 * D - (window_reset - t);
-            let line = account_series::SeriesRow {
+            (
+                window_reset,
+                u32::try_from(into * 1000 / (7 * D)).unwrap_or(0),
+            )
+        };
+        let print = |said: account_series::Said, t: i64| {
+            account_series::SeriesRow {
                 t,
                 by: state.machine.clone(),
-                said: account_series::Said::Fig {
+                said,
+            }
+            .line()
+            .ok_or_else(|| Fail::die("a series row that will not print"))
+        };
+        let fig = |t: i64| {
+            let (window_reset, pct_x10) = week(t);
+            print(
+                account_series::Said::Fig {
                     five_hour: None,
                     seven_day: Some(account_series::Fig {
-                        pct_x10: u32::try_from(into * 1000 / (7 * D)).unwrap_or(0),
+                        pct_x10,
                         reset: window_reset,
                         at: t,
                         src: accounts::SOURCE_TAP.into(),
                         epoch: None,
                     }),
+                    ac: None,
+                    key: None,
                 },
-            }
-            .line()
-            .ok_or_else(|| Fail::die("a series row that will not print"))?;
+                t,
+            )
+        };
+        let mut text = String::new();
+        let push = |text: &mut String, line: String| {
             text.push_str(&line);
             text.push('\n');
+        };
+        let mut t = (now - DAILY_S).div_euclid(D) * D + D;
+        while t < now - HOURLY_S {
+            let (window_reset, first) = week(t);
+            let (_, last) = week(t + D - H);
+            push(
+                &mut text,
+                print(
+                    account_series::Said::Day(account_series::Day {
+                        span_s: D,
+                        tz_s: 0,
+                        five_hour: None,
+                        seven_day: Some(account_series::DayWeek {
+                            first,
+                            last: last.max(first),
+                            reset: window_reset,
+                            closed: window_reset < t + D,
+                        }),
+                        n: 24,
+                        ac: None,
+                        key: None,
+                    }),
+                    t,
+                )?,
+            );
+            t += D;
         }
-        text.push_str(&crate::util::read_regular_text(&path).unwrap_or_default());
+        let mut t = now - HOURLY_S + H;
+        while t < now - RAW_S {
+            push(&mut text, fig(t)?);
+            t += H;
+        }
+        let seeded = crate::util::read_regular_text(&path).unwrap_or_default();
+        let (from, to) = (now - RAW_S + H, now - 25 * H);
+        let one = fig(to)?.len() + 1;
+        let room = usize::try_from(BOUND_BYTES)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(text.len() + seeded.len() + 16 * 1024);
+        let raw = i64::try_from(room / one).unwrap_or(0).max(1);
+        for i in 0..raw {
+            push(&mut text, fig(from + (to - from) * i / raw)?);
+        }
+        text.push_str(&seeded);
         crate::util::write_fresh(&path, text)
             .map_err(|e| Fail::die(format!("cannot write {}: {e}", path.display())))?;
     }
@@ -911,7 +971,7 @@ fn resolver_cost(n: usize) -> Result<String, Fail> {
         .filter_map(|r| {
             let path = account_series::path_of(&dir, &r.label, &state.machine)?;
             let mut tail = account_series::Tail::new(path);
-            tail.refresh();
+            tail.refresh(now);
             Some((r.label.clone(), tail))
         })
         .collect();
@@ -933,13 +993,13 @@ fn resolver_cost(n: usize) -> Result<String, Fail> {
             .unwrap_or_default();
         read.push(t.elapsed().as_micros());
         let t = Instant::now();
-        let all = outlook::series_of(&dir, &roster, &state.machine);
+        let all = outlook::series_of(&dir, &roster, &state.machine, now);
         whole.push(t.elapsed().as_micros());
         let t = Instant::now();
         let series: std::collections::BTreeMap<String, Vec<account_series::SeriesRow>> = tails
             .iter_mut()
             .filter_map(|(label, tail)| {
-                tail.refresh();
+                tail.refresh(now);
                 (!tail.rows().is_empty()).then(|| (label.clone(), tail.rows().to_vec()))
             })
             .collect();
@@ -1036,6 +1096,38 @@ pub fn cmd_outlook_perf(args: &[String]) -> Res {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A full series ([`full_series`]) is shaped as a compaction leaves one, `day` rows and
+    /// hourly figures before the raw week, near [`account_series::BOUND_BYTES`] and within it;
+    /// and the memo's tails hold exactly what the report's whole read holds of it
+    /// ([`resolver_cost`]'s check). Control: a whole read that skips the outlook's view
+    /// (`outlook::series_of` without `account_series::outlook_view`) holds the `day` rows no tail
+    /// holds, and the check fails.
+    #[test]
+    fn a_full_series_is_near_the_bound_and_its_tails_read_what_the_whole_read_reads() {
+        let world = World::new(crate::instance::CONFIG_OFF).expect("a world");
+        let now = 1_792_956_600;
+        seed(&world, &plan('A'), now).expect("seeded");
+        let roster = accounts::Roster::load(&world.cfg.join("aterm").join("accounts.toml"))
+            .expect("the roster");
+        let dir = harness_state(&world);
+        let (state, _) = accounts::Store::at(&dir).load(now).expect("the store");
+        full_series(&dir, &roster, &state, now).expect("grown");
+        for row in &roster.rows {
+            let path = account_series::path_of(&dir, &row.label, &state.machine).expect("a path");
+            let text = std::fs::read_to_string(&path).expect("a series");
+            let len = text.len() as u64;
+            assert!(
+                len <= account_series::BOUND_BYTES
+                    && len > account_series::BOUND_BYTES - 128 * 1024,
+                "{}: {len} bytes",
+                row.label
+            );
+            assert!(text.contains(r#""k":"day""#), "{}: day rows", row.label);
+        }
+        let cost = resolver_cost(2).expect("the tails' rows are the whole read's");
+        assert!(cost.contains("series rows"), "{cost}");
+    }
 
     /// Every scene seeds `me` first and as this Mac's own login, writes only inside its world,
     /// and C's `pool1` is never read; B's and C's `alt1` stand at 92%. Control: A reads `pool1`.

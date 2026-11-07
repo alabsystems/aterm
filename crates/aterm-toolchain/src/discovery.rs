@@ -459,37 +459,11 @@ pub fn linked_tool_bin(prefix: &Path, tool: &str) -> Option<PathBuf> {
         .then_some(dir)
 }
 
-#[cfg(not(test))]
-const DATE_PROBE_BOUND: Duration = Duration::from_secs(5);
-/// A unit test's drivers are stand-ins that print and exit: their answer must come, so the
-/// probe waits on the hang detector.
-#[cfg(test)]
-const DATE_PROBE_BOUND: Duration = aterm_spec::wait::MUST_HAPPEN;
+/// A runnable compiler must answer its identity probes; scheduling delay is not absence.
+const DATE_PROBE_BOUND: Duration = Duration::from_secs(60);
 
-/// The bound a test set on each driver probe, in milliseconds (0: none set).
-#[cfg(any(test, debug_assertions))]
-static PROBE_BOUND_FOR_TEST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Bound each driver probe (`--print sysroot`, `-vV`) by `bound` instead of the product's 5 s,
-/// for this process.
-///
-/// Another crate's test whose stand-in drivers print and exit sets the hang detector here: their
-/// answer must come, and a loaded machine that outlasts 5 s would otherwise read a pinned
-/// toolchain as missing and a borrowed tool as gone.
-#[cfg(any(test, debug_assertions))]
-#[doc(hidden)]
-pub fn set_probe_bound_for_test(bound: Duration) {
-    let ms = u64::try_from(bound.as_millis()).unwrap_or(u64::MAX).max(1);
-    PROBE_BOUND_FOR_TEST_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// `DATE_PROBE_BOUND`, or the bound a test set with [`set_probe_bound_for_test`].
+/// The hang detector shared by every compiler identity probe.
 pub(crate) fn probe_bound() -> Duration {
-    #[cfg(any(test, debug_assertions))]
-    match PROBE_BOUND_FOR_TEST_MS.load(std::sync::atomic::Ordering::Relaxed) {
-        0 => {}
-        ms => return Duration::from_millis(ms),
-    }
     DATE_PROBE_BOUND
 }
 
@@ -595,9 +569,21 @@ impl Probe<'_> {
 }
 
 pub(crate) fn bounded_stdout(program: &Path, args: &[&str], bound: Duration) -> Option<String> {
+    bounded_stdout_at(program, args, bound, std::time::Instant::now())
+}
+
+fn bounded_stdout_at(
+    program: &Path,
+    args: &[&str],
+    bound: Duration,
+    started: std::time::Instant,
+) -> Option<String> {
     use std::io::Read as _;
     use std::process::Stdio;
     const MAX_STDOUT: u64 = 64 << 10;
+    if started.elapsed() >= bound {
+        return None;
+    }
     #[expect(
         clippy::disallowed_types,
         reason = "a std-only probe: this crate takes no dependency, so it cannot reach aterm-uds"
@@ -622,7 +608,6 @@ pub(crate) fn bounded_stdout(program: &Path, args: &[&str], bound: Duration) -> 
                 .and_then(|_| String::from_utf8(buf).ok()),
         );
     });
-    let started = std::time::Instant::now();
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -2547,6 +2532,36 @@ mod tests {
             );
         }
         fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_delayed_compiler_still_answers_its_identity_probe() {
+        let fixture = aterm_tempfile::tempdir().unwrap();
+        let bin = dated_bin(
+            fixture.path(),
+            &fixture.path().join("compiler"),
+            "2026-09-17",
+        );
+        let answer = bounded_stdout_at(
+            &bin.join("trustc"),
+            &["--print", "sysroot"],
+            probe_bound(),
+            std::time::Instant::now() - Duration::from_secs(6),
+        );
+        assert_eq!(
+            answer.as_deref().map(str::trim),
+            bin.parent().unwrap().to_str()
+        );
+        assert_eq!(
+            bounded_stdout_at(
+                &bin.join("trustc"),
+                &["--print", "sysroot"],
+                probe_bound(),
+                std::time::Instant::now() - Duration::from_secs(61),
+            ),
+            None,
+        );
     }
 
     #[cfg(unix)]

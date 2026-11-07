@@ -10,6 +10,10 @@ use std::process::ExitCode;
 #[path = "resource_run.rs"]
 mod resource_run;
 pub use resource_run::main_entry as resource_run_main_entry;
+pub use resource_run::{
+    OriginalRootStore, capture_original_root_store,
+    main_entry_with_original_store as resource_run_main_entry_with_original_store,
+};
 #[path = "resource_inspect.rs"]
 mod resource_inspect;
 pub use resource_inspect::main_entry as resource_inspect_main_entry;

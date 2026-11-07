@@ -119,7 +119,10 @@ const fn unresolved_program_recheck(attempts: u8) -> Duration {
     }
 }
 
-fn zone_hash(rows: &[String], cursor: crate::presence::Cursor) -> u64 {
+/// The hash of what an agent verdict is read from: the zone's rows, the cursor, and the title's
+/// run bit ([`crate::presence::title_runs`]), so a title that alone says a turn runs or ended is
+/// read again though no row moved.
+fn zone_hash(rows: &[String], cursor: crate::presence::Cursor, runs: bool) -> u64 {
     let mut h = aterm_hash::Fnv1a64::new();
     for row in rows {
         h.write(row.as_bytes());
@@ -127,6 +130,7 @@ fn zone_hash(rows: &[String], cursor: crate::presence::Cursor) -> u64 {
     }
     h.write(format!("{cursor:?}").as_bytes());
     h.write(b"\n");
+    h.write(if runs { b"runs\n" } else { b"rest\n" });
     h.finish()
 }
 
@@ -153,6 +157,12 @@ struct AgentWatch {
     /// every [`PROGRAM_RECHECK`] whether or not its screen moves, since the front writes a line
     /// only about once a minute while the claims ahead of it come and go.
     build_waiting: bool,
+    /// The title's run bit at the last read ([`crate::presence::title_runs`]).
+    runs_seen: bool,
+    /// When a read saw the run bit fall: a reading short of a turn's end taken within
+    /// [`AGENT_MIN_INTERVAL`] of it is read again then rather than published
+    /// ([`StatusObserver::agent_observe`]).
+    rest_at: Option<Instant>,
 }
 
 /// Published agent status tuple: `(word, detail, prompt_subject, program_name)`.
@@ -170,6 +180,11 @@ pub(crate) struct AgentStep {
     pub(crate) turn: crate::presence::TurnFacts,
     pub(crate) publish: Option<AgentPublish>,
     pub(crate) gauges: crate::session_timeline::AgentGauges,
+    /// The read found the zone the published verdict was read from unchanged, so that verdict
+    /// stands for this screen too and the sweep moves its stamp to it. A read the rest settle
+    /// withholds publishes nothing and leaves this false: the published word was read from an
+    /// earlier screen, and its stamp keeps naming that one (agent-verdict-gate).
+    pub(crate) zone_unchanged: bool,
 }
 
 /// High-level activity phase of a terminal session.
@@ -3012,7 +3027,10 @@ impl StatusObserver {
                     .resolved_at
                     .filter(|_| w.build_waiting && w.pgid > 0)
                     .map(|at| (at + PROGRAM_RECHECK).max(slot.next_due));
-                [followup, unresolved, confirmation, build_wait]
+                let settle = w
+                    .rest_at
+                    .map(|at| (at + AGENT_MIN_INTERVAL).max(slot.next_due));
+                [followup, unresolved, confirmation, build_wait, settle]
                     .into_iter()
                     .flatten()
                     .min()
@@ -3149,13 +3167,17 @@ impl StatusObserver {
         }
     }
 
-    /// Returns whether the current sweep should read `session`'s terminal screen rows for agent classification.
+    /// Returns whether the current sweep should read `session`'s terminal screen rows for agent
+    /// classification. `runs` is the title's run bit ([`crate::presence::title_runs`]): a move of
+    /// it alone is a move, since a title-only OSC moves neither the screen nor the cursor, and so
+    /// is a rest settle come due ([`AgentWatch::rest_at`]).
     pub(crate) fn agent_zone_wanted(
         &mut self,
         session: u64,
         generation: crate::control::ScreenGen,
         cursor: crate::presence::Cursor,
         program: &Option<String>,
+        runs: bool,
         now: Instant,
     ) -> bool {
         let w = self.agents.entry(session).or_insert_with(|| AgentWatch {
@@ -3163,8 +3185,14 @@ impl StatusObserver {
             ..AgentWatch::default()
         });
         let program_moved = w.program_seen.as_ref() != Some(program);
-        let moved =
-            w.seq_seen != Some(generation) || w.cursor_seen != Some(cursor) || program_moved;
+        let settle_due = w
+            .rest_at
+            .is_some_and(|at| now.saturating_duration_since(at) >= AGENT_MIN_INTERVAL);
+        let moved = w.seq_seen != Some(generation)
+            || w.cursor_seen != Some(cursor)
+            || program_moved
+            || w.runs_seen != runs
+            || settle_due;
         if !moved {
             return false;
         }
@@ -3185,7 +3213,17 @@ impl StatusObserver {
         reason = "one observation's facts, each read under a different lock or \
                   syscall by the sweep; a struct would only rename the list"
     )]
-    /// Runs one agent screen-classification step for `session`.
+    /// Runs one agent screen-classification step for `session`. `title` is the program's window
+    /// title, read under the lock `rows` were (`""` where it set none).
+    ///
+    /// THE REST SETTLE. Claude Code rests its title about 23 ms before the frame that draws its
+    /// reply's last line and its done row (2.1.311 lab `mr`), so a read between the two is a
+    /// reply short of its end under a title at rest. A reading that is no busy, taken within
+    /// [`AGENT_MIN_INTERVAL`] of a read that saw the title's run bit fall, is not published unless
+    /// the reader sees the program's own end drawn ([`aterm_phase::ScreenReader::end_drawn`]):
+    /// the watch reads again at that instant ([`StatusObserver::next_wake`]), so the frame drawn
+    /// just after the rest is the one published, and a turn that ends with no later frame is
+    /// published by then.
     pub(crate) fn agent_observe(
         &mut self,
         session: u64,
@@ -3195,6 +3233,7 @@ impl StatusObserver {
         program: Option<String>,
         pgid: i32,
         resolving: bool,
+        title: &str,
         now: Instant,
     ) -> AgentStep {
         let w = self.agents.entry(session).or_insert_with(|| AgentWatch {
@@ -3267,9 +3306,22 @@ impl StatusObserver {
         w.seq_seen = Some(generation);
         w.cursor_seen = Some(cursor);
         w.followup = moved || resolving;
-        let hash = zone_hash(crate::presence::live_zone(&rows), cursor);
-        if w.zone_hash == Some(hash) && !program_moved {
-            return AgentStep::default();
+        let runs = crate::presence::title_runs(title);
+        if runs {
+            w.rest_at = None;
+        } else if w.runs_seen {
+            w.rest_at = Some(now);
+        }
+        w.runs_seen = runs;
+        let settling = w
+            .rest_at
+            .is_some_and(|at| now.saturating_duration_since(at) < AGENT_MIN_INTERVAL);
+        let hash = zone_hash(crate::presence::live_zone(&rows), cursor, runs);
+        if w.zone_hash == Some(hash) && !program_moved && w.rest_at.is_none() {
+            return AgentStep {
+                zone_unchanged: true,
+                ..AgentStep::default()
+            };
         }
         w.zone_hash = Some(hash);
         w.program_seen = Some(program.clone());
@@ -3283,6 +3335,7 @@ impl StatusObserver {
             known,
             &rows,
             cursor,
+            title,
             now,
         );
         if let crate::presence::AgentVerdict::Agent {
@@ -3292,6 +3345,20 @@ impl StatusObserver {
         } = &verdict
         {
             w.frame = Some((pgid, *program));
+        }
+        if w.rest_at.is_some() {
+            let ended = verdict.reading().is_none_or(|r| {
+                matches!(r.phase, crate::presence::AgentPhase::Busy)
+                    || verdict
+                        .program()
+                        .is_some_and(|p| p.reader().end_drawn(&rows))
+            });
+            if settling && !ended {
+                w.zone_hash = None;
+                w.followup = true;
+                return AgentStep::default();
+            }
+            w.rest_at = None;
         }
         let reading = verdict.reading().cloned();
         let reading_changed = reading != w.reading;
@@ -3323,6 +3390,7 @@ impl StatusObserver {
             turn: verdict.turn(),
             publish: Some((verdict.word(), verdict.detail(), subject, verdict.program())),
             gauges,
+            zone_unchanged: false,
         }
     }
 
@@ -3691,10 +3759,19 @@ impl crate::App {
                 )
             };
             let cursor = crate::presence::Cursor::At(Some(usize::from(guard.cursor().row)));
+            // The program's own title, read in the hold the rows are: under a status line it is
+            // the one sign that a reply still being drawn is a turn running. Never the roster's
+            // title, which a person's tab name overrides.
+            let title = guard.title_arc();
             let read = (!guard.frame_unfinished_at(now)
-                && self
-                    .session_status
-                    .agent_zone_wanted(id, generation, cursor, &program, now))
+                && self.session_status.agent_zone_wanted(
+                    id,
+                    generation,
+                    cursor,
+                    &program,
+                    crate::presence::title_runs(&title),
+                    now,
+                ))
             .then(|| std::sync::Arc::new(crate::frame_memo::ScreenText::of(&guard)));
             drop(guard);
             let (zone, stamp) = match read {
@@ -3939,9 +4016,9 @@ impl crate::App {
                 crate::integration_notice::heal_for(channel, front_agent, moves, codex_line)
             });
             let _ = self.integration_notices.observe(id, heal, now);
-            let step = self
-                .session_status
-                .agent_observe(id, generation, zone, cursor, program, pgid, resolve, now);
+            let step = self.session_status.agent_observe(
+                id, generation, zone, cursor, program, pgid, resolve, &title, now,
+            );
             if blocks.more {
                 self.session_status.owe_look(id);
             }
@@ -3978,7 +4055,11 @@ impl crate::App {
                         .lock()
                         .unwrap_or_else(|p| p.into_inner());
                     timeline.note_grid(grid, now);
-                    timeline.note_agent_stamp(stamp);
+                    // Only an unchanged zone's read stands for the published word; a read the
+                    // rest settle withheld leaves the stamp on the screen that word was read from.
+                    if step.zone_unchanged {
+                        timeline.note_agent_stamp(stamp);
+                    }
                     false
                 }
                 _ => false,

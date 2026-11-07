@@ -130,6 +130,20 @@ mod tests {
     use super::*;
     #[test]
     fn close_only_keeper_retains_original_lock_without_changing_or_reopening_source() {
+        const TEST: &str = "client::sdk::tests::close_only_keeper_retains_original_lock_without_changing_or_reopening_source";
+        const ROLE: &str = "TRUST_SDK_KEEPER_FD_TEST";
+        if std::env::var(ROLE).as_deref() != Ok(TEST) {
+            // Assert final close after this process has executed, without an
+            // unrelated parallel fork temporarily inheriting the description.
+            // The child runs the same real duplicate/lock/close assertions.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(ROLE, TEST)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "original SDK keeper control failed: {output:?}");
+            return;
+        }
         let root = std::env::temp_dir().join(format!(
             "trust-sdk-keeper-{}-{}",
             std::process::id(),

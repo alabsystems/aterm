@@ -1350,3 +1350,413 @@ fn a_refill_the_tap_saw_cuts_the_warning_and_the_wall() {
         .expect("current");
     assert_eq!((week.pct_x10, week.source.as_str()), (1000, SOURCE_WALL));
 }
+
+const FABLE: &str = "seven_day_overage_included";
+
+/// `state` with the screen's word on the Fable week.
+fn fable_said(mut state: State, pct: u32, reset: Option<i64>, at: i64, wall: bool) -> State {
+    state
+        .accounts
+        .entry("main".to_owned())
+        .or_default()
+        .weeks_said
+        .insert(
+            FABLE.to_owned(),
+            accounts::WeekSaid {
+                pct: Some(pct),
+                reset,
+                at,
+                by: MACHINE.to_owned(),
+                wall,
+                ends_by: None,
+            },
+        );
+    state
+}
+
+fn unread() -> State {
+    State {
+        machine: MACHINE.to_string(),
+        ..State::default()
+    }
+}
+
+/// The Fable row of the `--json` document.
+fn fable_doc(l: &Look<'_>) -> Value {
+    let d = doc(l);
+    let windows = d["accounts"][0]["windows"]
+        .as_array()
+        .expect("windows")
+        .clone();
+    windows
+        .into_iter()
+        .find(|w| w["id"] == Value::from(FABLE))
+        .expect("the Fable window")
+}
+
+#[test]
+fn a_screens_fable_week_shows_with_its_source_and_a_newer_window_wins() {
+    let p = profile(None);
+    let none = unread();
+    let l = look(none.accounts.get("main"), &p, Tap::On);
+    assert!(
+        text(&l, &view(&l)).contains(
+            "  Fable  \u{2014}  no /usage seen on this home \u{b7} plan: Fable included\n"
+        ),
+        "the control: no word of the screen's keeps the missing word"
+    );
+    for (pct, wall, source) in [(85, false, SOURCE_WARNING), (100, true, SOURCE_WALL)] {
+        let state = fable_said(unread(), pct, Some(WEEK_END), NOW - HOUR, wall);
+        let l = look(state.accounts.get("main"), &p, Tap::On);
+        let v = view(&l);
+        let fable = win(&v, FABLE);
+        assert_eq!(
+            fable.current(NOW).map(|f| (f.pct_x10, f.source.as_str())),
+            Some((pct * 10, source))
+        );
+        assert_eq!(fable.void_at, None);
+        let row = format!(
+            "  Fable  {pct}% used \u{b7} {}% left \u{b7} resets Sun Oct 18 20:50 (in 3d4h)   as of 1h ({source}, here) \u{b7} plan: Fable included\n",
+            100 - pct
+        );
+        let shown = text(&l, &v);
+        assert!(shown.contains(&row), "{row:?} in {shown}");
+        let j = fable_doc(&l);
+        assert_eq!(
+            (&j["resets_at"], &j["void_at"], &j["source"]),
+            (&Value::from(WEEK_END), &Value::Null, &Value::from(source))
+        );
+    }
+    let cached = profile(Some(json!({"limits": [{
+        "kind": "weekly_scoped", "percent": 40.0, "resets_at": "2026-10-18T20:50:00Z",
+        "scope": {"model": {"display_name": "Fable"}}}]})));
+    let older = fable_said(unread(), 85, Some(NOW + HOUR), NOW - 3 * DAY, false);
+    let l = look(older.accounts.get("main"), &cached, Tap::On);
+    assert_eq!(
+        win(&view(&l), FABLE)
+            .current(NOW)
+            .map(|f| (f.pct_x10, f.source.as_str())),
+        Some((400, SOURCE_USAGE_CACHE)),
+        "the cache's newer window"
+    );
+}
+
+/// A cached `/usage` body read before the wall, its Fable week at 40% to [`WEEK_END`].
+fn fable_cached() -> Result<Profile, NoProfile> {
+    profile(Some(json!({"limits": [{
+        "kind": "weekly_scoped", "percent": 40.0, "resets_at": "2026-10-18T20:50:00Z",
+        "scope": {"model": {"display_name": "Fable"}}}]})))
+}
+
+#[test]
+fn a_fable_wall_that_named_no_reset_is_full_with_no_reset_given() {
+    let p = fable_cached();
+    let walled = fable_said(tapped(100, 500, NOW - MIN), 100, None, NOW - HOUR, true);
+    let l = look(walled.accounts.get("main"), &p, Tap::On);
+    let v = view(&l);
+    let fable = win(&v, FABLE);
+    assert_eq!(
+        fable.void_at,
+        Some(WEEK_END),
+        "the reset an older reading of the Fable week named"
+    );
+    assert_eq!(fable.resets_at(), None);
+    let shown = text(&l, &v);
+    let row =
+        "  Fable  100%, no reset given \u{b7} as of 1h (wall, here) \u{b7} plan: Fable included\n";
+    assert!(shown.contains(row), "{row:?} in {shown}");
+    let j = fable_doc(&l);
+    assert_eq!(
+        (
+            &j["resets_at"],
+            &j["resets_at_rfc3339"],
+            &j["void_at"],
+            &j["void_at_rfc3339"],
+            &j["state"],
+            &j["used_pct"],
+            &j["source"],
+        ),
+        (
+            &Value::Null,
+            &Value::Null,
+            &Value::from(WEEK_END),
+            &Value::from("2026-10-18T20:50:00Z"),
+            &Value::from("current"),
+            &Value::from(100u64),
+            &Value::from("wall"),
+        ),
+        "{j}"
+    );
+    let d = doc(&l);
+    let week = &d["accounts"][0]["windows"][1];
+    assert_eq!(
+        (&week["void_at"], &week["void_at_rfc3339"]),
+        (&Value::Null, &Value::Null),
+        "every window carries the key, null unless it named no reset"
+    );
+
+    let alone = fable_said(unread(), 100, None, NOW - HOUR, true);
+    let none = profile(None);
+    let l = look(alone.accounts.get("main"), &none, Tap::On);
+    assert_eq!(
+        win(&view(&l), FABLE).void_at,
+        Some(NOW - HOUR + WEEK_WINDOW_S),
+        "with no reset of the Fable week held, a week after the reading"
+    );
+
+    let mut tapped_wall = tapped(100, 500, NOW - MIN);
+    let _ = accounts::note_wall(
+        &mut tapped_wall,
+        "main",
+        FABLE,
+        None,
+        NOW - HOUR,
+        NOW - HOUR,
+    );
+    let l = look(tapped_wall.accounts.get("main"), &p, Tap::On);
+    let v = view(&l);
+    assert_eq!(
+        (
+            win(&v, FABLE).void_at,
+            win(&v, FABLE).current(NOW).map(|f| f.pct_x10)
+        ),
+        (Some(WEEK_END), Some(1000)),
+        "a wall a 429 recorded with no reset is the same form"
+    );
+}
+
+#[test]
+fn a_fable_wall_that_named_no_reset_is_void_after_the_week_and_on_a_newer_reading() {
+    let p = fable_cached();
+    let walled = fable_said(tapped(100, 500, NOW - MIN), 100, None, NOW - HOUR, true);
+    let after = Look {
+        now: WEEK_END + MIN,
+        ..look(walled.accounts.get("main"), &p, Tap::On)
+    };
+    let j = fable_doc(&after);
+    assert_eq!(
+        (
+            &j["state"],
+            &j["used_pct"],
+            &j["resets_at"],
+            &j["void_at"],
+            &j["missing"]["reason"]
+        ),
+        (
+            &Value::from("void"),
+            &Value::Null,
+            &Value::Null,
+            &Value::from(WEEK_END),
+            &Value::from("window-reset")
+        ),
+        "{j}"
+    );
+    let shown = text(&after, &view(&after));
+    assert!(
+        shown.contains("  Fable  \u{2014}  window reset by "),
+        "a reset no reading named is no window's instant: {shown}"
+    );
+    let before = Look {
+        now: WEEK_END - MIN,
+        ..after
+    };
+    assert_eq!(
+        fable_doc(&before)["state"],
+        Value::from("current"),
+        "the control: current up to the reset"
+    );
+    let older = fable_said(unread(), 100, None, NOW - 3 * DAY, true);
+    let l = look(older.accounts.get("main"), &p, Tap::On);
+    let fable = win(&view(&l), FABLE).clone();
+    assert_eq!(
+        (fable.void_at, fable.current(NOW).map(|f| f.pct_x10)),
+        (None, Some(400)),
+        "a newer reading of the week replaces it"
+    );
+    let newer = fable_said(unread(), 100, None, NOW - DAY, true);
+    let l = look(newer.accounts.get("main"), &p, Tap::On);
+    assert_eq!(
+        win(&view(&l), FABLE).void_at,
+        Some(WEEK_END),
+        "the control: an older reading does not, and its reset ends the wall's week"
+    );
+}
+
+/// The week of all models is another window than a model's own: its reset, and a reading of the
+/// week after it, neither end a model's wall that named no reset nor bring it back.
+#[test]
+fn a_fable_wall_that_named_no_reset_is_its_own_weeks_alone() {
+    let p = profile(None);
+    let walled = fable_said(tapped(100, 500, NOW - MIN), 100, None, NOW - HOUR, true);
+    let mut rolled = walled.clone();
+    let next = TapRead {
+        seven_day: Some(WindowRead {
+            pct_x10: 50,
+            reset: WEEK_END + WEEK_WINDOW_S,
+            refilled: None,
+        }),
+        at: WEEK_END + DAY,
+        seen_before: true,
+        ..TapRead::default()
+    };
+    accounts::note_reading(&mut rolled, "main", &next, WEEK_END + DAY);
+    let fable = |state: &State, now: i64| {
+        let l = Look {
+            now,
+            ..look(state.accounts.get("main"), &p, Tap::On)
+        };
+        let v = view(&l);
+        let fable = win(&v, FABLE);
+        (fable.void_at, fable.current(now).map(|f| f.pct_x10))
+    };
+    assert_eq!(
+        fable(&rolled, WEEK_END + DAY),
+        fable(&walled, WEEK_END + DAY),
+        "a reading of the next week of all models"
+    );
+    assert_eq!(
+        fable(&walled, WEEK_END + MIN),
+        (Some(NOW - HOUR + WEEK_WINDOW_S), Some(1000)),
+        "past the reset of the week of all models"
+    );
+}
+
+/// The no-reset form is a wall's: a warning that named no reset is no figure, as a session or
+/// weekly warning that named none is not.
+#[test]
+fn a_fable_warning_that_named_no_reset_is_no_figure() {
+    let p = profile(None);
+    let warned = fable_said(unread(), 85, None, NOW - HOUR, false);
+    let l = look(warned.accounts.get("main"), &p, Tap::On);
+    let v = view(&l);
+    assert_eq!(
+        (win(&v, FABLE).fig.as_ref(), win(&v, FABLE).void_at),
+        (None, None)
+    );
+    assert!(
+        text(&l, &v).contains("  Fable  \u{2014}  no /usage seen on this home"),
+        "{}",
+        text(&l, &v)
+    );
+}
+
+/// A tap's 429 that named no reset and a screen's wall that named one, read in the same second:
+/// the reset is known.
+#[test]
+fn a_reset_read_with_a_no_reset_wall_of_its_second_is_kept() {
+    let p = profile(None);
+    let mut state = fable_said(unread(), 100, Some(WEEK_END), NOW - HOUR, true);
+    let _ = accounts::note_wall(&mut state, "main", FABLE, None, NOW - HOUR, NOW - HOUR);
+    let l = look(state.accounts.get("main"), &p, Tap::On);
+    let v = view(&l);
+    let fable = win(&v, FABLE);
+    assert_eq!((fable.void_at, fable.resets_at()), (None, Some(WEEK_END)));
+    let mut alone = unread();
+    let _ = accounts::note_wall(&mut alone, "main", FABLE, None, NOW - HOUR, NOW - HOUR);
+    let l = look(alone.accounts.get("main"), &p, Tap::On);
+    assert_eq!(
+        win(&view(&l), FABLE).void_at,
+        Some(NOW - HOUR + WEEK_WINDOW_S),
+        "the control: the 429 alone"
+    );
+}
+
+/// A limit reset used on the Fable week ([`accounts::reset_outcome`]'s word, no figure and no
+/// reset) cuts an older figure of the week, as a refill the screen said cuts the session's and the
+/// week's, and outranks an older 429 that named no reset.
+#[test]
+fn a_limit_reset_used_on_the_fable_week_cuts_its_older_figure() {
+    let p = fable_cached();
+    let mut state = unread();
+    let _ = accounts::note_wall(
+        &mut state,
+        "main",
+        FABLE,
+        None,
+        NOW - 2 * HOUR,
+        NOW - 2 * HOUR,
+    );
+    state
+        .accounts
+        .entry("main".to_owned())
+        .or_default()
+        .weeks_said
+        .insert(
+            FABLE.to_owned(),
+            accounts::WeekSaid {
+                pct: None,
+                reset: None,
+                at: NOW - HOUR,
+                by: MACHINE.to_owned(),
+                wall: false,
+                ends_by: None,
+            },
+        );
+    let l = look(state.accounts.get("main"), &p, Tap::On);
+    let v = view(&l);
+    let fable = win(&v, FABLE);
+    assert_eq!(
+        (fable.missing, fable.current(NOW).is_some(), fable.void_at),
+        (Some(Missing::ResetUsed), false, None)
+    );
+    let none = unread();
+    let l = look(none.accounts.get("main"), &p, Tap::On);
+    assert_eq!(
+        win(&view(&l), FABLE).current(NOW).map(|f| f.pct_x10),
+        Some(400),
+        "the control: the cached figure with no reset since"
+    );
+}
+
+#[test]
+fn a_fable_wall_that_named_no_reset_has_the_rolling_weeks_dollars() {
+    let prices = PriceTable::from_toml(PRICES_TOML).expect("the table");
+    let model = prices
+        .models()
+        .find(|m| m.starts_with("claude-fable"))
+        .expect("a Fable row")
+        .to_owned();
+    let mut spend = spend::Spend::new(std::path::Path::new("/h"), &prices);
+    let tokens = TokenUsage {
+        input: 1_000_000,
+        ..TokenUsage::default()
+    };
+    spend.add_message(
+        &Message {
+            at: NOW - 2 * HOUR,
+            model: &model,
+            tokens,
+            approx: false,
+        },
+        &prices,
+        NOW,
+    );
+    let usd = prices.message_usd(&model, &tokens).expect("priced");
+    let p = profile(None);
+    let figure = |reset: Option<i64>| {
+        let state = fable_said(tapped(100, 500, NOW - MIN), 100, reset, NOW - HOUR, true);
+        let l = Look {
+            spend: Some(SpendLook {
+                spend: &spend,
+                complete: true,
+            }),
+            ..look(state.accounts.get("main"), &p, Tap::On)
+        };
+        let v = view(&l);
+        (
+            dollars(&l, &v, win(&v, FABLE)).expect("a figure"),
+            text(&l, &v),
+        )
+    };
+    let (unnamed, shown) = figure(None);
+    assert!(unnamed.rolling, "{unnamed:?}");
+    assert_eq!(unnamed.from, NOW - WEEK_WINDOW_S);
+    assert!((unnamed.used.usd - usd).abs() < 1e-6);
+    assert_eq!(unnamed.capacity.err(), Some(spend::Why::NoReading));
+    assert!(shown.contains("Fable so far "), "{shown}");
+    let (named, _) = figure(Some(WEEK_END));
+    assert!(
+        !named.rolling,
+        "the control: a wall that named its reset gives the window"
+    );
+}

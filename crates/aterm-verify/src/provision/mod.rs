@@ -249,7 +249,8 @@ stamp.json (pwsh also requires Microsoft's Developer ID). The rustup
 row copies the pinned rustup-init in as `rustup` (its self-install never runs, and
 nothing is written to CARGO_HOME), then has that copy add the checkout's stock pin
 (aterm_toolchain::rustup::STOCK_PIN, the release publish/config.sh's wasm32 clause
-builds on) with clippy and every cell's std, and the release chain's stable with its
+builds on) with clippy (and off macOS llvm-tools, whose llvm-nm the win32 oracles
+read Windows import libraries with) and every cell's std, and the release chain's stable with its
 x86_64 slice's std on a Mac, to rustup's own home where they are missing (auto-install
 off first in a home it never ran in); no dev lane rides stable. It reads the network.
 

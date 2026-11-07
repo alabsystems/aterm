@@ -57,6 +57,11 @@ pub(super) enum ReturnReceipt {
 pub(super) trait MemberResources {
     fn configure(&mut self, command: &mut spawnfd::Command) -> io::Result<()>;
     fn bind_child(&mut self, pid: u32) -> io::Result<()>;
+    /// A separately negotiated produced profile reports its actual selected
+    /// suspended identity only after both image holds, before this owner's GO.
+    fn publish_prepared(&mut self, _: (u32, u64), _: &mut Events) -> io::Result<()> {
+        Ok(())
+    }
     fn finish_inputs(&mut self) -> Option<Result<(), String>> {
         None
     }
@@ -275,6 +280,10 @@ impl<D: MemberResources> OwnedAttempt<D> {
                 .as_mut()
                 .ok_or_else(|| refused("member descriptors missing"))?
                 .bind_child(bound.pid)?;
+            self.resources
+                .as_mut()
+                .ok_or_else(|| refused("member descriptors missing"))?
+                .publish_prepared((bound.pid, bound.birth), &mut self.events)?;
             custody.validate()?;
             custody.before_go()?;
             let (monotonic_ns, unix_ns) = clocks()?;
@@ -537,7 +546,7 @@ fn poll_bound(
     }
     let (status, accounting) = match crate::resource_accounting::try_reap(
         bound.child.child_mut(),
-        events.requires_accounting(),
+        events.collect_accounting(),
     ) {
         Ok(Some(value)) => value,
         Ok(None) => return false,

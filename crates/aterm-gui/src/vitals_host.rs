@@ -4227,7 +4227,7 @@ fn peaks_json(peaks: &Peaks) -> Option<String> {
     aterm_json::to_string(&doc).ok()
 }
 
-fn peaks_of(text: &str) -> Option<Peaks> {
+pub(crate) fn peaks_of(text: &str) -> Option<Peaks> {
     let doc: PeaksDoc = aterm_json::from_str(text).ok()?;
     (doc.schema == PEAKS_SCHEMA).then(|| {
         Peaks::from_pairs(

@@ -70,6 +70,8 @@ mod start;
 #[cfg(test)]
 #[path = "resource_admission_owner_tests.rs"]
 mod tests;
+#[path = "resource_admission_workload.rs"]
+pub(super) mod workload;
 
 pub(super) struct Owner {
     // Retain the exact validated canonical domain; tests use a fresh private scope.
@@ -90,10 +92,12 @@ pub(super) struct Owner {
     metadata_pause: Option<preparation::Pause>,
 }
 struct Pending {
+    queued_at: Instant,
     submission: AuthorizedSubmission,
     events: job::Events,
     recipe: Option<recipe::Recipe>,
     probe: Option<recipe::Probe>,
+    primary: Option<std::sync::Arc<workload::Primary>>,
     sdk: Option<trust_resource_controller::SdkCustody>,
     waiter: Option<MemoryWait>,
     claim: Option<Claim>,
@@ -103,6 +107,27 @@ struct Pending {
     scope_reference: Option<aterm_capacity::CohortClosureRef>,
     cancelled: bool,
     resolver: Option<resolver_root::Preparation>,
+}
+impl Pending {
+    /// The new workload's original whole-attempt clock includes admission.
+    /// Repeated inspections and final GO cannot renew that selected bound.
+    fn workload_deadline(&self) -> io::Result<Option<Instant>> {
+        if !workload::purpose(&self.submission.request) {
+            return Ok(None);
+        }
+        let millis = self
+            .submission
+            .request
+            .timeout_ms
+            .filter(|ms| {
+                *ms > 0 && *ms <= trust_resource_controller::workload::host::MAX_ROOT_TIMEOUT_MS
+            })
+            .ok_or_else(|| refused("original workload deadline unavailable"))?;
+        self.queued_at
+            .checked_add(Duration::from_millis(millis))
+            .map(Some)
+            .ok_or_else(|| refused("original workload deadline is unrepresentable"))
+    }
 }
 /// A request's memory wait in this user's ledger, and the `kind=admission` row its admission owes
 /// ([`aterm_capacity::telemetry::Owed`], Continuum TM-1): written at the look that decides it,
@@ -125,10 +150,13 @@ struct Failed {
     no_child: Option<Box<spawnfd::NotSpawned>>,
     checked_at: Option<Instant>,
     _sdk: Option<std::sync::Arc<sdk::Keeper>>,
+    _primary: Option<std::sync::Arc<workload::Primary>>,
     refusal: Option<(job::Events, String)>,
     settled: bool,
 }
 struct Job {
+    #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+    control_eof_before_reap_test: bool,
     binding: Binding,
     delegation: aterm_types::resource_subgroup::JobContext,
     program: PathBuf,
@@ -140,6 +168,7 @@ struct Job {
     sdk: Option<trust_resource_controller::SdkCustody>,
     members: BTreeMap<[u8; 16], member_queue::Slot>,
     loans: BTreeMap<[u8; 16], parent_loan::RunState>,
+    workload: Option<workload::State>,
     // Preparing members join on drop. Keep the original transport and SDK
     // owners until every member has joined or retained uncertain custody.
     metadata_gnu: Option<metadata::RootGnu>,
@@ -213,6 +242,31 @@ impl Resources {
     }
 }
 impl Owner {
+    #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+    pub(super) fn control_eof_before_reap_test(&mut self, binding: &Binding) -> bool {
+        let Some(job) = self
+            .jobs
+            .get_mut(&(binding.session.clone(), binding.attempt))
+        else {
+            return false;
+        };
+        if !job.launched || job.reaped || job.settled {
+            return false;
+        }
+        // Order the real control EOF before the owning reap. This touches no
+        // target status, signal or scope receipt; original custody stays held.
+        job.control_eof_before_reap_test = true;
+        true
+    }
+    #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+    pub(super) fn cancel_test(&mut self) {
+        for pending in &mut self.pending {
+            pending.events.abandon();
+        }
+        for job in self.jobs.values_mut() {
+            job.events.abandon();
+        }
+    }
     pub(super) fn idle(&self) -> bool {
         self.pending.is_empty() && self.jobs.is_empty() && self.failed.is_empty()
     }
@@ -253,7 +307,7 @@ impl Owner {
         let ready = !self.faulted
             && self.fence.check_current().is_ok()
             && self.ledger.cohort_aware().is_ok_and(|ready| ready);
-        aterm_json::json!({"version":3,"ready":ready,"recipes":["ay-campaign-v3","targo-native-v3"],"unqualified":"refused","inspection":"resource-inspect-v3","status":"json-lines-v3","timeout":"actual-start","accounting":crate::resource_accounting::supported().then_some(trust_resource_controller::accounting::CAPABILITY)})
+        aterm_json::json!({"version":3,"ready":ready,"recipes":["ay-campaign-v3","targo-native-v3"],"unqualified":"refused","inspection":"resource-inspect-v3","status":"json-lines-v3","timeout":"actual-start","accounting":crate::resource_accounting::supported().then_some(trust_resource_controller::accounting::CAPABILITY),"root_store_expectation":crate::runtime::store_expectation_supported().then_some(aterm_ctl::resource_admission_transport::store_expectation::CAPABILITY)})
     }
     pub(super) fn accepts(&self, binding: &Binding) -> bool {
         !self.faulted
@@ -282,6 +336,7 @@ impl Owner {
             self.faulted = true;
         }
         self.tick_failed();
+        self.tick_workload_registrations();
         self.tick_members();
         if self.faulted {
             for job in self

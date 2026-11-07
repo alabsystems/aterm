@@ -67,6 +67,8 @@ aterm-toml = { workspace = true }
 # The identity record's input names, which the perf lanes keep out of a bench build.
 aterm-stamp = { workspace = true }
 aterm-uds = { workspace = true }
+# Held-vs-path file identities during run-log retention, on Unix and Windows.
+aterm-dirfd = { workspace = true }
 # The instance the run rides in, reached through aterm ctl's own client path
 # (`hosting_sock`, `connect_then_read_token`, `exchange_lines`): `window_list`
 # reads the run-start line's `listed:` word from it where verify's own read of

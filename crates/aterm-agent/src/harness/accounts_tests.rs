@@ -7278,6 +7278,7 @@ fn said(at: i64, credits: Option<CreditsRead>, warning: Option<WarningRead>) -> 
         day: at.div_euclid(DAY),
         credits,
         warning,
+        week: None,
     }
 }
 
@@ -10267,4 +10268,479 @@ fn settings_and_the_profile_store_only_move_a_route_toward_outside() {
             AuthRoute::Outside
         );
     }
+}
+
+fn week_read(model: aterm_phase::WeekModel, pct: u32, reset: Option<i64>, wall: bool) -> WeekRead {
+    WeekRead {
+        bucket: week_bucket(model),
+        pct,
+        reset,
+        wall,
+    }
+}
+
+fn week_said_at(at: i64, week: WeekRead) -> UsageSaid {
+    UsageSaid {
+        week: Some(week),
+        ..said(at, None, None)
+    }
+}
+
+const FABLE: &str = "seven_day_overage_included";
+
+/// A model's week a screen said is a record for the stats alone (the stats design's §8.2): a
+/// Fable wall and a Fable warning near full leave every reading a decision makes as it was, on an
+/// account seen otherwise and on one seen no other way, where the same wall recorded as a wall
+/// stands. Its record is the stats' word, not the usage word that brings the accounts look.
+#[test]
+fn weeks_said_holds_a_models_week_and_no_decision_reads_it() {
+    use aterm_phase::WeekModel;
+    let r = own_row();
+    let row = &r.rows[0];
+    let reset = NOW + 3 * DAY;
+    for seen in [true, false] {
+        let dir = tmp("weeks-said-decisions");
+        let store = Store::at(dir.path());
+        if seen {
+            set_credits(&store, OWN, org_off());
+            record_usage(
+                &store,
+                &r,
+                "s-1",
+                &stored(),
+                &warned(NOW, true, 40, Some(reset)),
+                NOW,
+            );
+        }
+        let decided = |now: i64| {
+            let state = store.load(now).expect("ours").0;
+            let account = state.account(OWN);
+            (
+                account.limited_until(now),
+                account.low(now),
+                account.leave_early(now),
+                account.observed(),
+                condition(row, &state, true, now),
+                windows_full(&r, &state, now),
+            )
+        };
+        let before = decided(NOW + MIN);
+        assert_eq!(
+            (before.3, before.4),
+            if seen {
+                (true, Condition::Usable)
+            } else {
+                (false, Condition::Unseen)
+            },
+            "seen otherwise: {seen}"
+        );
+        for week in [
+            week_read(WeekModel::Fable, 95, Some(reset), false),
+            week_read(WeekModel::Fable, 100, Some(reset), true),
+            week_read(WeekModel::Fable, 100, None, true),
+        ] {
+            assert_eq!(
+                record_usage(
+                    &store,
+                    &r,
+                    "s-1",
+                    &stored(),
+                    &week_said_at(NOW + MIN, week),
+                    NOW + MIN
+                )
+                .as_str(),
+                "stats",
+                "{week:?}"
+            );
+            let held = held(&store, OWN, NOW + MIN);
+            assert_eq!(
+                held.weeks_said.get(FABLE).map(|w| (w.pct, w.reset, w.wall)),
+                Some((Some(week.pct), week.reset, week.wall))
+            );
+            assert_eq!(
+                decided(NOW + MIN),
+                before,
+                "seen otherwise: {seen}, {week:?}"
+            );
+        }
+        let wall = StandingWall {
+            at: (NOW + MIN).unsigned_abs(),
+            until: Some(reset.unsigned_abs()),
+            window: Some(FABLE.to_string()),
+            credits: None,
+        };
+        record_wall(&store, &r, "s-1", &stored(), &wall, NOW - HOUR, NOW + MIN);
+        assert!(
+            decided(NOW + MIN).0.is_some(),
+            "the control: the same wall recorded as a wall stands"
+        );
+    }
+}
+
+#[test]
+fn weeks_said_keeps_the_newest_read_and_one_warned_row_per_move() {
+    use aterm_phase::WeekModel;
+    let r = own_row();
+    let dir = tmp("weeks-said-order");
+    let store = Store::at(dir.path());
+    let now = NOW + 3 * HOUR;
+    let record = |at: i64, week: WeekRead| {
+        record_usage(&store, &r, "s-1", &stored(), &week_said_at(at, week), now)
+    };
+    let fable = |pct: u32, wall: bool| week_read(WeekModel::Fable, pct, Some(NOW + DAY), wall);
+    assert_eq!(
+        record(NOW, fable(85, false)),
+        Recorded::Stats {
+            account: OWN.to_string(),
+            events: 1,
+        }
+    );
+    assert_eq!(
+        record(NOW + MIN, fable(85, false)),
+        Recorded::Stats {
+            account: OWN.to_string(),
+            events: 0,
+        },
+        "the same figure said again: its newer instant, no row"
+    );
+    assert_eq!(
+        record(NOW - HOUR, fable(100, true)),
+        Recorded::Unchanged,
+        "an older read"
+    );
+    let kept = held(&store, OWN, NOW + MIN).weeks_said[FABLE].clone();
+    assert_eq!((kept.pct, kept.at, kept.wall), (Some(85), NOW + MIN, false));
+    assert!(!kept.by.is_empty(), "the machine that read it");
+    record(NOW + HOUR, fable(100, true));
+    record(
+        NOW + HOUR,
+        week_read(WeekModel::Sonnet, 100, Some(NOW + DAY), true),
+    );
+    let unnamed = WeekRead {
+        bucket: "seven_day_opus",
+        ..fable(100, true)
+    };
+    assert_eq!(
+        record(NOW + 2 * HOUR, unnamed),
+        Recorded::Unchanged,
+        "a bucket no screen names"
+    );
+    let held = held(&store, OWN, NOW + 2 * HOUR);
+    assert_eq!(
+        held.weeks_said
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        [FABLE, "seven_day_sonnet"]
+    );
+    assert_eq!(
+        rows_of(&store, Kind::Warned),
+        ["fable week 85%", "fable wall", "sonnet wall"]
+    );
+}
+
+#[test]
+fn weeks_said_round_trips_the_state_and_goes_with_another_account() {
+    let said = WeekSaid {
+        pct: Some(100),
+        reset: None,
+        at: NOW - HOUR,
+        by: "3f9a1b2c4d5e6f70".to_string(),
+        wall: true,
+        ends_by: Some(NOW + DAY),
+    };
+    let mut s = State::default();
+    s.accounts.insert(OWN.to_string(), Account::default());
+    let empty = s.to_json();
+    assert!(
+        !empty.contains("weeks_said"),
+        "an account with none writes no key: {empty}"
+    );
+    s.accounts
+        .get_mut(OWN)
+        .expect("held")
+        .weeks_said
+        .insert(FABLE.to_string(), said.clone());
+    s.accounts.get_mut(OWN).expect("held").weeks_said.insert(
+        "seven_day_sonnet".to_string(),
+        WeekSaid {
+            pct: None,
+            reset: None,
+            at: NOW - 2 * HOUR,
+            by: "3f9a1b2c4d5e6f70".to_string(),
+            wall: false,
+            ends_by: None,
+        },
+    );
+    let text = s.to_json();
+    assert_eq!(
+        State::from_json(&text, NOW),
+        Ok(s.clone()),
+        "a figure and a reset's word"
+    );
+    assert_eq!(
+        State::from_json(&empty, NOW).map(|back| back.account(OWN).weeks_said.is_empty()),
+        Ok(true),
+        "a state with none reads none"
+    );
+    let ahead = text.replace(
+        &format!("\"at\":{}", NOW - HOUR),
+        &format!("\"at\":{}", NOW + DAY),
+    );
+    assert_ne!(ahead, text, "the stamp");
+    let capped = State::from_json(&ahead, NOW).expect("loads");
+    assert!(
+        capped.account(OWN).weeks_said[FABLE].at <= NOW + STAMP_SKEW_S,
+        "a stamp past the clock is capped"
+    );
+    let key = |id: &str| super::super::profile::AccountKey::claude(id);
+    let mut state = State::default();
+    let read = |at: i64, key| TapRead {
+        seven_day: Some(WindowRead {
+            pct_x10: 400,
+            reset: NOW + DAY,
+            refilled: None,
+        }),
+        at,
+        seen_before: true,
+        key,
+        ..TapRead::default()
+    };
+    note_reading(
+        &mut state,
+        OWN,
+        &read(NOW - 2 * HOUR, key("0f6c2b8e-1d3a-4c5e-9b7f-2a4d6e8c0b1a")),
+        NOW - 2 * HOUR,
+    );
+    state
+        .accounts
+        .get_mut(OWN)
+        .expect("held")
+        .weeks_said
+        .insert(FABLE.to_string(), said);
+    note_reading(
+        &mut state,
+        OWN,
+        &read(NOW - 2 * HOUR, key("0f6c2b8e-1d3a-4c5e-9b7f-2a4d6e8c0b1a")),
+        NOW - HOUR,
+    );
+    assert_eq!(
+        state.account(OWN).weeks_said.len(),
+        1,
+        "the control: the same account's reading keeps it"
+    );
+    note_reading(
+        &mut state,
+        OWN,
+        &read(NOW, key("7a1e3c5b-2d4f-4a6b-8c0d-1e3f5a7b9c2d")),
+        NOW,
+    );
+    assert!(
+        state.account(OWN).weeks_said.is_empty(),
+        "another account's reading drops it"
+    );
+}
+
+/// A limit reset used on a model's week, or the vendor's word that its limit lifted, is the
+/// newest word on that week: a read from before it (the screen a local `/limit-reset` leaves, its
+/// newest answer older than the reset) does not bring the walled figure back.
+#[test]
+fn weeks_said_holds_a_limit_reset_on_its_week_over_the_reads_before_it() {
+    use aterm_phase::WeekModel;
+    let reset = NOW + DAY;
+    let walled = |done: &ResetDone<'_>| {
+        let mut state = State {
+            machine: "3f9a1b2c4d5e6f70".to_string(),
+            ..State::default()
+        };
+        let _ = note_wall(&mut state, OWN, FABLE, Some(reset), NOW - HOUR, NOW - HOUR);
+        state
+            .accounts
+            .get_mut(OWN)
+            .expect("held")
+            .weeks_said
+            .insert(
+                FABLE.to_string(),
+                WeekSaid {
+                    pct: Some(100),
+                    reset: Some(reset),
+                    at: NOW - HOUR,
+                    by: String::new(),
+                    wall: true,
+                    ends_by: None,
+                },
+            );
+        assert_eq!(
+            claim_reset(
+                &mut state,
+                OWN,
+                (FABLE, reset),
+                "s-1",
+                41,
+                "1792078800.250000",
+                NOW - 30 * MIN
+            ),
+            ResetClaimed::Taken
+        );
+        let _ = reset_outcome(&mut state, OWN, reset, "s-1", done, NOW - 20 * MIN);
+        let record = state.accounts.get_mut(OWN).expect("held");
+        let before = week_read(WeekModel::Fable, 85, Some(NOW + 4 * DAY), false);
+        let taken = note_week(
+            record,
+            OWN,
+            before,
+            NOW - 25 * MIN,
+            "3f9a1b2c4d5e6f70",
+            NOW - 10 * MIN,
+        )
+        .is_some();
+        let held = &state.account(OWN).weeks_said[FABLE];
+        (taken, (held.pct, held.reset, held.at))
+    };
+    assert_eq!(
+        walled(&ResetDone::Used {
+            kind: aterm_phase::ResetKind::Weekly,
+            left: Some(0),
+        }),
+        (false, (None, None, NOW - 20 * MIN)),
+        "a reset used on the Fable week"
+    );
+    assert_eq!(
+        walled(&ResetDone::Lifted),
+        (false, (None, Some(reset), NOW - 20 * MIN)),
+        "the Fable limit lifted"
+    );
+    assert_eq!(
+        walled(&ResetDone::Kept("not now")),
+        (true, (Some(85), Some(NOW + 4 * DAY), NOW - 25 * MIN)),
+        "the control: a reset kept leaves the week to the newer read"
+    );
+}
+
+/// The footer keeps a warning drawn before the wall that followed it, and a local command (the
+/// `/model` the wall suggests) ends the turn on its own answer with no newer answer from the
+/// vendor: a warning read with the wall's own instant is no newer word than the wall.
+#[test]
+fn weeks_said_keeps_a_wall_over_a_warning_of_its_instant() {
+    use aterm_phase::WeekModel;
+    let r = own_row();
+    let dir = tmp("weeks-said-wall-first");
+    let store = Store::at(dir.path());
+    let now = NOW + HOUR;
+    let record = |at: i64, week: WeekRead| {
+        record_usage(&store, &r, "s-1", &stored(), &week_said_at(at, week), now)
+    };
+    let warning = week_read(WeekModel::Fable, 85, Some(NOW + 4 * DAY), false);
+    record(
+        NOW,
+        week_read(WeekModel::Fable, 100, Some(NOW + 2 * HOUR), true),
+    );
+    record(NOW, warning);
+    let kept = |at: i64| {
+        let kept = held(&store, OWN, at).weeks_said[FABLE].clone();
+        (kept.pct, kept.wall)
+    };
+    assert_eq!(
+        kept(now),
+        (Some(100), true),
+        "the footer's warning beside the wall"
+    );
+    record(NOW + MIN, warning);
+    assert_eq!(
+        kept(now),
+        (Some(85), false),
+        "the control: a newer answer's warning is the newer word"
+    );
+}
+
+/// Where a wall names no reset, the reset an earlier read of the same week named is when that
+/// week ends: a warning's `resets …`, then the usage-credits wall with none.
+#[test]
+fn weeks_said_ends_a_no_reset_wall_with_the_week_an_earlier_read_named() {
+    use crate::harness::account_stats::{Look, Tap, view};
+    use aterm_phase::WeekModel;
+    let r = own_row();
+    let void_at = |warned: (i64, i64), walled: i64| {
+        let dir = tmp("weeks-said-ends");
+        let store = Store::at(dir.path());
+        let record = |at: i64, week: WeekRead| {
+            record_usage(
+                &store,
+                &r,
+                "s-1",
+                &stored(),
+                &week_said_at(at, week),
+                NOW + DAY,
+            )
+        };
+        record(
+            warned.0,
+            week_read(WeekModel::Fable, 85, Some(warned.1), false),
+        );
+        record(walled, week_read(WeekModel::Fable, 100, None, true));
+        let account = held(&store, OWN, NOW + DAY);
+        let profile = Err(super::super::profile::NoProfile::NoHome);
+        let look = Look {
+            now: walled + MIN,
+            tz_s: 0,
+            machine: Some("3f9a1b2c4d5e6f70"),
+            label: OWN,
+            profile: &profile,
+            account: Some(&account),
+            state_unread: false,
+            several: false,
+            api_key_seen: false,
+            tap: Tap::On,
+            spend: None,
+            prices_as_of: None,
+            login: None,
+            sessions: Err("not-counted"),
+        };
+        view(&look)
+            .windows
+            .into_iter()
+            .find(|w| w.id == FABLE)
+            .and_then(|w| w.void_at)
+    };
+    assert_eq!(
+        void_at((NOW, NOW + 2 * DAY), NOW + HOUR),
+        Some(NOW + 2 * DAY),
+        "the reset the warning named"
+    );
+    assert_eq!(
+        void_at((NOW, NOW + 30 * MIN), NOW + HOUR),
+        Some(NOW + HOUR + WEEK_WINDOW_S),
+        "the control: a week that reset before the wall says nothing of the wall's"
+    );
+}
+
+/// Only the weeks a screen names load ([`week_model`]): a damaged or a later build's state keeps
+/// no other key, and none of those crowds a named week out.
+#[test]
+fn weeks_said_loads_only_the_weeks_a_screen_names() {
+    let said = WeekSaid {
+        pct: Some(100),
+        reset: None,
+        at: NOW - HOUR,
+        by: "3f9a1b2c4d5e6f70".to_string(),
+        wall: true,
+        ends_by: None,
+    };
+    let mut s = State::default();
+    let account = s.accounts.entry(OWN.to_string()).or_default();
+    for bucket in (0..9)
+        .map(|i| format!("a{i}"))
+        .chain([FABLE.to_string(), "seven_day_sonnet".to_string()])
+    {
+        account.weeks_said.insert(bucket, said.clone());
+    }
+    let back = State::from_json(&s.to_json(), NOW).expect("loads");
+    assert_eq!(
+        back.account(OWN)
+            .weeks_said
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        [FABLE, "seven_day_sonnet"]
+    );
 }

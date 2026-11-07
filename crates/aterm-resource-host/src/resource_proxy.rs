@@ -28,6 +28,12 @@ const POLL: Duration = Duration::from_millis(100);
 /// Submission must be bounded; it must not reconstruct the complete command
 /// from ambient environment or retain redundant standard-stream descriptions.
 pub(crate) trait Backend {
+    /// Select only the original inherited directory. Discovery is deferred
+    /// until intake has checked every advertised original descriptor.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn original_store(&mut self, _store: wire::client::workload::EarlyHostStore) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
     fn submit(
         &mut self,
         request: wire::Request,
@@ -41,6 +47,34 @@ pub(crate) trait Backend {
 /// Recognize only the exact private entry; helper success is transport health,
 /// never the target's exit code. No diagnostics use the target's standard I/O.
 pub(crate) fn entry(args: &[OsString], backend: &mut dyn Backend) -> Option<ExitCode> {
+    match wire::WorkloadHelperFds::parse(args) {
+        Ok(Some(fds)) => {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            let result = (|| {
+                let pending = wire::client::workload::snapshot_host_store_descriptor(fds.store)?;
+                // SAFETY: exact fresh private helper entry, before any FD
+                // allocation/config/import. The child-only inherited store
+                // slot is disjoint from stdio/control/proof and all sources;
+                // intake checks those sources before discovery may allocate.
+                let store =
+                    unsafe { wire::client::workload::capture_host_store_descriptor(pending) }?;
+                backend.original_store(store)?;
+                run(fds.transport, backend, true, Some(fds))
+            })();
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            let result: io::Result<()> = {
+                let _ = fds;
+                Err(io::ErrorKind::Unsupported.into())
+            };
+            return Some(if result.is_ok() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(75)
+            });
+        }
+        Ok(None) => {}
+        Err(_) => return Some(ExitCode::from(75)),
+    }
     let (fds, accounted) = match wire::HelperFds::parse(args) {
         Ok(None) => match wire::HelperFds::parse_accounted(args) {
             Ok(Some(fds)) => (fds, true),
@@ -50,7 +84,7 @@ pub(crate) fn entry(args: &[OsString], backend: &mut dyn Backend) -> Option<Exit
         Ok(Some(fds)) => (fds, false),
         Err(_) => return Some(ExitCode::from(75)),
     };
-    Some(if run(fds, backend, accounted).is_ok() {
+    Some(if run(fds, backend, accounted, None).is_ok() {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(75)
@@ -221,7 +255,12 @@ fn intake(fds: wire::HelperFds, request: &wire::Request) -> io::Result<(StdioCon
         Delegations { cpu, gnu, fences },
     ))
 }
-fn run(fds: wire::HelperFds, backend: &mut dyn Backend, accounted: bool) -> io::Result<()> {
+fn run(
+    fds: wire::HelperFds,
+    backend: &mut dyn Backend,
+    accounted: bool,
+    original_store: Option<wire::WorkloadHelperFds>,
+) -> io::Result<()> {
     let control = socket(fds.control)?;
     let producer = socket(fds.producer)?;
     let mut channel = wire::Channel::new(UnixStream::from(control))?;
@@ -231,6 +270,12 @@ fn run(fds: wire::HelperFds, backend: &mut dyn Backend, accounted: bool) -> io::
     } else {
         wire::Request::decode(&bytes)?
     };
+    if let Some(original) = original_store {
+        if request.role != wire::Role::Compile {
+            return Err(invalid());
+        }
+        original.validate_delegations(&request.delegations)?;
+    }
     let context = Context {
         root: request.binding.root_attempt,
         member: request.member_attempt,

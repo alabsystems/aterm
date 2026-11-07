@@ -2,11 +2,12 @@
 // Copyright 2026 Andrew Yates
 
 //! THIS MAC'S CREDENTIAL NEEDS ON THE DIGEST (docs/DESIGN-credential-requests-2026-10-27.md
-//! §10): the need ledger states [`Family::Secrets`] as a level, one entry per need that awaits a
-//! person, and none for a need the lab is still working on. A need that ends (given, declined,
-//! retired) takes its entry down at the next pass. The window reads the ledger's file only
-//! when its size or time moved, at most every half minute, and never moves a need. The vault,
-//! and so the ledger, runs on unix alone.
+//! §10): the need ledger states [`Family::Secrets`] as a level, one entry per want that awaits a
+//! person, and one more, for the vault, while the vault admin's aterm has written nothing on a
+//! posted request for the silence (§6.1); none for a need the lab is still working on. A need
+//! that ends (given, declined, retired) takes its entry down at the next pass. The window reads
+//! the ledger's file only when its size or time moved, at most every half minute, and never
+//! moves a need. The vault, and so the ledger, runs on unix alone.
 
 use aterm_messages::exceptions::Family;
 use std::time::{Duration, Instant, SystemTime};

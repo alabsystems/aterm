@@ -8599,6 +8599,11 @@ mod gesture_tests {
             app.glass_swallows_at(wid, x, y),
             "control: vacated mode-row cell is swallowed"
         );
+        let (strip_x, strip_y) = px_of(&app, wid, (0, 20));
+        assert!(
+            !app.glass_swallows_at(wid, strip_x, strip_y),
+            "tab-strip row above the terminal grid is never swallowed"
+        );
         app.on_cursor_moved(wid, x, y);
         app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
         app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);

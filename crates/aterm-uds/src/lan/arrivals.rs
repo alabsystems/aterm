@@ -61,7 +61,8 @@ impl Arrivals {
     }
 
     /// Bound a consumer's wait while a socket was made before its listener was
-    /// ready. Unchanged refused or outdated generations are not repeatedly dialled.
+    /// ready, or its broker did not judge this process. Unchanged refused or
+    /// outdated generations are not repeatedly dialled.
     #[must_use]
     pub fn wait_for(&self, most: Duration) -> Duration {
         self.retry.map_or(most, |at| {
@@ -172,11 +173,15 @@ impl Arrivals {
                 self.retry = None;
                 Ok(true)
             }
+            // A refusal of this code and another protocol stand for this generation.
             Err(LanError::Unavailable(Unavailable::Outdated { .. } | Unavailable::Refused(_))) => {
                 self.retry = None;
                 Ok(false)
             }
-            Err(_) => {
+            // No listener yet, a broker that did not judge this process (its code check did not
+            // finish, or it was serving its most connections), or a failed exchange.
+            Err(LanError::Unavailable(Unavailable::NotInstalled | Unavailable::Unchecked(_)))
+            | Err(LanError::Io(_)) => {
                 self.retry = Some(Instant::now() + self.delay);
                 self.delay = (self.delay * 2).min(Duration::from_secs(30));
                 Ok(false)

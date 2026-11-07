@@ -312,7 +312,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_first_mover_is_held_to_the_lock() {
-        crate::discovery::set_probe_bound_for_test(aterm_spec::wait::MUST_HAPPEN);
         let hold = aterm_tempfile::tempdir().expect("scratch");
         let root = hold.path().canonicalize().expect("canonical");
         let rustc = |dir: &Path, commit: &str| {

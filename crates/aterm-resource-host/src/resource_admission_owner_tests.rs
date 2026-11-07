@@ -248,6 +248,21 @@ impl World {
         Self::with_scratch(Scratch::new())
     }
     fn with_scratch(scratch: Scratch) -> Self {
+        let (owner, namespace, retirement) = Self::prepare(&scratch);
+        Self {
+            owner,
+            namespace,
+            retirement,
+            scratch,
+        }
+    }
+    fn prepare(
+        scratch: &Scratch,
+    ) -> (
+        Owner,
+        Namespace,
+        aterm_capacity::build_cpu::LegacyRetirement,
+    ) {
         let home = scratch.path.join("home");
         std::fs::DirBuilder::new()
             .mode(0o700)
@@ -283,12 +298,7 @@ impl World {
             #[cfg(target_os = "macos")]
             metadata_pause: None,
         };
-        Self {
-            owner,
-            namespace,
-            retirement,
-            scratch,
-        }
+        (owner, namespace, retirement)
     }
 }
 
@@ -305,85 +315,7 @@ impl World {
         timeout: Duration,
         attempt: [u8; 16],
     ) -> (Binding, CohortClosureRef, CtlStream) {
-        let binding = Binding {
-            session: "s-acde".into(),
-            attempt,
-        };
-        self.owner.journal.create(&binding).unwrap();
-        let machine = Fixed::new(Reading::of_gib(64, 60, 2));
-        let need = Need::new("resource-run: actual private owner fixture")
-            .mem(MEMORY)
-            .margin(aterm_capacity::build_cpu::default_memory_reserve());
-        // Run the real private memory admission AFTER host journal preparation. Do not
-        // admit around a backend-layout refusal or replace its authority with observations.
-        let claim = match Waiter::enter_cohort(&self.owner.ledger, &machine, need)
-            .unwrap()
-            .poll(&machine)
-        {
-            Polled::Admitted(claim) => claim,
-            other => panic!("private memory was not admitted: {other:?}"),
-        };
-        let reference = claim.cohort_closure_ref().unwrap();
-        let (host, client) = CtlStream::pair().unwrap();
-        let host: OwnedFd = host.into();
-        let mut events = job::Events::new(host.try_clone().unwrap(), binding.clone()).unwrap();
-        events.emit(Event::Queued).unwrap();
-        let pid = std::process::id();
-        let birth = process::read_birth(i32::try_from(pid).unwrap()).unwrap().0;
-        let null = || -> OwnedFd { File::open("/dev/null").unwrap().into() };
-        let output = || -> OwnedFd {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .open("/dev/null")
-                .unwrap()
-                .into()
-        };
-        let submission = AuthorizedSubmission {
-            request: Submission {
-                binding: binding.clone(),
-                peer_pid: pid,
-                peer_birth: birth,
-                argv: vec![b"/bin/sleep".to_vec(), b"60".to_vec()],
-                cwd: self.scratch.path.as_os_str().as_bytes().to_vec(),
-                env: Vec::new(),
-                cpu_units: 1,
-                memory_bytes: MEMORY,
-                label: "actual private owner fixture".into(),
-                timeout_ms: Some(timeout.as_millis().try_into().unwrap()),
-            },
-            peer: Peer { pid, birth },
-            fds: Attachments {
-                stdin: null(),
-                stdout: output(),
-                stderr: output(),
-                events: host,
-            },
-        };
-        submission.request.validate().unwrap();
-        self.owner.pending.push_back(Pending {
-            resolver: None,
-            submission,
-            events,
-            recipe: Some(recipe::Recipe {
-                kind: recipe::Kind::Ay,
-                compiler: None,
-                program: "/bin/sleep".into(),
-                arguments: vec![OsString::from("60")],
-                environment: Vec::new(),
-                cwd: self.scratch.path.clone(),
-                width: 1,
-                metadata_sdk: None,
-            }),
-            sdk: None,
-            probe: None,
-            waiter: None,
-            claim: Some(claim),
-            recovery: None,
-            admitted: None,
-            scope_reference: None,
-            cancelled: false,
-        });
-        (binding, reference, client)
+        queue_owned(&mut self.owner, &self.scratch.path, timeout, attempt)
     }
 
     fn settle(&mut self) {
@@ -440,6 +372,95 @@ impl World {
         assert!(!self.owner.accepts(binding));
         assert!(!self.owner.faulted);
     }
+}
+
+fn queue_owned(
+    owner: &mut Owner,
+    cwd: &std::path::Path,
+    timeout: Duration,
+    attempt: [u8; 16],
+) -> (Binding, CohortClosureRef, CtlStream) {
+    let binding = Binding {
+        session: "s-acde".into(),
+        attempt,
+    };
+    owner.journal.create(&binding).unwrap();
+    let machine = Fixed::new(Reading::of_gib(64, 60, 2));
+    let need = Need::new("resource-run: actual private owner fixture")
+        .mem(MEMORY)
+        .margin(aterm_capacity::build_cpu::default_memory_reserve());
+    // Run the real private memory admission AFTER host journal preparation. Do not
+    // admit around a backend-layout refusal or replace its authority with observations.
+    let claim = match Waiter::enter_cohort(&owner.ledger, &machine, need)
+        .unwrap()
+        .poll(&machine)
+    {
+        Polled::Admitted(claim) => claim,
+        other => panic!("private memory was not admitted: {other:?}"),
+    };
+    let reference = claim.cohort_closure_ref().unwrap();
+    let (host, client) = CtlStream::pair().unwrap();
+    let host: OwnedFd = host.into();
+    let mut events = job::Events::new(host.try_clone().unwrap(), binding.clone()).unwrap();
+    events.emit(Event::Queued).unwrap();
+    let pid = std::process::id();
+    let birth = process::read_birth(i32::try_from(pid).unwrap()).unwrap().0;
+    let null = || -> OwnedFd { File::open("/dev/null").unwrap().into() };
+    let output = || -> OwnedFd {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .unwrap()
+            .into()
+    };
+    let submission = AuthorizedSubmission {
+        request: Submission {
+            binding: binding.clone(),
+            peer_pid: pid,
+            peer_birth: birth,
+            argv: vec![b"/bin/sleep".to_vec(), b"60".to_vec()],
+            cwd: cwd.as_os_str().as_bytes().to_vec(),
+            env: Vec::new(),
+            cpu_units: 1,
+            memory_bytes: MEMORY,
+            label: "actual private owner fixture".into(),
+            timeout_ms: Some(timeout.as_millis().try_into().unwrap()),
+        },
+        peer: Peer { pid, birth },
+        fds: Attachments {
+            stdin: null(),
+            stdout: output(),
+            stderr: output(),
+            events: host,
+        },
+    };
+    submission.request.validate().unwrap();
+    owner.pending.push_back(Pending {
+        queued_at: Instant::now(),
+        primary: None,
+        resolver: None,
+        submission,
+        events,
+        recipe: Some(recipe::Recipe {
+            kind: recipe::Kind::Ay,
+            compiler: None,
+            program: "/bin/sleep".into(),
+            arguments: vec![OsString::from("60")],
+            environment: Vec::new(),
+            cwd: cwd.to_path_buf(),
+            width: 1,
+            metadata_sdk: None,
+        }),
+        sdk: None,
+        probe: None,
+        waiter: None,
+        claim: Some(claim),
+        recovery: None,
+        admitted: None,
+        scope_reference: None,
+        cancelled: false,
+    });
+    (binding, reference, client)
 }
 
 impl Drop for World {
@@ -875,6 +896,196 @@ fn cancelled_paid_metadata_preparation_joins_before_native_release_and_settlemen
 #[path = "resource_admission_owner_tests/metadata_native.rs"]
 #[cfg(target_os = "macos")]
 mod metadata_native;
+
+#[test]
+fn workload_ancestry_slice_waits_without_renewing_or_granting_original_resources() {
+    let mut world = World::new();
+    let (binding, memory, client) = world.queue_sleep(HANG);
+    assert_eq!(read_event(&client, &binding), Event::Queued);
+    let mut pending = world.owner.pending.pop_front().unwrap();
+    pending.events.account().unwrap();
+    pending.submission.request.argv = vec![
+        b"/unselected/targo".to_vec(),
+        b"--resource-workload-v1".to_vec(),
+    ];
+    pending.submission.request.cpu_units = 2;
+    pending.recipe = None;
+    let original = pending.workload_deadline().unwrap();
+    for _ in 0..2 {
+        assert!(
+            world
+                .owner
+                .workload_inspection_wait_test(&mut pending, Instant::now())
+                .unwrap()
+        );
+        assert_eq!(pending.workload_deadline().unwrap(), original);
+        assert!(pending.primary.is_none());
+        assert!(world.owner.jobs.is_empty());
+        assert_eq!(world.owner.debt.reserved().unwrap(), 0);
+        assert_eq!(world.owner.ledger.list().unwrap().len(), 1);
+    }
+    // Published metadata admission uses its own one-minute observation hang
+    // detector, not the NEW workload's resumable inspection slice. Its actual
+    // expired observation still refuses instead of becoming queued work.
+    pending.submission.request.argv[1] = b"--resource-metadata-v1".to_vec();
+    pending.submission.request.cpu_units = 1;
+    assert_eq!(
+        world
+            .owner
+            .check_fresh_metadata_ancestry_at(&pending, Instant::now() - HANG)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::TimedOut
+    );
+    pending.submission.request.argv[1] = b"--resource-workload-v1".to_vec();
+    pending.submission.request.cpu_units = 2;
+    pending.queued_at = Instant::now()
+        .checked_sub(HANG + Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(
+        world
+            .owner
+            .workload_inspection_wait_test(&mut pending, Instant::now() + HANG)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::TimedOut
+    );
+    world.owner.pending.push_back(pending);
+    world.owner.tick_queue();
+    assert!(world.owner.pending.is_empty());
+    assert_eq!(world.owner.failed.len(), 1);
+    let deadline = Instant::now() + HANG;
+    while !world.owner.idle() {
+        assert!(Instant::now() < deadline);
+        world.owner.tick();
+    }
+    let terminal = aterm_types::resource_admission::AccountedEventFrame::decode(
+        &wire::read_frame(&client, deadline).unwrap(),
+        &binding,
+    )
+    .unwrap();
+    assert!(
+        matches!(terminal.finished.event, Event::Refused { reason } if reason.contains("deadline"))
+    );
+    assert_eq!(world.owner.debt.reserved().unwrap(), 0);
+    assert_eq!(
+        world.owner.ledger.reap_cohort_claim(&memory).unwrap(),
+        CohortClaimState::Closed
+    );
+    assert!(!world.owner.journal.fresh(&binding).unwrap());
+}
+
+#[test]
+fn workload_final_go_preserves_the_original_absolute_clock() {
+    let queued = Instant::now();
+    let deadline = queued + Duration::from_secs(2);
+    let early = start::remaining_workload_timeout(deadline, queued).unwrap();
+    let later_go = queued + Duration::from_secs(1);
+    let later = start::remaining_workload_timeout(deadline, later_go).unwrap();
+    assert!(later < early);
+    assert!(queued.checked_add(early).unwrap() <= deadline);
+    assert!(later_go.checked_add(later).unwrap() <= deadline);
+    assert!(start::remaining_workload_timeout(deadline, deadline).is_none());
+    assert!(
+        start::remaining_workload_timeout(deadline, deadline + Duration::from_nanos(1)).is_none()
+    );
+}
+
+#[test]
+fn workload_queue_expiry_and_parent_close_keep_paid_preparation_until_join() {
+    for expire in [true, false] {
+        let mut world = World::new();
+        let (binding, memory, client) = world.queue_sleep(HANG);
+        assert_eq!(read_event(&client, &binding), Event::Queued);
+        let mut pending = world.owner.pending.pop_front().unwrap();
+        pending.events.account().unwrap();
+        pending.submission.request.argv = vec![
+            b"/unselected/targo".to_vec(),
+            b"--resource-workload-v1".to_vec(),
+        ];
+        pending.submission.request.cpu_units = 2;
+        pending.recipe = None;
+        let width = NonZeroU32::new(2).unwrap();
+        let context = recovery::context(&binding, &memory, MEMORY, width.get());
+        let material = world
+            .owner
+            .debt
+            .prepare_recoverable(
+                aterm_capacity::build_cpu::Owner::current(None),
+                width,
+                context,
+            )
+            .unwrap();
+        let (parent, leaf) = world.owner.journal.authority(&binding).unwrap();
+        let mut prepared = material.persist(&parent, &leaf).unwrap();
+        let reservation = world
+            .owner
+            .debt
+            .try_acquire_all_recoverable(&mut prepared)
+            .unwrap()
+            .unwrap();
+        pending.primary = Some(workload::Primary::new(reservation));
+        pending.recovery = Some(prepared);
+        let (probe, release) = recipe::Probe::paused();
+        pending.probe = Some(probe);
+        if expire {
+            pending.queued_at = Instant::now()
+                .checked_sub(HANG + Duration::from_secs(1))
+                .unwrap();
+        }
+        let client = if expire {
+            Some(client)
+        } else {
+            drop(client);
+            None
+        };
+        world.owner.pending.push_back(pending);
+        world.owner.tick_queue();
+        assert_eq!(world.owner.pending.len(), 1);
+        assert_eq!(world.owner.debt.reserved().unwrap(), 2);
+        assert_eq!(world.owner.ledger.list().unwrap().len(), 1);
+        assert!(world.owner.jobs.is_empty());
+        release.send(()).unwrap();
+        let deadline = Instant::now() + HANG;
+        while !world
+            .owner
+            .pending
+            .front()
+            .unwrap()
+            .probe
+            .as_ref()
+            .unwrap()
+            .finished()
+        {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(POLL);
+        }
+        world.owner.tick_queue();
+        assert!(world.owner.pending.is_empty());
+        assert_eq!(world.owner.failed.len(), 1);
+        assert_eq!(world.owner.debt.reserved().unwrap(), 2);
+        while !world.owner.idle() {
+            assert!(Instant::now() < deadline);
+            world.owner.tick();
+        }
+        if let Some(client) = client {
+            let terminal = aterm_types::resource_admission::AccountedEventFrame::decode(
+                &wire::read_frame(&client, deadline).unwrap(),
+                &binding,
+            )
+            .unwrap();
+            assert!(
+                matches!(terminal.finished.event, Event::Refused { reason } if reason.contains("deadline"))
+            );
+        }
+        assert_eq!(world.owner.debt.reserved().unwrap(), 0);
+        assert_eq!(
+            world.owner.ledger.reap_cohort_claim(&memory).unwrap(),
+            CohortClaimState::Closed
+        );
+        assert!(!world.owner.journal.fresh(&binding).unwrap());
+    }
+}
 #[cfg(target_os = "macos")]
 pub(super) fn metadata_native_role() {
     metadata_native::early_role();
@@ -883,6 +1094,9 @@ pub(super) fn metadata_native_role() {
 #[path = "resource_admission_owner_tests/resolver_native.rs"]
 #[cfg(target_os = "macos")]
 mod resolver_native;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[path = "resource_admission_owner_tests/workload_native.rs"]
+mod workload_native;
 
 #[path = "resource_admission_owner_tests/resolver_engineering.rs"]
 #[cfg(target_os = "macos")]

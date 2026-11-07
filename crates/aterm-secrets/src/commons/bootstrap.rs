@@ -342,7 +342,13 @@ impl Descriptor {
         }
     }
 
-    pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
+    /// Decode and verify a Commons control value without creating custody or ingesting history.
+    /// Only an authenticated vault observation or independently pinned journal establishes
+    /// the returned descriptor's authority; decoding alone grants no admission or access.
+    ///
+    /// # Errors
+    /// The schema, node bounds, signatures, roots or repair witnesses are invalid.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < DESCRIPTOR_HEADER || bytes.len() > MAX_DESCRIPTOR || &bytes[..4] != b"ACD1"
         {
             return Err(Error::new("invalid Commons bootstrap descriptor"));

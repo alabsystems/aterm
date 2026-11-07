@@ -316,7 +316,20 @@ fn sequence() -> io::Result<u32> {
 }
 
 const MAX_REPLY: usize = 64 * 1024;
-const MAX_MESSAGES: usize = 64;
+/// Unrelated messages and interrupted reads do not invalidate the requested route.
+/// The absolute deadline bounds a kernel that never supplies its correlated reply.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn receive_route(
+    until: Instant,
+    mut next: impl FnMut() -> io::Result<Option<Route>>,
+) -> io::Result<Route> {
+    loop {
+        within(until)?;
+        if let Some(route) = next()? {
+            return Ok(route);
+        }
+    }
+}
 const WITHIN: Duration = Duration::from_secs(60);
 
 /// Hang detector for local kernel observations: admission, recheck, bind/listen and route queries.
@@ -430,6 +443,50 @@ fn align4(length: usize) -> io::Result<usize> {
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unrelated_route_messages_do_not_discard_the_correlated_reply() {
+        let expected = Route {
+            index: 1,
+            source: Some("127.0.0.1".parse().unwrap()),
+            direct: false,
+        };
+        let mut unrelated = 64;
+        let actual = receive_route(Instant::now() + Duration::from_secs(60), || {
+            if unrelated > 0 {
+                unrelated -= 1;
+                Ok(None)
+            } else {
+                Ok(Some(expected.clone()))
+            }
+        });
+        assert_eq!(actual.unwrap(), expected);
+    }
+
+    #[test]
+    fn route_receive_keeps_the_deadline_and_real_read_errors() {
+        let mut calls = 0;
+        assert_eq!(
+            receive_route(Instant::now(), || {
+                calls += 1;
+                Ok(None)
+            })
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(calls, 0);
+        assert_eq!(
+            receive_route(Instant::now() + Duration::from_secs(60), || {
+                calls += 1;
+                Err(io::ErrorKind::PermissionDenied.into())
+            })
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(calls, 1);
+    }
 
     fn loopback() -> (&'static str, u32) {
         let name = if cfg!(target_os = "macos") {

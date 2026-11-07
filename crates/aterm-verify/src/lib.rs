@@ -38,6 +38,7 @@ pub mod plan;
 pub mod provision;
 mod release_test_env;
 pub mod report;
+mod run_log;
 /// Nothing outlives its run: the run record, the stage-end survivor check and the next run's start ending a dead run's proven members (`docs/DESIGN-leftover-processes-2026-10-16.md` §3.3, §5.4, §8.1).
 pub mod runs;
 pub mod rustup;
@@ -2582,84 +2583,6 @@ fn held_dirs(tools: &Toolchain) -> Vec<PathBuf> {
     dirs
 }
 
-const LOGS_KEPT: usize = 20;
-
-fn open_log(chosen: Option<&Path>, cwd: &Path, ctx: &Ctx) -> Option<(PathBuf, std::fs::File)> {
-    let path = match chosen {
-        Some(p) => cwd.join(p),
-        None => {
-            let dir = ctx.state_dir().join("logs.noindex");
-            prune_logs(&dir);
-            let secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs());
-            dir.join(format!("{secs}-{}.log", std::process::id()))
-        }
-    };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let open = (|| -> std::io::Result<std::fs::File> {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
-        }
-        let f = opts.open(&path)?;
-        if !f.metadata()?.is_file() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "not a regular file",
-            ));
-        }
-        f.set_len(0)?;
-        Ok(f)
-    })();
-    match open {
-        Ok(f) => Some((path, f)),
-        Err(e) => {
-            eprintln!("verify: cannot write the run log {}: {e}", path.display());
-            None
-        }
-    }
-}
-
-/// Only names the default writer can produce belong to its retention quota.
-fn is_run_log(name: &OsStr) -> bool {
-    let Some(name) = name.to_str() else {
-        return false;
-    };
-    let Some((secs, pid)) = name.strip_suffix(".log").and_then(|s| s.split_once('-')) else {
-        return false;
-    };
-    let (Ok(secs), Ok(pid)) = (secs.parse::<u64>(), pid.parse::<u32>()) else {
-        return false;
-    };
-    pid != 0 && name == format!("{secs}-{pid}.log")
-}
-
-fn prune_logs(dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    let mut logs: Vec<(std::time::SystemTime, PathBuf)> = entries
-        .flatten()
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
-        .filter(|e| is_run_log(&e.file_name()))
-        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
-        .collect();
-    if logs.len() < LOGS_KEPT {
-        return;
-    }
-    logs.sort_unstable();
-    let drop_n = logs.len() + 1 - LOGS_KEPT;
-    for (_, p) in logs.into_iter().take(drop_n) {
-        let _ = std::fs::remove_file(p);
-    }
-}
-
 /// The checkout `cwd` is in.
 #[must_use]
 pub fn checkout_root(cwd: &Path) -> Option<PathBuf> {
@@ -2937,11 +2860,14 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
             return code;
         }
     };
-    let log = open_log(parsed.log.as_deref(), cwd, &ctx);
-    let log_shown = log.as_ref().map(|(path, _)| path.display().to_string());
+    let mut log = run_log::open(
+        parsed.log.as_deref(),
+        cwd,
+        &ctx.state_dir().join("logs.noindex"),
+    );
+    let log_shown = log.as_ref().map(|log| log.path.display().to_string());
     let mut sink = std::io::sink();
-    let mut log_file = log.as_ref().and_then(|(_, f)| f.try_clone().ok());
-    let log_writer: &mut (dyn Write + Send) = match log_file.as_mut() {
+    let log_writer: &mut (dyn Write + Send) = match log.as_mut() {
         Some(f) => f,
         None => &mut sink,
     };
@@ -2960,9 +2886,9 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
     #[cfg(unix)]
     {
         if let Some(line) = disk::keep_used(&ctx, code == exit::PASS) {
-            let _ = log_file.as_mut().map(|f| writeln!(f, "{line}"));
+            let _ = log.as_mut().map(|f| writeln!(f, "{line}"));
         }
-        let_disk_go(disk, code == exit::PASS, log_file.as_mut());
+        let_disk_go(disk, code == exit::PASS, log.as_mut());
     }
     end_run(&ctx, &scratch);
     if parsed.background && stopping() && code != exit::FAILED {
@@ -2984,7 +2910,7 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
 /// Then, whatever the run's disk, it says on stderr how it was held and how many walks of its
 /// directories it made ([`disk::event`]).
 #[cfg(unix)]
-fn let_disk_go(held: disk::Disk, passed: bool, log: Option<&mut std::fs::File>) {
+fn let_disk_go(held: disk::Disk, passed: bool, log: Option<&mut impl Write>) {
     let mode = held.mode();
     let held = match held {
         disk::Disk::Held(held) => held,
@@ -3212,62 +3138,6 @@ mod memory_claim_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn run_log_retention_preserves_unrelated_files_and_removes_only_old_run_logs() {
-        let dir = aterm_tempfile::tempdir().unwrap();
-        let write_at = |name: &str, seconds: u64| {
-            let path = dir.path().join(name);
-            std::fs::write(&path, name).unwrap();
-            std::fs::OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .unwrap()
-                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds))
-                .unwrap();
-            path
-        };
-        let unrelated: Vec<_> = [
-            "notes.txt",
-            "chosen.log",
-            "1-0.log",
-            "1-2-3.log",
-            "1-.log",
-            "01-2.log",
-            "1-02.log",
-            "+1-2.log",
-            "1-+2.log",
-            "18446744073709551616-1.log",
-            "1-4294967296.log",
-        ]
-        .into_iter()
-        .map(|name| (write_at(name, 1), name))
-        .collect();
-        let logs: Vec<_> = (0..LOGS_KEPT + 4)
-            .map(|i| write_at(&format!("1700000000-{}.log", i + 1), 100 + i as u64))
-            .collect();
-
-        prune_logs(dir.path());
-
-        for (path, bytes) in unrelated {
-            assert_eq!(
-                std::fs::read_to_string(&path).expect("unrelated file preserved"),
-                bytes,
-                "{}",
-                path.display()
-            );
-        }
-        let removed = logs.len() + 1 - LOGS_KEPT;
-        for (i, path) in logs.iter().enumerate() {
-            assert_eq!(path.exists(), i >= removed, "{}", path.display());
-        }
-        write_at("1700000001-123.log", 200);
-        assert_eq!(
-            logs.iter().filter(|path| path.exists()).count() + 1,
-            LOGS_KEPT,
-            "the oldest generated logs were removed to reserve one incoming slot"
-        );
-    }
 
     #[test]
     fn background_runs_admit_their_disk_as_background() {
@@ -3517,9 +3387,6 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            // Each stand-in driver prints its sysroot and exits, so its answer must come: the
-            // discovery's probes of them wait on the hang detector, not the product's 5 s.
-            toolchain::set_probe_bound_for_test(aterm_spec::wait::MUST_HAPPEN);
             let runnable = |path: &Path, body: &str| {
                 std::fs::create_dir_all(path.parent().expect("bin")).expect("mkdir");
                 std::fs::write(path, format!("#!/bin/sh\n{body}\n")).expect("write");
@@ -4439,7 +4306,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_locked_checkout_runs_the_locked_build_and_says_a_shim_that_does_not() {
-        toolchain::set_probe_bound_for_test(aterm_spec::wait::MUST_HAPPEN);
         let scratch = aterm_tempfile::tempdir().expect("scratch");
         let home = scratch.path().canonicalize().expect("canonical");
         let env = EnvSnapshot {

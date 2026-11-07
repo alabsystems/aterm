@@ -2790,6 +2790,7 @@ mod tests {
                 Some("claude".into()),
                 42,
                 false,
+                "",
                 Instant::now(),
             );
             let (word, detail, subject, reader) = step.publish.expect("the wall was read");
@@ -2960,6 +2961,7 @@ mod tests {
                     Some(program.into()),
                     42,
                     false,
+                    "",
                     Instant::now(),
                 );
                 let (word, detail, subject, reader) = step.publish.expect("the wall was read");

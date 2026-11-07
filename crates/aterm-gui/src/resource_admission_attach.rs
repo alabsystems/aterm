@@ -6,6 +6,25 @@ use aterm_types::resource_admission::Submission;
 use aterm_uds::CtlStream;
 use std::{io, time::Instant};
 
+pub(crate) fn attach_accounted_expected(
+    stream: &CtlStream,
+    owner_authenticated: bool,
+    deadline: Instant,
+    authorize: impl FnOnce(&Submission, Peer) -> bool,
+    matches_backend: impl FnOnce(&std::os::fd::OwnedFd) -> io::Result<bool>,
+    submit: impl FnOnce(AuthorizedSubmission, std::os::fd::OwnedFd) -> io::Result<()>,
+) -> io::Result<()> {
+    let (authorized, expected) = transport::store_expectation::receive_submission(
+        stream,
+        owner_authenticated,
+        deadline,
+        authorize,
+        matches_backend,
+    )?;
+    submit(authorized, expected)?;
+    transport::store_expectation::acknowledge(stream, deadline)
+}
+
 /// Dispatch after consuming exactly `resource-admission-v3 attach`. The
 /// dispatcher supplies the exact Instance-principal verdict, never a remote or
 /// delegated principal. Session ownership and duplicate-attempt handling remain

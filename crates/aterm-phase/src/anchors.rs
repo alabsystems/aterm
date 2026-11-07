@@ -827,6 +827,10 @@ pub const ANCHORS: &[Anchor] = &[
     // screen echoes it typed as `❯ /limit-reset`, its answer on the `⎿` row under it.
     lit("reset.command", "limit-reset", "2.1.303"),
     lit("wall.fable", "You've reached your Fable limit", "2.1.267"),
+    // The per-model wall as 2.1.301 builds it (`You've hit your ${Rye[rateLimitType]}${resets}`,
+    // `seven_day_overage_included:"Fable limit"`, `seven_day_sonnet:"Sonnet limit"` in 2.1.319).
+    composed("wall.fable_hit", "You've hit your Fable limit", "2.1.301"),
+    composed("wall.sonnet_hit", "You've hit your Sonnet limit", "2.1.300"),
     lit("wall.auto_continue", "continuing automatically", "2.1.268"),
     lit(
         "wall.auto_continue.fired",
@@ -1084,6 +1088,8 @@ pub const ANCHORS: &[Anchor] = &[
         "2.1.301",
     ),
     lit("usage.warning", "You've used", "2.1.300"),
+    // The Fable week's name in the warning (`You've used ${n}% of your ${Rye[rateLimitType]}`).
+    lit("usage.fable_limit", "Fable limit", "2.1.301"),
     lit("login.expires_in", "Your login expires in ", "2.1.300"),
     lit("login.renew_hint", "run /login to renew", "2.1.300"),
 ];

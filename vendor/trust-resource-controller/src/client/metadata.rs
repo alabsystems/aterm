@@ -17,7 +17,7 @@ pub use crate::MetadataResult;
 use crate::{
     Cancel, Channel, GnuTransport, METADATA_EVENT_PREFIX_MAX_BYTES, METADATA_MAX_OUTPUT,
     MetadataCompletion, MetadataEvent, MetadataFailureObservation, MetadataPrepared,
-    SealedMetadataRequest, Started, Status,
+    SealedMetadataRequest, Started, Status, StatusFrame,
 };
 
 /// Actual held CPU/GNU descriptions, whose source labels must exactly match
@@ -26,6 +26,20 @@ use crate::{
 pub struct MetadataIo {
     pub descriptions: Vec<OwnedFd>,
 }
+
+/// The actual pipe read by an incremental workload observer. Chunks are raw
+/// bytes, including bytes received beyond the retained member-prefix bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MetadataOutputStream {
+    Stdout,
+    Stderr,
+}
+type OutputObserver<'a> = dyn FnMut(MetadataOutputStream, &[u8]) -> io::Result<()> + 'a;
+mod produced;
+mod refusal;
+pub use produced::{ProducedError, ProducedFailureObservation, ProducedMember, ProducedResult};
+mod linker;
+pub use linker::{LinkerError, LinkerMember, LinkerOutcome, LinkerResult};
 
 pub enum MetadataError {
     BeforeRequest(io::Error),
@@ -60,15 +74,36 @@ impl std::error::Error for MetadataError {}
 // lifecycle owner, while each validates its own mandatory request envelope.
 #[derive(Clone)]
 enum NativeQueryRequest {
+    Linker(crate::linker::Request),
     Metadata(SealedMetadataRequest),
     Resolver(crate::resolver::SealedResolverQueryRequest),
+    Workload(crate::workload::host::CompilerQuery),
+    Produced(
+        crate::workload::host::produced::ProducedRequest,
+        crate::workload::host::produced::RegistrationAck,
+    ),
 }
 trait NativeQuery {
+    fn linker(&self) -> Option<&crate::linker::Request> {
+        None
+    }
     fn member(&self) -> &crate::Request;
     fn validate_request(&self) -> io::Result<()>;
     fn payload(&self) -> io::Result<Vec<u8>>;
     fn purpose_hello(&self) -> io::Result<Vec<u8>>;
     fn validate_prepared(&self, prepared: &MetadataPrepared) -> io::Result<()>;
+    fn produced_prepared(
+        &self,
+        _bytes: &[u8],
+    ) -> io::Result<Option<crate::workload::host::produced::ProducedPrepared>> {
+        Ok(None)
+    }
+    fn workload_completion(&self) -> Option<(u64, crate::workload::host::MemberKind)> {
+        None
+    }
+    fn output_limit(&self) -> usize {
+        METADATA_MAX_OUTPUT
+    }
 }
 impl NativeQuery for SealedMetadataRequest {
     fn member(&self) -> &crate::Request {
@@ -104,35 +139,108 @@ impl NativeQuery for crate::resolver::SealedResolverQueryRequest {
         p.validate_for_resolver(self)
     }
 }
+impl NativeQuery for crate::workload::host::CompilerQuery {
+    fn member(&self) -> &crate::Request {
+        &self.member
+    }
+    fn validate_request(&self) -> io::Result<()> {
+        self.validate()
+    }
+    fn payload(&self) -> io::Result<Vec<u8>> {
+        self.encode()
+    }
+    fn purpose_hello(&self) -> io::Result<Vec<u8>> {
+        self.hello()
+    }
+    fn validate_prepared(&self, prepared: &MetadataPrepared) -> io::Result<()> {
+        self.validate_prepared(prepared)
+    }
+    fn workload_completion(&self) -> Option<(u64, crate::workload::host::MemberKind)> {
+        Some((0, crate::workload::host::MemberKind::CompilerQuery))
+    }
+}
 impl NativeQuery for NativeQueryRequest {
+    fn linker(&self) -> Option<&crate::linker::Request> {
+        match self {
+            Self::Linker(request) => Some(request),
+            _ => None,
+        }
+    }
     fn member(&self) -> &crate::Request {
         match self {
+            Self::Linker(r) => &r.member,
             Self::Metadata(r) => r.member(),
             Self::Resolver(r) => r.member(),
+            Self::Workload(r) => r.member(),
+            Self::Produced(r, _) => &r.member,
         }
     }
     fn validate_request(&self) -> io::Result<()> {
         match self {
+            Self::Linker(r) => r.validate(),
             Self::Metadata(r) => r.validate_request(),
             Self::Resolver(r) => r.validate_request(),
+            Self::Workload(r) => r.validate_request(),
+            Self::Produced(r, _) => r.validate(),
         }
     }
     fn payload(&self) -> io::Result<Vec<u8>> {
         match self {
+            Self::Linker(r) => r.encode(),
             Self::Metadata(r) => r.payload(),
             Self::Resolver(r) => r.payload(),
+            Self::Workload(r) => r.payload(),
+            Self::Produced(r, _) => r.encode(),
         }
     }
     fn purpose_hello(&self) -> io::Result<Vec<u8>> {
         match self {
+            Self::Linker(r) => r.hello(),
             Self::Metadata(r) => r.purpose_hello(),
             Self::Resolver(r) => r.purpose_hello(),
+            Self::Workload(r) => r.purpose_hello(),
+            Self::Produced(r, _) => r.hello(),
         }
     }
     fn validate_prepared(&self, p: &MetadataPrepared) -> io::Result<()> {
         match self {
+            Self::Linker(_) => Err(invalid("linker loan requires its distinct preparation 57")),
             Self::Metadata(r) => r.validate_prepared(p),
             Self::Resolver(r) => r.validate_prepared(p),
+            Self::Workload(r) => r.validate_prepared(p),
+            Self::Produced(_, _) => {
+                Err(invalid("produced output requires its separate mixed-root preparation"))
+            }
+        }
+    }
+    fn produced_prepared(
+        &self,
+        bytes: &[u8],
+    ) -> io::Result<Option<crate::workload::host::produced::ProducedPrepared>> {
+        let Self::Produced(request, ack) = self else {
+            return Ok(None);
+        };
+        if crate::wire::header(bytes, 54).is_err() {
+            return Ok(None);
+        }
+        let prepared = crate::workload::host::produced::ProducedPrepared::decode(bytes, request)?;
+        if prepared.executable != ack.executable || prepared.key != ack.key {
+            return Err(invalid("produced preparation differs from original live registration"));
+        }
+        Ok(Some(prepared))
+    }
+    fn workload_completion(&self) -> Option<(u64, crate::workload::host::MemberKind)> {
+        match self {
+            Self::Workload(r) => r.workload_completion(),
+            Self::Produced(r, _) => Some((r.key.ordinal, r.kind)),
+            _ => None,
+        }
+    }
+    fn output_limit(&self) -> usize {
+        match self {
+            Self::Produced(..) => crate::workload::host::produced::MAX_OUTPUT_BYTES,
+            Self::Linker(_) => crate::linker::MAX_OUTPUT,
+            _ => METADATA_MAX_OUTPUT,
         }
     }
 }
@@ -147,6 +255,9 @@ pub struct MetadataMember {
     poisoned: bool,
     result_delivered: bool,
     failure_observed: bool,
+    // Positive only after StreamReady::Refused AND actual original-pin
+    // validation. A poll io error or cached frame cannot set this predicate.
+    refusal_finalized: bool,
 }
 
 fn invalid(reason: &'static str) -> io::Error {
@@ -169,13 +280,22 @@ fn ordered(request: &impl NativeQuery, descriptions: Vec<OwnedFd>) -> io::Result
         result
             .push(descriptors.remove(&cpu.source).ok_or_else(|| invalid("missing original CPU"))?);
     }
-    let (read, write) = match &request.member().delegations.gnu {
+    let gnu = match &request.member().delegations.gnu {
         GnuTransport::NumericPipe { read, write } | GnuTransport::NamedFifo { read, write, .. } => {
-            (read, write)
+            Some((read, write))
+        }
+        GnuTransport::None
+            if request.linker().is_some()
+                || matches!(
+                    request.member().role,
+                    crate::Role::WorkloadQuery | crate::Role::WorkloadProduced
+                ) =>
+        {
+            None
         }
         GnuTransport::None => return Err(invalid("missing original GNU transport")),
     };
-    for descriptor in [read, write] {
+    for descriptor in gnu.into_iter().flat_map(|(read, write)| [read, write]) {
         result.push(
             descriptors
                 .remove(&descriptor.source)
@@ -210,6 +330,16 @@ impl Client {
     ) -> Result<MetadataMember, MetadataError> {
         self.native_query(&NativeQueryRequest::Resolver(request.clone()), io, deadline)
     }
+    /// Distinct cooperative workload purpose. It borrows the original actual
+    /// CPU description without a GNU token or a resolver-role substitution.
+    pub fn workload_query(
+        &self,
+        request: &crate::workload::host::CompilerQuery,
+        io: MetadataIo,
+        deadline: Instant,
+    ) -> Result<MetadataMember, MetadataError> {
+        self.native_query(&NativeQueryRequest::Workload(request.clone()), io, deadline)
+    }
     fn native_query(
         &self,
         request: &NativeQueryRequest,
@@ -223,7 +353,7 @@ impl Client {
             let host = self.host.connect(deadline)?;
             let mut control = Channel::new(host.stream().try_clone()?)?;
             let (events, target_events) = UnixStream::pair()?;
-            let (output, stdout, stderr) = Capture::new()?;
+            let (output, stdout, stderr) = Capture::with_limit(request.output_limit())?;
             let stdin = File::open("/dev/null")?;
             control.send(&hello, deadline)?;
             if control.receive(deadline)? != [0x50] {
@@ -242,12 +372,14 @@ impl Client {
                         state: Lifecycle::default(),
                         observed: ObservedEvents::default(),
                         cancel_sent: false,
+                        failed: false,
                     },
                     request: request.clone(),
                     _descriptions: descriptions,
                     poisoned: false,
                     result_delivered: false,
                     failure_observed: false,
+                    refusal_finalized: false,
                 },
                 stdin,
                 stdout,
@@ -295,6 +427,12 @@ impl Client {
 }
 
 impl MetadataMember {
+    /// Present only after the negotiated workload terminal, actual output/event
+    /// EOF and original host validation. Missing components remain unobserved;
+    /// no malformed/unknown execution can yield a measured zero.
+    pub fn accounting(&self) -> Option<crate::accounting::Observation> {
+        self.result_delivered.then_some(self.streams.state.accounting).flatten()
+    }
     pub fn started(&self) -> Option<Started> {
         self.streams.state.started
     }
@@ -309,33 +447,82 @@ impl MetadataMember {
     /// stream bytes once. This never reports Completed, exit or retirement;
     /// the caller must still cancel/fail and retire the original native scope.
     pub fn take_failure_observation(&mut self) -> Option<MetadataFailureObservation> {
+        self.take_failure_observation_inner(&mut None)
+    }
+
+    /// Workload-only final bounded drain into the SAME original observer. A
+    /// failed observer is never retried; its already-read prefix remains in
+    /// the returned incomplete observation. This grants no retirement fact.
+    pub fn take_failure_observation_with_observer(
+        &mut self,
+        observer: &mut OutputObserver<'_>,
+    ) -> io::Result<Option<MetadataFailureObservation>> {
+        self.require_workload_observer()?;
+        Ok(self.take_failure_observation_inner(&mut Some(observer)))
+    }
+
+    fn take_failure_observation_inner(
+        &mut self,
+        observer: &mut Option<&mut OutputObserver<'_>>,
+    ) -> Option<MetadataFailureObservation> {
         if self.result_delivered || self.failure_observed {
             return None;
         }
         self.failure_observed = true;
         self.poisoned = true;
-        Some(self.streams.take_failure_observation(&self.request))
+        Some(self.streams.take_failure_observation_inner(&self.request, observer))
     }
 
     /// Bounded nonblocking work except a ready partial event frame, whose
     /// original absolute deadline is capped at250ms. A lost/malformed lifecycle
     /// poisons this execution unit; it never produces a fabricated exit.
     pub fn poll(&mut self, deadline: Instant) -> io::Result<Option<MetadataResult>> {
+        self.poll_observed(deadline, &mut None)
+    }
+
+    /// Observe each actual workload-query stdout/stderr read incrementally,
+    /// after retaining its bounded prefix and overflow fact, before reading
+    /// anything else. Observer errors poison this SAME member; they cannot
+    /// become completion, accounting or permission to replay. Metadata and
+    /// resolver purposes retain their original non-observing API unchanged.
+    pub fn poll_with_observer(
+        &mut self,
+        deadline: Instant,
+        observer: &mut OutputObserver<'_>,
+    ) -> io::Result<Option<MetadataResult>> {
+        self.require_workload_observer()?;
+        self.poll_observed(deadline, &mut Some(observer))
+    }
+
+    fn require_workload_observer(&self) -> io::Result<()> {
+        require_workload_observer(&self.request)
+    }
+
+    fn poll_observed(
+        &mut self,
+        deadline: Instant,
+        observer: &mut Option<&mut OutputObserver<'_>>,
+    ) -> io::Result<Option<MetadataResult>> {
         if self.poisoned {
             return Err(invalid("metadata lifecycle is unusable; never replay"));
         }
-        let result = self.poll_inner(deadline);
+        let result = self.poll_inner(deadline, observer);
         if result.is_err() {
             self.poisoned = true;
         }
         result
     }
 
-    fn poll_inner(&mut self, deadline: Instant) -> io::Result<Option<MetadataResult>> {
-        match self.streams.poll(&self.request, deadline)? {
+    fn poll_inner(
+        &mut self,
+        deadline: Instant,
+        observer: &mut Option<&mut OutputObserver<'_>>,
+    ) -> io::Result<Option<MetadataResult>> {
+        match self.streams.poll_inner(&self.request, deadline, observer)? {
             StreamReady::Pending => Ok(None),
             StreamReady::Refused => {
                 self.pin.validate(deadline)?;
+                self.refusal_finalized = true;
                 Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     format!(
@@ -368,6 +555,17 @@ impl MetadataMember {
     }
 }
 
+fn require_workload_observer(request: &NativeQueryRequest) -> io::Result<()> {
+    if matches!(request, NativeQueryRequest::Workload(_) | NativeQueryRequest::Produced(..)) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "incremental output observation requires a distinct workload purpose",
+        ))
+    }
+}
+
 #[derive(Default)]
 struct ObservedEvents {
     prefix: Vec<u8>,
@@ -393,6 +591,9 @@ struct MetadataStreams {
     state: Lifecycle,
     observed: ObservedEvents,
     cancel_sent: bool,
+    // Permanent protocol/capture failure history, independent of a retained
+    // earlier terminal. Final diagnostic draining never clears this veto.
+    failed: bool,
 }
 impl MetadataStreams {
     fn cancel(&mut self, request: &impl NativeQuery, deadline: Instant) -> io::Result<()> {
@@ -412,11 +613,37 @@ impl MetadataStreams {
         )
     }
 
+    #[cfg(test)]
     fn poll(&mut self, request: &impl NativeQuery, deadline: Instant) -> io::Result<StreamReady> {
+        self.poll_inner(request, deadline, &mut None)
+    }
+
+    fn poll_inner(
+        &mut self,
+        request: &impl NativeQuery,
+        deadline: Instant,
+        observer: &mut Option<&mut OutputObserver<'_>>,
+    ) -> io::Result<StreamReady> {
+        if self.failed {
+            return Err(invalid("native stream has an earlier protocol/capture failure"));
+        }
+        let outcome = self.poll_checked(request, deadline, observer);
+        if outcome.is_err() {
+            self.failed = true;
+        }
+        outcome
+    }
+
+    fn poll_checked(
+        &mut self,
+        request: &impl NativeQuery,
+        deadline: Instant,
+        observer: &mut Option<&mut OutputObserver<'_>>,
+    ) -> io::Result<StreamReady> {
         if Instant::now() >= deadline {
             return Err(io::ErrorKind::TimedOut.into());
         }
-        self.output.drain()?;
+        self.output.drain_observed(observer)?;
         if self.output.exceeded {
             self.cancel(request, deadline)?;
         }
@@ -435,22 +662,64 @@ impl MetadataStreams {
             let observed = &mut self.observed;
             let bytes =
                 self.events.receive_observed(frame_deadline, |bytes| observed.record(bytes))?;
-            let event = MetadataEvent::decode(
-                &bytes,
-                request.member().binding.root_attempt,
-                request.member().member_attempt,
-            )?;
+            let root = request.member().binding.root_attempt;
+            let member = request.member().member_attempt;
+            if let Some(loan) = request.linker()
+                && crate::wire::header(&bytes, crate::linker::PREPARED_TAG).is_ok()
+            {
+                self.state.accept_linker(crate::linker::Prepared::decode(&bytes, loan)?)?;
+                continue;
+            }
+            if let Some(prepared) = request.produced_prepared(&bytes)? {
+                self.state.accept_produced(prepared)?;
+                continue;
+            }
+            let event = if let Some(loan) = request.linker() {
+                if let Ok(completion) = crate::linker::Completion::decode(&bytes, loan) {
+                    self.state.accounting = Some(completion.observation);
+                    self.state.linker_completed = Some(completion.clone());
+                    MetadataEvent::Completed(completion.completed)
+                } else {
+                    let event = MetadataEvent::decode(&bytes, root, member)?;
+                    if matches!(event, MetadataEvent::Completed(_) | MetadataEvent::Prepared(_)) {
+                        return Err(invalid(
+                            "linker loan requires distinct preparation/retirement",
+                        ));
+                    }
+                    event
+                }
+            } else if let Some((phase, kind)) = request.workload_completion() {
+                use crate::workload::host::Completion;
+                if let Ok(completion) = Completion::decode(&bytes, root, member) {
+                    if completion.phase != phase || completion.kind != kind {
+                        return Err(invalid("workload completion purpose or phase differs"));
+                    }
+                    self.state.accounting = Some(completion.observation);
+                    self.state.workload = Some(completion.clone());
+                    MetadataEvent::Completed(completion.completed)
+                } else {
+                    let event = MetadataEvent::decode(&bytes, root, member)?;
+                    if matches!(event, MetadataEvent::Completed(_)) {
+                        return Err(invalid(
+                            "workload member requires original owning-wait accounting",
+                        ));
+                    }
+                    event
+                }
+            } else {
+                MetadataEvent::decode(&bytes, root, member)?
+            };
             self.state.accept(event, request)?;
         }
         if self.state.refused.is_some() {
-            self.output.drain()?;
+            self.output.drain_observed(observer)?;
             if !self.output.eof.iter().all(|eof| *eof) || !self.events.at_eof()? {
                 return Ok(StreamReady::Pending);
             }
             return Ok(StreamReady::Refused);
         }
         if self.state.completed.is_some() {
-            self.output.drain()?;
+            self.output.drain_observed(observer)?;
             if !self.output.eof.iter().all(|eof| *eof) || !self.events.at_eof()? {
                 return Ok(StreamReady::Pending);
             }
@@ -458,11 +727,20 @@ impl MetadataStreams {
         }
         Ok(StreamReady::Pending)
     }
+    #[cfg(test)]
     fn take_failure_observation(
         &mut self,
         request: &impl NativeQuery,
     ) -> MetadataFailureObservation {
-        let capture_error = self.output.drain().err().map(|e| e.to_string());
+        self.take_failure_observation_inner(request, &mut None)
+    }
+
+    fn take_failure_observation_inner(
+        &mut self,
+        request: &impl NativeQuery,
+        observer: &mut Option<&mut OutputObserver<'_>>,
+    ) -> MetadataFailureObservation {
+        let capture_error = self.output.drain_observed(observer).err().map(|e| e.to_string());
         MetadataFailureObservation {
             root_attempt: request.member().binding.root_attempt,
             member_attempt: request.member().member_attempt,
@@ -482,11 +760,58 @@ impl MetadataStreams {
 struct Lifecycle {
     attached: bool,
     prepared: Option<MetadataPrepared>,
+    produced: Option<crate::workload::host::produced::ProducedPrepared>,
+    linker: Option<crate::linker::Prepared>,
+    linker_completed: Option<crate::linker::Completion>,
     started: Option<Started>,
     completed: Option<MetadataCompletion>,
     refused: Option<String>,
+    // Retain the exact authenticated binding/status independently of a poll
+    // io error. ErrorKind alone must never establish positive refusal.
+    refused_frame: Option<StatusFrame>,
+    accounting: Option<crate::accounting::Observation>,
+    workload: Option<crate::workload::host::Completion>,
 }
 impl Lifecycle {
+    fn accept_linker(&mut self, prepared: crate::linker::Prepared) -> io::Result<()> {
+        let (host, boot) = process::host_boot()?;
+        if !self.attached
+            || self.prepared.is_some()
+            || self.produced.is_some()
+            || self.linker.is_some()
+            || self.started.is_some()
+            || self.completed.is_some()
+            || self.refused.is_some()
+            || prepared.host != host
+            || prepared.boot != boot
+            || prepared.policy != program::RUNTIME_POLICY
+            || prepared.scope != program::INPUT_SCOPE
+        {
+            return Err(invalid("linker preparation ordering or original input profile differs"));
+        }
+        self.linker = Some(prepared);
+        Ok(())
+    }
+    fn accept_produced(
+        &mut self,
+        prepared: crate::workload::host::produced::ProducedPrepared,
+    ) -> io::Result<()> {
+        let (host, boot) = process::host_boot()?;
+        if !self.attached
+            || self.prepared.is_some()
+            || self.produced.is_some()
+            || self.linker.is_some()
+            || self.started.is_some()
+            || self.completed.is_some()
+            || self.refused.is_some()
+            || prepared.host != host
+            || prepared.boot != boot
+        {
+            return Err(invalid("produced preparation ordering or original host differs"));
+        }
+        self.produced = Some(prepared);
+        Ok(())
+    }
     fn accept(&mut self, event: MetadataEvent, request: &impl NativeQuery) -> io::Result<()> {
         if self.completed.is_some() || self.refused.is_some() {
             return Err(invalid("event after metadata terminal"));
@@ -497,6 +822,8 @@ impl Lifecycle {
                 let (host, boot) = process::host_boot()?;
                 if !self.attached
                     || self.prepared.is_some()
+                    || self.produced.is_some()
+                    || self.linker.is_some()
                     || self.started.is_some()
                     || prepared.policy != program::RUNTIME_POLICY
                     || prepared.scope != program::INPUT_SCOPE
@@ -508,15 +835,41 @@ impl Lifecycle {
                 self.prepared = Some(prepared);
             }
             MetadataEvent::Status(frame) => match frame.status {
-                Status::Attached if !self.attached && self.prepared.is_none() => {
+                Status::Attached
+                    if !self.attached
+                        && self.prepared.is_none()
+                        && self.produced.is_none()
+                        && self.linker.is_none() =>
+                {
                     self.attached = true
                 }
                 Status::Started(started)
-                    if self.attached && self.prepared.is_some() && self.started.is_none() =>
+                    if self.attached
+                        && (self.prepared.is_some()
+                            || self.produced.is_some()
+                            || self.linker.is_some())
+                        && self.started.is_none() =>
                 {
+                    if self
+                        .produced
+                        .as_ref()
+                        .is_some_and(|prepared| prepared.identity != started.identity)
+                    {
+                        return Err(invalid(
+                            "produced Started is not its original suspended child",
+                        ));
+                    }
+                    if self.linker.as_ref().is_some_and(|p| p.identity != started.identity) {
+                        return Err(invalid(
+                            "linker Started differs from original suspended child",
+                        ));
+                    }
                     self.started = Some(started)
                 }
-                Status::Refused { reason } if self.started.is_none() => self.refused = Some(reason),
+                Status::Refused { ref reason } if self.started.is_none() => {
+                    self.refused = Some(reason.clone());
+                    self.refused_frame = Some(frame);
+                }
                 _ => {
                     return Err(invalid(
                         "metadata lifecycle missing, duplicate, unknown or contradictory",
@@ -539,9 +892,23 @@ struct Capture {
     bytes: [Vec<u8>; 2],
     eof: [bool; 2],
     exceeded: bool,
+    observer_failed: bool,
+    limit: usize,
 }
 impl Capture {
+    #[cfg(test)]
     fn new() -> io::Result<(Self, std::io::PipeWriter, std::io::PipeWriter)> {
+        Self::with_limit(METADATA_MAX_OUTPUT)
+    }
+    fn with_limit(limit: usize) -> io::Result<(Self, std::io::PipeWriter, std::io::PipeWriter)> {
+        if !matches!(
+            limit,
+            METADATA_MAX_OUTPUT
+                | crate::workload::host::produced::MAX_OUTPUT_BYTES
+                | crate::linker::MAX_OUTPUT
+        ) {
+            return Err(invalid("unsupported native capture profile"));
+        }
         let (stdout, target_stdout) = io::pipe()?;
         let (stderr, target_stderr) = io::pipe()?;
         for pipe in [&stdout, &stderr] {
@@ -560,12 +927,24 @@ impl Capture {
                 bytes: Default::default(),
                 eof: [false; 2],
                 exceeded: false,
+                observer_failed: false,
+                limit,
             },
             target_stdout,
             target_stderr,
         ))
     }
+    #[cfg(test)]
     fn drain(&mut self) -> io::Result<()> {
+        self.drain_observed(&mut None)
+    }
+
+    fn drain_observed(&mut self, observer: &mut Option<&mut OutputObserver<'_>>) -> io::Result<()> {
+        if self.observer_failed {
+            return Err(io::Error::other(
+                "workload output observer failed; retained stream prefix is incomplete",
+            ));
+        }
         let mut buffer = [0; 4096];
         for index in 0..2 {
             for _ in 0..16 {
@@ -575,10 +954,21 @@ impl Capture {
                         break;
                     }
                     Ok(count) => {
-                        let available = METADATA_MAX_OUTPUT
-                            .saturating_sub(self.bytes[0].len() + self.bytes[1].len());
+                        let available =
+                            self.limit.saturating_sub(self.bytes[0].len() + self.bytes[1].len());
                         self.bytes[index].extend_from_slice(&buffer[..count.min(available)]);
                         self.exceeded |= count > available;
+                        if let Some(observer) = observer.as_mut() {
+                            let stream = match index {
+                                0 => MetadataOutputStream::Stdout,
+                                _ => MetadataOutputStream::Stderr,
+                            };
+                            // Arm before calling user code: even a caught
+                            // unwind cannot resume reads or complete capture.
+                            self.observer_failed = true;
+                            observer(stream, &buffer[..count])?;
+                            self.observer_failed = false;
+                        }
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,

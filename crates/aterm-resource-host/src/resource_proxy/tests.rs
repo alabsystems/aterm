@@ -34,6 +34,19 @@ fn only_exact_entry_may_touch_private_descriptors() {
             assert!(entry(&args, &mut Never).is_none());
         }
     }
+    let fds = wire::WorkloadHelperFds {
+        transport: wire::HelperFds {
+            control: 11,
+            producer: 12,
+        },
+        store: 13,
+    };
+    let mut extra = fds.arguments().unwrap();
+    extra.push("extra".into());
+    assert_eq!(entry(&extra, &mut Never), Some(ExitCode::from(75)));
+    let mut alias = fds.arguments().unwrap();
+    alias[4] = "--store-fd=11".into();
+    assert_eq!(entry(&alias, &mut Never), Some(ExitCode::from(75)));
 }
 #[test]
 fn actual_terminal_mapping_keeps_target_outcome_separate_from_helper_health() {

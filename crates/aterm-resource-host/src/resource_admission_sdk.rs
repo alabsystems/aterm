@@ -27,7 +27,9 @@ pub(super) struct Keeper {
     ready_before: std::fs::Metadata,
     execution: PathBuf,
     build: u64,
-    held: trust_resource_provenance::program::HeldProgram,
+    held: Arc<trust_resource_provenance::program::HeldProgram>,
+    workload_compiler: std::sync::OnceLock<Arc<trust_resource_provenance::program::HeldProgram>>,
+    workload_linker: std::sync::OnceLock<Arc<trust_resource_provenance::program::HeldProgram>>,
 }
 fn stamp(meta: &std::fs::Metadata) -> (u64, u64, u64, u32, u32, i64, i64, i64, i64) {
     (
@@ -70,6 +72,29 @@ fn current(path: &std::path::Path, file: &File, before: &std::fs::Metadata) -> i
     Ok(())
 }
 impl Keeper {
+    pub(super) fn execution(&self) -> &std::path::Path {
+        &self.execution
+    }
+    pub(super) fn build(&self) -> u64 {
+        self.build
+    }
+    pub(super) fn lease_path(&self) -> &std::path::Path {
+        self.lease.path()
+    }
+    pub(super) fn original_inputs(&self) -> Arc<trust_resource_provenance::program::HeldProgram> {
+        Arc::clone(&self.held)
+    }
+    pub(super) fn program_sha256(&self) -> io::Result<[u8; 32]> {
+        self.validate()?;
+        let mut digest = [0; 32];
+        if !aterm_codec::hex::decode_into(
+            self.held.observation().executable.sha256.as_bytes(),
+            &mut digest,
+        ) {
+            return Err(refused("original managed SDK digest is malformed"));
+        }
+        Ok(digest)
+    }
     pub(super) fn resolver_compiler(&self) -> PathBuf {
         self.execution.join("bin/trustc")
     }
@@ -81,6 +106,101 @@ impl Keeper {
             deadline,
         )?;
         self.validate()
+    }
+    pub(super) fn require_workload_protocol(&self, deadline: Instant) -> io::Result<()> {
+        self.validate()?;
+        self.held.require_workload_protocol_marker(
+            &trust_resource_controller::workload::WORKLOAD_PROTOCOL_MARKER,
+            deadline,
+        )?;
+        self.validate()
+    }
+    fn capture_workload_program(
+        &self,
+        name: &str,
+        deadline: Instant,
+    ) -> io::Result<Arc<trust_resource_provenance::program::HeldProgram>> {
+        self.validate()?;
+        let program = self.execution.join("bin").join(name);
+        let (file, before) = open(&program)?;
+        if before.len() > 1024 * 1024 * 1024 {
+            return Err(refused(
+                "workload compiler image exceeds native input bound",
+            ));
+        }
+        use std::os::unix::fs::FileExt as _;
+        let mut hash = aterm_digest::Sha256::new();
+        let mut bytes = [0u8; 65536];
+        let mut offset = 0;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            let count = file.read_at(&mut bytes, offset)?;
+            if count == 0 {
+                break;
+            }
+            offset += count as u64;
+            if offset > before.len() {
+                return Err(refused("workload compiler grew during capture"));
+            }
+            hash.update(&bytes[..count]);
+        }
+        if offset != before.len() {
+            return Err(refused("workload compiler changed during capture"));
+        }
+        current(&program, &file, &before)?;
+        let held = trust_resource_provenance::program::HeldProgram::open(
+            &self.execution,
+            &program,
+            &hash.finalize(),
+            deadline,
+        )?;
+        current(&program, &file, &before)?;
+        self.validate()?;
+        Ok(Arc::new(held))
+    }
+    pub(super) fn capture_workload_compiler(&self, deadline: Instant) -> io::Result<()> {
+        if self.workload_compiler.get().is_some() || self.workload_linker.get().is_some() {
+            return Err(refused("workload compiler/linker inputs already captured"));
+        }
+        let held = self.capture_workload_program("trustc", deadline)?;
+        held.require_workload_member_protocol_marker(
+            &trust_resource_controller::workload::WORKLOAD_MEMBER_PROTOCOL_MARKER,
+            deadline,
+        )?;
+        let linker = self.capture_workload_program("rust-lld", deadline)?;
+        self.workload_compiler
+            .set(held)
+            .map_err(|_| refused("workload compiler capture raced"))?;
+        self.workload_linker
+            .set(linker)
+            .map_err(|_| refused("workload linker capture raced"))?;
+        self.validate()
+    }
+    pub(super) fn workload_linker(
+        &self,
+        deadline: Instant,
+    ) -> io::Result<Arc<trust_resource_provenance::program::HeldProgram>> {
+        self.validate()?;
+        let held = self
+            .workload_linker
+            .get()
+            .ok_or_else(|| refused("original workload linker not captured before GO"))?;
+        held.validate(deadline)?;
+        Ok(Arc::clone(held))
+    }
+    pub(super) fn workload_compiler(
+        &self,
+        deadline: Instant,
+    ) -> io::Result<Arc<trust_resource_provenance::program::HeldProgram>> {
+        self.validate()?;
+        let held = self
+            .workload_compiler
+            .get()
+            .ok_or_else(|| refused("original workload compiler not captured before GO"))?;
+        held.validate(deadline)?;
+        Ok(Arc::clone(held))
     }
 
     pub(super) fn capture(
@@ -165,7 +285,9 @@ impl Keeper {
             ready_before,
             execution,
             build,
-            held,
+            held: Arc::new(held),
+            workload_compiler: std::sync::OnceLock::new(),
+            workload_linker: std::sync::OnceLock::new(),
         };
         result.validate()?;
         if !atpkg::store::build_is_complete(&subject.path(layout)) {
@@ -183,7 +305,14 @@ impl Keeper {
         self.lease.check_current()?;
         current(&self.program_path, &self.program, &self.program_before)?;
         current(&self.ready_path, &self.ready, &self.ready_before)?;
-        native_inputs::validate(&self.held, started)
+        native_inputs::validate(&self.held, started)?;
+        if let Some(compiler) = self.workload_compiler.get() {
+            native_inputs::validate(compiler, started)?;
+        }
+        if let Some(linker) = self.workload_linker.get() {
+            native_inputs::validate(linker, started)?;
+        }
+        Ok(())
     }
     pub(super) fn runtime_environment(
         &self,

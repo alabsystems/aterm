@@ -4685,6 +4685,12 @@ const NO_HANDOFF_WRITES: &[(&str, &str)] = &[
     // immutable desks continue to hold the reader to those bytes (tests/fixtures/handoff/README.md).
     ("layout", "AgentRestore.gemini"),
     ("layout", "NativeLeafRestore.metadata"),
+    // Retired with aterm's own notices: the newest recorded release wrote it, so the hold wants
+    // it named here until a release's `fields.toml` omits it. The first one recorded after the
+    // field went does; this row then answers "listed, but no desk reaches it" and
+    // generate_handoff_fixtures fails: remove it then. Older metas keep the field; the reader
+    // skips it.
+    ("meta", "OutputStateRepr.program_state_began"),
     ("meta", "ColorRepr.stack"),
     ("meta", "CursorStyle::Hidden"),
     ("meta", "CursorStyle::HollowBlock"),

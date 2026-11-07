@@ -42,6 +42,7 @@ fn transcript_usage_rejects_answers_before_the_process_started() {
                     pct: 89,
                     reset: Some(ACCT_NOW + 3600),
                 }),
+                week: None,
             }
         };
         let read = UsageRead {
@@ -127,6 +128,7 @@ fn transcript_usage_and_walls_admit_the_captured_source_at_the_writer() {
                         pct: 89,
                         reset: Some(ACCT_NOW + 3600),
                     }),
+                    week: None,
                 }
             };
             let read = UsageRead {

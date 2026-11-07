@@ -117,9 +117,9 @@ pub(super) fn write_fresh_token(path: &Path, token: &str) -> Option<()> {
     f.flush().ok()
 }
 
-/// How long [`SocketOwner::hold`] waits out another launch's probe, which holds a free lock only
-/// from its `try_lock` to its `unlock`.
-const SOCKET_OWNER_PATIENCE: std::time::Duration = std::time::Duration::from_millis(100);
+/// A minute hang detector for another launch's ownership probe to release its temporary lock.
+/// A descheduled probe must not discard the serving instance's ownership evidence.
+const SOCKET_OWNER_HANG: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// This instance's hold on its control socket while it serves it: the `flock` on the socket's
 /// token file, which [`socket_is_live`](super::socket_is_live) probes. A stopped or unscheduled
@@ -135,13 +135,31 @@ impl SocketOwner {
     /// cannot be taken (a filesystem with no `flock`), which leaves the socket judged by a connect
     /// alone.
     pub(crate) fn hold(token_path: &Path) -> Option<Self> {
-        use crate::native_document_host::{AdvisoryLockRefusal, acquire_advisory_lock_within};
+        Self::hold_at(
+            token_path,
+            std::time::Instant::now(),
+            crate::native_document_host::acquire_advisory_lock_within,
+        )
+    }
+
+    fn hold_at(
+        token_path: &Path,
+        started: std::time::Instant,
+        acquire: impl FnOnce(
+            std::fs::File,
+            std::time::Duration,
+        ) -> Result<
+            crate::native_document_host::HeldAdvisoryLock,
+            crate::native_document_host::AdvisoryLockRefusal,
+        >,
+    ) -> Option<Self> {
+        use crate::native_document_host::AdvisoryLockRefusal;
         let taken = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
             .open(token_path)
             .map_err(AdvisoryLockRefusal::Failed)
-            .and_then(|file| acquire_advisory_lock_within(file, SOCKET_OWNER_PATIENCE));
+            .and_then(|file| acquire(file, SOCKET_OWNER_HANG.saturating_sub(started.elapsed())));
         let why = match taken {
             Ok(held) => return Some(Self { _held: held }),
             Err(AdvisoryLockRefusal::Busy) => "another holder".to_string(),
@@ -193,6 +211,61 @@ pub(super) fn peer_verdict(peer: Option<u32>, our_uid: u32) -> Result<(), String
     match peer {
         Some(uid) if uid == our_uid => Ok(()),
         other => Err(format!("connect (peer uid {other:?} != {our_uid})")),
+    }
+}
+
+#[cfg(test)]
+mod socket_owner_tests {
+    use super::*;
+    use crate::native_document_host::{
+        AdvisoryLockRefusal, HeldAdvisoryLock, acquire_advisory_lock_within,
+    };
+    use std::fs::File;
+    use std::time::{Duration, Instant};
+
+    fn token() -> (aterm_tempfile::TempDir, std::path::PathBuf) {
+        let dir = crate::test_scratch::short_dir("socket owner scheduling");
+        let path = dir.path().join("fixture.token");
+        assert!(write_fresh_token(&path, &"0".repeat(64)).is_some());
+        (dir, path)
+    }
+
+    fn release_after_contention(
+        file: File,
+        left: Duration,
+        probe: HeldAdvisoryLock,
+    ) -> Result<HeldAdvisoryLock, AdvisoryLockRefusal> {
+        let (file, refusal) = HeldAdvisoryLock::try_lock_keeping(file)
+            .expect_err("the first observation must see the competing native probe");
+        assert!(matches!(refusal, std::fs::TryLockError::WouldBlock));
+        if left.is_zero() {
+            return Err(AdvisoryLockRefusal::Busy);
+        }
+        drop(probe);
+        acquire_advisory_lock_within(file, left)
+    }
+
+    #[test]
+    fn startup_can_follow_a_delayed_probe_but_still_has_a_hang_detector() {
+        let (_dir, path) = token();
+        for (elapsed, expected) in [
+            (Duration::from_millis(200), true),
+            (Duration::from_secs(61), false),
+        ] {
+            let probe = HeldAdvisoryLock::lock(File::open(&path).unwrap()).unwrap();
+            let held = SocketOwner::hold_at(&path, Instant::now() - elapsed, |file, left| {
+                release_after_contention(file, left, probe)
+            });
+            assert_eq!(held.is_some(), expected, "elapsed={elapsed:?}");
+            if held.is_some() {
+                assert_eq!(
+                    aterm_uds::ownerlock::probe(&path),
+                    aterm_uds::ownerlock::Owner::Live
+                );
+            }
+            drop(held);
+            assert!(SocketOwner::hold(&path).is_some());
+        }
     }
 }
 

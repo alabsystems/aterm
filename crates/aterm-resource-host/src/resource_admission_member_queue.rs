@@ -8,7 +8,10 @@ use crate::subgroup_delegation::Prepared;
 use aterm_ctl::resource_subgroup_client::{AuthorizedSubgroup, Delegations, Rights};
 use aterm_types::resource_admission::Event;
 use aterm_types::resource_subgroup::Request;
-use std::os::{fd::OwnedFd, unix::ffi::OsStrExt as _};
+use std::os::{
+    fd::{AsFd as _, OwnedFd},
+    unix::ffi::OsStrExt as _,
+};
 
 enum Purpose {
     Member {
@@ -19,6 +22,7 @@ enum Purpose {
         edge: parent_loan::Edge,
         accounted: bool,
     },
+    Linker(Box<trust_resource_controller::linker::Request>),
 }
 #[derive(Default)]
 pub(super) struct ProxyMode {
@@ -40,6 +44,7 @@ struct Pending {
     timeout: Option<Duration>,
     named_targets: Option<[u32; 2]>,
     loan: Option<parent_loan::Edge>,
+    linker: Option<trust_resource_controller::linker::Request>,
 }
 struct Preparing {
     // Declaration order joins the worker before returning any paid scheduling
@@ -54,6 +59,7 @@ struct Active {
     peer: Peer,
     proof: Option<crate::resource_producer::TransportProof>,
     cpu: Option<u32>,
+    cpu_target: Option<u32>,
     loan: Option<parent_loan::Edge>,
     sdk: Option<trust_resource_controller::SdkCustody>,
     bound: bool,
@@ -63,10 +69,14 @@ struct Active {
     drained: bool,
 }
 enum State {
+    Produced(Box<workload::ProducedMember>),
     Pending(Box<Pending>),
     Preparing(Box<Preparing>),
     Active(Box<Active>),
-    Refused { events: job::Events, settled: bool },
+    Refused {
+        events: Box<job::Events>,
+        settled: bool,
+    },
     Vacant,
 }
 pub(super) struct Slot {
@@ -75,6 +85,31 @@ pub(super) struct Slot {
     state: State,
 }
 impl Slot {
+    pub(super) fn produced(binding: Binding, member: workload::ProducedMember) -> Self {
+        Self {
+            binding,
+            units: 0,
+            state: State::Produced(Box::new(member)),
+        }
+    }
+    pub(super) fn is_produced(&self) -> bool {
+        matches!(self.state, State::Produced(_))
+    }
+    pub(super) fn workload_primary(&mut self, peer: Peer) -> Option<(u32, u32)> {
+        match &mut self.state {
+            State::Active(active) => {
+                if !active.retired
+                    && active.attempt.identity() == Some((peer.pid, peer.birth))
+                    && active.attempt.covers(peer)
+                {
+                    Some((active.cpu?, active.cpu_target?))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
     pub(super) fn loan_parent(&mut self, peer: Peer, edge: parent_loan::Edge) -> bool {
         self.binding.attempt == edge.parent
             && match &mut self.state {
@@ -96,12 +131,14 @@ impl Slot {
     }
     pub(super) fn covers(&mut self, peer: Peer) -> bool {
         match &mut self.state {
+            State::Produced(member) => member.covers(peer),
             State::Active(active) => active.attempt.covers(peer),
             _ => false,
         }
     }
     pub(super) fn group(&self) -> Option<i32> {
         match &self.state {
+            State::Produced(member) => member.group(),
             State::Active(active) => active.attempt.group(),
             _ => None,
         }
@@ -129,6 +166,9 @@ impl Slot {
         }
     }
     pub(super) fn subject(&self) -> Option<aterm_types::resource_inspection::Subject> {
+        if let State::Produced(member) = &self.state {
+            return member.subject();
+        }
         let State::Active(active) = &self.state else {
             return None;
         };
@@ -151,6 +191,17 @@ impl member::MemberResources for Prepared {
     }
 }
 impl Owner {
+    pub(in super::super) fn submit_linker(&mut self, incoming: crate::linker_transport::Incoming) {
+        let timeout = incoming.sealed.member.timeout_ns.map(Duration::from_nanos);
+        self.submit_member_inner(
+            incoming.subgroup,
+            Purpose::Linker(Box::new(incoming.sealed)),
+            None,
+            None,
+            timeout,
+            None,
+        );
+    }
     pub(in super::super) fn submit_member(&mut self, incoming: AuthorizedSubgroup) {
         let timeout = incoming
             .request
@@ -187,6 +238,20 @@ impl Owner {
             None,
         );
     }
+    pub(in super::super) fn submit_workload_query(
+        &mut self,
+        incoming: crate::workload_transport::Incoming,
+    ) {
+        let timeout = incoming.sealed.member.timeout_ns.map(Duration::from_nanos);
+        self.submit_member_inner(
+            incoming.subgroup,
+            Purpose::Sealed(Box::new(metadata::Purpose::WorkloadQuery(incoming.sealed))),
+            None,
+            None,
+            timeout,
+            None,
+        );
+    }
     pub(super) fn submit_member_proved(
         &mut self,
         incoming: AuthorizedSubgroup,
@@ -216,10 +281,21 @@ impl Owner {
         timeout: Option<Duration>,
         named_targets: Option<[u32; 2]>,
     ) {
-        let (sealed, loan, accounted) = match purpose {
-            Purpose::Member { accounted } => (None, None, accounted),
-            Purpose::Sealed(sealed) => (Some(*sealed), None, false),
-            Purpose::Loan { edge, accounted } => (None, Some(edge), accounted),
+        let (sealed, loan, accounted, linker) = match purpose {
+            Purpose::Member { accounted } => (None, None, accounted, None),
+            Purpose::Sealed(sealed) => (Some(*sealed), None, false, None),
+            Purpose::Loan { edge, accounted } => (None, Some(edge), accounted, None),
+            Purpose::Linker(request) => {
+                let Ok(loan) = request.loan() else {
+                    return;
+                };
+                (
+                    None,
+                    Some(parent_loan::Edge::of(loan, request.member.member_attempt)),
+                    false,
+                    Some(*request),
+                )
+            }
         };
         // A replay receives no new no-child claim or implicit permission to retry.
         if !matches!(
@@ -233,8 +309,18 @@ impl Owner {
                 if let Some(purpose) = &sealed {
                     purpose.authorize(&mut check);
                 }
+                check.linker = linker.clone();
                 self.authorize_member(&check)
-            });
+            }) && !(sealed.is_none()
+                && linker.is_none()
+                && proof.is_none()
+                && self
+                    .jobs
+                    .get(&(
+                        incoming.request.job.session.clone(),
+                        incoming.request.job.attempt,
+                    ))
+                    .is_some_and(|job| job.workload.is_some()));
         let AuthorizedSubgroup {
             request,
             peer,
@@ -253,8 +339,22 @@ impl Owner {
         if accounted && events.account().is_err() {
             return;
         }
+        if let Some(linker) = &linker
+            && events.linker(linker).is_err()
+        {
+            return;
+        }
         if let Some(sealed) = &sealed {
-            events.metadata(sealed.member().binding.root_attempt);
+            if matches!(sealed, metadata::Purpose::WorkloadQuery(_)) {
+                if events
+                    .workload(sealed.member().binding.root_attempt)
+                    .is_err()
+                {
+                    return;
+                }
+            } else {
+                events.metadata(sealed.member().binding.root_attempt);
+            }
         }
         if !accepted {
             let _ = events.emit(Event::Refused {
@@ -273,8 +373,33 @@ impl Owner {
         let _ = events.emit(Event::Queued);
         let root = (request.job.session.clone(), request.job.attempt);
         if let Some(job) = self.jobs.get_mut(&root) {
+            if let Some(workload) = job.workload.as_mut() {
+                let kind = if matches!(&sealed, Some(metadata::Purpose::WorkloadQuery(_))) {
+                    workload::CensusKind::Query
+                } else if loan.is_some() {
+                    workload::CensusKind::Linker
+                } else {
+                    workload::CensusKind::Compiler
+                };
+                if workload.register(binding.attempt, kind).is_err() {
+                    self.faulted = true;
+                    let _ = self.journal.settle(&binding); // Lexical no ARM or downstream delivery.
+                    let _ = events.emit(Event::Refused {
+                        reason: "workload census refused before ARM".into(),
+                    });
+                    return;
+                }
+                // Legacy Role1/4 wire remains byte-for-byte unchanged; the new
+                // workload census independently retains the SAME owning wait.
+                events.observe_accounting();
+            }
             if matches!(&sealed, Some(metadata::Purpose::Resolver(_))) {
                 job.resolver_queries += 1;
+            }
+            if matches!(&sealed, Some(metadata::Purpose::WorkloadQuery(_)))
+                && let Some(state) = job.workload.as_mut()
+            {
+                state.queries += 1;
             }
             job.members.insert(
                 binding.attempt,
@@ -295,6 +420,7 @@ impl Owner {
                         timeout,
                         named_targets,
                         loan,
+                        linker,
                     })),
                 },
             );
@@ -336,12 +462,25 @@ impl Owner {
     ) -> bool {
         let state = std::mem::replace(&mut slot.state, State::Vacant);
         slot.state = match state {
+            State::Produced(mut member) => {
+                match member.tick(self, job, self.faulted) {
+                    Ok(true) => return true,
+                    Ok(false) => {}
+                    Err(_) => {
+                        self.faulted = true;
+                        job.cause = CompletionCause::ResourceLimit;
+                        job.cleanup_at.get_or_insert_with(Instant::now);
+                    }
+                }
+                State::Produced(member)
+            }
             State::Pending(mut pending) => {
                 let allowed = members::Authorization::of(&pending.request, pending.peer).is_ok_and(
                     |mut check| {
                         if let Some(purpose) = &pending.sealed {
                             purpose.authorize(&mut check);
                         }
+                        check.linker = pending.linker.clone();
                         members::live(&self.fence, &self.debt, job, &check)
                     },
                 );
@@ -352,14 +491,53 @@ impl Owner {
                 if !allowed || !proof_valid || pending.events.cancelled() || self.faulted {
                     refuse_pending(*pending, "member cancelled or original coverage lost")
                 } else {
-                    match Prepared::try_new_mapped(
-                        &self.pool,
-                        &self.debt,
-                        self.pool.slots().get(),
-                        &pending.request,
-                        &pending.delegated,
-                        pending.named_targets,
-                    ) {
+                    let scheduling = if let Some(workload) = &mut job.workload {
+                        let deadline = job
+                            .timeout
+                            .map(|timeout| job.started + timeout)
+                            .unwrap_or_else(Instant::now);
+                        pending
+                            .delegated
+                            .cpu
+                            .as_ref()
+                            .ok_or_else(|| refused("workload member has no original CPU"))
+                            .and_then(|offered| {
+                                if pending.loan.is_some() {
+                                    // A linker is the explicit parked compiler's
+                                    // SAME continuation, never another bank loan.
+                                    workload.primary.original_for(offered.as_fd()).map(Some)
+                                } else {
+                                    workload.member_original(
+                                        pending.request.member.binding.attempt,
+                                        offered.as_fd(),
+                                        deadline,
+                                    )
+                                }
+                            })
+                            .and_then(|original| {
+                                original
+                                    .map(|original| {
+                                        Prepared::from_workload_original(
+                                            &self.debt,
+                                            &pending.request,
+                                            &pending.delegated,
+                                            pending.named_targets,
+                                            original,
+                                        )
+                                    })
+                                    .transpose()
+                            })
+                    } else {
+                        Prepared::try_new_mapped(
+                            &self.pool,
+                            &self.debt,
+                            self.pool.slots().get(),
+                            &pending.request,
+                            &pending.delegated,
+                            pending.named_targets,
+                        )
+                    };
+                    match scheduling {
                         Ok(None) => State::Pending(pending),
                         Ok(Some(prepared))
                             if pending.loan.is_some_and(|edge| {
@@ -401,21 +579,78 @@ impl Owner {
                                 "member units exceed the original root ceiling",
                             )
                         }
-                        Ok(Some(prepared)) if pending.sealed.is_some() => {
-                            let original_gnu = job.metadata_gnu.as_ref().is_some_and(|gnu| {
-                                gnu.matches(&pending.delegated.gnu).unwrap_or(false)
-                            });
+                        Ok(Some(prepared))
+                            if pending.sealed.is_some() || job.workload.is_some() =>
+                        {
+                            let original_gnu = if pending.linker.is_some()
+                                || matches!(
+                                    &pending.sealed,
+                                    Some(metadata::Purpose::WorkloadQuery(_))
+                                ) {
+                                pending.delegated.gnu.is_empty() && prepared.cpu_slot().is_some()
+                            } else if pending.sealed.is_none() && job.workload.is_some() {
+                                // Prepared validates the actual original GNU
+                                // descriptors; no count creates that transport.
+                                !pending.delegated.gnu.is_empty()
+                            } else {
+                                job.metadata_gnu.as_ref().is_some_and(|gnu| {
+                                    gnu.matches(&pending.delegated.gnu).unwrap_or(false)
+                                })
+                            };
                             if !original_gnu {
                                 refuse_pending(
                                     *pending,
                                     "metadata GNU differs from the original admitted root",
                                 )
                             } else {
-                                let sealed = pending
-                                    .sealed
-                                    .as_ref()
-                                    .expect("checked metadata purpose")
-                                    .clone();
+                                let input: io::Result<metadata::Preparation> = (|| {
+                                    let deadline = Instant::now() + Duration::from_secs(30);
+                                    if let Some(request) = &pending.linker {
+                                        let held = job
+                                            .metadata_sdk
+                                            .as_ref()
+                                            .ok_or_else(|| refused("original linker SDK missing"))?
+                                            .workload_linker(deadline)?;
+                                        return Ok(metadata::Preparation::Linker {
+                                            request: request.clone(),
+                                            held,
+                                        });
+                                    }
+                                    let original = if job.workload.is_some() {
+                                        Some(
+                                            job.metadata_sdk
+                                                .as_ref()
+                                                .ok_or_else(|| {
+                                                    refused("workload SDK keeper missing")
+                                                })?
+                                                .workload_compiler(deadline)?,
+                                        )
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(sealed) = &pending.sealed {
+                                        Ok(metadata::Preparation::Metadata {
+                                            purpose: sealed.clone(),
+                                            held: original,
+                                        })
+                                    } else {
+                                        let command = member_recipe::command(
+                                            job,
+                                            &pending.request,
+                                            pending.timeout,
+                                        )?;
+                                        let held = original.ok_or_else(|| {
+                                            refused("workload original compiler not captured")
+                                        })?;
+                                        let targets = prepared.child_targets()?;
+                                        Ok(metadata::Preparation::Native {
+                                            command,
+                                            held,
+                                            targets,
+                                        })
+                                    }
+                                })(
+                                );
                                 #[cfg(all(test, target_os = "macos"))]
                                 let pause = self.metadata_pause.take();
                                 #[cfg(all(test, target_os = "macos"))]
@@ -428,10 +663,7 @@ impl Owner {
                                         if let Some(pause) = pause {
                                             pause.wait()?;
                                         }
-                                        metadata::prepare(
-                                            sealed,
-                                            Instant::now() + Duration::from_secs(30),
-                                        )
+                                        input?.run(Instant::now() + Duration::from_secs(30))
                                     });
                                 match worker {
                                     Ok(worker) => {
@@ -476,6 +708,7 @@ impl Owner {
                             if let Some(purpose) = &preparing.pending.sealed {
                                 purpose.authorize(&mut check);
                             }
+                            check.linker = preparing.pending.linker.clone();
                             members::live(&self.fence, &self.debt, job, &check)
                         });
                 preparing.cancelled |= !allowed;
@@ -532,10 +765,35 @@ impl Owner {
                 mut events,
                 mut settled,
             } => {
-                if !settled {
+                let returned = job.workload.as_mut().map_or(Ok(()), |workload| {
+                    if job.reaped {
+                        workload.host_closed_after_root_exit(slot.binding.attempt);
+                        Ok(())
+                    } else {
+                        workload.return_member(
+                            slot.binding.attempt,
+                            job.timeout
+                                .map(|timeout| job.started + timeout)
+                                .unwrap_or_else(Instant::now),
+                        )
+                    }
+                });
+                if returned
+                    .as_ref()
+                    .is_err_and(|error| error.kind() != io::ErrorKind::WouldBlock)
+                {
+                    self.faulted = true;
+                    job.cleanup_at.get_or_insert_with(Instant::now);
+                }
+                if !settled && returned.is_ok() {
                     settled = self.journal.settle(&slot.binding).is_ok();
                 }
                 if settled && events.drained() {
+                    if let Some(workload) = job.workload.as_mut()
+                        && workload.refused(slot.binding.attempt).is_err()
+                    {
+                        self.faulted = true;
+                    }
                     return true;
                 }
                 State::Refused { events, settled }
@@ -555,8 +813,15 @@ impl Owner {
         metadata: Option<metadata::Command>,
     ) -> State {
         let (mut command, inputs) = if let Some(prepared) = metadata {
-            if pending.events.prepared(&prepared.inputs.inventory).is_err() {
-                return refuse_pending(pending, "metadata input inventory unavailable");
+            if let Some(inventory) = prepared.inputs.inventory.as_ref() {
+                if pending.events.prepared(inventory).is_err() {
+                    return refuse_pending(pending, "metadata input inventory unavailable");
+                }
+            } else if pending.sealed.is_some() {
+                return refuse_pending(
+                    pending,
+                    "metadata purpose lost its original input inventory",
+                );
             }
             (prepared.command, Some(prepared.inputs))
         } else {
@@ -570,7 +835,13 @@ impl Owner {
         if let Some(arg0) = &pending.arg0 {
             command.arg0(std::ffi::OsStr::from_bytes(arg0));
         }
-        let sdk = match sdk::member(job.compiler.as_ref(), &mut prepared, &mut command) {
+        // Linker is a nondelegating target: CPU5 is its sole guard. The Host
+        // retains original SDK ownership; no SDK/root/control locator leaks.
+        let sdk = match if pending.linker.is_some() {
+            Ok(None)
+        } else {
+            sdk::member(job.compiler.as_ref(), &mut prepared, &mut command)
+        } {
             Ok(value) => value,
             Err(_) => return refuse_pending(pending, "original SDK guard unavailable"),
         };
@@ -585,7 +856,12 @@ impl Owner {
             self.faulted=true;
             return refuse_pending(pending,"member intent could not be committed before ARM");
         }
-        if matches!(&pending.sealed, Some(metadata::Purpose::Resolver(_))) {
+        if pending.linker.is_some()
+            || matches!(
+                &pending.sealed,
+                Some(metadata::Purpose::Resolver(_) | metadata::Purpose::WorkloadQuery(_))
+            )
+        {
             // Role 5 has no caller-supplied source input. Own the empty reader
             // before GO even when a direct peer transferred another handle.
             match File::open("/dev/null") {
@@ -607,14 +883,26 @@ impl Owner {
             timeout,
             named_targets: _,
             loan,
+            linker: _,
         } = pending;
         command
             .stdin(spawnfd::Stdio::from(stdin))
             .stdout(spawnfd::Stdio::from(stdout))
             .stderr(spawnfd::Stdio::from(stderr));
         let cpu = prepared.cpu_slot();
+        let cpu_target = match request.cpu {
+            aterm_types::resource_subgroup::CpuDelegation::SharedBorrow { target_fd } => {
+                Some(target_fd)
+            }
+            _ => None,
+        };
         let retained_sdk = job.metadata_sdk.clone();
         let retained_compiler = job.compiler.clone();
+        let retained_primary = job.workload.as_ref().map(|state| state.primary.clone());
+        let retained_output = job
+            .workload
+            .as_ref()
+            .and_then(workload::State::retained_output_locks);
         let attempt = member::OwnedAttempt::launch(
             &mut member_custody::Borrowed {
                 job,
@@ -632,6 +920,8 @@ impl Owner {
                 inputs,
                 _sdk: retained_sdk,
                 _compiler: retained_compiler,
+                _primary: retained_primary,
+                _output: retained_output,
             },
             events,
             request.member.binding,
@@ -643,6 +933,7 @@ impl Owner {
             peer,
             proof,
             cpu,
+            cpu_target,
             loan,
             sdk,
             bound: false,
@@ -677,6 +968,14 @@ impl Owner {
             journal: &self.journal,
         };
         let progress = active.attempt.poll(&mut custody, cause);
+        if let Some(workload) = custody.job.workload.as_mut()
+            && workload
+                .observe(binding.attempt, active.attempt.identity(), &progress)
+                .is_err()
+        {
+            self.faulted = true;
+            custody.job.cleanup_at.get_or_insert_with(Instant::now);
+        }
         if progress.uncertain
             || (progress.launched && !progress.go_attempted)
             || active.attempt.binding() != binding
@@ -713,7 +1012,13 @@ impl Owner {
                             .update(binding, "member_running", aterm_json::json!({}))
                             .is_ok();
                 if active.bound {
-                    let _ = active.attempt.start(&mut custody);
+                    if let Ok(started) = active.attempt.start(&mut custody)
+                        && let Some(workload) = custody.job.workload.as_mut()
+                        && workload.started(binding.attempt, started).is_err()
+                    {
+                        self.faulted = true;
+                        custody.job.cleanup_at.get_or_insert_with(Instant::now);
+                    }
                 } else {
                     self.faulted = true;
                     let _ = active
@@ -747,7 +1052,7 @@ fn refuse_pending(mut pending: Pending, reason: &str) -> State {
         reason: reason.into(),
     });
     State::Refused {
-        events: pending.events,
+        events: Box::new(pending.events),
         settled: false,
     }
 }

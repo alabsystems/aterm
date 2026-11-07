@@ -13,10 +13,12 @@
 pub mod accounting;
 mod context;
 mod helper_fds;
+pub mod linker;
 mod locator;
 pub mod resolver;
 mod sealed_metadata;
-pub use helper_fds::HelperFds;
+pub mod workload;
+pub use helper_fds::{HelperFds, WorkloadHelperFds};
 pub use sealed_metadata::{
     CONTEXT_SDK_CAPABILITY, CONTEXT_SDK_ROLE, METADATA_CAPABILITIES_JSON, METADATA_CAPABILITY,
     METADATA_CAPABILITY_QUERY, METADATA_EVENT_PREFIX_MAX_BYTES, METADATA_MAX_OUTPUT,

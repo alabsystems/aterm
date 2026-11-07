@@ -19,21 +19,47 @@ use trust_resource_controller::{GnuTransport, Request};
 use trust_resource_provenance::Store;
 
 pub(crate) struct NativeBackend {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    original: Option<Original>,
     #[cfg(test)]
     store: Option<Store>,
+}
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct Original {
+    early: Option<trust_resource_controller::client::workload::EarlyHostStore>,
+    client: Option<trust_resource_controller::client::Client>,
 }
 impl NativeBackend {
     pub(crate) const fn account() -> Self {
         Self {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            original: None,
             #[cfg(test)]
             store: None,
         }
     }
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn for_store(store: Store) -> Self {
-        Self { store: Some(store) }
+        Self {
+            original: None,
+            store: Some(store),
+        }
     }
-    fn connect(&self, deadline: Instant) -> io::Result<trust_resource_provenance::Host> {
+    fn connect(&mut self, deadline: Instant) -> io::Result<trust_resource_provenance::Host> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(original) = &mut self.original {
+            if original.client.is_none() {
+                // Selected failure consumes the original locator. It cannot
+                // retry another path or fall back to the account controller.
+                let early = original.early.take().ok_or_else(invalid)?;
+                original.client = Some(early.discover(deadline)?);
+            }
+            return original
+                .client
+                .as_ref()
+                .ok_or_else(invalid)?
+                .connect_original_host(deadline);
+        }
         #[cfg(test)]
         if let Some(store) = &self.store {
             return store.connect_ancestor(deadline);
@@ -73,6 +99,20 @@ impl Rights {
     }
 }
 impl Backend for NativeBackend {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn original_store(
+        &mut self,
+        store: trust_resource_controller::client::workload::EarlyHostStore,
+    ) -> io::Result<()> {
+        if self.original.is_some() || !store.is_present() {
+            return Err(invalid());
+        }
+        self.original = Some(Original {
+            early: Some(store),
+            client: None,
+        });
+        Ok(())
+    }
     fn submit(
         &mut self,
         request: Request,

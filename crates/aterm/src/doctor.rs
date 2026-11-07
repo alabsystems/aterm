@@ -1805,9 +1805,17 @@ fn command_line_tools() -> Option<aterm_machines::init_clt::CommandLineTools> {
 /// chosen for a build. Its compiler commands start without the project's environment, so
 /// header search paths and other compiler configuration cannot masquerade as broken tools.
 /// Ordinary build probes retain that environment and those overrides.
+/// Its private build directory uses the system `/tmp` root (through aterm-tempfile's quiet
+/// placement), independently of a project's `TMPDIR`.
 #[cfg(target_os = "macos")]
 fn base_clt_probe(path: Option<&std::ffi::OsStr>) -> atpkg::prereq::CcVerdict {
-    base_clt_probe_on(path, atpkg::prereq::CcHost::waited_on())
+    base_clt_probe_on(
+        path,
+        atpkg::prereq::CcHost {
+            tmp_root: "/tmp".into(),
+            ..atpkg::prereq::CcHost::waited_on()
+        },
+    )
 }
 
 #[cfg(target_os = "macos")]

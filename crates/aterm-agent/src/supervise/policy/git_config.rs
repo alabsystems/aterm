@@ -277,12 +277,24 @@ pub struct GitView {
 const MAX_SUBMODULE_DEPTH: usize = 8;
 const MAX_SUBMODULES: usize = 64;
 
-/// How long one git the check runs may take before it is killed and the read
-/// is refused (the line escalates, as for any read that cannot be made).
-#[cfg(not(test))]
-const GIT_READ_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
-#[cfg(test)]
-const GIT_READ_WAIT: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
+/// A minute hang detector for each required git read. Scheduling delay does not establish a
+/// config hazard; an unanswered read still escalates once the whole hang detector expires.
+const GIT_READ_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn git_output(cmd: &mut Command) -> Result<std::process::Output, aterm_uds::deadline::RunError> {
+    git_output_after(cmd, std::time::Duration::ZERO)
+}
+
+fn git_output_after(
+    cmd: &mut Command,
+    elapsed: std::time::Duration,
+) -> Result<std::process::Output, aterm_uds::deadline::RunError> {
+    let left = GIT_READ_WAIT
+        .checked_sub(elapsed)
+        .filter(|left| !left.is_zero())
+        .ok_or(aterm_uds::deadline::RunError::TimedOut)?;
+    aterm_uds::deadline::output_within(cmd, left)
+}
 
 /// The worker process as the kernel recorded it at exec ([`atpkg::caller_shell::process_args`]).
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -599,7 +611,7 @@ impl Probe<'_> {
         let run = |args: &[&str]| {
             let mut cmd = self.git(dir);
             cmd.args(args);
-            aterm_uds::deadline::output_within(&mut cmd, GIT_READ_WAIT)
+            git_output(&mut cmd)
         };
         let listed = run(&["config", "--list", "-z", "--show-scope"])
             .map_err(|e| format!("cannot read the git config in {}: {e}", dir.display()))?;

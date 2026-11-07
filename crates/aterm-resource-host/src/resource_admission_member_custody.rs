@@ -111,6 +111,27 @@ impl member::MemberCustody for Borrowed<'_> {
         if let Some(edge) = self.loan {
             self.fence.check_current()?;
             parent_loan::returned(self.job, edge, receipt, self.journal)?;
+        } else if let Some(workload) = self.job.workload.as_mut() {
+            if workload.foreign_member(self.member) {
+                // This private registered member consumed the already parked
+                // phase, not a compiler-bank loan. The actual scope receipt
+                // above returns no fresh CPU or GNU unit.
+                return Ok(());
+            }
+            // The owning state machine supplies this only after no ARM or
+            // positive native scope closure. A nonblocking reply keeps the
+            // original resources and event writer until the SAME bank ACK.
+            if self.job.reaped {
+                workload.host_closed_after_root_exit(self.member);
+            } else {
+                workload.return_member(
+                    self.member,
+                    self.job
+                        .timeout
+                        .map(|timeout| self.job.started + timeout)
+                        .unwrap_or_else(Instant::now),
+                )?;
+            }
         }
         Ok(())
     }

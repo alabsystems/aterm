@@ -100,6 +100,45 @@ const CONFIG_MAX_BYTES: usize = 128 + MAX_SLOTS as usize * 64;
 pub struct Pool(Arc<Inner>);
 
 impl Pool {
+    /// Only the authenticated workload receiver can call this path: `file` is
+    /// transferred by the actual original live custodian, never caller-offered.
+    /// There is deliberately no lock/acquire/repair syscall here. The original
+    /// host and receiver retain the SAME description; closing copies, rather
+    /// than an explicit unlock, is their only permitted release operation.
+    #[cfg(all(feature = "native-host", any(target_os = "linux", target_os = "macos")))]
+    pub(crate) fn continue_workload_original(&self, slot: u32, file: File) -> io::Result<Lease> {
+        self.validate_path()?;
+        check_private(&file, false)?;
+        if self.0.identities.get(slot as usize) != Some(&Identity::of(&file)?) {
+            return Err(invalid("original workload description differs from sealed slot"));
+        }
+        // This is diagnostic attribution only; custody is supplied by the
+        // opaque live transfer before this private method can be reached.
+        use std::os::unix::fs::FileExt as _;
+        let mut bytes = [0; MAX_RECORD_BYTES + 1];
+        let mut read = 0;
+        loop {
+            match file.read_at(&mut bytes[read..], read as u64) {
+                Ok(0) => break,
+                Ok(count) => {
+                    read += count;
+                    if read > MAX_RECORD_BYTES {
+                        return Err(invalid("original workload CPU record exceeds bound"));
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let record = Record::parse(
+            std::str::from_utf8(&bytes[..read])
+                .map_err(|_| invalid("original workload CPU record is not text"))?,
+        )?;
+        if record.slot != slot {
+            return Err(invalid("original workload slot record differs"));
+        }
+        Ok(Lease { slot, owner: record.owner, file })
+    }
     /// Open the current account's pool. `slots` is the machine-wide capacity,
     /// not this invocation's local `-j` limit. Conflicting capacities refuse.
     pub fn for_current_user(slots: NonZeroU32) -> io::Result<Self> {

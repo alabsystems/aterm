@@ -48,8 +48,8 @@ pub const USAGE: &str = "
                  [--no-install | --install-dir DIRECTORY] [--no-link] [--no-pin]
       Build this checkout, dirty or not, into `aterm (dev).app` with the Trust
       toolchain the cutter resolves (by default `targo --unverified build
-      --release -p aterm`): its own bundle id (com.aterm.aterm.dev), this Mac's slice only,
-      HEAD's committer epoch as its build number. It is signed locally and
+      --release -p aterm --bin aterm`): its own bundle id (com.aterm.aterm.dev),
+      this Mac's slice only, HEAD's committer epoch as its build number. It is signed locally and
       installed beside the release; nothing is claimed, notarized or published.
         --profile PROFILE   release (default) or test. Test builds the ordinary app
                             with `build --profile test`, using debug/aterm for
@@ -417,7 +417,7 @@ fn build_command(
     cmd.current_dir(root)
         .args(["--unverified", "build"])
         .args(profile.cargo_args())
-        .args(["-p", "aterm", "--target-dir"])
+        .args(["-p", "aterm", "--bin", "aterm", "--target-dir"])
         .arg(target)
         .env("PATH", joined);
     for key in [
@@ -491,7 +491,7 @@ pub fn run_build(root: &Path, opts: &Options) -> Result<(), String> {
     println!("==> toolchain: {version} ({})", targo.display());
     let target = target_dir(root, std::env::var_os("CARGO_TARGET_DIR"));
     println!(
-        "==> targo --unverified build {} -p aterm  [{}, build {}]",
+        "==> targo --unverified build {} -p aterm --bin aterm  [{}, build {}]",
         opts.profile.cargo_args().join(" "),
         stamp.commit,
         stamp.build
@@ -1109,6 +1109,8 @@ mod tests {
                 "--release",
                 "-p",
                 "aterm",
+                "--bin",
+                "aterm",
                 "--target-dir",
                 "/src/aterm/target"
             ]
@@ -1191,6 +1193,8 @@ mod tests {
                 "--profile",
                 "test",
                 "-p",
+                "aterm",
+                "--bin",
                 "aterm",
                 "--target-dir",
                 "/warm/test-profile.noindex",

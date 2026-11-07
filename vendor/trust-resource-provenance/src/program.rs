@@ -472,11 +472,66 @@ impl HeldProgram {
     ) -> io::Result<()> {
         self.validate(deadline)?;
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        resolver_marker::require(&self.executable.file, _expected, deadline)?;
+        protocol_marker::require(
+            &self.executable.file,
+            protocol_marker::Profile::Resolver,
+            _expected,
+            deadline,
+        )?;
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "native resolver image declarations require macOS arm64",
+        ));
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        self.validate(deadline)
+    }
+
+    /// Read the distinct workload declaration through this same held image.
+    /// This support predicate never establishes live readiness, original CPU
+    /// lease-set/SDK/output custody, execution, source or proof authority.
+    pub fn require_workload_protocol_marker(
+        &self,
+        _expected: &[u8; 64],
+        deadline: Instant,
+    ) -> io::Result<()> {
+        self.validate(deadline)?;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        protocol_marker::require(
+            &self.executable.file,
+            protocol_marker::Profile::Workload,
+            _expected,
+            deadline,
+        )?;
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "native workload image declarations require macOS arm64",
+        ));
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        self.validate(deadline)
+    }
+
+    /// Require the distinct compiler member-original/extra/return declaration
+    /// from this same held executable. Generic resource-v3 and root-workload
+    /// support are insufficient. This grants no CPU, SDK, GO or proof authority.
+    pub fn require_workload_member_protocol_marker(
+        &self,
+        _expected: &[u8; 64],
+        deadline: Instant,
+    ) -> io::Result<()> {
+        self.validate(deadline)?;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        protocol_marker::require(
+            &self.executable.file,
+            protocol_marker::Profile::WorkloadMember,
+            _expected,
+            deadline,
+        )?;
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "native workload compiler declarations require macOS arm64",
         ));
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         self.validate(deadline)
@@ -496,7 +551,9 @@ impl HeldProgram {
 #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 mod macho;
 #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
-mod resolver_marker;
+mod protocol_marker;
+
+pub mod produced;
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 mod tests;

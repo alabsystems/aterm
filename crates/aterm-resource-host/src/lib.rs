@@ -17,6 +17,8 @@ mod forward;
 #[cfg(unix)]
 mod inspection;
 #[cfg(unix)]
+mod linker_transport;
+#[cfg(unix)]
 mod metadata_prelude;
 #[cfg(unix)]
 mod metadata_transport;
@@ -48,7 +50,12 @@ mod subgroup_delegation;
 #[path = "subgroup_delegation_unsupported.rs"]
 mod subgroup_delegation;
 #[cfg(unix)]
-pub use client::{authorize, capabilities_at, inspect_at, submit, submit_accounted};
+mod workload_transport;
+#[cfg(unix)]
+pub use client::{
+    authorize, capabilities_at, inspect_at, matches_original_store_at, submit, submit_accounted,
+    submit_accounted_expected,
+};
 #[cfg(unix)]
 pub use enrollment::answer as answer_enrollment;
 #[cfg(unix)]

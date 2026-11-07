@@ -5220,6 +5220,18 @@ struct TapNoted {
     at: i64,
 }
 
+/// What a tap reading's store transaction left of the label, read under `accounts.lock` for the
+/// readings series ([`account_series::note_committed`]) once the transaction commits.
+#[derive(Debug)]
+struct SeriesTake {
+    machine: String,
+    five_hour: Option<accounts::WindowFig>,
+    seven_day: Option<accounts::WindowFig>,
+    ac: Option<String>,
+    key: Option<profile::AccountKey>,
+    now: i64,
+}
+
 /// Where a usage tap's reading is taken ([`WorkerIdle::tap_step`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TapAt {
@@ -5510,8 +5522,11 @@ impl IdleHost for WorkerIdle {
         let warning = seen.warning.as_ref().map_or("-".to_string(), |w| {
             format!("{} {}%", w.window.name(), w.pct)
         });
+        let week = seen.week.as_ref().map_or("-".to_string(), |w| {
+            format!("{} {}%", w.model.name(), w.pct)
+        });
         aterm_log::info!(
-            "harness @{}: account usage {word}: credits {credits} warning {warning}",
+            "harness @{}: account usage {word}: credits {credits} warning {warning} week {week}",
             self.sid
         );
         if word == "usage" {
@@ -7211,16 +7226,18 @@ impl WorkerIdle {
                     .accounts
                     .get(&label)
                     .is_some_and(|a| a.low(now) || a.limited_until(now).is_some());
-            let windows = state.accounts.get(&label).map(|a| &a.windows);
-            series = Some((
-                state.machine.clone(),
-                windows
+            let record = state.accounts.get(&label);
+            let windows = record.map(|a| &a.windows);
+            series = Some(SeriesTake {
+                machine: state.machine.clone(),
+                five_hour: windows
                     .and_then(|w| w.get(accounts::SESSION_LIMIT))
                     .cloned(),
-                windows.and_then(|w| w.get(accounts::WEEK_LIMIT)).cloned(),
-                account_series::recorded(&events, held),
+                seven_day: windows.and_then(|w| w.get(accounts::WEEK_LIMIT)).cloned(),
+                ac: record.and_then(|a| a.pk.clone()),
+                key: record.and_then(|a| a.key),
                 now,
-            ));
+            });
             Ok(events)
         });
         match noted {
@@ -7231,16 +7248,22 @@ impl WorkerIdle {
                 if low_or_limited {
                     (self.hooks.acts.accounts_upkeep).make(UpkeepStep::Renew);
                 }
-                // The readings series takes the reading the store just recorded, under its own
-                // lock (docs/DESIGN-accounts-outlook-2026-10-25.md §4.2).
-                if let Some((machine, five, seven, recorded, now)) = series {
-                    let _ = account_series::note_recorded(
+                // The readings series takes what the store just committed, under its own lock
+                // (docs/DESIGN-account-stats-2026-10-15.md §5).
+                if let Some(take) = series {
+                    let _ = account_series::note_committed(
                         &seat.state,
                         &label,
-                        &machine,
-                        (five.as_ref(), seven.as_ref()),
-                        recorded,
-                        now,
+                        &take.machine,
+                        &account_series::Committed {
+                            five_hour: take.five_hour.as_ref(),
+                            seven_day: take.seven_day.as_ref(),
+                            events: &events,
+                            held_back,
+                            ac: take.ac.as_deref(),
+                            key: take.key,
+                        },
+                        take.now,
                     );
                 }
                 if !held_back {
@@ -20652,7 +20675,9 @@ fn usage_said(seen: &UsageSeen, at: i64, offset: i64) -> accounts::UsageSaid {
 }
 
 /// What `seen` says, as true at `at`, placing any local reset clock at its target instant's
-/// offset (`local_at`).
+/// offset (`local_at`). A model's week is read only where its reset is placed or where a wall
+/// named none (the stats design's Q11): a warning that named none, or a reset no clock places,
+/// says no week.
 fn usage_said_local(
     seen: &UsageSeen,
     at: i64,
@@ -20683,6 +20708,19 @@ fn usage_said_local(
             weekly: w.window == aterm_phase::credits::Window::Weekly,
             pct: u32::from(w.pct),
             reset: w.reset.as_deref().and_then(place),
+        }),
+        week: seen.week.as_ref().and_then(|w| {
+            let reset = match w.reset.as_deref() {
+                Some(text) => Some(place(text)?),
+                None if w.wall => None,
+                None => return None,
+            };
+            Some(accounts::WeekRead {
+                bucket: accounts::week_bucket(w.model),
+                pct: u32::from(w.pct),
+                reset,
+                wall: w.wall,
+            })
         }),
     }
 }

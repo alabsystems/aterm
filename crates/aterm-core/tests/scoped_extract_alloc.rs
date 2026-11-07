@@ -321,6 +321,54 @@ fn styled_ansi_emission_cost() {
     }
 }
 
+#[test]
+#[ignore = "manual numeric SGR formatting measurement; run alone"]
+fn sgr_byte_formatting_cost() {
+    use std::fmt::Write as _;
+    eprintln!();
+    const REPEATS: usize = 4096;
+    let expected: String = (0..=u8::MAX).map(|value| value.to_string()).collect();
+    for mode in ["fmt", "byte"] {
+        let mut out = String::with_capacity(768);
+        let before = instructions();
+        let (_, calls) = allocs_in(|| {
+            for _ in 0..REPEATS {
+                out.clear();
+                if mode == "fmt" {
+                    for value in 0..=u8::MAX {
+                        let _ = write!(out, "{}", std::hint::black_box(value));
+                    }
+                } else {
+                    for value in 0..=u8::MAX {
+                        aterm_grid::push_sgr_byte(&mut out, std::hint::black_box(value));
+                    }
+                }
+                std::hint::black_box(&out);
+            }
+        });
+        let bytes = ALLOC_BYTES.with(Cell::get);
+        let retired = before.zip(instructions()).map(|(a, b)| b - a);
+        assert_eq!(out, expected);
+        assert_eq!(calls, 0);
+        eprintln!(
+            "sgr_number mode={mode} values=256 repeats={REPEATS} instructions={retired:?} allocation_calls={calls} allocated_bytes={bytes}"
+        );
+    }
+}
+
+#[test]
+fn every_sgr_byte_appends_without_allocating_into_reserved_text() {
+    let prefix = "日prefix  ";
+    let mut out = String::with_capacity(32);
+    out.push_str(prefix);
+    for value in 0..=u8::MAX {
+        out.truncate(prefix.len());
+        let (_, calls) = allocs_in(|| aterm_grid::push_sgr_byte(&mut out, value));
+        assert_eq!(calls, 0, "SGR byte {value}");
+        assert_eq!(out, format!("{prefix}{value}"));
+    }
+}
+
 fn assert_same_styled_cells(
     original: &aterm_core::terminal::Terminal,
     replay: &aterm_core::terminal::Terminal,

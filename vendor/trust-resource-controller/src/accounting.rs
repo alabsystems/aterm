@@ -6,7 +6,7 @@
 use std::io;
 
 use crate::wire::{Encoder, header, invalid};
-use crate::{Request, Role, Status, StatusFrame};
+use crate::{Request, Status, StatusFrame};
 
 pub const CAPABILITY: &str = "owning-wait-accounting-v1";
 pub const PROXY_ROLE: &str = "proxy-member-accounted-v1";
@@ -90,7 +90,7 @@ pub struct AccountedRequest {
 impl AccountedRequest {
     pub fn encode(&self) -> io::Result<Vec<u8>> {
         self.request.validate()?;
-        if matches!(self.request.role, Role::SealedMetadata | Role::ResolverQuery) {
+        if !self.request.role.is_proxy_member() {
             return Err(invalid());
         }
         let mut e = Encoder::new(36);

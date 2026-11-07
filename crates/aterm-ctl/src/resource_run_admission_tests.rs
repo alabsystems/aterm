@@ -7,6 +7,15 @@ use std::os::fd::AsRawFd as _;
 
 #[test]
 fn unready_preflight_is_a_refusal_without_submitting_execution_descriptors() {
+    refusing_preflight(false, false);
+}
+
+#[test]
+fn missing_original_store_capability_refuses_without_submitting_root_descriptors() {
+    refusing_preflight(true, true);
+}
+
+fn refusing_preflight(ready: bool, expectation: bool) {
     let directory = crate::test_scratch_dir("resource-unready");
     let path = directory.path().join("socket");
     let listener = aterm_uds::CtlListener::bind(&path).unwrap();
@@ -25,7 +34,7 @@ fn unready_preflight_is_a_refusal_without_submitting_execution_descriptors() {
         assert_eq!(request, "resource-admission-v3 capabilities\n");
         writeln!(
             stream,
-            "OK resource-admission-v3 capabilities\n{{\"version\":3,\"ready\":false}}"
+            "OK resource-admission-v3 capabilities\n{{\"version\":3,\"ready\":{ready},\"accounting\":\"owning-wait-accounting-v1\"}}"
         )
         .unwrap();
     });
@@ -37,7 +46,8 @@ fn unready_preflight_is_a_refusal_without_submitting_execution_descriptors() {
         job: "unready-test".into(),
         command: vec!["/usr/bin/false".into()],
         capabilities: false,
-        accounted: false,
+        accounted: expectation,
+        expected_store: expectation.then(|| std::fs::File::open(directory.path()).unwrap()),
         resources: Some(super::super::Resources {
             cpu_units: 1,
             memory_bytes: 1024,

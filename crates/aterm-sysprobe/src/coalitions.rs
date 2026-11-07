@@ -29,10 +29,10 @@ const TYPE_RESOURCE: u32 = 0;
 
 const TASKS_STARTED: usize = 0;
 const TASKS_EXITED: usize = 1;
-const CPU_TIME: usize = 3;
+pub(crate) const CPU_TIME: usize = 3;
 const BYTES_READ: usize = 6;
-const EQOS_LEN: usize = 23;
-const EQOS: usize = 24;
+pub(crate) const EQOS_LEN: usize = 23;
+pub(crate) const EQOS: usize = 24;
 const PHYS_FOOTPRINT: usize = 40;
 
 /// One resource coalition's counters, read now.
@@ -71,6 +71,29 @@ pub struct CoalitionRead {
 #[must_use]
 pub fn coalitions() -> Option<CoalitionRead> {
     imp::coalitions()
+}
+
+/// One read of every resource coalition's whole usage record ([`records`]): what
+/// [`coalitions`] decodes, with every word kept, for a decoder of words it does not read
+/// ([`crate::coalition_heat`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecordRead {
+    /// How many coalitions the kernel listed.
+    pub listed: u32,
+    /// The highest id the kernel listed, answered or not (`None` for an empty list).
+    pub newest: Option<u64>,
+    /// Whether the list filled its buffer, so coalitions past it (the newest) may be missing.
+    pub truncated: bool,
+    /// Each listed coalition that answered: its id and its record, in list order. A word the
+    /// kernel did not write holds [`UNWRITTEN`].
+    pub records: Vec<(u64, [u64; USAGE_WORDS])>,
+}
+
+/// Every resource coalition's whole usage record, by the same list and copy [`coalitions`]
+/// makes; `None` where the list cannot be read, and off macOS.
+#[must_use]
+pub fn records() -> Option<RecordRead> {
+    imp::records()
 }
 
 /// The id of `pid`'s resource coalition; `None` when the kernel does not say, and off macOS.
@@ -270,7 +293,7 @@ pub(crate) fn read_of(
 mod imp {
     use std::ffi::{c_int, c_void};
 
-    use super::{CoalitionRead, LIST_ENTRY, UNWRITTEN, USAGE_WORDS};
+    use super::{CoalitionRead, LIST_ENTRY, RecordRead, UNWRITTEN, USAGE_WORDS};
 
     const PROC_PIDCOALITIONINFO: c_int = 20;
     const LISTCOALITIONS_SINGLE_TYPE: c_int = 2;
@@ -351,6 +374,19 @@ mod imp {
         Some(super::read_of(&listed, truncated, raw_usage, timebase))
     }
 
+    pub(super) fn records() -> Option<RecordRead> {
+        let (listed, truncated) = list()?;
+        Some(RecordRead {
+            listed: u32::try_from(listed.len()).unwrap_or(u32::MAX),
+            newest: listed.iter().map(|&(id, _)| id).max(),
+            truncated,
+            records: listed
+                .iter()
+                .filter_map(|&(id, _)| Some((id, raw_usage(id)?)))
+                .collect(),
+        })
+    }
+
     pub(super) fn self_check(pid: u32) -> Result<u64, &'static str> {
         let id = coalition_of(pid).ok_or("no_coalition")?;
         let raw = raw_usage(id).ok_or("no_usage")?;
@@ -370,9 +406,13 @@ mod imp {
 
 #[cfg(not(target_os = "macos"))]
 mod imp {
-    use super::CoalitionRead;
+    use super::{CoalitionRead, RecordRead};
 
     pub(super) fn coalitions() -> Option<CoalitionRead> {
+        None
+    }
+
+    pub(super) fn records() -> Option<RecordRead> {
         None
     }
 

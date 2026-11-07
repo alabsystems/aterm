@@ -665,13 +665,15 @@ const WAIT_SKEW_S: u64 = 2;
 pub struct UsageSeen {
     pub credits: Option<aterm_phase::credits::Credits>,
     pub warning: Option<aterm_phase::credits::Warning>,
+    /// A model's week, its wall or its warning ([`aterm_phase::ScreenReader::model_week`]).
+    pub week: Option<aterm_phase::ModelWeek>,
 }
 
 impl UsageSeen {
-    /// Returns `true` if either a credits notice or usage warning is present.
+    /// Returns `true` if a credits notice, a usage warning or a model's week is present.
     #[must_use]
     pub const fn says(&self) -> bool {
-        self.credits.is_some() || self.warning.is_some()
+        self.credits.is_some() || self.warning.is_some() || self.week.is_some()
     }
 }
 
@@ -3794,6 +3796,7 @@ impl<'a, C: Ctl> Session<'a, C> {
         let seen = UsageSeen {
             credits,
             warning: reader.usage_warning(rows),
+            week: reader.model_week(rows),
         };
         let now = self.fx.mono();
         let retell = Duration::from_secs(

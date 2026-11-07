@@ -841,13 +841,15 @@ impl CommandLineTools {
     /// way aside, which hold only a download); outside it, the row reads the tools in place and
     /// names the steps left for setup's one password, so no pass blocks on them. Once this run's
     /// root half ran, its read-back says the tools alone: what that left owed is in the journal.
+    /// A refusing or unanswered compiler also defers to confirmed installer custody; without
+    /// that custody it retains its blocked or unknown classification.
     fn read(&self, sys: &dyn System) -> (Probe, Option<Unfinished>) {
-        let from = match (self.found)(sys) {
+        let (from, unready) = match (self.found)(sys) {
             Found::Present(now) => return self.read_present(sys, now),
-            Found::Refuses(why) => return (Probe::Blocked { why }, Some(Unfinished::Refuses)),
-            Found::Unknown(why) => return (Probe::Unusable { why }, Some(Unfinished::Unread)),
+            Found::Refuses(why) => (why, Some(Unfinished::Refuses)),
+            Found::Unknown(why) => (why, Some(Unfinished::Unread)),
             Found::NotHere(why) => return (Probe::NotApplicable { why }, None),
-            Found::Missing(from) => from,
+            Found::Missing(from) => (from, None),
         };
         match held(sys) {
             crate::items::developer::Holder::Install => {
@@ -866,7 +868,7 @@ impl CommandLineTools {
                     Some(Unfinished::AppleWindow),
                 );
             }
-            crate::items::developer::Holder::Unread => {
+            crate::items::developer::Holder::Unread if unready.is_none() => {
                 return (
                     Probe::Unusable {
                         why: format!("{from}; the current installer owner could not be read"),
@@ -874,7 +876,15 @@ impl CommandLineTools {
                     Some(Unfinished::Unread),
                 );
             }
-            crate::items::developer::Holder::Nothing => {}
+            crate::items::developer::Holder::Unread | crate::items::developer::Holder::Nothing => {}
+        }
+        if let Some(unfinished) = unready {
+            let probe = if unfinished == Unfinished::Refuses {
+                Probe::Blocked { why: from }
+            } else {
+                Probe::Unusable { why: from }
+            };
+            return (probe, Some(unfinished));
         }
         if let Some(held) = self.held_back(sys, &from, true) {
             return held;
@@ -1428,6 +1438,62 @@ mod tests {
         let mut sys = console();
         sys.admin = Some(true);
         assert_eq!(run(&sys, &missing(), Mode::Plan).outcome, Outcome::Planned);
+    }
+
+    /// An existing repair may temporarily break a compiler that was already installed. Its
+    /// custody defers both refusing and unanswered probes; losing custody restores the actual
+    /// failure, and a later ready probe recovers the row without another password attempt.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_active_repair_defers_a_refusing_or_unanswered_compiler_until_it_recovers() {
+        let apple = format!(
+            "/System/Library/CoreServices/{}",
+            aterm_types::macos_setup::APPLE_TOOLS_INSTALLER
+        );
+        for (found, unheld, unfinished) in [
+            (
+                Found::Refuses("compiler mid replacement".into()),
+                Outcome::Blocked,
+                Unfinished::Refuses,
+            ),
+            (
+                Found::Unknown("compiler did not answer during replacement".into()),
+                Outcome::Unknown,
+                Unfinished::Unread,
+            ),
+        ] {
+            for (owner, held) in [
+                ("/usr/sbin/softwareupdate", Unfinished::Busy),
+                ("/usr/sbin/installer", Unfinished::Busy),
+                (apple.as_str(), Unfinished::AppleWindow),
+            ] {
+                let sys = Arc::new(console());
+                sys.file(crate::items::developer::PLACEHOLDER, b"")
+                    .running(&["/sbin/launchd", owner]);
+                let (item, said, tab) = in_tab(&sys, found.clone());
+                let waiting = run(&sys, &item, Mode::Apply);
+                assert_eq!(waiting.outcome, Outcome::Deferred, "{owner}: {waiting:?}");
+                assert!(deferred(&waiting));
+                assert_eq!(tab.unfinished(), Some(held));
+                assert!(asked(&sys).is_empty());
+                assert!(said.lock().unwrap().is_empty());
+
+                sys.running(&["/sbin/launchd"]);
+                assert_eq!(run(&sys, &item, Mode::Apply).outcome, unheld);
+                assert_eq!(tab.unfinished(), Some(unfinished));
+
+                sys.file(CC, b"repaired compiler");
+                assert_eq!(run(&sys, &item, Mode::Apply).outcome, Outcome::Ok);
+                assert!(asked(&sys).is_empty());
+                assert!(said.lock().unwrap().is_empty());
+            }
+            let sys = Arc::new(unread_console());
+            let (item, said, tab) = in_tab(&sys, found);
+            assert_eq!(run(&sys, &item, Mode::Apply).outcome, unheld);
+            assert_eq!(tab.unfinished(), Some(unfinished));
+            assert!(asked(&sys).is_empty());
+            assert!(said.lock().unwrap().is_empty());
+        }
     }
 
     /// With an install of the tools under way (the placeholder held by `softwareupdate`, Apple's
