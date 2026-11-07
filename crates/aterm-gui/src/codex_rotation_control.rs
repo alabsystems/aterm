@@ -414,13 +414,13 @@ fn publish(
         current_attempt: None,
         revoked: false,
     };
-    pool::with_prepared_writer(env, &receipt, |_, _| {
+    pool::with_prepared_writer(env, &receipt, |_, writer| {
         if let Some(id) = renewal::read_index(index)?
             && renewal::read_receipt(env, &id).is_none_or(|old| !old.may_replace())
         {
             return Err("existing-receipt");
         }
-        renewal::write_receipt(env, &receipt)?;
+        writer.create(&receipt)?;
         aterm_agent::harness::upgrade_models::write_atomic_mode(index, &receipt.id, Some(0o600))
             .map_err(|_| "index")?;
         Ok(receipt.clone())

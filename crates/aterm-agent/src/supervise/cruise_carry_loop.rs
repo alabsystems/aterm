@@ -16,7 +16,7 @@ use super::super::policy::go_ahead::{self, RULE_GO_AHEAD};
 use super::super::policy::needs;
 use super::super::policy::turn_end::{
     GO_AHEAD_REFUSED, GO_AHEAD_WAIT, GoAheadVerdict, TurnEndAction, TurnEndReading, TurnEndTiming,
-    go_ahead_answer, go_ahead_answers,
+    go_ahead_answer, go_ahead_answers_on, needs_words,
 };
 use super::approvals::Outcome;
 use super::turn_end_loop::Written;
@@ -109,16 +109,32 @@ impl BreakPark {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct TurnWords {
     /// Its last message's lines and its earlier messages' lines, each line the program wrapped
-    /// read as one (`said_lines`, `turn_lines_before`): what the needs fold reads.
+    /// read as one (`said_lines`, `turn_lines_before`).
     lines: (Option<String>, Option<String>),
-    /// Its last message and its earlier messages as drawn (`said_tail`, `turn_said_before`): what
-    /// the go-ahead reads, as a turn end's reading holds them.
+    /// Its last message and its earlier messages as drawn (`said_tail`, `turn_said_before`), as a
+    /// turn end's reading holds them: the irreversible guard reads the last as drawn too
+    /// ([`go_ahead_answers_on`]).
     said: (Option<String>, Option<String>),
     /// Where each earlier message after the first opens in `lines.1` and `said.1`
     /// ([`needs::Breaks`]).
     breaks: needs::Breaks,
     /// It opens cut: the act's own rows may head it.
     opens_cut: bool,
+}
+
+impl TurnWords {
+    /// THE WORDS THE NEEDS FOLD AND THE GO-AHEAD'S PARK BOTH READ, `(before, tail)`: each message
+    /// as its measured lines where they hold the words it draws, else as drawn, its earlier
+    /// messages told apart ([`needs_words`]), as a point reads its turn
+    /// ([`TurnEndReading::needs_said`]). So a line the go-ahead answers at a break is the line
+    /// the fold stands, never a row of one.
+    fn needs_said(&self) -> (Option<needs::Before<'_>>, Option<&str>) {
+        needs_words(
+            (self.said.0.as_deref(), self.said.1.as_deref()),
+            (self.lines.0.as_deref(), self.lines.1.as_deref()),
+            &self.breaks,
+        )
+    }
 }
 
 /// A turn read live since the last settled break or point.
@@ -801,14 +817,10 @@ impl<C: Ctl> Session<'_, C> {
             return None;
         }
         let turn = self.break_turn(screen);
-        let (tail, said) = &turn.lines;
+        let (earlier, tail) = turn.needs_said();
         let before = self.turn_end.shown_key();
-        self.turn_end.fold_break_needs(
-            said.as_deref()
-                .map(|t| needs::Before::new(t, &turn.breaks.lines)),
-            tail.as_deref(),
-            turn.opens_cut,
-        );
+        self.turn_end
+            .fold_break_needs(earlier, tail, turn.opens_cut);
         self.break_go_ahead(&turn, (screen.seq, at + waited), cfg, review);
         Some(before)
     }
@@ -839,23 +851,17 @@ impl<C: Ctl> Session<'_, C> {
         review: &mut dyn Review,
     ) {
         // The break's turn read as a turn end reads it, whole where it opens above the screen,
-        // as the needs fold read it ([`Self::break_turn`]).
-        let (tail, before) = &turn.said;
-        let at_break = tail.as_deref().and_then(|t| {
-            self.turn_end.go_ahead_at_break(
-                before
-                    .as_deref()
-                    .map(|b| needs::Before::new(b, &turn.breaks.said)),
-                t,
-                turn.opens_cut,
-            )
-        });
+        // in the words the needs fold read ([`Self::break_turn`], [`TurnWords::needs_said`]).
+        let (before, tail) = turn.needs_said();
+        let at_break =
+            tail.and_then(|t| self.turn_end.go_ahead_at_break(before, t, turn.opens_cut));
         let parks = at_break.is_some();
         // The go-ahead goes at a break where it would at a turn end: the turn read whole (its
-        // earlier messages too), never over an irreversible ask ([`go_ahead_answers`]), never
-        // within a person's hold. Past the routine answer budget, the carry changes approach.
+        // earlier messages too), never over an irreversible ask, read in the rows as drawn and in
+        // the words the park read ([`go_ahead_answers_on`]), never within a person's hold. Past
+        // the routine answer budget, the carry changes approach.
         let parked = at_break
-            .filter(|_| go_ahead_answers(tail.as_deref()))
+            .filter(|_| go_ahead_answers_on(turn.said.0.as_deref(), tail))
             .filter(|_| !self.turn_end.go_ahead_held(now));
         let park = parked.clone().filter(|_| cfg.answer_questions);
         let host = self.stall_host.clone().filter(|_| {

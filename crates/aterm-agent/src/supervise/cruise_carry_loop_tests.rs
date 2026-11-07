@@ -3525,6 +3525,60 @@ fn a_break_that_parks_on_a_go_ahead_gets_the_owners_standing_go_ahead() {
     );
 }
 
+/// A WRAPPED PARK AT A BREAK KEEPS ITS LINE OFF (§15.6): the break's turn parks on a need Claude
+/// Code wrapped in its 118 cells before a capital the go-ahead reader's own view does not join
+/// (`… with the small fix` above `Claude Code needs.`), in its report or in an earlier message;
+/// the break's needs fold reads the reader's measured lines, and the go-ahead's park reads the
+/// same words, so the go-ahead goes in the carry's place and the line it answers never goes up.
+/// CONTROL: the need on one row, a pane wide enough.
+#[test]
+fn a_wrapped_park_at_a_break_gets_the_go_ahead_and_never_goes_up() {
+    use crate::supervise::policy::go_ahead::GO_AHEAD_ANSWER;
+    const NEED: &str = "NEEDS YOU: say \"rerun the checks\" so I can build and test my parser \
+                        branch and push it to main with the small fix Claude Code needs.";
+    const LAST: &str = "The suite runs in the background; the docs are next.";
+    let wrapped = aterm_phase::prompt::fixtures::ink_wrap(NEED, 118);
+    assert!(
+        wrapped.len() == 2 && wrapped[1].starts_with("Claude"),
+        "the pane wraps before a capital: {wrapped:#?}"
+    );
+    let report = |need: &[String]| {
+        let mut said = vec!["Both workflows are running.".to_string()];
+        said.extend(need.iter().cloned());
+        waiting(&said.iter().map(String::as_str).collect::<Vec<_>>())
+    };
+    let earlier = |need: &[String]| waiting_turn(None, Some(&need.join("\n")), LAST);
+    let one_row = [NEED.to_string()];
+    for (tag, screen) in [
+        ("carry-park-one-row", report(&one_row)),
+        ("carry-park-earlier-one-row", earlier(&one_row)),
+        ("carry-park-earlier-wrapped", earlier(&wrapped)),
+        ("carry-park-wrapped", report(&wrapped)),
+    ] {
+        let drawn = move |_| screen.clone();
+        let cruise = Script {
+            policy: SupervisorConfig {
+                answer_questions: true,
+                ..under(Autopilot::Cruise)
+            },
+            drawn: &drawn,
+            set: &|_| {},
+            ..Script::new(tag, Occupancy::Observe, &[0, 30])
+        }
+        .run(&mut nothing);
+        let sent = sent(&cruise);
+        assert!(
+            sent.len() == 1 && sent[0].starts_with(GO_AHEAD_ANSWER),
+            "{tag}: {sent:#?}"
+        );
+        assert!(
+            raised(&cruise).is_empty(),
+            "{tag}: the go-ahead answers the line, yet it went up: {:#?}",
+            cruise.requests()
+        );
+    }
+}
+
 /// A PERSON'S TURN THAT ENDS AT A BREAK HOLDS THE HOUR, AS AT A TURN END (2026-10-29 review 4,
 /// read by keys): their key opens a turn (`human_ms` times it) whose agent ends it with its
 /// background work running, whatever their message said: the break gets the carry without its

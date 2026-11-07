@@ -659,6 +659,83 @@ fn a_red_or_a_dirty_checkout_pushes_nothing() {
     assert_eq!(origin_main(&world), before, "nothing was pushed");
 }
 
+/// A resumed landing stays put when main has advanced past it. Dirty work still refuses;
+/// committing new work in that same checkout must judge and land against the advanced main.
+#[test]
+fn an_already_landed_checkout_resumes_without_absorbing_main_or_losing_new_work() {
+    let world = world();
+    commit(&world.work, "a/x.txt", "a2\n");
+    let (code, said, _) = land_with(&world, crates(&["a"]), Lane::Pass, |_, _| green());
+    assert_eq!(code, exit::PASS, "{said:#?}");
+    let landed = origin_main(&world);
+    assert_eq!(git(&world.work, &["rev-parse", "HEAD"]), landed);
+    let advanced = rival_moves(&world, "b/y.txt", "b2\n");
+    assert_ne!(advanced, landed);
+
+    let said = RefCell::new(Vec::new());
+    let resume = || {
+        land(
+            &world.work,
+            &mut Seams {
+                git: &git_cmd,
+                judge: &mut |_, _| panic!("an already-landed checkout needs no judgment"),
+                branch: &mut |_, _| panic!("an already-landed checkout needs no branch scope"),
+                lane: &mut |_, _| panic!("an already-landed checkout needs no lane verdict"),
+                say: &mut |line: &str| said.borrow_mut().push(line.to_owned()),
+            },
+        )
+    };
+    assert_eq!(resume(), exit::PASS, "{:#?}", said.borrow());
+    assert_eq!(git(&world.work, &["rev-parse", "HEAD"]), landed);
+    assert_eq!(origin_main(&world), advanced);
+    assert!(git(&world.work, &["status", "--porcelain"]).is_empty());
+    assert_eq!(
+        std::fs::read_to_string(world.work.join("b/y.txt")).expect("old main's file"),
+        "b\n",
+        "the no-op must not merge newer main into the checkout"
+    );
+
+    write(&world.work, "a/x.txt", "a3\n");
+    write(&world.work, "loose.txt", "unfinished\n");
+    let dirty = git(&world.work, &["status", "--porcelain"]);
+    assert_eq!(resume(), exit::COULD_NOT_RUN, "{:#?}", said.borrow());
+    assert_eq!(git(&world.work, &["rev-parse", "HEAD"]), landed);
+    assert_eq!(origin_main(&world), advanced);
+    assert_eq!(git(&world.work, &["status", "--porcelain"]), dirty);
+    for (file, text) in [("a/x.txt", "a3\n"), ("loose.txt", "unfinished\n")] {
+        assert_eq!(
+            std::fs::read_to_string(world.work.join(file)).expect("preserved work"),
+            text
+        );
+    }
+
+    std::fs::remove_file(world.work.join("loose.txt")).expect("finish loose work");
+    let new_work = commit(&world.work, "a/x.txt", "a3\n");
+    let (code, said, bases) = land_with(&world, crates(&["a"]), Lane::Pass, |_, _| green());
+    assert_eq!(code, exit::PASS, "{said:#?}");
+    assert_eq!(
+        bases.as_slice(),
+        std::slice::from_ref(&advanced),
+        "new work must be judged"
+    );
+    let tip = origin_main(&world);
+    assert_ne!(tip, advanced);
+    assert_eq!(git(&world.work, &["rev-parse", "HEAD"]), tip);
+    for ancestor in [&advanced, &new_work] {
+        git(
+            &world.work,
+            &["merge-base", "--is-ancestor", ancestor, &tip],
+        );
+    }
+    for (file, text) in [("a/x.txt", "a3\n"), ("b/y.txt", "b2\n")] {
+        assert_eq!(
+            std::fs::read_to_string(world.work.join(file)).expect("landed file"),
+            text
+        );
+    }
+    assert!(git(&world.work, &["status", "--porcelain"]).is_empty());
+}
+
 /// An inherited red lands, named in the landing's `Aterm-Inherited`. NEGATIVE CONTROL: the same
 /// red, main's lane naming it just as much, in one of the branch's crates counts and pushes
 /// nothing.

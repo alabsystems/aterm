@@ -45,9 +45,7 @@ impl Terminal {
         out.push_str("\x1b[H");
         for r in 0..u16::try_from(rows).unwrap_or(u16::MAX) {
             let _ = write!(out, "\x1b[{};1H\x1b[K", r + 1);
-            if let Some(row_ansi) = grid.row_ansi_text_screen(r) {
-                out.push_str(&row_ansi);
-            }
+            let _ = grid.push_row_ansi_text_screen(r, &mut out);
             out.push_str("\x1b[0m");
         }
         let c = self.cursor();
@@ -56,10 +54,9 @@ impl Terminal {
             && self.modes().auto_wrap
             && c.col.saturating_add(1) == cols
             && grid.row_at_screen(c.row).is_some_and(|r| r.len() == cols)
-            && let Some(row_ansi) = grid.row_ansi_text_screen(c.row)
         {
             let _ = write!(out, "\x1b[{};1H\x1b[K", c.row as usize + 1);
-            out.push_str(&row_ansi);
+            let _ = grid.push_row_ansi_text_screen(c.row, &mut out);
             out.push_str("\x1b[0m");
         } else {
             let _ = write!(out, "\x1b[{};{}H", c.row as usize + 1, c.col as usize + 1);
@@ -241,9 +238,7 @@ fn paint_rows(out: &mut String, grid: &Grid) {
     out.push_str("\x1b[0m");
     for r in 0..grid.rows() {
         let _ = write!(out, "\x1b[{};1H\x1b[K", r + 1);
-        if let Some(row) = grid.row_ansi_text_screen(r) {
-            out.push_str(&row);
-        }
+        let _ = grid.push_row_ansi_text_screen(r, out);
         out.push_str("\x1b[0m");
     }
 }
@@ -258,10 +253,9 @@ fn reprint_wrapped(out: &mut String, grid: &Grid, cursor: Cursor) -> bool {
     {
         return false;
     }
-    let Some(row) = grid.row_ansi_text_screen(cursor.row) else {
-        return false;
-    };
-    let _ = write!(out, "\x1b[{};1H\x1b[K{row}\x1b[0m", cursor.row + 1);
+    let _ = write!(out, "\x1b[{};1H\x1b[K", cursor.row + 1);
+    let _ = grid.push_row_ansi_text_screen(cursor.row, out);
+    out.push_str("\x1b[0m");
     true
 }
 

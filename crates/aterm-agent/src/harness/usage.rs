@@ -2711,6 +2711,7 @@ mod tests {
             model: None,
             ctx_left: None,
             dur_us: 0,
+            row: None,
         };
         let mut a = live_account();
         a.add_reading(&reading, 1_012);
@@ -2751,6 +2752,7 @@ mod tests {
             model: Some("claude-opus-5-5".to_string()),
             ctx_left: None,
             dur_us: 0,
+            row: None,
         }
     }
 

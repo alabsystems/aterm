@@ -4340,27 +4340,11 @@ mod tests {
             assert_eq!(report.turns, 0, "{at}: a carried report begins no turn");
             assert_eq!(t.program_state().turn_edges().count(), 1, "CONTROL");
             assert_eq!(report.turn_edges().count(), 0, "{at}: and carries no edge");
-            assert_eq!(
-                report.restored_from,
-                Some(t.program_state().began),
-                "{at}: source identity is separate from local numbering"
-            );
             restored.process(b"\x1b]7501;state=blocked:app=codex:kind=permission\x1b\\");
             assert_eq!(
                 restored.program_state().began,
                 report.began,
                 "{at}: the box re-sent is the same box"
-            );
-            assert_eq!(
-                restored.program_state().restored_from,
-                report.restored_from,
-                "{at}: equal re-sends retain source lineage"
-            );
-            restored.process(b"\x1b]7501;state=working:app=codex\x1b\\");
-            assert_eq!(
-                restored.program_state().restored_from,
-                None,
-                "{at}: a real move ends inherited identity"
             );
         }
     }
@@ -4496,12 +4480,9 @@ mod tests {
         cp.output_state.program_state = Some("state=blocked:app=codex:kind=question".into());
         restored.restore_checkpoint(&cp);
         assert_eq!(
-            (
-                restored.program_state().began,
-                restored.program_state().restored_from
-            ),
-            (1, None),
-            "an old checkpoint assigns a local episode without source lineage"
+            restored.program_state().began,
+            1,
+            "the restore assigns its own local episode"
         );
         cp.output_state.program_state_began = Some(1);
         assert_eq!(restored.capture_output_state_repr(), cp.output_state);

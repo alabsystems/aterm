@@ -26,11 +26,16 @@
 //! - **What the sheets stop saying is retracted, three-way too.** A cell an earlier import of
 //!   a source kind read now wrote, and that source no longer states, is withdrawn: a set element
 //!   (a service, an alias) becomes `false`, a region, flow, mailbox link, alias link, note or rank
-//!   empty, and a preference no source states now ends (`row = ended`); an account or address no
-//!   longer listed is a finding, never removed. A source not read this run retracts nothing: a
-//!   fleet file is its own source, since a kind has several, and a kind with a file that could
-//!   not be read is not read. A run with a file or an address cell it could not read ends no
-//!   preference at all, since what it missed may state any of them.
+//!   empty, and a preference no source states now ends (`row = ended`); an account, address or
+//!   machine no longer listed is a finding, never removed, and a password stays, as the one copy
+//!   of a credential. A source not read this run retracts nothing: a fleet file is its own source,
+//!   since a kind has several, and a kind with a file that could not be read is not read. A
+//!   replica's dump is its own source by its bytes, so an edit makes it another: what the keys
+//!   its earlier imports on this Mac made wrote ([`covered::Record::sources`]) and the edit no
+//!   longer says, a phone and a machine's or a phone's fact among them, is a `differs` finding in
+//!   either mode and stays, so the replica reads uncovered until the owner settles each cell;
+//!   another Mac's replica, named alike, stays another source. A run with a file or an address
+//!   cell it could not read ends no preference at all, since what it missed may state any of them.
 //! - **Notes are kept, behind the guard** (design §0). The text of a note cell goes in its row's
 //!   `note`, three-way, so an owner's note wins, with its coordinate in `notes_src`. A cell the
 //!   note guard refuses (credential-shaped, naming a secret, holding an address) is never copied:
@@ -228,6 +233,9 @@ pub struct Sheet {
     /// Cells a dump's replica holds concurrent values for, by 1-based (row, column): never
     /// written, each a finding.
     pub conflicted: BTreeSet<(usize, usize)>,
+    /// The source keys this same replica's earlier imports made, by the record beside it: what
+    /// they wrote this sheet may take back ([`Self::said`]). Empty for any other sheet.
+    pub earlier: BTreeSet<String>,
 }
 
 /// Whether a sheet header names a credential: its column's cells are flags at most.
@@ -262,6 +270,17 @@ impl Sheet {
                 }
                 _ => true,
             }
+    }
+
+    /// Whether the source row `row`, key `pk`, is what this sheet can take a cell back from: this
+    /// sheet as it is ([`Self::wrote`]), or for a replica's table an earlier import of the same
+    /// replica, whose bytes its edit changed. Read fill-only, what that wrote is another source's
+    /// value, so the withdrawal is reported like any other difference, and not written.
+    fn said(&self, pk: &str, row: &cell::Row) -> bool {
+        self.wrote(pk, row)
+            || (self.earlier.contains(pk)
+                && row.get("kind").and_then(Value::as_str) == Some(self.kind.word())
+                && row.get("name").and_then(Value::as_str) == Some(self.name.as_str()))
     }
 
     /// Parse `bytes` (at most the importer's CSV caps) as a sheet named `name`.
@@ -376,6 +395,7 @@ impl Sheet {
             mode: Mode::FillOnly,
             secrets: BTreeMap::new(),
             conflicted: BTreeSet::new(),
+            earlier: BTreeSet::new(),
         })
     }
 
@@ -420,6 +440,7 @@ impl Sheet {
             mode: Mode::FillOnly,
             secrets: BTreeMap::new(),
             conflicted: BTreeSet::new(),
+            earlier: BTreeSet::new(),
         })
     }
 
@@ -659,7 +680,7 @@ pub enum Kind {
     SecretFlagLike,
     /// A dump made without `--show-passwords` (`<redacted>`): never written.
     SecretRedacted,
-    /// A protected address holds no password: the value is never written.
+    /// A protected address holds no password and no mailbox: the value is never written.
     ProtectedSecret,
     /// A dump column with no home in the registry: its name only.
     Unmapped,
@@ -864,6 +885,27 @@ const RETRACT_VALUES: [(&str, &str); 9] = [
     ("preference", "rank"),
 ];
 
+/// The value columns a replica's dump writes that a later read of it no longer stating them reports,
+/// and never empties: a sheet leaves such a cell blank for many reasons besides "none".
+const REPORT_VALUES: [(&str, &str); 16] = [
+    ("address", "phone"),
+    ("machine", "make"),
+    ("machine", "arch"),
+    ("machine", "os"),
+    ("machine", "chip"),
+    ("machine", "ram_gb"),
+    ("machine", "disk_gb"),
+    ("machine", "nickname"),
+    ("machine", "nickname_aliases"),
+    ("machine", "location"),
+    ("machine", "note"),
+    ("mailbox", "webmail"),
+    ("phone", "carrier"),
+    ("phone", "line_type"),
+    ("phone", "device"),
+    ("phone", "note"),
+];
+
 /// The room a row's `note` column gives (`registry::note`).
 const NOTE_BYTES: usize = 512;
 
@@ -888,7 +930,7 @@ impl ReadNow<'_> {
         };
         self.settled
             && self.kinds.contains(kind)
-            && (!several_word(kind) || self.files.iter().any(|sheet| sheet.wrote(pk, row)))
+            && (!several_word(kind) || self.files.iter().any(|sheet| sheet.said(pk, row)))
     }
 }
 
@@ -1001,6 +1043,10 @@ struct Planner<'a> {
     /// Every address read this run, with its row's key and coordinate.
     listed: BTreeMap<String, (String, Coord)>,
     minted_labels: BTreeSet<String>,
+    /// The phones this run made up a label for, for lack of a word: a source's word replaces it.
+    placeholder_labels: BTreeSet<String>,
+    /// The `ai_accounts` rows of a dump the vendor's mark says hold no account, by id.
+    no_account: BTreeSet<String>,
     /// The swarm roster as a source: its key and SHA-256, named by its canonical bytes.
     roster: (String, String),
     /// Every address either sheet lists as an AI login.
@@ -1126,6 +1172,8 @@ pub fn plan(input: &Input<'_>, cells: &Cells) -> Result<Plan> {
         corrected: BTreeSet::new(),
         listed: BTreeMap::new(),
         minted_labels: BTreeSet::new(),
+        placeholder_labels: BTreeSet::new(),
+        no_account: BTreeSet::new(),
         roster: roster_source(input.macs),
         logins: listed_logins(input.sheets),
         links: names::NameLinks::read(input.sheets, input.macs),
@@ -1134,6 +1182,7 @@ pub fn plan(input: &Input<'_>, cells: &Cells) -> Result<Plan> {
     };
     let mut order: Vec<usize> = (0..input.sheets.len()).collect();
     order.sort_by_key(|&n| (input.sheets[n].mode, input.sheets[n].kind));
+    planner.dump_marks();
     for n in order {
         planner.sheet(n)?;
     }
@@ -2131,6 +2180,19 @@ impl Planner<'_> {
                         }
                         if let Some(pk) = self.mailbox(&mailbox, sheet.kind, &at)? {
                             self.want(&ADDRESS, &address_pk, column, json!(pk), &at);
+                        } else if column == "mailbox"
+                            && self
+                                .address_key(&mailbox)
+                                .is_some_and(|login| self.guarded(&login))
+                        {
+                            // The owner's word names a protected login: no cell can hold it.
+                            self.findings.insert(Finding {
+                                kind: Kind::ProtectedSecret,
+                                collection: Some(ADDRESS.name),
+                                pk: Some(address_pk.clone()),
+                                column: Some("mailbox".to_owned()),
+                                at: vec![at.clone()],
+                            });
                         }
                     }
                     Err(_) => {
@@ -2253,12 +2315,16 @@ impl Planner<'_> {
     /// The mailbox that signs in as `address`: keyed from the key of that address's row
     /// ([`keys::mailbox_pk`], the row [`Self::address`] names, wanted too, from `kind`), with its
     /// `login` that row. A new row's label is the first free `<service>-<n>`; a held row keeps the
-    /// label it has. `None` where the address names no one row (several say it): nothing of the
-    /// mailbox is written.
+    /// label it has. `None` where the address names no one row (several say it), or a protected
+    /// one: nothing of the mailbox is written.
     fn mailbox(&mut self, address: &str, kind: SheetKind, at: &Coord) -> Result<Option<String>> {
         let Some(login) = self.address(address, kind, at) else {
             return Ok(None);
         };
+        // A protected address is no mailbox's login: whatever names it as one makes none.
+        if self.guarded(&login) {
+            return Ok(None);
+        }
         let pk = keys::mailbox_pk(&login)?;
         let domain = address.split_once('@').map_or("", |(_, d)| d);
         let (service, code_path) = mailbox_service(domain);
@@ -2355,10 +2421,16 @@ impl Planner<'_> {
                     let given = label.filter(|l| !used.contains(*l)).map(str::to_owned);
                     let label = match given {
                         Some(label) => label,
-                        None => (1..)
-                            .map(|k| format!("phone-{k}"))
-                            .find(|label| !used.contains(label.as_str()))
-                            .ok_or_else(|| Error::new("no phone label could be minted"))?,
+                        None => {
+                            let stated = self.replica_phone_labels();
+                            self.placeholder_labels.insert(pk.clone());
+                            (1..)
+                                .map(|k| format!("phone-{k}"))
+                                .find(|label| {
+                                    !used.contains(label.as_str()) && !stated.contains(label)
+                                })
+                                .ok_or_else(|| Error::new("no phone label could be minted"))?
+                        }
                     };
                     self.minted_labels.insert(label.clone());
                     self.want(&PHONE, &pk, "label", json!(label), at);
@@ -2686,6 +2758,7 @@ impl Planner<'_> {
                             self.link_alias(&address_pk, &root_pk, &at);
                         }
                         if !is_protected
+                            && !self.guarded(&address_pk)
                             && let Some(mb_pk) = self.mailbox(&root_addr, SheetKind::Emails, &at)?
                         {
                             self.want(&ADDRESS, &address_pk, "mailbox", json!(mb_pk), &at);
@@ -2783,6 +2856,14 @@ impl Planner<'_> {
         // The `+tag` rule's cells move only on a run that can see the owner's corrections.
         let logins_read = read.kinds.contains(SheetKind::Logins.word());
         let sources = &current[SOURCE.name];
+        // A replica's dump states its links and facts itself, so what it wrote it answers for
+        // alone, whichever other kinds this run read.
+        let from_dump = |field: &Field| {
+            source_row(field, sources).is_some_and(|(_, row)| {
+                row.get("kind").and_then(Value::as_str)
+                    == Some(SheetKind::FleetDb(Dump::Emails).word())
+            })
+        };
         // The source this run read that a retraction of `field` is written under: the file of the
         // one that wrote it, by name for a kind with several files.
         let retract_source = |field: &Field| -> Option<(usize, String)> {
@@ -2795,7 +2876,7 @@ impl Planner<'_> {
                 .sheets
                 .iter()
                 .enumerate()
-                .find(|(_, sheet)| sheet.wrote(wrote_pk, wrote))
+                .find(|(_, sheet)| sheet.said(wrote_pk, wrote))
                 .map(|(n, sheet)| (n, sheet.source.clone()))
         };
         // How the source at `n` writes, and whether `field` is its own earlier import's. The
@@ -2817,6 +2898,23 @@ impl Planner<'_> {
                 .sheets
                 .get(n)
                 .is_some_and(|sheet| sheet.wrote(wrote_pk, wrote))
+        };
+        // Whether `field` links a mailbox whose login only this run marks protected: the link
+        // stays, as that row's own mailbox does, since the owner's word may win the mark.
+        let login_marked_now = |field: &Field| {
+            field
+                .value()
+                .and_then(Value::as_str)
+                .and_then(|mailbox| current[MAILBOX.name].rows.get(mailbox))
+                .and_then(|mailbox| mailbox.get("login"))
+                .and_then(Value::as_str)
+                .is_some_and(|login| {
+                    protected.contains(login)
+                        && !current[ADDRESS.name]
+                            .rows
+                            .get(login)
+                            .is_some_and(check::protected)
+                })
         };
         // What each source found another import holding otherwise, by key and column.
         let mut differs: BTreeMap<usize, BTreeSet<(&'static str, String, String)>> =
@@ -2967,6 +3065,23 @@ impl Planner<'_> {
                     });
                     Ok(())
                 };
+                // A protected row holds no mailbox, whichever source names one, and no hint, which
+                // is no source's word: one held is taken back below once the registry holds the mark.
+                if name == ADDRESS.name
+                    && (protected.contains(pk) || current_row.is_some_and(check::protected))
+                {
+                    want.values.remove("mailbox_hint");
+                    if let Some(wanted) = want.values.remove("mailbox") {
+                        plan.counts.entry(name).or_default().kept += 1;
+                        plan.findings.push(Finding {
+                            kind: Kind::ProtectedSecret,
+                            collection: Some(name),
+                            pk: Some(pk.clone()),
+                            column: Some("mailbox".to_owned()),
+                            at: vec![wanted.at],
+                        });
+                    }
+                }
                 for (column, wanted) in &want.values {
                     step(
                         &mut changes,
@@ -3083,9 +3198,18 @@ impl Planner<'_> {
                         step: outcome,
                     });
                 }
-                // What an earlier import of a kind read now wrote here and no sheet states now.
+                // What an earlier import of a kind read now wrote here and no sheet states now. A
+                // source's own earlier word goes; one an earlier read of an edited replica wrote is
+                // reported and kept, since what the edit removed may be a value it could not carry.
+                // A protected row's mailbox and hint go only once the registry holds the mark, and
+                // so does another row's link to that row's mailbox: a run's mark may yet lose to the
+                // owner's word.
+                let shielded = name == ADDRESS.name && current_row.is_some_and(check::protected);
+                let marked_now = name == ADDRESS.name && protected.contains(pk) && !shielded;
+                let mut withdrawn = Vec::new();
                 if let Some(row) = current_row {
                     for (column, field) in &row.fields {
+                        let shield = matches!(column.as_str(), "mailbox" | "mailbox_hint");
                         match field {
                             Field::Set(elements)
                                 if RETRACT_SETS.contains(&(name, column.as_str())) =>
@@ -3101,46 +3225,82 @@ impl Planner<'_> {
                                             && Self::linked_to(&links, row, elem))
                                         && let Some((ret_sheet, ret_source)) = retract_source(field)
                                     {
+                                        if own(Some(field), ret_sheet) {
+                                            step(
+                                                &mut changes,
+                                                column,
+                                                Some(elem),
+                                                Value::Bool(false),
+                                                ret_sheet,
+                                                &ret_source,
+                                                Some(field),
+                                                &mut plan,
+                                            )?;
+                                        } else {
+                                            withdrawn.push((
+                                                ret_sheet,
+                                                format!("{column}.{elem}"),
+                                                Value::Bool(false),
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            _ if (RETRACT_VALUES.contains(&(name, column.as_str()))
+                                || (REPORT_VALUES.contains(&(name, column.as_str()))
+                                    && from_dump(field)))
+                                && !(marked_now && shield)
+                                && !(name == ADDRESS.name && shield && login_marked_now(field))
+                                && field.value().is_some_and(|x| !x.is_null())
+                                && retractable(field, sources, &read)
+                                && (logins_read
+                                    || name != ADDRESS.name
+                                    || !matches!(column.as_str(), "alias_of" | "kind")
+                                    || from_dump(field))
+                                // An address this run could not resolve may be the one that states
+                                // this row's mailbox, link or hint, as it may state a preference.
+                                && !(address_unread && name == ADDRESS.name)
+                                && !want.values.contains_key(column.as_str()) =>
+                            {
+                                if let Some((ret_sheet, ret_source)) = retract_source(field) {
+                                    if RETRACT_VALUES.contains(&(name, column.as_str()))
+                                        && (own(Some(field), ret_sheet) || (shielded && shield))
+                                    {
                                         step(
                                             &mut changes,
                                             column,
-                                            Some(elem),
-                                            Value::Bool(false),
+                                            None,
+                                            Value::Null,
                                             ret_sheet,
                                             &ret_source,
                                             Some(field),
                                             &mut plan,
                                         )?;
+                                    } else {
+                                        withdrawn.push((ret_sheet, column.clone(), Value::Null));
                                     }
-                                }
-                            }
-                            _ if RETRACT_VALUES.contains(&(name, column.as_str()))
-                                && field.value().is_some_and(|x| !x.is_null())
-                                && retractable(field, sources, &read)
-                                && (logins_read
-                                    || name != ADDRESS.name
-                                    || !matches!(column.as_str(), "alias_of" | "kind"))
-                                // An address this run could not resolve may be the one that states
-                                // this mailbox, as it may state a preference.
-                                && !(address_unread && name == ADDRESS.name && column == "mailbox")
-                                && !want.values.contains_key(column.as_str()) =>
-                            {
-                                if let Some((ret_sheet, ret_source)) = retract_source(field) {
-                                    step(
-                                        &mut changes,
-                                        column,
-                                        None,
-                                        Value::Null,
-                                        ret_sheet,
-                                        &ret_source,
-                                        Some(field),
-                                        &mut plan,
-                                    )?;
                                 }
                             }
                             _ => {}
                         }
                     }
+                }
+                for (_, column, x) in &withdrawn {
+                    plan.counts.entry(name).or_default().kept += 1;
+                    plan.findings.push(Finding {
+                        kind: Kind::Differs,
+                        collection: Some(name),
+                        pk: Some(pk.clone()),
+                        column: Some(column.clone()),
+                        at: Vec::new(),
+                    });
+                    plan.planned.push(Planned {
+                        collection: name,
+                        pk: pk.clone(),
+                        column: column.clone(),
+                        x: x.clone(),
+                        step: Step::Kept,
+                    });
                 }
                 let fresh = current_row.is_none();
                 if fresh {
@@ -3212,7 +3372,8 @@ impl Planner<'_> {
                 for n in secret_touched {
                     touched_rows.insert((n, name, pk.clone()));
                 }
-                for (n, column) in secret_differs {
+                let withdrawn = withdrawn.into_iter().map(|(n, column, _)| (n, column));
+                for (n, column) in secret_differs.into_iter().chain(withdrawn) {
                     differs
                         .entry(n)
                         .or_default()
@@ -3226,8 +3387,8 @@ impl Planner<'_> {
         // A preference an earlier import wrote that no source states now ends, three-way: a row
         // with an owner's cell on it stays and is a finding, and an account with a cell this run
         // could not read keeps its rows, as does every row when a file or an address cell could
-        // not be read, since what was missed may state any of them. An account or address no
-        // source lists now is reported and left for the owner.
+        // not be read, since what was missed may state any of them. An account, address or machine
+        // no source lists now is reported and left for the owner.
         let login_unsettled = |row: &cell::Row| {
             row.get("account")
                 .and_then(Value::as_str)
@@ -3273,6 +3434,23 @@ impl Planner<'_> {
             let Some((ret_sheet, source)) = retract_source(field) else {
                 continue;
             };
+            // An edited replica ends none its earlier read wrote: the withdrawal is reported.
+            if !own(Some(field), ret_sheet) {
+                differs.entry(ret_sheet).or_default().insert((
+                    PREFERENCE.name,
+                    pk.clone(),
+                    crate::typed::LIFECYCLE.to_owned(),
+                ));
+                plan.findings.push(Finding {
+                    kind: Kind::Differs,
+                    collection: Some(PREFERENCE.name),
+                    pk: Some(pk.clone()),
+                    column: Some(crate::typed::LIFECYCLE.to_owned()),
+                    at: Vec::new(),
+                });
+                plan.counts.entry(PREFERENCE.name).or_default().kept += 1;
+                continue;
+            }
             let ended = json!("ended");
             if cell::import_step(Some(field), &ended) != ImportStep::Write {
                 continue;
@@ -3309,7 +3487,7 @@ impl Planner<'_> {
                 .entry(name)
                 .or_default() += 1;
         }
-        for collection in [&ACCOUNT, &ADDRESS] {
+        for collection in [&ACCOUNT, &ADDRESS, &MACHINE] {
             for (pk, row) in &current[collection.name].rows {
                 if !rows
                     .get(collection.name)

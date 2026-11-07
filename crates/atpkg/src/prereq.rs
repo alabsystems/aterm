@@ -151,6 +151,11 @@ pub struct CcHost {
     /// The inherited SDK override. An explicit SDK is mutable outside Apple's install receipts,
     /// so a successful probe using it is not cached.
     pub sdkroot_override: Option<PathBuf>,
+    /// The inherited minimum macOS version for a build, independent of installed tool health.
+    pub deployment_target_override: Option<std::ffi::OsString>,
+    /// Inherit project compiler configuration. Machine setup clears the environment instead,
+    /// then applies the explicit probe inputs and temporary directory.
+    pub inherit_environment: bool,
     /// How long each compiler probe may take: [`PROBE_TIMEOUT`] on this machine.
     pub bound: Duration,
     /// Where the build probe makes its private directory.
@@ -169,6 +174,8 @@ impl CcHost {
                 .then(|| PathBuf::from(aterm_types::clt_shim::XCODE_DEVELOPER)),
             developer_dir_override: std::env::var_os("DEVELOPER_DIR").map(PathBuf::from),
             sdkroot_override: std::env::var_os("SDKROOT").map(PathBuf::from),
+            deployment_target_override: std::env::var_os("MACOSX_DEPLOYMENT_TARGET"),
+            inherit_environment: true,
             bound: PROBE_TIMEOUT,
             tmp_root: std::env::temp_dir(),
         }
@@ -208,6 +215,30 @@ impl CcHost {
         self.sdkroot_override
             .as_deref()
             .filter(|sdk| !sdk.as_os_str().is_empty())
+    }
+
+    fn deployment_target(&self) -> Option<&OsStr> {
+        self.deployment_target_override
+            .as_deref()
+            .filter(|target| !target.is_empty())
+    }
+
+    fn apply_environment(&self, cmd: &mut aterm_uds::spawnfd::Command) {
+        if !self.inherit_environment {
+            cmd.env_clear().env("TMPDIR", &self.tmp_root);
+        }
+        cmd.env_remove("DEVELOPER_DIR")
+            .env_remove("SDKROOT")
+            .env_remove("MACOSX_DEPLOYMENT_TARGET");
+        if let Some(developer) = self.developer_override() {
+            cmd.env("DEVELOPER_DIR", developer);
+        }
+        if let Some(sdk) = self.sdkroot() {
+            cmd.env("SDKROOT", sdk);
+        }
+        if let Some(target) = self.deployment_target() {
+            cmd.env("MACOSX_DEPLOYMENT_TARGET", target);
+        }
     }
 }
 
@@ -278,7 +309,9 @@ pub fn probe_cached(path_var: Option<&OsStr>, host: &CcHost, cache: Option<&CcCa
 /// now ([`crate::probe_cache::identity`]), the active developer directory (`DEVELOPER_DIR`,
 /// else `xcode-select`'s link, else Xcode or the standalone tools), the identity of its `clang`,
 /// the Command Line Tools receipt's time, the SDK a build would fall back to and the `PATH`
-/// the build sees. `None` when the compiler cannot be read or an explicit SDK is used:
+/// the build sees, its minimum macOS deployment target, and whether project configuration is
+/// inherited. `None` when the compiler cannot
+/// be read or an explicit SDK is used:
 /// changes within that SDK have no Apple install receipt to retire a cached success.
 /// The fresh-output policy domain retires verdicts made by weaker output checks.
 fn cc_key(
@@ -316,7 +349,7 @@ fn cc_key(
             .unwrap_or_default()
     }
     crate::probe_cache::key([
-        Some("fresh-executable-link-v1".to_owned()),
+        Some("fresh-executable-link-v3".to_owned()),
         Some(kind.to_owned()),
         crate::probe_cache::identity(cc),
         Some(developer_dir.display().to_string()),
@@ -324,6 +357,8 @@ fn cc_key(
         Some(receipt),
         Some(sdk),
         Some(lossy(path_var)),
+        Some(lossy(host.deployment_target())),
+        Some(host.inherit_environment.to_string()),
     ])
 }
 
@@ -497,14 +532,11 @@ fn build_probe_in(
     let run_cc = |sdkroot: Option<&Path>, program: &Path| {
         let mut cmd = aterm_uds::spawnfd::command(cc);
         cmd.arg("-o").arg(program).arg(&source).current_dir(dir);
-        cmd.env_remove("DEVELOPER_DIR").env_remove("SDKROOT");
-        if let Some(developer) = host.developer_override() {
-            cmd.env("DEVELOPER_DIR", developer);
-        }
+        host.apply_environment(&mut cmd);
         if let Some(path) = path_var {
             cmd.env("PATH", path);
         }
-        if let Some(sdk) = sdkroot.or(host.sdkroot()) {
+        if let Some(sdk) = sdkroot {
             cmd.env("SDKROOT", sdk);
         }
         crate::doctor::output_bounded_capturing(&mut cmd, host.bound)
@@ -580,13 +612,7 @@ fn ask(bin: &Path, driver: &Path, args: &[&str], host: &CcHost) -> CcVerdict {
     let bound = host.bound;
     let mut cmd = aterm_uds::spawnfd::command(bin);
     cmd.args(args);
-    cmd.env_remove("DEVELOPER_DIR").env_remove("SDKROOT");
-    if let Some(developer) = host.developer_override() {
-        cmd.env("DEVELOPER_DIR", developer);
-    }
-    if let Some(sdk) = host.sdkroot() {
-        cmd.env("SDKROOT", sdk);
-    }
+    host.apply_environment(&mut cmd);
     match crate::doctor::output_bounded_capturing(&mut cmd, bound) {
         None => CcVerdict::Unanswered {
             driver: driver.to_path_buf(),
@@ -663,6 +689,8 @@ mod tests {
             xcode_developer_dir: None,
             developer_dir_override: None,
             sdkroot_override: None,
+            deployment_target_override: None,
+            inherit_environment: true,
             bound: ANSWER,
             tmp_root,
         }
@@ -909,6 +937,8 @@ mod tests {
             xcode_developer_dir: None,
             developer_dir_override: None,
             sdkroot_override: None,
+            deployment_target_override: None,
+            inherit_environment: true,
             bound: ANSWER,
             tmp_root: tmp_root.clone(),
         };
@@ -1212,6 +1242,106 @@ mod tests {
         assert_eq!(probe_cached(path, &host, None), ready);
         assert_eq!(runs(), 6, "no cache: the compiler is asked");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_system_probe_does_not_inherit_a_projects_compiler_environment() {
+        const CHILD: &str = "ATERM_CC_ENVIRONMENT_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let witness = aterm_tempfile::tempdir().unwrap();
+            let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+            cmd.args([
+                "--exact",
+                "prereq::tests::a_system_probe_does_not_inherit_a_projects_compiler_environment",
+                "--nocapture",
+            ])
+            .env(CHILD, witness.path())
+            .env("CPATH", "project header configuration");
+            let output = aterm_uds::deadline::output_until(
+                &mut cmd,
+                std::time::Instant::now() + Duration::from_secs(60),
+            )
+            .unwrap();
+            assert!(
+                output.status.success() && witness.path().join("checked").is_file(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let root = scratch("compiler-environment");
+        let bin = root.join("bin");
+        script(
+            &bin.join("cc"),
+            "[ \"$1\" = --version ] && { echo cc; exit 0; }\nif [ -n \"$CPATH\" ]; then echo 'project headers refused' >&2; exit 1; fi\nprintf x > \"$2\"\n/bin/chmod +x \"$2\"",
+        );
+        let mut host = plain_host(&root);
+        let cache = CcCache {
+            file: root.join("state/cc"),
+            receipt: root.join("no-receipt"),
+        };
+        let path = Some(bin.as_os_str());
+        let refused = |verdict| matches!(verdict, CcVerdict::Broken { why, .. } if why == "project headers refused");
+        assert!(refused(probe_cached(path, &host, Some(&cache))));
+        host.inherit_environment = false;
+        assert_eq!(
+            probe_cached(path, &host, Some(&cache)),
+            CcVerdict::Ready {
+                driver: bin.join("cc")
+            }
+        );
+        host.inherit_environment = true;
+        assert!(
+            refused(probe_cached(path, &host, Some(&cache))),
+            "a system-only fact must not stand for the project's build"
+        );
+        std::fs::write(
+            PathBuf::from(std::env::var_os(CHILD).unwrap()).join("checked"),
+            b"yes",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_changed_deployment_target_cannot_reuse_a_cached_success() {
+        let root = scratch("deployment-target");
+        let bin = root.join("bin");
+        let asked = root.join("asked");
+        script(
+            &bin.join("cc"),
+            &format!(
+                "echo asked >> '{}'\ncase \"$1\" in\n--version) echo cc;;\n-o) if [ \"$MACOSX_DEPLOYMENT_TARGET\" = unavailable ]; then echo 'build target unavailable' >&2; exit 1; fi; printf x > \"$2\"; /bin/chmod +x \"$2\";;\nesac",
+                asked.display()
+            ),
+        );
+        let mut host = plain_host(&root);
+        let cache = CcCache {
+            file: root.join("state/cc"),
+            receipt: root.join("no-receipt"),
+        };
+        let path = Some(bin.as_os_str());
+        let runs = || std::fs::read_to_string(&asked).unwrap().lines().count();
+        let ready = CcVerdict::Ready {
+            driver: bin.join("cc"),
+        };
+        assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+        assert_eq!(runs(), 2);
+        host.deployment_target_override = Some("unavailable".into());
+        assert!(matches!(
+            probe_cached(path, &host, Some(&cache)),
+            CcVerdict::Broken { why, .. } if why == "build target unavailable"
+        ));
+        assert_eq!(
+            runs(),
+            4,
+            "a changed build target must ask the compiler again"
+        );
+        host.deployment_target_override = Some("11.0".into());
+        assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+        assert_eq!(runs(), 6);
+        assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+        assert_eq!(runs(), 6, "an unchanged target retains its successful fact");
     }
 
     #[test]

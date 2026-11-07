@@ -473,6 +473,29 @@ pub fn current(paths: &Paths, first: &'static Compiled) -> &'static Compiled {
         })
 }
 
+/// [`current`] for a read a person waits on: the generation this Mac's catalog names, read
+/// under `read_by` with the ordinary admission's wait for each holder, and a failure to read it
+/// the read's own, never the first generation in its place.
+///
+/// # Errors
+/// The catalog cannot be read by `read_by`.
+pub(crate) fn current_within(
+    paths: &Paths,
+    first: &'static Compiled,
+    read_by: std::time::Instant,
+) -> Result<&'static Compiled> {
+    let chain = first.chain();
+    if chain.len() == 1 {
+        return Ok(first);
+    }
+    Ok(
+        application::peek_catalog_within(paths, read_by, &crate::admission::deadline)?
+            .map_or(first, |(trust, snapshot)| {
+                current_in(&snapshot, trust, &chain)
+            }),
+    )
+}
+
 /// The compiled table of `table`'s family at `generation`.
 fn generation_of(table: &Table, generation: u64) -> Option<&'static Compiled> {
     let target_family = table.role.split('.').next().unwrap_or(table.role);
@@ -919,6 +942,20 @@ impl Handle {
         Self { paths, compiled }
     }
 
+    /// [`Self::at`] for a read a person waits on: the generation is read as [`current_within`]
+    /// reads it, observed again while it meets a holder, until `read_by`.
+    ///
+    /// # Errors
+    /// This Mac's catalog cannot be read by `read_by`.
+    pub fn at_until(
+        paths: Paths,
+        compiled: &'static Compiled,
+        read_by: std::time::Instant,
+    ) -> Result<Self> {
+        let compiled = reopened(read_by, || current_within(&paths, compiled, read_by))?;
+        Ok(Self { paths, compiled })
+    }
+
     /// The table this handle reaches.
     pub const fn compiled(&self) -> &'static Compiled {
         self.compiled
@@ -1038,6 +1075,34 @@ impl Handle {
                     &Log::read_with(session, store, scope, decode)?,
                 ))
             })
+        })
+    }
+
+    /// [`Self::view`] for a read a person waits on, such as the resolution of a fleet label. Each
+    /// wait for a holder of the vault or of custody is the ordinary admission's
+    /// ([`crate::admission::deadline`], asked as each such stage starts), so a holder keeps this read
+    /// waiting no longer than any other; the reading itself may run until `read_by`, so a loaded
+    /// Mac's pace, or a successor home's predecessors read beside its own custody, is no refusal;
+    /// and a read that met a holder is observed again until then.
+    ///
+    /// # Errors
+    /// As [`Self::view`], or the read ran out of time at `read_by`.
+    pub fn view_until(&self, read_by: std::time::Instant) -> Result<View> {
+        let table = self.compiled.table;
+        reopened(read_by, || {
+            application::observe_store_within(
+                &self.paths,
+                self.descriptor(),
+                read_by,
+                &crate::admission::deadline,
+                |session, store, scope| {
+                    Ok(View::read(
+                        table,
+                        session,
+                        &Log::read_with(session, store, scope, decode)?,
+                    ))
+                },
+            )
         })
     }
 

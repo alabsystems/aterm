@@ -184,10 +184,12 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
     // session reads them that way. Its phones' numbers are fleet_db's keys, printed by every
     // verb that names a phone; they go with fleet_db (A13).
     #[cfg(unix)]
-    if fleet_db_reveals(&words)
-        && let Err(error) =
-            crate::alab::command::session::decide(&crate::alab::command::session::facts())
-    {
+    if let Err(error) = fleet_db_reveals(&words).and_then(|reveals| {
+        if reveals {
+            crate::alab::command::session::decide(&crate::alab::command::session::facts())?;
+        }
+        Ok(())
+    }) {
         let _ = writeln!(std::io::stderr(), "aterm db: {error}");
         return ExitCode::from(1);
     }
@@ -383,8 +385,10 @@ pub fn run(words: &[String]) -> Result<Value> {
     ) && local::holds_fleet_tables(dir)?
     {
         return Err(Error::new(
-            "this folder holds the fleet tables: write them with `aterm db emails`, `computers`, \
-             `phones` or `ai-accounts`, not a private verb",
+            "this folder holds the fleet tables, which no private verb writes. `aterm db put \
+             <table> <key> <json>` takes no folder and writes this Mac's replica; once an import \
+             moved them, `aterm db emails`, `computers`, `phones` and `ai-accounts` do (`aterm db \
+             --help` says which)",
         ));
     }
     let value = match command {
@@ -935,34 +939,36 @@ fn status(db: &Database) -> Value {
 
 /// Whether `words` show or write fleet_db's plaintext: `--show-passwords` (`--reveal`), a `dump`
 /// to a file, its file read as fleet_db reads it (the word after `--dir` is its folder), or a
-/// private `get` or `scan` of a folder that holds the fleet tables, which print what is stored. A
-/// folder that cannot be told apart counts as one.
+/// private `get` or `scan` of a folder that holds the fleet tables, which print what is stored.
+///
+/// # Errors
+/// A folder that cannot be told apart: no verb runs on it, and this says why.
 #[cfg(unix)]
-fn fleet_db_reveals(words: &[String]) -> bool {
+fn fleet_db_reveals(words: &[String]) -> Result<bool> {
     if words
         .iter()
         .any(|w| w == "--show-passwords" || w == "--reveal")
     {
-        return true;
+        return Ok(true);
     }
     if matches!(words.first().map(String::as_str), Some("get" | "scan"))
         && let Some(dir) = words.windows(2).find(|pair| pair[0] == "--dir")
-        && local::holds_fleet_tables(Path::new(&dir[1])).unwrap_or(true)
+        && local::holds_fleet_tables(Path::new(&dir[1]))?
     {
-        return true;
+        return Ok(true);
     }
     if words.first().map(String::as_str) != Some("dump") {
-        return false;
+        return Ok(false);
     }
     let mut rest = words[1..].iter();
     while let Some(word) = rest.next() {
         if word == "--dir" {
             rest.next();
         } else if !word.starts_with("--") {
-            return true;
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
 }
 
 #[cfg(all(test, unix))]
@@ -981,10 +987,10 @@ mod reveal_gate_tests {
             "dump --dir /r out.json",
             "dump out.json --dir /r",
         ] {
-            assert!(fleet_db_reveals(&words(gated)), "{gated}");
+            assert!(fleet_db_reveals(&words(gated)).unwrap(), "{gated}");
         }
         for open in ["dump", "dump --dir /r", "emails", "put emails a@b {}"] {
-            assert!(!fleet_db_reveals(&words(open)), "{open}");
+            assert!(!fleet_db_reveals(&words(open)).unwrap(), "{open}");
         }
     }
 }
@@ -1061,32 +1067,68 @@ mod private_verb_tests {
         }
         let scan = ["scan", "--dir", d, "--collection", "emails"];
         assert!(run(&line(&scan)).is_ok());
-        assert!(fleet_db_reveals(&line(&scan)));
-        assert!(fleet_db_reveals(&line(&[
-            "get",
-            "--dir",
-            d,
-            "--collection",
-            "c",
-            "--key",
-            "k"
-        ])));
+        assert!(fleet_db_reveals(&line(&scan)).unwrap());
+        assert!(
+            fleet_db_reveals(&line(&[
+                "get",
+                "--dir",
+                d,
+                "--collection",
+                "c",
+                "--key",
+                "k"
+            ]))
+            .unwrap()
+        );
 
         let other = tmp.path().join("other");
         local::init(&other, "accounts").unwrap();
         let o = other.to_str().unwrap();
-        assert!(!fleet_db_reveals(&line(&[
-            "scan",
-            "--dir",
-            o,
-            "--collection",
-            "c"
-        ])));
+        assert!(!fleet_db_reveals(&line(&["scan", "--dir", o, "--collection", "c"])).unwrap());
 
         let reserved = tmp.path().join("reserved");
         let r = reserved.to_str().unwrap();
         assert!(run(&line(&["init", "--dir", r, "--namespace", "alab"])).is_err());
         assert!(!reserved.join("database.json").exists());
+    }
+
+    /// A folder no verb can open says why, to a write and to a read: no plaintext is at stake, and
+    /// its file is not what is wrong. The fleet tables stay unwritable behind any of them.
+    /// NEGATIVE CONTROL: with `holds_fleet_tables` starting at its file, each write names the file:
+    /// `` existing database state is not a private regular file ``.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_no_verb_can_open_says_why() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let open = tmp.path().join("open");
+        local::init(&open, "accounts").unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let healthy = tmp.path().join("healthy");
+        local::init(&healthy, "accounts").unwrap();
+        let link = tmp.path().join("link");
+        symlink(&healthy, &link).unwrap();
+        let plain = tmp.path().join("plain");
+        aterm_uds::private_file::write_private(tmp.path(), "plain", b"x").unwrap();
+        let fleet = tmp.path().join("fleet");
+        local::ensure_fleet(&fleet, &[0x5a; 32]).unwrap();
+        std::fs::set_permissions(&fleet, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for (dir, says) in [
+            (&open, "open to other users"),
+            (&link, "symlink"),
+            (&plain, "no directory"),
+            (&fleet, "open to other users"),
+        ] {
+            let d = dir.to_str().unwrap();
+            let refused = run(&line(&["stop", "--dir", d])).unwrap_err().to_string();
+            assert!(refused.contains(says), "{d}: {refused}");
+            let scan = ["scan", "--dir", d, "--collection", "c"];
+            let refused = fleet_db_reveals(&line(&scan)).unwrap_err().to_string();
+            assert!(refused.contains(says), "{d}: {refused}");
+        }
+        let gone = tmp.path().join("gone");
+        let scan = ["scan", "--dir", gone.to_str().unwrap(), "--collection", "c"];
+        assert!(!fleet_db_reveals(&line(&scan)).unwrap());
     }
 
     /// A neighbour holding the writer lock changes neither what a folder is nor its answer: another
@@ -1102,7 +1144,7 @@ mod private_verb_tests {
         let o = other.to_str().unwrap();
         let scan = ["scan", "--dir", o, "--collection", "c"];
         let neighbour = Database::open(&other).unwrap();
-        assert!(!fleet_db_reveals(&line(&scan)));
+        assert!(!fleet_db_reveals(&line(&scan)).unwrap());
         assert!(run(&line(&scan)).unwrap_err().is_busy());
         drop(neighbour);
 
@@ -1110,13 +1152,7 @@ mod private_verb_tests {
         local::ensure_fleet(&fleet, &[0x5a; 32]).unwrap();
         let d = fleet.to_str().unwrap();
         let neighbour = Database::open(&fleet).unwrap();
-        assert!(fleet_db_reveals(&line(&[
-            "scan",
-            "--dir",
-            d,
-            "--collection",
-            "emails"
-        ])));
+        assert!(fleet_db_reveals(&line(&["scan", "--dir", d, "--collection", "emails"])).unwrap());
         let request = "11".repeat(16);
         let refused = run(&line(&[
             "put",

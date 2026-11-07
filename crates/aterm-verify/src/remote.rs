@@ -2,8 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! The verifier's remote boundary: GitHub goes through agh, local repositories through git.
-//! Objects are imported at an exact observed OID; writes carry the expected ref and stop on
-//! an unknown outcome. Neither a failed agh command nor an unrecognised URL falls back to git.
+//! Pinned reads import an exact observed OID; ordinary main refreshes reuse the checkout's
+//! objects. Writes carry the expected ref and stop on an unknown outcome. Neither a failed
+//! agh command nor an unrecognised URL falls back to git.
 
 use aterm_json::{Value, json};
 use aterm_uds::spawnfd::Command;
@@ -28,7 +29,20 @@ pub(crate) fn run(
     until: Instant,
 ) -> Result<Output, String> {
     let mut cmd = match tool {
-        Tool::Git => git(root),
+        Tool::Git => {
+            let mut cmd = git(root);
+            // Local discovery and snapshot reads answer for this checkout, even
+            // when the caller inherited another repository's Git environment.
+            for (key, _) in std::env::vars_os() {
+                if key.as_encoded_bytes().starts_with(b"GIT_") {
+                    cmd.env_remove(key);
+                }
+            }
+            cmd.env("GIT_NO_REPLACE_OBJECTS", "1")
+                .env("GIT_NO_LAZY_FETCH", "1")
+                .env("GIT_TERMINAL_PROMPT", "0");
+            cmd
+        }
         Tool::Agh => {
             let mut cmd = aterm_uds::spawnfd::command("agh");
             cmd.current_dir(root);
@@ -153,6 +167,45 @@ impl<'a> Remote<'a> {
             kind,
             run,
         })
+    }
+
+    /// Refresh ordinary live main through agh's incremental snapshot operation.
+    /// Pinned provenance reads still use [`Self::fetch`]. A failed refresh never
+    /// turns a previous local snapshot into a successful current observation.
+    pub(crate) fn refresh_main(&self) -> Result<String, String> {
+        let Kind::Github(slug) = &self.kind else {
+            return self
+                .fetch("refs/heads/main")?
+                .ok_or_else(|| "remote main is absent".into());
+        };
+        const INTO: &str = "refs/agh/fetched-main";
+        let direct = (self.run)(Tool::Git, &words(&["symbolic-ref", "--quiet", INTO]))?;
+        match direct.status.code() {
+            Some(1) => {}
+            Some(0) => return Err("agh's main snapshot ref is symbolic".into()),
+            _ => return Err("cannot inspect agh's main snapshot ref".into()),
+        }
+        let mut args = words(&["repo", "fetch-main", slug]);
+        args.push(self.root.as_os_str().to_owned());
+        success(Tool::Agh, (self.run)(Tool::Agh, &args)?)?;
+        let out = success(
+            Tool::Git,
+            (self.run)(Tool::Git, &words(&["rev-parse", "--verify", INTO]))?,
+        )?;
+        let tip = std::str::from_utf8(&out)
+            .map_err(|_| "agh's main snapshot is not UTF-8")?
+            .trim();
+        if !aterm_types::land_trailer::object_id(tip) {
+            return Err("agh's main snapshot is not one exact object ID".into());
+        }
+        let kind = success(
+            Tool::Git,
+            (self.run)(Tool::Git, &words(&["cat-file", "-t", tip]))?,
+        )?;
+        if kind != b"commit\n" {
+            return Err("agh's main snapshot is not a commit object".into());
+        }
+        Ok(tip.into())
     }
 
     /// Import the exact commit a ref names, or report an absent ref. No branch/index is moved.

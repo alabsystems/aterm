@@ -41,6 +41,8 @@ pub(super) struct NameLinks {
     contested: BTreeSet<String>,
     /// The transport ids a source states beside each name.
     nodes: BTreeMap<String, BTreeSet<String>>,
+    /// The mesh ids a source states beside each name: a row's `node`.
+    principals: BTreeMap<String, BTreeSet<String>>,
     /// The hosts a source states beside each name.
     hosts: BTreeMap<String, BTreeSet<String>>,
 }
@@ -52,6 +54,7 @@ struct Stated {
     label: String,
     names: BTreeSet<String>,
     node: Option<String>,
+    principal: Option<String>,
     host: Option<String>,
 }
 
@@ -98,6 +101,12 @@ impl NameLinks {
                         .or_default()
                         .insert(node.clone());
                 }
+                if let Some(principal) = &row.principal {
+                    self.principals
+                        .entry(name.clone())
+                        .or_default()
+                        .insert(principal.clone());
+                }
                 if let Some(host) = &row.host {
                     self.hosts
                         .entry(name.clone())
@@ -119,7 +128,7 @@ impl NameLinks {
     }
 
     /// `name` and every name linked to it through names no source contests.
-    fn of(&self, name: &str) -> BTreeSet<String> {
+    pub(super) fn of(&self, name: &str) -> BTreeSet<String> {
         let mut names = BTreeSet::from([name.to_owned()]);
         let mut todo = vec![name.to_owned()];
         while let Some(next) = todo.pop() {
@@ -199,6 +208,7 @@ fn sheet_rows(sheet: &Sheet) -> Vec<Stated> {
             label: stated,
             names,
             node: cell(node).and_then(|cell| node_word(cell)),
+            principal: cell(node).and_then(|cell| principal_word(cell)),
             host: cell(host).and_then(|cell| host_word(cell, raw)),
         });
     }
@@ -344,6 +354,14 @@ impl Planner<'_> {
         other_transport || other_principal
     }
 
+    /// The one mesh id sources state beside `names`: two say nothing of which Mac it is.
+    fn stated_principal(&self, names: &BTreeSet<String>) -> Option<String> {
+        let stated = NameLinks::beside(names, &self.links.principals);
+        (stated.len() == 1)
+            .then(|| stated.into_iter().next())
+            .flatten()
+    }
+
     /// The row that what sources state beside `names` finds, by node, then host, then the names
     /// themselves. A name answered by a row another Mac's node holds is a clash, never a match.
     fn found(
@@ -352,6 +370,13 @@ impl Planner<'_> {
         mut transports: BTreeSet<String>,
         principal: Option<&str>,
     ) -> Result<Option<String>, Kind> {
+        let stated = self.stated_principal(names);
+        let principal = principal.or(stated.as_deref());
+        if let Some(node) = principal
+            && let Some(pk) = sole(self.rows_on_node("node", node), Kind::NodeAmbiguous)?
+        {
+            return Ok(Some(pk));
+        }
         transports.extend(NameLinks::beside(names, &self.links.nodes));
         let on_node: BTreeSet<String> = transports
             .iter()
@@ -597,14 +622,25 @@ impl Planner<'_> {
 
     /// The rows a source's machine row finds by the node and the host it states: `Ok(None)` for
     /// neither, or a row found, by those alone.
-    fn stated_row(&self, node: Option<&str>, host: Option<&str>) -> Result<Option<String>, Kind> {
+    fn stated_row(
+        &self,
+        label: &str,
+        node: Option<&str>,
+        host: Option<&str>,
+    ) -> Result<Option<String>, Kind> {
+        let principal = self.stated_principal(&self.links.of(label));
+        if let Some(mesh) = &principal
+            && let Some(pk) = sole(self.rows_on_node("node", mesh), Kind::NodeAmbiguous)?
+        {
+            return Ok(Some(pk));
+        }
         let on_node = node.map_or_else(BTreeSet::new, |node| self.rows_on_node("fleet_node", node));
         if let Some(pk) = sole(on_node, Kind::NodeAmbiguous)? {
             return Ok(Some(pk));
         }
         let transports: BTreeSet<String> = node.map(str::to_owned).into_iter().collect();
         let mut on_host = host.map_or_else(BTreeSet::new, |host| self.rows_on_host(&[host]));
-        on_host.retain(|pk| !self.other_mac(pk, &transports, None));
+        on_host.retain(|pk| !self.other_mac(pk, &transports, principal.as_deref()));
         sole(on_host, Kind::HostAmbiguous)
     }
 
@@ -618,7 +654,7 @@ impl Planner<'_> {
         host: Option<&str>,
         at: &Coord,
     ) -> Option<String> {
-        match self.stated_row(node, host) {
+        match self.stated_row(&label.canonical(), node, host) {
             Err(kind) => {
                 self.find(kind, Some(MACHINE.name), None, vec![at.clone()]);
                 None
@@ -653,7 +689,7 @@ impl Planner<'_> {
         node: Option<&str>,
         host: Option<&str>,
     ) -> Option<String> {
-        match self.stated_row(node, host) {
+        match self.stated_row(&label.canonical(), node, host) {
             Ok(Some(pk)) => Some(pk),
             Ok(None) => self.machine_key(label),
             Err(_) => None,
@@ -895,6 +931,13 @@ fn known_birth(mac: &KnownMac, held: impl Fn(&str) -> bool) -> Option<String> {
 fn node_word(raw: &str) -> Option<String> {
     let node = raw.trim().to_ascii_lowercase();
     aterm_codec::hex::is_lower(&node, 32).then_some(node)
+}
+
+/// A mesh id in its stored spelling: a row's `node`, which a replica spells `n-<16 hex>` or bare.
+fn principal_word(raw: &str) -> Option<String> {
+    let node = raw.trim().to_ascii_lowercase();
+    let mesh = node.strip_prefix("n-").unwrap_or(&node);
+    aterm_codec::hex::is_lower(mesh, 16).then(|| mesh.to_owned())
 }
 
 /// The transport id a replica row states for matching `fleet_node`: a concurrent or malformed cell

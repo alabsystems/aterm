@@ -682,9 +682,7 @@ impl Git<'_> {
             crate::remote::run(self.root, self.make, tool, args, until)
         };
         let remote = crate::remote::Remote::open(self.root, REMOTE, &run)?;
-        let tip = remote
-            .fetch(&format!("refs/heads/{MAIN}"))?
-            .ok_or("remote main is absent")?;
+        let tip = remote.refresh_main()?;
         self.local(&["update-ref", &format!("refs/remotes/{REMOTE}/{MAIN}"), &tip])?;
         Ok(tip)
     }

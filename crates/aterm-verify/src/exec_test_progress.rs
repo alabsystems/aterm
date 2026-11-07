@@ -11,6 +11,8 @@
 //! RUN), a decisive failed case ends its binary when its run halts at its first red: `exec`
 //! stops it there ([`Seen::Red`]), and the binary's log already holds the block its red row's
 //! "why" comes from. A spared case ([`Seen::Spared`]) halts nothing, and reading goes on.
+//! Libtest's long-running case event is also reported live ([`Seen::RunningLong`]), once per
+//! started, unfinished case; it decides no verdict and halts nothing.
 //!
 //! An event counts only as libtest writes it: a whole line, for a case that started earlier in
 //! the same stream, and that case's first end. That guards against accidents (a line cut short, a
@@ -27,9 +29,12 @@ use crate::libtest_json::{Kind, case_block, line_event};
 /// The longest line read as an event; a longer one is [`Seen::Undecided`].
 pub(super) const LINE_CAP: usize = 4 << 20;
 
-/// What one failed case, read as it ended, makes of its binary.
+/// What a case reports while its binary runs: a long wait or its failed block.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Seen {
+    /// Libtest reports that a still-running case exceeded its reporting interval. This is
+    /// progress information, never a failure or permission to stop the binary.
+    RunningLong { case: String },
     /// With the failed cases before it, this one makes its binary a FAIL whatever comes after;
     /// `marks`, its own block's.
     Red { case: String, marks: Marks },
@@ -50,6 +55,7 @@ pub(super) struct LiveCases {
     oversized: bool,
     started: BTreeSet<String>,
     ended: BTreeSet<String>,
+    long_running: BTreeSet<String>,
     seen: Vec<Marks>,
     red: bool,
 }
@@ -64,13 +70,14 @@ impl LiveCases {
             oversized: false,
             started: BTreeSet::new(),
             ended: BTreeSet::new(),
+            long_running: BTreeSet::new(),
             seen: Vec::new(),
             red: false,
         })
     }
 
-    /// A bounded read of newly appended output: each failed case it ends, in log order. Nothing
-    /// once a case was [`Seen::Red`].
+    /// A bounded read of newly appended output: failed cases and long-running reports, in log
+    /// order. Nothing once a case was [`Seen::Red`].
     pub(super) fn poll(&mut self) -> Vec<Seen> {
         let mut out = Vec::new();
         if self.red {
@@ -131,6 +138,13 @@ impl LiveCases {
             "started" => {
                 self.started.insert(name);
                 None
+            }
+            "timeout"
+                if self.started.contains(&name)
+                    && !self.ended.contains(&name)
+                    && self.long_running.insert(name.clone()) =>
+            {
+                Some(Seen::RunningLong { case: name })
             }
             "ok" | "failed" | "ignored" => {
                 if !self.started.contains(&name) || !self.ended.insert(name.clone()) {

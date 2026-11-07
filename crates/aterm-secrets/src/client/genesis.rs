@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm secrets genesis`: ALab's admin signs Genesis v2 once
-//! (`docs/DESIGN-fluid-swarm-2026-10-28.md` §3.3.8, F12), with a released aterm, and the release
-//! after it compiles the record's digest ([`crate::ALAB_GENESIS`]).
+//! `aterm secrets genesis`: a configured vault's admin signs and seeds Genesis v2 once.
+//! ALab's admin does so only with a released aterm (`docs/DESIGN-fluid-swarm-2026-10-28.md`
+//! §3.3.8, F12), and the release after it compiles the record's digest ([`crate::ALAB_GENESIS`]).
 //!
 //! The record lists every `[machines]` recipient of the published vault, with the binding
-//! Commons' current roster holds for it, under its `aterm-swarm-roster` label. The `ALAB_SIGNER`
-//! seed in the admin locker signs it, as provenance only: builds check it by its digest.
+//! Commons' current roster holds for it, under its `aterm-swarm-roster` label. A private vault
+//! uses its own pinned signer and current Commons authority. ALab uses `ALAB_SIGNER`, as
+//! provenance only: builds check its record by the compiled digest.
 
 use super::*;
 use crate::commons::bootstrap::{Availability, Bootstrap};
@@ -17,7 +18,7 @@ use crate::membership_log::{Record, Root};
 /// What [`admin_sign_genesis`] wrote.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SignedGenesis {
-    /// The record's digest: ALab's network id, which F12b compiles in.
+    /// The record's digest: ALab's network id is the one F12b compiles in.
     pub digest: [u8; 32],
     /// How many machines it lists.
     pub members: usize,
@@ -37,14 +38,95 @@ pub fn admin_sign_genesis(paths: &Paths, out: &Path) -> crate::Result<SignedGene
     sign_genesis(paths, out, &lineage, released)
 }
 
+/// The CLI's configured realm: only an explicit private URL gains the private route. A default
+/// URL, any known ALab lineage or a live genesis retains the released-admin operation.
+pub(crate) fn configured_genesis(paths: &Paths, out: &Path) -> crate::Result<SignedGenesis> {
+    let cfg = config(paths)?.ok_or_else(|| Error::new("no vault configured"))?;
+    if matches!(cfg.source, Source::Url(_)) && private_realm(paths, &cfg)? {
+        seed_vault_genesis(paths, out)
+    } else {
+        admin_sign_genesis(paths, out)
+    }
+}
+
+fn private_realm(paths: &Paths, cfg: &Config) -> crate::Result<bool> {
+    let reads = Reads::new(paths);
+    if matches!(&cfg.source, Source::Url(url) if crate::is_alab_default_url(url))
+        || cfg
+            .signer
+            .is_some_and(|pin| Retired::compiled().lineage(&pin, &reads.lineage(cfg)))
+    {
+        return Ok(false);
+    }
+    let (_, mut store) = records_store_selected(&reads, Some(cfg))?;
+    let selected = crate::records_storage::selected(&paths.records_file())?;
+    let records =
+        match fsx::read_private(selected.path(), crate::membership_log::MAX_RECORDS_STREAM)? {
+            Some(bytes) => crate::membership_log::decode_records(bytes.as_slice())?,
+            None => Vec::new(),
+        };
+    selected.confirm()?;
+    let compiled = crate::membership_log::genesis::compiled()?;
+    if compiled.is_some_and(|root| {
+        store.pinned_network() == Some(root) || records.iter().any(|record| *record.id() == root)
+    }) {
+        return Ok(false);
+    }
+    // A broken layout or stream is not a new private realm. Keep strict verification here;
+    // the ordinary recovery reader deliberately keeps valid fragments of a damaged file.
+    if store
+        .ingest_classified(records)
+        .iter()
+        .any(|(_, verdict)| matches!(verdict, crate::membership_log::MemberVerdict::Refused(..)))
+    {
+        return Err(Error::new("membership records contain refused history"));
+    }
+    Ok(true)
+}
+
+fn revalidate_private_genesis(
+    paths: &Paths,
+    admin: &Admin,
+    bootstrap: &Bootstrap,
+    access: &crate::commons::roster::Access,
+    lock: &StateLock,
+) -> crate::Result<()> {
+    if config(paths)?.as_ref() != Some(&admin.config) || !private_realm(paths, &admin.config)? {
+        return Err(Error::new(
+            "the configured genesis realm changed before publication",
+        ));
+    }
+    let current = enrollment::admin_cached_held(paths, lock)?;
+    if current.config != admin.config || current.opened_heads != admin.opened_heads {
+        return Err(Error::new(
+            "the authenticated genesis admin version changed before publication",
+        ));
+    }
+    bootstrap.revalidate_immutable_custody()?;
+    let current = bootstrap.access_held(lock)?.ok_or_else(|| {
+        Error::new("the genesis Commons roster became unavailable before publication")
+    })?;
+    if current.head() != access.head()
+        || current.basis() != access.basis()
+        || current.generation() != access.generation()
+        || current.local().binding() != access.local().binding()
+    {
+        return Err(Error::new(
+            "the genesis Commons roster changed before publication",
+        ));
+    }
+    Ok(())
+}
+
 /// Sign and seed Genesis v2 into `out` for a non-ALab vault using the signer pinned in `paths`'s
 /// `source.toml`.
 ///
 /// # Errors
-/// `paths` has no configured signer, it names the ALab vault, or [`sign_genesis`] fails.
+/// `paths` has no configured signer, its realm is protected or unreadable, its authenticated
+/// configuration changes before publication, or [`sign_genesis`] fails.
 pub fn seed_vault_genesis(paths: &Paths, out: &Path) -> crate::Result<SignedGenesis> {
     let cfg = config(paths)?.ok_or_else(|| Error::new("no vault configured"))?;
-    if alab_vault(&cfg) {
+    if !private_realm(paths, &cfg)? {
         return Err(Error::new(
             "the ALab vault's Genesis v2 is signed with admin_sign_genesis",
         ));
@@ -52,7 +134,7 @@ pub fn seed_vault_genesis(paths: &Paths, out: &Path) -> crate::Result<SignedGene
     let lineage = cfg
         .signer
         .ok_or_else(|| Error::new("a plain vault has no signer key"))?;
-    sign_genesis(paths, out, &lineage, true)
+    sign_genesis_in_realm(paths, out, &lineage, true, Some(&cfg))
 }
 
 /// Sign Genesis v2 for a scratch vault whose signer public key hex is `signer`. This seam is
@@ -92,6 +174,16 @@ pub(super) fn sign_genesis(
     lineage: &[u8; 32],
     released: bool,
 ) -> crate::Result<SignedGenesis> {
+    sign_genesis_in_realm(paths, out, lineage, released, None)
+}
+
+fn sign_genesis_in_realm(
+    paths: &Paths,
+    out: &Path,
+    lineage: &[u8; 32],
+    released: bool,
+    private: Option<&Config>,
+) -> crate::Result<SignedGenesis> {
     if !released {
         return Err(Error::new(
             "Genesis v2 is signed once, with a released aterm: this aterm is a dev build",
@@ -104,6 +196,11 @@ pub(super) fn sign_genesis(
         )));
     }
     let admin = admin_open(paths)?;
+    if private.is_some_and(|expected| expected != &admin.config) {
+        return Err(Error::new(
+            "the configured genesis realm changed while opening its admin authority",
+        ));
+    }
     if envelope::signer_public(&admin.seed)? != *lineage {
         return Err(Error::new(
             "Genesis v2 is ALab's, and another key signs this vault",
@@ -182,18 +279,13 @@ pub(super) fn sign_genesis(
     };
     let now_ms = aterm_time::unix_millis().unwrap_or(0);
     let record = Record::genesis(&admin.seed, root, founders, now_ms)?;
-    if !fsx::write_new(out, record.bytes(), 0o644)? {
-        return Err(Error::new(format!(
-            "{} exists: Genesis v2 is signed once, into a new file",
-            out.display()
-        )));
-    }
     let digest = *record.id();
 
     // F14 (`DESIGN-fluid-swarm` §3.3.6, §4.1): seed initial audience epochs, wraps and encrypted
     // entries into the membership log alongside Genesis v2 (`out` itself remains the single Genesis
     // record whose digest F12b compiles in).
-    let mut log = crate::membership_log::Log::new(record)?;
+    let mut log = crate::membership_log::Log::new(record.clone())?;
+    let mut seeded = None;
     if let Ok(req) = bootstrap.request() {
         let actor = req.binding().actor();
         let incarnation = *req.binding().incarnation();
@@ -216,21 +308,46 @@ pub(super) fn sign_genesis(
             for rec in log.records() {
                 let _ = store.insert(rec.clone())?;
             }
-            let wire = store.encode();
-            let _ = super::save_records(paths, &wire)?;
-            if matches!(admin.config.source, Source::Url(_))
-                && let Ok(bound) = super::records_bound(paths, &store)
-            {
-                let urls = super::ledger_publish::candidate_server_urls(paths, &admin.config, &[]);
-                let _ = super::fan_out::post_records_to(
-                    &urls,
-                    &wire,
-                    bound,
-                    super::fan_out::one_exchange(),
-                );
-            }
-            let _ = super::sync(paths, None);
+            seeded = Some(store);
         }
+    }
+
+    // Network and Commons reads above may block. Bind the private operation to the admin's
+    // authenticated source and current local authority while the existing writer lock is held.
+    let held = private
+        .map(|_| StateLock::take_at(paths, &paths.lock_file()))
+        .transpose()?;
+    if let Some(lock) = &held {
+        revalidate_private_genesis(paths, &admin, &bootstrap, &access, lock)?;
+    }
+    if !fsx::write_new(out, record.bytes(), 0o644)? {
+        return Err(Error::new(format!(
+            "{} exists: Genesis v2 is signed once, into a new file",
+            out.display()
+        )));
+    }
+    let wire = seeded.as_ref().map(crate::membership_log::Store::encode);
+    if let Some(wire) = &wire {
+        if held.is_some() {
+            let _ = super::save_records_unlocked(paths, wire)?;
+        } else {
+            let _ = super::save_records(paths, wire)?;
+        }
+    }
+    drop(held);
+    if let (Some(store), Some(wire)) = (seeded, wire) {
+        if matches!(admin.config.source, Source::Url(_))
+            && let Ok(bound) = super::records_bound(paths, &store)
+        {
+            let urls = super::ledger_publish::candidate_server_urls(paths, &admin.config, &[]);
+            let _ = super::fan_out::post_records_to(
+                &urls,
+                &wire,
+                bound,
+                super::fan_out::one_exchange(),
+            );
+        }
+        let _ = super::sync(paths, None);
     }
 
     Ok(SignedGenesis { digest, members })

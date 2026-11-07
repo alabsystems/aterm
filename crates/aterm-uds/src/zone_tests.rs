@@ -325,3 +325,48 @@ fn the_local_clock_says_what_date_says() {
         }
     }
 }
+
+/// Windows: the offset now is the one the zone record says is in force now
+/// (`GetTimeZoneInformation`: its bias, plus the daylight or standard bias it reports active), a
+/// second reading by another API; an instant before 1601, which `FILETIME` cannot hold, has none.
+/// NEGATIVE CONTROL: the arm that answered nothing here before (`None` for every instant, so the
+/// usage tap said its reset in UTC) fails the first assertion.
+#[cfg(windows)]
+#[test]
+fn the_windows_offset_now_is_the_zone_records() {
+    #[repr(C)]
+    struct TimeZoneInformation {
+        bias: i32,
+        _standard_name: [u16; 32],
+        _standard_date: [u16; 8],
+        standard_bias: i32,
+        _daylight_name: [u16; 32],
+        _daylight_date: [u16; 8],
+        daylight_bias: i32,
+    }
+    unsafe extern "system" {
+        fn GetTimeZoneInformation(info: *mut TimeZoneInformation) -> u32;
+    }
+    const TIME_ZONE_ID_DAYLIGHT: u32 = 2;
+    let mut info = std::mem::MaybeUninit::<TimeZoneInformation>::zeroed();
+    // SAFETY: `info` is writable storage for one TIME_ZONE_INFORMATION.
+    let id = unsafe { GetTimeZoneInformation(info.as_mut_ptr()) };
+    assert_ne!(id, u32::MAX, "the zone record reads");
+    // SAFETY: the call above filled the structure.
+    let info = unsafe { info.assume_init() };
+    let active = if id == TIME_ZONE_ID_DAYLIGHT {
+        info.daylight_bias
+    } else {
+        info.standard_bias
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after 1970")
+        .as_secs();
+    let now = i64::try_from(now).expect("a second count");
+    let offset = local_offset_at(now).expect("the zone reads");
+    assert_eq!(offset, -i64::from(info.bias + active) * 60);
+    assert_eq!(offset % (15 * 60), 0, "{offset}");
+    assert!((-12 * 3600..=14 * 3600).contains(&offset), "{offset}");
+    assert_eq!(local_offset_at(-11_644_473_601), None, "before 1601");
+}

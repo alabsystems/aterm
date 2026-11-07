@@ -903,6 +903,7 @@ fn the_registry_takes_the_nouns_once_imported_or_where_no_replica_is() {
         digest: None,
         epoch: None,
         at_ms: NOW,
+        sources: std::collections::BTreeSet::new(),
     };
     crate::alab::import::covered::write(&dir, &record, &[]).unwrap();
     assert!(serves(paths), "this Mac's import ran");

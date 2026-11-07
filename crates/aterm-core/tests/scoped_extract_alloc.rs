@@ -90,6 +90,8 @@ fn instructions() -> Option<u64> {
 #[ignore = "manual before/after live row extraction measurement; run alone"]
 fn live_row_extraction_cost() {
     use aterm_core::terminal::{SearchRows, Terminal};
+    // Separate records from libtest's unfinished status line under --nocapture.
+    eprintln!();
     const REPEATS: usize = 256;
     for cols in [80u16, 4096] {
         for shape in [
@@ -160,6 +162,62 @@ fn live_row_extraction_cost() {
                     "live_row cols={cols} shape={shape} trim={trim} repeats={REPEATS} instructions={retired:?} allocation_calls={calls} allocated_bytes={bytes}"
                 );
             }
+            let ansi = terminal.grid().row_ansi_text_screen(0).unwrap();
+            let before = instructions();
+            let (_, calls) = allocs_in(|| {
+                for _ in 0..REPEATS {
+                    std::hint::black_box(terminal.grid().row_ansi_text_screen(0).unwrap());
+                }
+            });
+            let bytes = ALLOC_BYTES.with(Cell::get);
+            let retired = before.zip(instructions()).map(|(a, b)| b - a);
+            assert_eq!(terminal.grid().row_ansi_text_screen(0).unwrap(), ansi);
+            eprintln!(
+                "ansi_row cols={cols} shape={shape} repeats={REPEATS} instructions={retired:?} allocation_calls={calls} allocated_bytes={bytes}"
+            );
+            for history in [false, true] {
+                if history {
+                    terminal.process("\r\n".repeat(24).as_bytes());
+                    terminal.scroll_to_top();
+                }
+                let expected = terminal.row_text(0).unwrap();
+                assert_eq!(expected.trim_end(), text.trim_end());
+                for reused in [false, true] {
+                    let mut out = expected.clone();
+                    if !history && !reused && matches!(shape, "short" | "short-space") {
+                        let before = instructions();
+                        let (_, calls) = allocs_in(|| {
+                            for _ in 0..REPEATS {
+                                let mut control = String::with_capacity(8);
+                                control.push_str(&expected);
+                                std::hint::black_box(control);
+                            }
+                        });
+                        let bytes = ALLOC_BYTES.with(Cell::get);
+                        let retired = before.zip(instructions()).map(|(a, b)| b - a);
+                        eprintln!(
+                            "allocator_control cols={cols} shape={shape} repeats={REPEATS} instructions={retired:?} allocation_calls={calls} allocated_bytes={bytes}"
+                        );
+                    }
+                    let before = instructions();
+                    let (_, calls) = allocs_in(|| {
+                        for _ in 0..REPEATS {
+                            if reused {
+                                assert!(terminal.row_text_into(0, &mut out));
+                                std::hint::black_box(&out);
+                            } else {
+                                std::hint::black_box(terminal.row_text(0).unwrap());
+                            }
+                        }
+                    });
+                    let bytes = ALLOC_BYTES.with(Cell::get);
+                    let retired = before.zip(instructions()).map(|(a, b)| b - a);
+                    assert_eq!(out, expected);
+                    eprintln!(
+                        "viewport_row cols={cols} shape={shape} history={history} reused={reused} repeats={REPEATS} instructions={retired:?} allocation_calls={calls} allocated_bytes={bytes}"
+                    );
+                }
+            }
         }
         let terminal = Terminal::new(24, cols);
         let mut rows = SearchRows::with_capacity(24);
@@ -171,6 +229,134 @@ fn live_row_extraction_cost() {
         eprintln!(
             "live_snapshot cols={cols} rows=24 instructions={retired:?} allocation_calls={calls} allocated_bytes={bytes}"
         );
+    }
+}
+
+#[test]
+#[ignore = "manual styled ANSI allocation/instruction measurement; run alone"]
+fn styled_ansi_emission_cost() {
+    use aterm_core::terminal::Terminal;
+    // Separate records from libtest's unfinished status line under --nocapture.
+    eprintln!();
+    const REPEATS: usize = 16;
+    for cols in [80u16, 4096] {
+        for rows in [1u16, 24] {
+            for shape in [
+                "plain",
+                "uniform",
+                "indexed",
+                "rgb",
+                "attributes",
+                "underline",
+                "wide-mark",
+            ] {
+                let mut input = String::new();
+                for row in 0..rows {
+                    if row > 0 {
+                        input.push_str("\r\n");
+                    }
+                    let width = if shape == "wide-mark" { 2 } else { 1 };
+                    for col in 0..cols / width {
+                        let odd = col % 2 == 1;
+                        input.push_str(match shape {
+                            "uniform" => "\x1b[1;38;5;17m",
+                            "indexed" | "wide-mark" if odd => "\x1b[38;5;255;48;5;9m",
+                            "indexed" | "wide-mark" => "\x1b[38;5;2;48;5;18m",
+                            "rgb" if odd => "\x1b[38;2;255;128;64;48;2;1;2;3m",
+                            "rgb" => "\x1b[38;2;12;34;56;48;2;78;90;123m",
+                            "attributes" if odd => "\x1b[0;1;3;4:3;5;7;9;53m",
+                            "attributes" => "\x1b[0;2;4:2;8;73m",
+                            "underline" if odd => "\x1b[4:3;58:2::255:128:64m",
+                            "underline" => "\x1b[4:2;58:5:9m",
+                            _ => "",
+                        });
+                        input.push_str(if shape == "wide-mark" {
+                            "日\u{301}"
+                        } else {
+                            "x"
+                        });
+                    }
+                }
+                let mut terminal = Terminal::new(rows, cols);
+                terminal.process(input.as_bytes());
+                let expected: Vec<_> = (0..rows)
+                    .map(|row| terminal.grid().row_ansi_text_screen(row).unwrap())
+                    .collect();
+                for mode in ["row", "frame", "restore"] {
+                    let emit = || match mode {
+                        "row" => terminal.grid().row_ansi_text_screen(0).unwrap(),
+                        "frame" => terminal.serialize_ansi(usize::from(rows), Some(0)),
+                        _ => terminal.serialize_restore_ansi(),
+                    };
+                    let before = instructions();
+                    let (_, calls) = allocs_in(|| {
+                        for _ in 0..REPEATS {
+                            std::hint::black_box(emit());
+                        }
+                    });
+                    let bytes = ALLOC_BYTES.with(Cell::get);
+                    let retired = before.zip(instructions()).map(|(a, b)| b - a);
+                    if mode != "row" {
+                        let mut replay = Terminal::new(rows, cols);
+                        replay.process(emit().as_bytes());
+                        assert_same_styled_cells(&terminal, &replay, rows, cols);
+                        for row in 0..rows {
+                            assert_eq!(
+                                replay.grid().row_ansi_text_screen(row).unwrap(),
+                                expected[usize::from(row)]
+                            );
+                        }
+                        if mode == "restore" {
+                            terminal.process(b"\r\nQ");
+                            replay.process(b"\r\nQ");
+                            assert_same_styled_cells(&terminal, &replay, rows, cols);
+                        }
+                    }
+                    eprintln!(
+                        "styled_ansi cols={cols} rows={rows} shape={shape} mode={mode} repeats={REPEATS} instructions={retired:?} allocation_calls={calls} allocated_bytes={bytes}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn assert_same_styled_cells(
+    original: &aterm_core::terminal::Terminal,
+    replay: &aterm_core::terminal::Terminal,
+    rows: u16,
+    cols: u16,
+) {
+    for row in 0..rows {
+        for col in 0..cols {
+            let a = original.grid().cell(row, col).unwrap();
+            let b = replay.grid().cell(row, col).unwrap();
+            assert_eq!(a.flags(), b.flags(), "flags at {row}:{col}");
+            assert_eq!(a.colors(), b.colors(), "colors at {row}:{col}");
+            assert_eq!(
+                original.grid().fg_rgb_at(row, col),
+                replay.grid().fg_rgb_at(row, col)
+            );
+            assert_eq!(
+                original.grid().bg_rgb_at(row, col),
+                replay.grid().bg_rgb_at(row, col)
+            );
+            assert_eq!(
+                original
+                    .grid()
+                    .cell_extra(row, col)
+                    .and_then(|extra| extra.underline_color_u32()),
+                replay
+                    .grid()
+                    .cell_extra(row, col)
+                    .and_then(|extra| extra.underline_color_u32()),
+                "underline color at {row}:{col}",
+            );
+            assert_eq!(
+                original.cell_grapheme(usize::from(row), usize::from(col)),
+                replay.cell_grapheme(usize::from(row), usize::from(col))
+            );
+        }
     }
 }
 
@@ -273,6 +459,17 @@ fn a_dense_combining_cell_grows_its_text_at_most_once_after_initial_reservation(
                     calls <= 2,
                     "trim {mark:?} prefix={prefix} count={count}: {calls} allocations"
                 );
+                let (actual, calls) = allocs_in(|| terminal.row_text(0).unwrap());
+                assert_eq!(actual, text);
+                assert!(
+                    calls <= 2,
+                    "viewport {mark:?} prefix={prefix} count={count}: {calls} allocations"
+                );
+                let mut reused = actual;
+                let (valid, calls) = allocs_in(|| terminal.row_text_into(0, &mut reused));
+                assert!(valid);
+                assert_eq!(reused, text);
+                assert_eq!(calls, 0, "reused viewport text");
             }
         }
     }
@@ -285,4 +482,46 @@ fn a_dense_combining_cell_grows_its_text_at_most_once_after_initial_reservation(
         calls <= 2,
         "mixed marks followed by ASCII: {calls} allocations"
     );
+}
+
+#[test]
+fn styled_ansi_grows_only_its_output_and_appends_without_temporary_allocations() {
+    use aterm_core::terminal::Terminal;
+    for cols in [80u16, 4096] {
+        let mut input = String::new();
+        for col in 0..cols {
+            input.push_str(if col % 2 == 0 {
+                "\x1b[0;1;3;4:3;38;2;255;128;64;48;5;17;58:5:9m"
+            } else {
+                "\x1b[0;2;4:2;8;73;38;2;12;34;56;48;5;255;58:2::1:2:3m"
+            });
+            input.push_str("e\u{301}");
+        }
+        let mut terminal = Terminal::new(24, cols);
+        terminal.process(input.as_bytes());
+        let (expected, calls) = allocs_in(|| terminal.grid().row_ansi_text_screen(0).unwrap());
+        assert!(calls <= 12, "styled row width {cols}: {calls} allocations");
+        let mut replay = Terminal::new(24, cols);
+        replay.process(expected.as_bytes());
+        assert_same_styled_cells(&terminal, &replay, 1, cols);
+        let mut out = String::with_capacity(expected.len() + 8);
+        out.push_str("prefix  ");
+        let (valid, calls) = allocs_in(|| terminal.grid().push_row_ansi_text_screen(0, &mut out));
+        assert!(valid);
+        assert_eq!(calls, 0, "reserved styled append");
+        assert_eq!(out.strip_prefix("prefix  "), Some(expected.as_str()));
+        let (valid, calls) = allocs_in(|| {
+            terminal
+                .grid()
+                .push_row_ansi_text_screen(u16::MAX, &mut out)
+        });
+        assert!(!valid);
+        assert_eq!(calls, 0, "absent row append");
+        assert_eq!(out.strip_prefix("prefix  "), Some(expected.as_str()));
+        let mut restored = Terminal::new(24, cols);
+        restored.process(terminal.serialize_restore_ansi().as_bytes());
+        terminal.process(b"\r\nQ");
+        restored.process(b"\r\nQ");
+        assert_same_styled_cells(&terminal, &restored, 2, cols);
+    }
 }

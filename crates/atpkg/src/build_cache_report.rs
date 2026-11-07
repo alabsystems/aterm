@@ -19,6 +19,8 @@ pub(crate) enum KeepReason {
     ProcessUnavailable,
     InventoryUnavailable,
     CargoLocks,
+    #[cfg(unix)]
+    NoCargoLocks,
     InventoryChanged,
     PermissionChanged,
     Custody,
@@ -50,6 +52,10 @@ impl std::fmt::Display for KeepReason {
             Self::ProcessUnavailable => f.write_str("the process ownership scan was unavailable"),
             Self::InventoryUnavailable => f.write_str("the bounded cache inventory is unavailable"),
             Self::CargoLocks => f.write_str("its Cargo locks could not all be taken"),
+            #[cfg(unix)]
+            Self::NoCargoLocks => {
+                f.write_str("its complete cache inventory contains no Cargo lock files")
+            }
             Self::InventoryChanged => {
                 f.write_str("its cache inventory could not be confirmed unchanged and complete")
             }

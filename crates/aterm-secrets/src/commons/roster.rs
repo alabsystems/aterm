@@ -386,9 +386,19 @@ impl Access {
         )
     )]
     pub fn is_current(&self, journal: &Journal) -> bool {
+        self.is_current_observed(journal).unwrap_or(false)
+    }
+
+    /// [`Self::is_current`] for a caller that may observe again: a vault writer that holds the
+    /// state lock at this moment is [`crate::ErrorKind::VaultBusy`], not "no longer current".
+    /// Every other answer is the boolean's, an observation that cannot be read still not current.
+    ///
+    /// # Errors
+    /// A vault writer holds the state lock ([`crate::ErrorKind::VaultBusy`]); nothing was judged.
+    pub fn is_current_observed(&self, journal: &Journal) -> crate::Result<bool> {
         let current = if let Some(paths) = &self.log_paths {
             journal.trust() == self.trust
-                && crate::client::with_roster_observation(paths, |observation| {
+                && match crate::client::with_roster_observation_or_busy(paths, |observation| {
                     let Some(lock) = observation.state_lock() else {
                         return Ok(false);
                     };
@@ -401,10 +411,10 @@ impl Access {
                         self.log_heads_digest,
                         lock,
                     )
-                })
-                .ok()
-                .flatten()
-                .unwrap_or(false)
+                }) {
+                    Err(busy) if busy.kind() == crate::ErrorKind::VaultBusy => return Err(busy),
+                    observed => observed.ok().flatten().unwrap_or(false),
+                }
         } else {
             journal.trust() == self.trust
                 && journal.state()
@@ -413,7 +423,7 @@ impl Access {
                         basis: self.basis,
                     })
         };
-        aterm_db_core::roster_access(current, true, true)
+        Ok(aterm_db_core::roster_access(current, true, true))
     }
     /// Refuse a stale observation, a fork, missing history or failed durability
     /// before exposing the key to a trusted local caller's operation.

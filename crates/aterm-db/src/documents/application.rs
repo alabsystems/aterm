@@ -213,13 +213,59 @@ pub(crate) fn observe_store_if_declared_until<T>(
     deadline: std::time::Instant,
     action: impl FnOnce(&Session<'_>, &Store, Scope) -> Result<T>,
 ) -> Result<Option<T>> {
-    pass_current(deadline)?;
-    let paths = crate::generation::observed_paths_until(paths, deadline)?;
-    let paths = &paths;
-    let (bootstrap, journal) = Bootstrap::established_with_journal_until(paths, deadline)
-        .map_err(crate::table::failure)?;
-    let session = Session::from_observed_journal(&bootstrap, journal, Some(deadline))?;
-    observe_declared_in_session(&session, descriptor(&bootstrap)?, deadline, action)
+    observe_store_if_declared_within(paths, descriptor, deadline, &|| deadline, action)
+}
+
+/// [`observe_store_if_declared_until`] under two bounds, as
+/// [`crate::generation::Observation::observe_within`] takes them: `wait` is asked as each stage
+/// that waits for a holder of the vault or of custody starts (this home's and each
+/// predecessor's), and says when that stage's waits end; `read_by` is when the read says it ran
+/// out of time, a gate the selection, the session's generation checks and each table stage pass
+/// through. The selected home's custody is opened before its predecessors are observed, and the
+/// session keeps that observation ([`Session::observe_selected`]), so a successor home's
+/// predecessors are observed once per read, after every wait the read makes for the selected
+/// home's custody, not again when the session opens.
+pub(crate) fn observe_store_if_declared_within<T>(
+    paths: &Paths,
+    descriptor: impl FnOnce(&Bootstrap) -> Result<Descriptor>,
+    read_by: std::time::Instant,
+    wait: &dyn Fn() -> std::time::Instant,
+    action: impl FnOnce(&Session<'_>, &Store, Scope) -> Result<T>,
+) -> Result<Option<T>> {
+    pass_current(read_by)?;
+    let paths = crate::generation::observed_generation_until(paths, read_by)?;
+    let (bootstrap, journal) =
+        Bootstrap::established_with_journal_until(&paths, wait()).map_err(crate::table::failure)?;
+    let session = observed_session(&bootstrap, journal, read_by, wait)?;
+    observe_declared_in_session(&session, descriptor(&bootstrap)?, read_by, action)
+}
+
+/// A read-only session of the selected home whose established custody is `bootstrap`, with its
+/// control view `journal`: its predecessors observed now, after that custody was opened, and the
+/// observation kept for the session's checks.
+fn observed_session<'a>(
+    bootstrap: &'a Bootstrap,
+    journal: aterm_secrets::commons::journal::Journal,
+    read_by: std::time::Instant,
+    wait: &dyn Fn() -> std::time::Instant,
+) -> Result<Session<'a>> {
+    let selection = crate::generation::observe_generation(bootstrap.paths(), read_by, wait)?;
+    #[cfg(test)]
+    seams::selected();
+    Session::observe_selected(bootstrap, journal, selection, read_by)
+}
+
+/// [`observe_store`] under [`observe_store_if_declared_within`]'s two bounds, for a read a person
+/// waits on, given longer to read than any holder of the vault or of custody is given.
+pub(crate) fn observe_store_within<T>(
+    paths: &Paths,
+    descriptor: impl FnOnce(&Bootstrap) -> Result<Descriptor>,
+    read_by: std::time::Instant,
+    wait: &dyn Fn() -> std::time::Instant,
+    action: impl FnOnce(&Session<'_>, &Store, Scope) -> Result<T>,
+) -> Result<T> {
+    observe_store_if_declared_within(paths, descriptor, read_by, wait, action)?
+        .ok_or_else(|| Error::new("application table is not initialized"))
 }
 
 /// Observe another declared table through a bounded current application session.
@@ -300,16 +346,33 @@ pub(crate) fn peek_catalog(
     )>,
 > {
     let deadline = admission_deadline();
-    let paths = crate::generation::observed_paths_until(paths, deadline)?;
+    peek_catalog_within(paths, deadline, &|| deadline)
+}
+
+/// [`peek_catalog`] under [`observe_store_if_declared_within`]'s two bounds.
+///
+/// # Errors
+/// As [`peek_catalog`], or the read ran out of time at `read_by`.
+pub(crate) fn peek_catalog_within(
+    paths: &Paths,
+    read_by: std::time::Instant,
+    wait: &dyn Fn() -> std::time::Instant,
+) -> Result<
+    Option<(
+        aterm_secrets::commons::journal::Trust,
+        crate::catalog::Snapshot,
+    )>,
+> {
+    let paths = crate::generation::observed_generation_until(paths, read_by)?;
     if Bootstrap::cached(&paths)
         .map_err(crate::table::failure)?
         .is_none()
     {
         return Ok(None);
     }
-    let (bootstrap, journal) = Bootstrap::established_with_journal_until(&paths, deadline)
-        .map_err(crate::table::failure)?;
-    let session = Session::from_observed_journal(&bootstrap, journal, Some(deadline))?;
+    let (bootstrap, journal) =
+        Bootstrap::established_with_journal_until(&paths, wait()).map_err(crate::table::failure)?;
+    let session = observed_session(&bootstrap, journal, read_by, wait)?;
     let directory = Directory::new(&paths, bootstrap.trust());
     Ok(Some((
         bootstrap.trust(),
@@ -338,7 +401,7 @@ pub(crate) fn peek_declaration(
     descriptor: impl FnOnce(&Bootstrap) -> Result<Descriptor>,
     deadline: std::time::Instant,
 ) -> Result<Option<Declaration>> {
-    let paths = crate::generation::observed_paths_until(paths, deadline)?;
+    let paths = crate::generation::observed_generation_until(paths, deadline)?;
     if Bootstrap::cached(&paths)
         .map_err(crate::table::failure)?
         .is_none()
@@ -347,7 +410,7 @@ pub(crate) fn peek_declaration(
     }
     let (bootstrap, journal) = Bootstrap::established_with_journal_until(&paths, deadline)
         .map_err(crate::table::failure)?;
-    let session = Session::from_observed_journal(&bootstrap, journal, Some(deadline))?;
+    let session = observed_session(&bootstrap, journal, deadline, &|| deadline)?;
     let directory = Directory::new(&paths, bootstrap.trust());
     let table = descriptor(&bootstrap)?.scope.digest();
     let me = session.actor();
@@ -370,5 +433,29 @@ fn pass_current(deadline: std::time::Instant) -> Result<()> {
         Err(Error::new("application pass deadline expired"))
     } else {
         Ok(())
+    }
+}
+
+/// Test seams of the observation path.
+#[cfg(test)]
+pub(crate) mod seams {
+    use std::cell::RefCell;
+
+    thread_local! {
+        /// Run once a read on this thread has selected its generation, before its session opens.
+        static SELECTED: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
+    }
+
+    /// Run `hook` once this thread's next read ([`super::observe_store_if_declared_within`]) has
+    /// selected its generation, before it opens the selected home's session.
+    pub(crate) fn after_selection(hook: impl FnMut() + 'static) {
+        SELECTED.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(super) fn selected() {
+        let hook = SELECTED.with(|slot| slot.borrow_mut().take());
+        if let Some(mut hook) = hook {
+            hook();
+        }
     }
 }

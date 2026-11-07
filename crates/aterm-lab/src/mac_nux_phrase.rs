@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `lab mac nux`'s `vault-phrase` row: the owner's acceptance test ("a new LAN Mac downloads
-//! aterm, joins with one keyphrase approval from any existing member, and GitHub, publishing and
-//! AI accounts work") as one command, in one guest (`docs/DESIGN-fluid-swarm-2026-10-28.md` F10).
+//! `lab mac nux`'s `vault-phrase` row: private member admission and synthetic credential
+//! materialization in one guest (`docs/DESIGN-fluid-swarm-2026-10-28.md` F10). It exercises the
+//! explicit private-vault protocol, not default ALab enrollment, automatic subscriber setup,
+//! GitHub or publishing authentication, AI account access, or repository cloning.
+//!
+//! Before the realm is made, a broker-only baseline runs once as root through the same guest
+//! app and the existing password driver. Its prompts and result are recorded separately from
+//! member admission; no first-user password or update-prompt claim follows from this setup.
 //!
 //! Three identities share the guest, each a scratch `$HOME` under the lane's folder (as
 //! `vault-local` gives its admin one of its own):
@@ -25,12 +30,13 @@
 //!   writes the phrase to its record ([`read_desk`]). The shipped member shows a phrase only in
 //!   its own sheet (§3.3.5) and the lane reads no window, so the phrase is read there, as `lab
 //!   swarm partition` presses Allow in its own process.
-//! - The joiner is the build's own CLI: `aterm members join --no-wait` (install.sh's windowless
-//!   ask), then `aterm members join <phrase>` on a terminal, the phrase typed with the command as
-//!   the member's words say (its shell expands `$NUX_PHRASE`, so the lane's command lines never
+//! - The joiner first pins the seed's explicit URL and signer with ordinary `secrets join
+//!   --no-agent --no-wait`, remaining Pending with no credentials. The build's own CLI then runs
+//!   `aterm members join --no-wait`, then `aterm members join <phrase>` on a terminal, as the
+//!   member's words say (its shell expands `$NUX_PHRASE`, so the lane's command lines never
 //!   hold it; a join with no phrase has proved and asked by itself, never prompted, since
-//!   `f5eabf5697`), then its own subscriber (`aterm secrets watch`), as a joined Mac's agent runs
-//!   it. Each joiner command discovers the member through the LAN broker on the run's lab
+//!   `f5eabf5697`), then an explicitly owned subscriber (`aterm secrets watch`). Each joiner
+//!   command that discovers the member uses the LAN broker on the run's lab
 //!   members service, never the live `_alab._tcp` service.
 //!
 //! Isolation, which is why the browse runs on a lab service. This Mac is a live ALab member, and
@@ -118,6 +124,9 @@ const SEED_NAME: &str = "nux-seed";
 
 /// The Allowing member's machine name: a member, never an admin.
 pub const MEMBER_NAME: &str = "nux-member";
+
+/// The unapproved joiner's name in the private vault.
+const JOINER_NAME: &str = "nux-joiner";
 
 /// The Allowing member's desk record, in [`GUEST_NUX`].
 const DESK_RECORD: &str = "member-desk.txt";
@@ -300,14 +309,13 @@ fn watch(me: &str, home: &str) -> String {
     format!("({me} secrets watch </dev/null >{home}/watch.log 2>&1 &)")
 }
 
-/// The guest command that asks to join the seed's vault as `member`, named [`MEMBER_NAME`],
-/// pinned to its `signer` ([`signer_of`]); what it printed when it fails.
-fn member_join(aterm: &str, member: &str, signer: &str) -> String {
+/// Ask to join the seed's vault as `me`, named `name`, pinned to its `signer` ([`signer_of`]);
+/// what it printed when it fails. `home` holds only this scratch identity's output.
+fn pinned_join(me: &str, home: &str, name: &str, signer: &str) -> String {
     format!(
-        "{} secrets join 'http://127.0.0.1:{LOCAL_VAULT_PORT}/v1/{LOCAL_VAULT}#{signer}' \
-         --name {MEMBER_NAME} --no-agent --no-wait > {member}/join.out 2>&1 \
-         || {{ cat {member}/join.out; exit 1; }}",
-        as_home(aterm, member)
+        "{me} secrets join 'http://127.0.0.1:{LOCAL_VAULT_PORT}/v1/{LOCAL_VAULT}#{signer}' \
+         --name {name} --no-agent --no-wait > {home}/join.out 2>&1 \
+         || {{ cat {home}/join.out; exit 1; }}"
     )
 }
 
@@ -661,7 +669,11 @@ fn setup(
     row: &mut Row,
 ) -> Result<(Desk, Result<(), String>), Fail> {
     let helper = format!("{GUEST_NUX}/{GUEST_HELPER}");
-    let Homes { seed, member, .. } = h;
+    let Homes {
+        seed,
+        member,
+        joiner,
+    } = h;
     g.sh(&homes(h, record), STEP)?;
     g.sh(&serve(&g.aterm, seed), STEP)?;
     let up = within_hang(|| {
@@ -686,7 +698,10 @@ fn setup(
 
     // The member: an existing member that is no admin.
     let started = std::time::Instant::now();
-    g.sh(&member_join(&g.aterm, member, signer), STEP)?;
+    g.sh(
+        &pinned_join(&as_home(&g.aterm, member), member, MEMBER_NAME, signer),
+        STEP,
+    )?;
     let waiting = format!(
         "{}\n{}",
         g.read(&format!("{member}/join.out"))?,
@@ -746,6 +761,44 @@ fn setup(
             Ok(_) => Value::Ms(u64::try_from(made.elapsed().as_millis()).unwrap_or(u64::MAX)),
             Err(why) => Value::Text(format!("failed: {why}")),
         },
+    );
+
+    // An empty source means the live default vault, which A12 correctly refuses in this guest.
+    // Name this run's private realm before asking its members; neither an approval nor a
+    // password is supplied, and no subscriber is installed under the scratch home.
+    let me = as_joiner(&g.aterm, joiner, &lab.service);
+    g.sh(&pinned_join(&me, joiner, JOINER_NAME, signer), STEP)?;
+    let source: aterm_toml::Value =
+        aterm_toml::from_str(&g.read(&format!("{joiner}/.config/aterm/secrets/source.toml"))?)
+            .map_err(|_| Fail::die("the joiner's private vault source did not read back"))?;
+    let status: aterm_json::Value =
+        aterm_json::from_str(&g.sh(&format!("{me} secrets status --json"), STEP)?)
+            .map_err(|_| Fail::die("the joiner's private vault status did not read back"))?;
+    let vault = &status["vault"];
+    let url = format!("http://127.0.0.1:{LOCAL_VAULT_PORT}/v1/{LOCAL_VAULT}");
+    if source.get("url").and_then(aterm_toml::Value::as_str) != Some(url.as_str())
+        || source.get("path").is_some()
+        || source.get("signer").and_then(aterm_toml::Value::as_str) != Some(signer)
+        || vault["state"].as_str() != Some("known")
+        || vault["value"]["configured_signer"].as_str() != Some(signer)
+        || vault["value"]["membership"]["state"].as_str() != Some("pending")
+    {
+        return Err(Fail::die(
+            "the joiner did not remain Pending at the run's exact private vault and signer",
+        ));
+    }
+    let absent = CREDENTIALS
+        .iter()
+        .map(|c| {
+            let path = format!("{joiner}/.secrets/{}", c.file);
+            format!("test ! -e '{path}' && test ! -L '{path}'")
+        })
+        .collect::<Vec<_>>()
+        .join(" && ");
+    g.sh(&absent, STEP)?;
+    row.cell(
+        "joiner: explicit private vault before Allow",
+        Value::Text("exact source and signer; Pending; 3 credential files absent".into()),
     );
 
     g.sh(&watch(&as_home(&g.aterm, seed), seed), STEP)?;
@@ -1812,6 +1865,49 @@ fn joiner_table(
     Ok(last)
 }
 
+/// Prepare the row's real root broker with the guest's own app, without any other setup row.
+/// This is a separately recorded prerequisite, never a measured first-user elevation.
+fn prepare_broker(g: &Guest, row: &mut Row) -> Result<(), Fail> {
+    let baseline = format!("{GUEST_NUX}/phrase-broker.toml");
+    g.sh(
+        &format!(
+            "(umask 077; set -C; printf 'schema = 1\\n[lan]\\nbroker = true\\n' > '{baseline}')"
+        ),
+        STEP,
+    )?;
+    let (preparation, _) = g.drive_within(
+        "phrase-broker",
+        &format!("NUX_SUDO={}", g.sudo_password()),
+        &format!(
+            "/usr/bin/sudo -k -p 'Mac password: ' {} machines here apply '{baseline}'",
+            crate::util::shell_quote(&g.aterm)
+        ),
+        HANG,
+    )?;
+    drive_cells_within(row, "broker preparation: ", &preparation, HANG);
+    if preparation.exit != Some(0) {
+        return Err(Fail::die(
+            "the broker-only root preparation did not exit successfully",
+        ));
+    }
+    let status = super::lan::read_lan_status(&g.sh(
+        &format!("{} lan status", crate::util::shell_quote(&g.aterm)),
+        STEP,
+    )?);
+    match status {
+        super::lan::LanStatus::Serving { protocol, .. } if protocol == aterm_uds::lan::PROTOCOL => {
+            row.cell(
+                "broker preparation: root protocol",
+                Value::Text(format!("serving protocol {protocol}; direct path not used")),
+            );
+            Ok(())
+        }
+        _ => Err(Fail::die(
+            "the broker-only preparation left no compatible root broker",
+        )),
+    }
+}
+
 /// `vault-phrase` (the module docs).
 pub(super) fn vault_phrase(g: &Guest, run: &Path, row: &mut Row) -> Result<(), Fail> {
     let h = Homes {
@@ -1844,6 +1940,7 @@ pub(super) fn vault_phrase(g: &Guest, run: &Path, row: &mut Row) -> Result<(), F
              the live fleet's {MEMBER_SERVICE} members: the row ran none of the joiner's commands"
         )));
     }
+    prepare_broker(g, row)?;
     let guest = inet_addresses(&g.run(GUEST_ADDRESSES, STEP)?);
     let Some(lan) = lan_address(&guest) else {
         return Err(Fail::die(format!(
@@ -2498,14 +2595,6 @@ mod tests {
         assert_eq!(signer_of("aterm secrets join http://h:7485/v1/v\n"), None);
         assert_eq!(signer_of("aterm secrets join http://h:7485/v1/v#\n"), None);
         assert_eq!(signer_of(""), None);
-        let join = member_join("/A/aterm", "/n/member", "age1sx2k9");
-        assert!(
-            join.starts_with(
-                "/usr/bin/env HOME=/n/member /A/aterm secrets join \
-                 'http://127.0.0.1:7485/v1/"
-            ) && join.contains("#age1sx2k9' --name nux-member --no-agent --no-wait"),
-            "{join}"
-        );
         // The code `secrets join` and `secrets status` print (cli.rs's `waiting_line`,
         // `pending_membership`), approved by itself: `approve --all` needs a terminal.
         let waiting = "waiting for approval of nux-member (code abcd-efgh-ijkm-npqr): on an admin \

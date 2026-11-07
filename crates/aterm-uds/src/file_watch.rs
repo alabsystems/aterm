@@ -404,9 +404,11 @@ impl Took {
     /// a file; so does one not there (or a file where it was), whose own folder hears it made.
     /// A link that names no folder is left to the rounds instead: the folder it would name is
     /// made where no listener of the link's own folder hears it, and a round's look at the
-    /// path follows the link. So is any other refusal.
+    /// path follows the link. So is a file named through a link its reader cannot read
+    /// ([`link_unread`]), whose target no listener can be put on, and any other refusal.
     fn of(events: &mut dyn FileEvents, key: u64, path: &Path, shape: Shape) -> Self {
         let armed = match shape {
+            Shape::File if link_unread(path) => return Self::No,
             Shape::File => events.arm(key, path).map(|()| Self::File),
             Shape::Directory => match events.arm_directory(key, path) {
                 Ok(()) => Ok(Self::Entries),
@@ -426,6 +428,24 @@ impl Took {
             },
         };
         armed.unwrap_or(Self::No)
+    }
+}
+
+/// Whether `path` is a link its reader cannot read though a lookup goes through it (on macOS,
+/// one made under a strict umask: `readlink` needs read access to the link, a lookup does not).
+/// What it names cannot be found to listen on, so a key on it is looked at in the rounds,
+/// whose look follows the link. A host that holds each hop ([`link_chain`]) cannot name that
+/// target either.
+fn link_unread(path: &Path) -> bool {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        std::fs::symlink_metadata(path).is_ok_and(|there| there.file_type().is_symlink())
+            && link_target(path).is_err()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = path;
+        false
     }
 }
 
@@ -1218,8 +1238,9 @@ fn open_for_events(path: &Path, directory: bool) -> io::Result<std::fs::File> {
 mod kqueue {
     //! macOS: one kqueue, a vnode filter on each watched file and on its
     //! directory (or the nearest one above it that is there), one on each
-    //! folder above that, shared by every file whose path runs through it, and
-    //! a user event that wakes the wait.
+    //! folder above that, shared by every file whose path runs through it, a
+    //! file system filter that hears every mount and unmount, and a user event
+    //! that wakes the wait.
 
     use std::collections::{BTreeMap, BTreeSet};
     use std::io;
@@ -1258,6 +1279,21 @@ mod kqueue {
     const ABOVE_EVENTS: u32 =
         libc::NOTE_ATTRIB | libc::NOTE_DELETE | libc::NOTE_RENAME | libc::NOTE_REVOKE;
 
+    /// `<sys/event.h>`'s file system filter, and `<sys/mount.h>`'s events for a volume mounted
+    /// and one unmounted, which the generated libc does not carry.
+    const EVFILT_FS: i16 = -9;
+    const VQ_MOUNT: u32 = 0x0008;
+    const VQ_UNMOUNT: u32 = 0x0010;
+
+    /// Whether a file system event's `fflags` say a volume was mounted or unmounted: what every
+    /// path below the mount point names then changes, with no event on any vnode a listener
+    /// holds (the folder a volume covers hears nothing; measured on macOS 27.0 with a disk
+    /// image attached over a watched empty folder). The others (a low disk, a server not
+    /// answering) move no path.
+    pub(super) const fn remounted(fflags: u32) -> bool {
+        fflags & (VQ_MOUNT | VQ_UNMOUNT) != 0
+    }
+
     /// The listener on one folder above some keys' own folders, which every key whose path runs
     /// through that folder shares (closing it drops its filter).
     struct Above {
@@ -1293,6 +1329,7 @@ mod kqueue {
             // SAFETY: F_SETFD changes only this descriptor's close-on-exec flag.
             unsafe { libc::fcntl(kq.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
             change(&kq, user_event(0, libc::EV_ADD | libc::EV_CLEAR))?;
+            change(&kq, fs_event())?;
             Ok(Self {
                 kq: Arc::new(kq),
                 armed: BTreeMap::new(),
@@ -1755,6 +1792,13 @@ mod kqueue {
                 };
             }
             for event in events.iter().take(usize::try_from(count).unwrap_or(0)) {
+                if event.filter == EVFILT_FS {
+                    // A mount moves what any path names: every key looks again, armed again.
+                    if remounted(event.fflags) {
+                        touched.extend(self.armed.keys().copied());
+                    }
+                    continue;
+                }
                 if event.filter != libc::EVFILT_VNODE {
                     continue;
                 }
@@ -1786,6 +1830,18 @@ mod kqueue {
             filter: libc::EVFILT_VNODE,
             flags: libc::EV_ADD | libc::EV_CLEAR,
             fflags,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        }
+    }
+
+    /// The change entry that hears every volume's file system events ([`EVFILT_FS`], ident 0).
+    const fn fs_event() -> libc::kevent {
+        libc::kevent {
+            ident: 0,
+            filter: EVFILT_FS,
+            flags: libc::EV_ADD | libc::EV_CLEAR,
+            fflags: 0,
             data: 0,
             udata: std::ptr::null_mut(),
         }
@@ -2042,7 +2098,9 @@ mod inotify {
     //! wakes the wait. The kernel keeps one watch per folder, so a watch
     //! two keys hold stays until neither does. A folder's `IN_ATTRIB` cannot be
     //! asked for without its entries' (inotify(7)): those reach the wait, touch
-    //! no key, and end no wait ([`InotifyEvents::wait`]).
+    //! no key, and end no wait ([`InotifyEvents::wait`]). The wait also polls
+    //! this namespace's mount table, which a mount or unmount marks
+    //! ([`mount_table`]).
 
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::CString;
@@ -2091,6 +2149,24 @@ mod inotify {
         /// ([`super::volume_type_reports_every_writer`]).
         elsewhere: BTreeSet<u64>,
         routes: InotifyRoutes,
+        /// This namespace's mount table ([`mount_table`]), where it opened.
+        mounts: Option<OwnedFd>,
+    }
+
+    /// `/proc/self/mountinfo`, which `poll` marks `POLLPRI` (and `POLLERR`) once each time a
+    /// mount or unmount changes this namespace's table (proc(5)): what every path below a mount
+    /// point names then changes, with no inotify event on the folder it covers. `None` where it
+    /// does not open (no `/proc`), where no mount is heard.
+    fn mount_table() -> Option<OwnedFd> {
+        // SAFETY: a NUL-terminated path; `open` returns a fresh descriptor or -1.
+        let raw = unsafe {
+            libc::open(
+                c"/proc/self/mountinfo".as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC,
+            )
+        };
+        // SAFETY: `raw` is fresh and exclusively ours where it is not -1.
+        (raw >= 0).then(|| unsafe { OwnedFd::from_raw_fd(raw) })
     }
 
     impl InotifyEvents {
@@ -2119,6 +2195,7 @@ mod inotify {
                 files: BTreeMap::new(),
                 elsewhere: BTreeSet::new(),
                 routes: InotifyRoutes::default(),
+                mounts: mount_table(),
             })
         }
 
@@ -2473,9 +2550,15 @@ mod inotify {
                         events: libc::POLLIN,
                         revents: 0,
                     },
+                    // A negative descriptor, where the table did not open, `poll` passes over.
+                    libc::pollfd {
+                        fd: self.mounts.as_ref().map_or(-1, |table| table.as_raw_fd()),
+                        events: libc::POLLPRI,
+                        revents: 0,
+                    },
                 ];
-                // SAFETY: two live pollfd slots.
-                let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, super::poll_millis(left)) };
+                // SAFETY: three live pollfd slots.
+                let ready = unsafe { libc::poll(fds.as_mut_ptr(), 3, super::poll_millis(left)) };
                 if ready < 0 {
                     let error = io::Error::last_os_error();
                     return if error.kind() == io::ErrorKind::Interrupted {
@@ -2490,6 +2573,10 @@ mod inotify {
                 }
                 if fds[0].revents != 0 {
                     self.read_events(touched);
+                }
+                if fds[2].revents & (libc::POLLPRI | libc::POLLERR) != 0 {
+                    // A mount moves what any path names: every key looks again, armed again.
+                    touched.extend(self.keys.keys().copied());
                 }
                 if woken || ready == 0 || touched.len() > before || left == Some(Duration::ZERO) {
                     return Ok(());

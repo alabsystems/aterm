@@ -131,7 +131,14 @@ impl Scratch {
                 ..Pace::default()
             },
             need,
-            mode,
+            // A unit test records Background admission without depending on the test harness
+            // being its process-group leader. The watch integration launches the candidate
+            // verifier as a group leader before it requests the real mode.
+            if mode == Admit::Preemptible {
+                Admit::Wait
+            } else {
+                mode
+            },
             &mut |line| {
                 self.seen
                     .lock()
@@ -351,6 +358,97 @@ fn held_admit(need: Need, mode: Admit) -> Result<Claim, Error> {
 
 fn held_stage(_: &Ctx, spec: &StageSpec) -> Report {
     HELD.stage(spec)
+}
+
+static BACKGROUND_RESOURCES: Scratch = Scratch::new();
+
+fn background_resources_admit(need: Need, mode: Admit) -> Result<Claim, Error> {
+    BACKGROUND_RESOURCES.admit(need, mode)
+}
+
+/// Every internal stage of a repeatable tree owns one combined resource claim. A compiling stage
+/// asks for its measured memory and CPU together; a pure stage asks only for CPU; the dispatched
+/// test stage defers both to its binary plan. Each asks at Background rank, and its exact claim
+/// disappears at the boundary. NEGATIVE CONTROL: removing the core dimension, splitting it into
+/// a later claim, or making the test stage take an outer claim fails these assertions.
+#[test]
+fn background_stages_own_one_atomic_resource_claim() {
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    BACKGROUND_RESOURCES
+        .ledger
+        .set(dir.path().join("ledger"))
+        .expect("set once");
+    let mut ctx = Ctx::new(
+        dir.path().to_owned(),
+        gui(),
+        EnvSnapshot {
+            cargo_build_jobs: Some("5".into()),
+            ..EnvSnapshot::default()
+        },
+        dir.path().join("scratch"),
+    )
+    .with_memory(book(dir.path()));
+    ctx.background = true;
+
+    let mut compiling = crate::plan::declared(&gui())
+        .into_iter()
+        .find(|spec| spec.id == StageId::Tippy)
+        .expect("tippy stage");
+    compiling.mem = 12 * GIB;
+    let compile = crate::claim_memory(&ctx, &compiling, background_resources_admit)
+        .expect("admitted")
+        .expect("one resource claim");
+    assert_eq!(compile.claim.record().need.mem, 12 * GIB);
+    assert_eq!(compile.claim.record().need.cores, 5);
+    assert!(compile.claim.record().need.covers);
+    assert_eq!(compile.claim.cores(), 5);
+    assert!(compile.cover().is_some());
+    drop(compile);
+
+    let pure_spec = crate::plan::declared(&gui())
+        .into_iter()
+        .find(|spec| spec.id == StageId::Formatting)
+        .expect("formatting stage");
+    let pure = crate::claim_memory(&ctx, &pure_spec, background_resources_admit)
+        .expect("admitted")
+        .expect("one CPU claim");
+    assert_eq!(pure.claim.record().need.mem, 0);
+    assert_eq!(pure.claim.record().need.cores, 5);
+    assert!(!pure.claim.record().need.covers);
+    assert!(pure.cover().is_none());
+    drop(pure);
+
+    let dispatched = crate::plan::declared(&gui())
+        .into_iter()
+        .find(|spec| spec.id == StageId::Test)
+        .expect("test stage");
+    assert!(
+        crate::claim_memory(&ctx, &dispatched, background_resources_admit)
+            .expect("the deferred answer")
+            .is_none(),
+        "the test dispatcher, not its outer stage, owns the combined claim"
+    );
+
+    let seen = BACKGROUND_RESOURCES.take();
+    assert_eq!(
+        seen.asked,
+        [
+            (
+                format!("verify {}", compiling.title),
+                12 * GIB,
+                Admit::Preemptible
+            ),
+            (format!("verify {}", pure_spec.title), 0, Admit::Preemptible)
+        ]
+    );
+    assert!(
+        BACKGROUND_RESOURCES
+            .ledger()
+            .list()
+            .expect("the ledger")
+            .is_empty(),
+        "no stage claim survives its boundary"
+    );
 }
 
 /// A stage's memory is claimed before it starts and held until it ends: the lint (never

@@ -233,9 +233,7 @@ impl<'a> VisibleRowView<'a> {
                     && !grid.storage.extras.is_empty()
                     && let Some(extra) = grid.storage.extras.get(CellCoord::new(*screen_row, col))
                 {
-                    for &mark in extra.combining() {
-                        out.push(mark);
-                    }
+                    extra.push_combining_text(out);
                 }
             }
             Self::History { mat } => {
@@ -250,9 +248,7 @@ impl<'a> VisibleRowView<'a> {
                     out.push(if ch == '\0' { ' ' } else { ch });
                 }
                 if let Some(ex) = ex {
-                    for &mark in ex.combining() {
-                        out.push(mark);
-                    }
+                    ex.push_combining_text(out);
                 }
             }
             Self::Empty => {}

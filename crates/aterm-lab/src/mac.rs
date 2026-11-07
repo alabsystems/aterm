@@ -131,7 +131,7 @@ targo --unverified lab mac <verb> — the macOS guest lane: a disposable tart VM
                 guest's own administrator) and, --fda, Full Disk Access granted to the guest agent, made once by
                 the first run that needs it and kept stopped; booted with no window, each bench run in the guest
                 with tccd's log streamed; prints every row, the removable-volume requests tccd saw and a
-                ~/Desktop control; the clone deleted (--keep: stopped and kept as aterm-mac-dmg-kept-<pid>; a
+                ~/Desktop control; the clone deleted (--keep: stopped and kept as aterm-mac-dmg-kept-<pid>-<instance>; a
                 killed run's clone is reported by the next and retained). No tart here: it fetches tart
                 2.40.1 (SHA-256 and Developer ID checked) into ~/Library/Caches/aterm/mac-lane, or
                 $LAB_TART=/path/to/tart. ~2.5 min with the image and a base here. Exit 0 every row passed, 1 a
@@ -439,18 +439,72 @@ pub fn ended_lane_candidates(names: &str, me: i32, alive: impl Fn(i32) -> bool) 
     names
         .lines()
         .map(str::trim)
-        .filter(|name| {
-            name.strip_prefix(LANE_VM)
-                .filter(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
-                .and_then(|pid| pid.parse::<i32>().ok())
-                .is_some_and(|pid| pid != me && !alive(pid))
-        })
+        .filter(|name| lane_owner(name).is_some_and(|pid| pid != me && !alive(pid)))
         .map(str::to_owned)
         .collect()
 }
 
-/// The name every lane clone is made under, before its lane's pid.
+/// The name every lane clone is made under, before its owner pid and instance number.
 const LANE_VM: &str = "aterm-mac-dmg-";
+
+/// One clone's identity. Allocation always reads this process's actual owner pid.
+#[derive(Clone, Copy)]
+struct VmIdentity {
+    owner: u32,
+    instance: u64,
+}
+
+impl VmIdentity {
+    fn allocate() -> Result<Self, Fail> {
+        static NEXT: std::sync::Mutex<u64> = std::sync::Mutex::new(1);
+        let instance = {
+            let mut next = NEXT
+                .lock()
+                .map_err(|_| Fail::die("the macOS guest instance allocator is poisoned"))?;
+            let instance = *next;
+            *next = instance
+                .checked_add(1)
+                .ok_or_else(|| Fail::die("the macOS guest instance identities are exhausted"))?;
+            instance
+        };
+        Ok(Self {
+            owner: std::process::id(),
+            instance,
+        })
+    }
+
+    fn running_name(self) -> String {
+        format!("{LANE_VM}{}-{}", self.owner, self.instance)
+    }
+
+    fn kept_name(self) -> String {
+        format!("{LANE_VM}kept-{}-{}", self.owner, self.instance)
+    }
+}
+
+/// The owner of an old bare-pid clone or a current pid-instance clone. This is only a
+/// candidate for reporting; a name never grants custody or permission to remove a VM.
+fn lane_owner(name: &str) -> Option<i32> {
+    let mut parts = name.strip_prefix(LANE_VM)?.split('-');
+    let owner = parts.next()?;
+    let positive = |value: &str| {
+        !value.is_empty()
+            && value.bytes().all(|byte| byte.is_ascii_digit())
+            && value.parse::<u64>().is_ok_and(|number| number > 0)
+    };
+    if !positive(owner) {
+        return None;
+    }
+    if let Some(instance) = parts.next()
+        && !positive(instance)
+    {
+        return None;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    owner.parse().ok()
+}
 
 /// The name of the prepared base a run clones for `image` (`--fda`: the one with the grant):
 /// [`LANE_VM`]`base-`, the image's name with every character but a letter or digit made a `-`,
@@ -552,6 +606,7 @@ pub const fn control_verdict(
 pub(crate) struct Vm {
     pub(crate) tart: String,
     pub(crate) name: String,
+    identity: VmIdentity,
     share: PathBuf,
     log: PathBuf,
     run: Option<Child>,
@@ -573,7 +628,8 @@ impl Vm {
         share: &Path,
         keep: bool,
     ) -> Result<Vm, Fail> {
-        let name = format!("{LANE_VM}{}", std::process::id());
+        let identity = VmIdentity::allocate()?;
+        let name = identity.running_name();
         let status = aterm_uds::spawnfd::command(tart)
             .args(["clone", source, &name])
             .stdin(Stdio::null())
@@ -587,6 +643,7 @@ impl Vm {
             log: run.join("tart-run.log"),
             share: share.to_path_buf(),
             name,
+            identity,
             run: None,
             keep,
             promoted: false,
@@ -746,7 +803,7 @@ impl Drop for Vm {
             return;
         }
         if self.keep {
-            let kept = format!("{LANE_VM}kept-{}", std::process::id());
+            let kept = self.identity.kept_name();
             let renamed = aterm_uds::spawnfd::command(&self.tart)
                 .args(["rename", &self.name, &kept])
                 .stdin(Stdio::null())
@@ -1733,12 +1790,39 @@ mod tests {
 
     #[test]
     fn ended_lane_candidates_exclude_live_and_kept_names() {
-        let names = "aterm-mac-dmg-100\naterm-mac-dmg-200\naterm-mac-dmg-300\n\
-                     aterm-mac-dmg-kept-100\naterm-mac-dmg-\naterm-mac-dmg-1x\nother-vm\n";
+        let first = VmIdentity::allocate().unwrap();
+        let second = VmIdentity::allocate().unwrap();
+        assert_ne!(first.running_name(), second.running_name());
+        assert_ne!(first.kept_name(), second.kept_name());
+        let own = format!("{}\n{}\n", first.running_name(), second.running_name());
+        assert_eq!(
+            ended_lane_candidates(&own, 0, |_| false),
+            [first.running_name(), second.running_name()],
+            "both actual allocations carry recognizable owners"
+        );
+        assert!(
+            ended_lane_candidates(&own, i32::try_from(std::process::id()).unwrap(), |_| false)
+                .is_empty(),
+            "the actual allocator's own clones are never reported as stale"
+        );
+        let kept = format!("{}\n{}\n", first.kept_name(), second.kept_name());
+        assert_eq!(kept_by_lane(&kept).len(), 2);
+        assert!(ended_lane_candidates(&kept, 300, |_| false).is_empty());
+        let names = "aterm-mac-dmg-100\naterm-mac-dmg-100-1\naterm-mac-dmg-100-2\n\
+                     aterm-mac-dmg-200\naterm-mac-dmg-200-1\naterm-mac-dmg-300\naterm-mac-dmg-300-1\n\
+                     aterm-mac-dmg-kept-100\naterm-mac-dmg-kept-100-1\naterm-mac-dmg-base-image\n\
+                     aterm-mac-dmg-\naterm-mac-dmg-1x\naterm-mac-dmg-100-\naterm-mac-dmg-100-0\n\
+                     aterm-mac-dmg-0-1\naterm-mac-dmg-+100-1\naterm-mac-dmg-100-+1\n\
+                     aterm-mac-dmg-100-1-extra\naterm-mac-dmg-2147483648-1\n\
+                     aterm-mac-dmg-100-18446744073709551616\nother-vm\n";
         let alive = |pid: i32| pid == 200;
         assert_eq!(
             ended_lane_candidates(names, 300, alive),
-            ["aterm-mac-dmg-100"]
+            [
+                "aterm-mac-dmg-100",
+                "aterm-mac-dmg-100-1",
+                "aterm-mac-dmg-100-2"
+            ]
         );
         assert_eq!(ended_lane_candidates("", 300, alive), Vec::<String>::new());
     }

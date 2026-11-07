@@ -22,7 +22,7 @@ use super::fx::Fx;
 use super::journal::{CLEARED_MEMORY, CLEARED_TURN_END, Journal};
 use super::limit::{self, ResetSpec};
 use super::phase::{
-    Phase, busy_signal, last_said_index, last_said_line, last_said_row, status_row,
+    Phase, busy_seen, busy_signal, last_said_index, last_said_line, last_said_row, status_row,
 };
 use super::policy::approval::{Decision, footer_mode, readings_read_only};
 use super::policy::exception::Exception;
@@ -958,8 +958,9 @@ const FRAME_REREADS: u32 = 8;
 const WRITING_CAP: Duration = Duration::from_secs(3);
 /// Duration an unvouched idle read must persist before being treated as a point.
 const NO_EVIDENCE_HOLD: Duration = Duration::from_secs(1);
-/// Hang detector for an idle read held while the program's window title still reports a running
-/// turn: a minute of its reply unchanged, not a latency budget.
+/// Hang detector for a read held while the program's window title still reports a running turn: a
+/// minute of its reply unchanged ([`ScreenReader::said_tail`]), not a latency budget. A status line
+/// that refreshes, or a footer timer, moves the screen and not the reply.
 const TITLE_HOLD: Duration = Duration::from_secs(60);
 /// Hang detector for a read held while the agent has drawn nothing of its own
 /// ([`Session::first_frame_owed`]): a minute of unmoved screen, not a latency budget, since a
@@ -1055,6 +1056,25 @@ enum Next {
     Idle,
     /// Past the content seq of a read the agent had drawn nothing on.
     Moved(u64),
+    /// A turn the program's title runs and its screen does not show (a Claude Code reply drawn
+    /// under a status line, `aterm_phase::ScreenReader::title_live`): the log wakes the wait for
+    /// its end where the host keeps one, and the short settle does elsewhere. No busy row stands
+    /// to wait gone, and one that never shows answers `await gone` at once.
+    Run,
+}
+
+/// `screen`'s phase as its reader reads the rows beside what the window title read with them
+/// says of the program's run (`screen.title`, sent with the rows; a host that sends none says
+/// nothing): a turn the title runs and the screen does not show reads Busy
+/// ([`ScreenReader::phase_seen`]).
+fn phase_of(reader: &dyn ScreenReader, screen: &Screen) -> Phase {
+    reader.phase_seen(&screen.rows, reader.runs(screen.title.as_deref()))
+}
+
+/// Whether the program's title, read with `screen`'s rows, runs a turn the rows do not show
+/// ([`ScreenReader::title_live`]).
+fn title_run(reader: &dyn ScreenReader, screen: &Screen) -> bool {
+    reader.title_live(&screen.rows, reader.runs(screen.title.as_deref()))
 }
 
 /// The agent's first frame, as this loop has read it ([`Session::first_frame_owed`]).
@@ -2298,6 +2318,9 @@ pub struct Session<'a, C: Ctl> {
     limit_notice_row: Option<String>,
     transcript_wait_seq: Option<u64>,
     transcript_over_seq: Option<u64>,
+    /// The seq of a read whose title-only run outlasted [`TITLE_HOLD`] with its reply unchanged:
+    /// that read is taken as its screen alone shows it ([`Session::turn_of`]).
+    title_spent_seq: Option<u64>,
     standing_read: wall_confirm::StandingRead,
     limit_cut: Option<(ScreenKey, Option<usize>)>,
     message_fold: Option<(ScreenKey, Vec<usize>)>,
@@ -2749,6 +2772,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             limit_notice_row: None,
             transcript_wait_seq: None,
             transcript_over_seq: None,
+            title_spent_seq: None,
             standing_read: wall_confirm::StandingRead::default(),
             limit_cut: None,
             message_fold: None,
@@ -3567,7 +3591,13 @@ impl<'a, C: Ctl> Session<'a, C> {
 
     pub(super) fn turn_of(&self, screen: Screen) -> Turn {
         let reader = self.reader(&screen.rows);
-        let mut phase = reader.phase(&screen.rows);
+        let mut phase = phase_of(reader, &screen);
+        if phase == Phase::Busy
+            && self.title_spent_seq == Some(screen.seq)
+            && title_run(reader, &screen)
+        {
+            phase = reader.phase(&screen.rows);
+        }
         let carried = phase == Phase::Idle && self.transcript_wait_seq == Some(screen.seq);
         if carried {
             phase = Phase::Busy;
@@ -3592,7 +3622,7 @@ impl<'a, C: Ctl> Session<'a, C> {
 
     pub(super) fn point_of(&mut self, screen: Screen) -> Turn {
         let reader = self.reader(&screen.rows);
-        match reader.phase(&screen.rows) {
+        match phase_of(reader, &screen) {
             Phase::Idle => {
                 self.transcript_wait(reader, &screen);
             }
@@ -3665,7 +3695,7 @@ impl<'a, C: Ctl> Session<'a, C> {
         if let Some(mode) = footer_mode(&screen.rows) {
             self.footer = Some(mode);
         } else if self.footer.is_none() && !self.busy_read {
-            self.busy_read = reader.phase(&screen.rows) == Phase::Busy;
+            self.busy_read = phase_of(reader, &screen) == Phase::Busy;
         }
         let credits = reader.credits(&screen.rows);
         self.note_credits(reader, credits.as_ref(), &screen.rows);
@@ -4090,9 +4120,18 @@ impl<'a, C: Ctl> Session<'a, C> {
     /// `Some(false)` at rest, `None` where its reader reads no titles, the host refuses `title`, or
     /// the program set none (Claude Code under `CLAUDE_CODE_DISABLE_TERMINAL_TITLE`), so the
     /// title tells nothing.
-    fn title_reading(&mut self, reader: &dyn ScreenReader) -> Result<Option<bool>, Fail> {
+    /// The title read with `screen`'s rows (`text --json`'s `"title"`) is the one asked; a host
+    /// that sends none (an older build) is asked with `title`.
+    fn title_reading(
+        &mut self,
+        reader: &dyn ScreenReader,
+        screen: &Screen,
+    ) -> Result<Option<bool>, Fail> {
         if reader.title_runs("").is_none() {
             return Ok(None);
+        }
+        if let Some(title) = screen.title.as_deref() {
+            return Ok(reader.runs(Some(title)));
         }
         let r = self.call(&["title"])?;
         if self.unserved(&r) {
@@ -4271,7 +4310,7 @@ impl<'a, C: Ctl> Session<'a, C> {
     fn spent_turn(&self) -> Turn {
         match &self.last {
             Some(screen) => Turn {
-                phase: self.reader(&screen.rows).phase(&screen.rows),
+                phase: phase_of(self.reader(&screen.rows), screen),
                 screen: screen.clone(),
                 timed_out: true,
             },
@@ -4336,6 +4375,12 @@ impl<'a, C: Ctl> Session<'a, C> {
         // restarts it; a status line or a footer timer moving under the same reply does not, so
         // [`TITLE_HOLD`] of the reply unchanged ends the hold.
         let mut title_held: Option<(Option<String>, Instant)> = None;
+        // A turn only the title runs (`Next::Run`): what its reply said
+        // ([`ScreenReader::said_tail`]), and since when it has said it. A reply still drawing
+        // restarts it, so it is never cut short; a status line or a footer timer moving under the
+        // same reply does not, so [`TITLE_HOLD`] of the reply unchanged ends it, and the read is
+        // taken as its screen shows it.
+        let mut title_run_since: Option<(Option<String>, Instant)> = None;
         // A read of this turn saw it run (`saw.ran`). A wait taken up again keeps the run an
         // earlier wait saw: `saw` lasts until a look judges the turn, past a lost connection and
         // past a look the usage panel, an Off park or a reset ended. A title read since found the
@@ -4362,7 +4407,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             // Once a read showed the turn running (`footer_seen`), the log may wake the wait for
             // its end ([`log_wake`]); the read after it still decides. A cursor stands only from
             // one such wait to the next.
-            let on_the_log = footer_seen && matches!(next, Next::Gone(_));
+            let on_the_log = footer_seen && matches!(next, Next::Gone(_) | Next::Run);
             if !on_the_log {
                 log_at = None;
             }
@@ -4400,13 +4445,50 @@ impl<'a, C: Ctl> Session<'a, C> {
                     self.busy_wait(&["seq", &seq.to_string()], step, review)?;
                     unsettled = true;
                 }
+                Next::Run => {
+                    let woke = if on_the_log {
+                        self.log_wake(&mut log_at, step)?
+                    } else {
+                        log_wake::LogWoke::Screen
+                    };
+                    match woke {
+                        log_wake::LogWoke::Screen => {
+                            self.busy_wait(&["idle", SETTLE_MS], step.min(SETTLE_CAP), review)?;
+                        }
+                        log_wake::LogWoke::Word(word) => {
+                            let seq = self.last.as_ref().map_or(0, |s| s.seq);
+                            self.word_moved(seq, word, review);
+                        }
+                        log_wake::LogWoke::Answered | log_wake::LogWoke::TimedOut => {}
+                    }
+                    unsettled = true;
+                }
             }
             let mut screen = self.screen()?;
             let reader = self.reader(&screen.rows);
             if self.fx.mono() < deadline {
                 self.watch_context(&screen, reader, &mut |line| review.say(line))?;
             }
-            let mut phase = reader.phase(&screen.rows);
+            let mut phase = phase_of(reader, &screen);
+            let runs = reader.runs(screen.title.as_deref());
+            // A turn only the title runs holds while its reply changes, and TITLE_HOLD of the
+            // reply unchanged it is read as the screen shows it, the hold's NOTE said below.
+            let title_only = phase == Phase::Busy && title_run(reader, &screen);
+            if title_only {
+                let said = reader.said_tail(&screen.rows);
+                let since = match &title_run_since {
+                    Some((held, at)) if *held == said => *at,
+                    _ => self.fx.mono(),
+                };
+                if self.fx.since(since) >= TITLE_HOLD {
+                    phase = reader.phase(&screen.rows);
+                    self.title_spent_seq = Some(screen.seq);
+                    title_held = Some((said.clone(), since));
+                }
+                title_run_since = Some((said, since));
+            } else {
+                title_run_since = None;
+            }
             // A program still starting is neither idle nor busy. Until the agent has drawn
             // something of its own ([`Self::first_frame_owed`]), the loop waits for the screen
             // to move and reads again. A screen unmoved for FIRST_FRAME_HANG ends the hold, and
@@ -4470,7 +4552,7 @@ impl<'a, C: Ctl> Session<'a, C> {
                 // one the server's `gone` waits out [`aterm_core::terminal::GONE_SETTLE`].
                 if phase == Phase::Idle
                     && footer_seen
-                    && matches!(next, Next::Gone(_))
+                    && matches!(next, Next::Gone(_) | Next::Run)
                     && reader.frame_torn(&screen.rows)
                     && self.fx.mono() < deadline
                 {
@@ -4506,13 +4588,17 @@ impl<'a, C: Ctl> Session<'a, C> {
                 // Code rests its title about 23 ms before the frame that draws the reply's last
                 // line, so a screen read just before that flip under a title read just after it is
                 // a reply short of its last line. An end the program drew (Claude Code's done row,
-                // which comes with that last line or after it), a wall, and an end the transcript
-                // told decide as read: the title also runs while the agent's background agents or
-                // workflows do, its turn over.
+                // which comes with that last line or after it, or the interrupt a stopped turn
+                // ends on, as `title_live` reads it), a wall, and an end the transcript told
+                // decide as read: the title also runs while the agent's background agents or
+                // workflows do, its turn over. A health wall (Claude Code's critical-memory
+                // banner) is no such wall: the program draws it over a live turn too, and the
+                // restart it asks for waits for the reply's last line like any other end.
                 if matches!(phase, Phase::Idle | Phase::Question)
                     && !transcript_idle
                     && !reader.end_drawn(&screen.rows)
-                    && reader.wall(&screen.rows).is_none()
+                    && !reader.interrupted(&screen.rows)
+                    && reader.wall(&screen.rows) == reader.health_wall(&screen.rows)
                     && self.fx.mono() < deadline
                 {
                     let said = reader.said_tail(&screen.rows);
@@ -4525,7 +4611,7 @@ impl<'a, C: Ctl> Session<'a, C> {
                                 TITLE_HOLD.as_secs()
                             ));
                         }
-                        _ => match self.title_reading(reader)? {
+                        _ => match self.title_reading(reader, &screen)? {
                             Some(true) => {
                                 if title_held.as_ref().is_none_or(|(held, _)| *held != said) {
                                     title_held = Some((said, self.fx.mono()));
@@ -4553,7 +4639,9 @@ impl<'a, C: Ctl> Session<'a, C> {
                 });
             }
             unvouched_since = None;
-            title_held = None;
+            if !title_only {
+                title_held = None;
+            }
             saw.ran = true;
             title_rested = false;
             if writing {
@@ -4561,7 +4649,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             }
             let may_act = !writing
                 && ((self.stall_host.is_some()
-                    && (carried || reader.background_wait(&screen.rows).is_some()))
+                    && (carried || reader.background_wait_seen(&screen.rows, runs).is_some()))
                     || duty.as_deref().is_some_and(|d| {
                         reader.survey(&screen.rows) || *d.survey != Survey::Closed
                     }));
@@ -4592,7 +4680,10 @@ impl<'a, C: Ctl> Session<'a, C> {
                     self.end_memory_on_live_turn(reader, &screen.rows, screen.seq);
                 }
             }
-            if !writing && !carried && !signing_in && reader.background_wait(&screen.rows).is_none()
+            if !writing
+                && !carried
+                && !signing_in
+                && reader.background_wait_seen(&screen.rows, runs).is_none()
             {
                 self.took(screen.seq, opts.map(|o| &o.policy), review);
                 self.tell_face();
@@ -4621,8 +4712,9 @@ impl<'a, C: Ctl> Session<'a, C> {
                 }
                 if review.unattended() {
                     if !signing_in {
-                        let live =
-                            !writing && !carried && reader.background_wait(&screen.rows).is_none();
+                        let live = !writing
+                            && !carried
+                            && reader.background_wait_seen(&screen.rows, runs).is_none();
                         self.limit_on_busy(screen.seq, live, review)?;
                     }
                     if !writing
@@ -4635,7 +4727,7 @@ impl<'a, C: Ctl> Session<'a, C> {
                     }
                     // The agent working ends what it was told for, but a refused go-ahead
                     // stands through the breaks of its own background work, where it is told.
-                    let at_break = reader.background_wait(&screen.rows).is_some();
+                    let at_break = reader.background_wait_seen(&screen.rows, runs).is_some();
                     if self.wall_memory.is_none()
                         && !self.turn_end.compacting()
                         && !signing_in
@@ -4653,7 +4745,8 @@ impl<'a, C: Ctl> Session<'a, C> {
                         self.question_done(screen.seq, review)?;
                     }
                     if !writing && let Some(opts) = opts {
-                        let live = !carried && reader.background_wait(&screen.rows).is_none();
+                        let live =
+                            !carried && reader.background_wait_seen(&screen.rows, runs).is_none();
                         self.reset_at_work(&screen, live, opts, review)?;
                     }
                 }
@@ -4675,7 +4768,7 @@ impl<'a, C: Ctl> Session<'a, C> {
                     // and is no work past the wall it stands at: there the wall's hold stands, as
                     // that break told it, or each read would publish it and take it down again.
                     if !carried
-                        && reader.background_wait(&screen.rows).is_none()
+                        && reader.background_wait_seen(&screen.rows, runs).is_none()
                         && matches!(self.lasting_told, Some(Some(Lasting::Wall { .. })))
                     {
                         self.tell_lasting(host.as_ref(), None);
@@ -4713,7 +4806,7 @@ impl<'a, C: Ctl> Session<'a, C> {
                 }
             }
             if writing && unsettled {
-                next = if footer_seen && matches!(next, Next::Gone(_)) {
+                next = if footer_seen && matches!(next, Next::Gone(_) | Next::Run) {
                     Next::Settle
                 } else {
                     Next::Idle
@@ -4732,6 +4825,17 @@ impl<'a, C: Ctl> Session<'a, C> {
                     unscoped: false,
                     boxed: reader.busy_row_outlives_boxes(),
                 });
+                footer_seen = true;
+                continue;
+            }
+            // A turn only the title runs shows no busy row to wait gone: the log wakes the wait
+            // for its end (`footer_seen` arms it), and the short settle does where no log can.
+            if title_only
+                && !writing
+                && phase == Phase::Busy
+                && self.title_spent_seq != Some(screen.seq)
+            {
+                next = Next::Run;
                 footer_seen = true;
                 continue;
             }
@@ -7492,11 +7596,12 @@ impl<C: Ctl> Session<'_, C> {
         let reader = self.reader(&screen.rows);
         self.carry_read(reader, screen);
         let carried = self.transcript_wait_seq == Some(screen.seq);
+        let runs = reader.runs(screen.title.as_deref());
         let unfit = if carried {
             None
-        } else if reader.phase(&screen.rows) != Phase::Busy {
+        } else if phase_of(reader, screen) != Phase::Busy {
             Some(Guard::NotBusy)
-        } else if reader.background_wait(&screen.rows).is_none() {
+        } else if reader.background_wait_seen(&screen.rows, runs).is_none() {
             Some(Guard::NoBackgroundWait)
         } else {
             None
@@ -8318,7 +8423,8 @@ pub fn render_phase(turn: &Turn, reader: &dyn ScreenReader, python_allow: &[Stri
             }
         }
         Phase::Busy => {
-            match busy_rule(reader, rows) {
+            let title = turn.screen.title.as_deref();
+            match busy_rule(reader, rows, title) {
                 Some(b) => out.push_str(&format!("reason {b}\n")),
                 None if turn.screen.rows.is_empty() => {
                     out.push_str("reason no screen: no read answered before the timeout\n")
@@ -8328,8 +8434,9 @@ pub fn render_phase(turn: &Turn, reader: &dyn ScreenReader, python_allow: &[Stri
                 }
             }
             // A turn over under the agent's own background work: the phase it rests at, which
-            // the server publishes as `agent=` and the session log closes the turn at.
-            if let Some(rest) = reader.background_rest(rows) {
+            // the server publishes as `agent=` and the session log closes the turn at. A turn
+            // the title runs rests at none ([`ScreenReader::background_rest_seen`]).
+            if let Some(rest) = reader.background_rest_seen(rows, reader.runs(title)) {
                 out.push_str(&format!("rest {}\n", rest.name()));
             }
         }
@@ -8386,9 +8493,13 @@ fn esc_line(effect: Option<CancelEffect>) -> Option<&'static str> {
     }
 }
 
-fn busy_rule(reader: &dyn ScreenReader, rows: &[String]) -> Option<String> {
+/// Why `rows` read busy, beside what `title` (the window title read with them) says of the run:
+/// a turn only the title runs is `title: running`.
+fn busy_rule(reader: &dyn ScreenReader, rows: &[String], title: Option<&str>) -> Option<String> {
+    let runs = reader.runs(title);
     match reader.program() {
-        Program::Claude | Program::Generic => busy_signal(rows).map(|b| b.to_string()),
+        Program::Claude => busy_seen(rows, runs).map(|b| b.to_string()),
+        Program::Generic => busy_signal(rows).map(|b| b.to_string()),
         Program::Codex | Program::Grok | Program::Kimi | Program::Agy | Program::Muse => {
             let status_row = reader.busy_guard().is_some_and(|guard| {
                 aterm_observe::row_matcher(&guard).is_ok_and(|m| rows.iter().any(|r| m.matches(r)))
@@ -8396,10 +8507,13 @@ fn busy_rule(reader: &dyn ScreenReader, rows: &[String]) -> Option<String> {
             if status_row {
                 return Some("status row: esc to interrupt".to_string());
             }
-            if reader.phase(rows) != Phase::Busy {
+            if reader.phase_seen(rows, runs) != Phase::Busy {
                 return None;
             }
-            Some(match reader.background_wait(rows) {
+            if reader.phase(rows) != Phase::Busy {
+                return Some("title: running".to_string());
+            }
+            Some(match reader.background_wait_seen(rows, runs) {
                 Some(work) => format!("its own background work: {work}"),
                 None => "its reader reads it busy".to_string(),
             })

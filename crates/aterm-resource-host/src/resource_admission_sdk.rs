@@ -87,6 +87,13 @@ impl Keeper {
         layout: &atpkg::store::Layout,
         program_path: &std::path::Path,
     ) -> io::Result<Arc<Self>> {
+        Self::capture_at(layout, program_path, Instant::now())
+    }
+    fn capture_at(
+        layout: &atpkg::store::Layout,
+        program_path: &std::path::Path,
+        started: Instant,
+    ) -> io::Result<Arc<Self>> {
         let directory = program_path
             .parent()
             .ok_or_else(|| refused("SDK program parent missing"))?;
@@ -114,7 +121,7 @@ impl Keeper {
         };
         current(program_path, &program, &program_before)?;
         current(&ready_path, &ready, &ready_before)?;
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = started + Duration::from_secs(60);
         if program_before.len() > 1024 * 1024 * 1024 {
             return Err(refused(
                 "metadata service image exceeds native profile bound",
@@ -170,10 +177,13 @@ impl Keeper {
         Ok(Arc::new(result))
     }
     pub(super) fn validate(&self) -> io::Result<()> {
+        self.validate_at(Instant::now())
+    }
+    fn validate_at(&self, started: Instant) -> io::Result<()> {
         self.lease.check_current()?;
         current(&self.program_path, &self.program, &self.program_before)?;
         current(&self.ready_path, &self.ready, &self.ready_before)?;
-        self.held.validate(Instant::now() + Duration::from_secs(2))
+        native_inputs::validate(&self.held, started)
     }
     pub(super) fn runtime_environment(
         &self,
@@ -181,10 +191,14 @@ impl Keeper {
         self.held.runtime_environment()
     }
     pub(super) fn validate_loaded(&self, pid: u32) -> io::Result<()> {
-        self.validate()?;
-        self.held.validate_loaded(
+        self.validate_loaded_at(pid, Instant::now())
+    }
+    pub(super) fn validate_loaded_at(&self, pid: u32, started: Instant) -> io::Result<()> {
+        self.validate_at(started)?;
+        native_inputs::validate_loaded(
+            &self.held,
             trust_resource_provenance::process::read_identity(pid)?,
-            Instant::now() + Duration::from_secs(2),
+            started,
         )
     }
     pub(super) fn descriptor(&self) -> io::Result<OwnedFd> {
@@ -207,6 +221,10 @@ impl Keeper {
         })
     }
 }
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+#[path = "resource_admission_sdk/tests.rs"]
+mod tests;
 
 use std::os::fd::AsRawFd as _;
 use trust_resource_controller::SdkCustody;

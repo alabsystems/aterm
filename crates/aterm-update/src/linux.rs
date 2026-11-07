@@ -21,6 +21,8 @@ use serde::{Deserialize, Serialize};
 const RECORD_LIMIT: u64 = 256 * 1024;
 const APPCAST_LIMIT: u64 = 5 * 1024 * 1024;
 const BINARY_LIMIT: u64 = 512 * 1024 * 1024;
+// Loader and compiled-identity checks must finish; host scheduling is not a verdict.
+const PROBE_HANG: Duration = Duration::from_secs(60);
 const APPCAST: &str = "aterm-appcast.toml";
 const APPCAST_SIG: &str = "aterm-appcast.toml.sig";
 const ROSTER: &str = "aterm-machines.toml";
@@ -721,6 +723,17 @@ fn probe_candidate(
     private_dir: &Path,
     timeout: Duration,
 ) -> Result<(), String> {
+    probe_candidate_at(path, manifest, target, private_dir, timeout, Instant::now())
+}
+
+fn probe_candidate_at(
+    path: &Path,
+    manifest: &Manifest,
+    target: LinuxTarget,
+    private_dir: &Path,
+    timeout: Duration,
+    started: Instant,
+) -> Result<(), String> {
     use aterm_uds::spawnfd::Stdio;
     let (output_path, output) = fresh_file(private_dir, "probe-output")?;
     let output_path = Scratch(output_path);
@@ -736,7 +749,7 @@ fn probe_candidate(
             .stderr(Stdio::from(error))
             .spawn()
             .map_err(|e| format!("authenticated Linux candidate cannot start: {e}"))?;
-        let deadline = crate::instant_after(Instant::now(), timeout);
+        let deadline = crate::instant_after(started, timeout);
         let status = loop {
             let oversized = [&output_path.0, &error_path.0]
                 .into_iter()
@@ -842,15 +855,7 @@ pub fn install_release(
         candidate,
         &proof,
         PRODUCTION_PINS,
-        |path, manifest, target| {
-            probe_candidate(
-                path,
-                manifest,
-                target,
-                &context.dir,
-                Duration::from_secs(10),
-            )
-        },
+        |path, manifest, target| probe_candidate(path, manifest, target, &context.dir, PROBE_HANG),
     )
 }
 
@@ -1187,7 +1192,7 @@ pub fn enable(current_build: u64, proof_dir: Option<&Path>) -> Result<String, St
             &manifest,
             native()?,
             &context.dir,
-            Duration::from_secs(10),
+            PROBE_HANG,
         )?;
         if installed.build != current_build
             || installed.build < state.high_water.max(state.min_build)
@@ -1264,15 +1269,7 @@ fn apply_locked(
         state,
         proof,
         pins,
-        |path, manifest, target| {
-            probe_candidate(
-                path,
-                manifest,
-                target,
-                &context.dir,
-                Duration::from_secs(10),
-            )
-        },
+        |path, manifest, target| probe_candidate(path, manifest, target, &context.dir, PROBE_HANG),
         |_| Ok(()),
     )
 }
@@ -2275,15 +2272,7 @@ fn check_locked(
         PRODUCTION_PINS,
         source,
         provider,
-        |path, manifest, target| {
-            probe_candidate(
-                path,
-                manifest,
-                target,
-                &context.dir,
-                Duration::from_secs(10),
-            )
-        },
+        |path, manifest, target| probe_candidate(path, manifest, target, &context.dir, PROBE_HANG),
     )?;
     Ok(Checked::Channel)
 }

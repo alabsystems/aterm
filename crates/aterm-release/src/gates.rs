@@ -148,10 +148,9 @@ fn resolve_trust_stage2_bin() -> Result<PathBuf> {
             Ok(())
         }
     };
-    // The lock in the clone's working tree (its HEAD until the cut moves it to the candidate)
-    // names the build, so an index that flips `current` mid-run changes nothing here. Binding the
-    // candidate's own lock is `trust_lock::locked_prover` over `lock_at(R)`, which `prover()`
-    // takes once it runs after `choose_candidate()`.
+    // The clone's working-tree lock names the build here, independently of the store's `current`.
+    // Binding the chosen candidate's own lock remains A14 release integration work: move prover
+    // resolution after candidate selection and use `trust_lock::locked_prover` over `lock_at(R)`.
     let lock = env::current_dir().ok().and_then(|cwd| {
         let xdg = env::var_os("XDG_CONFIG_HOME")
             .filter(|d| !d.is_empty())

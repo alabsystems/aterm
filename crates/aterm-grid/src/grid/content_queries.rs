@@ -5,7 +5,8 @@
 //! Derived-content queries on [`Grid`]: text extraction and memory accounting.
 
 use super::Grid;
-use crate::CellCoord;
+use crate::{CellCoord, Row};
+use std::fmt::Write as _;
 
 impl Grid {
     /// The resolved character at a grid position.
@@ -128,12 +129,29 @@ impl Grid {
 
     /// A live screen row ([`row_text_screen`](Self::row_text_screen)).
     #[must_use]
-    #[allow(clippy::too_many_lines, reason = "flat SGR tracking per cell")]
     pub fn row_ansi_text_screen(&self, row: u16) -> Option<String> {
-        use crate::CellFlags;
-
         let r = self.storage.row_at_screen(row)?;
         let mut s = String::with_capacity(r.len() as usize * 2);
+        self.push_row_ansi_text(row, r, &mut s);
+        Some(s)
+    }
+
+    /// Append a live screen row's ANSI text, preserving the prefix in `out`.
+    /// Returns false for an absent row, leaving `out` unchanged.
+    #[must_use]
+    pub fn push_row_ansi_text_screen(&self, row: u16, out: &mut String) -> bool {
+        let Some(r) = self.storage.row_at_screen(row) else {
+            return false;
+        };
+        out.reserve(usize::from(r.len()));
+        self.push_row_ansi_text(row, r, out);
+        true
+    }
+
+    #[allow(clippy::too_many_lines, reason = "flat SGR tracking per cell")]
+    fn push_row_ansi_text(&self, row: u16, r: &Row, s: &mut String) {
+        use crate::CellFlags;
+
         let extras_empty = self.storage.extras.is_empty();
 
         let mut cur_bold = false;
@@ -236,60 +254,63 @@ impl Grid {
                     || want_bg_rgb.is_some();
 
                 if has_attrs {
-                    let mut params: Vec<String> = vec!["0".to_string()];
+                    s.push_str("\x1b[0");
                     if want_bold {
-                        params.push("1".to_string());
+                        s.push_str(";1");
                     }
                     if want_dim {
-                        params.push("2".to_string());
+                        s.push_str(";2");
                     }
                     if want_italic {
-                        params.push("3".to_string());
+                        s.push_str(";3");
                     }
                     if let Some(underline) = want_underline {
-                        params.push(underline.to_string());
+                        s.push(';');
+                        s.push_str(underline);
                     }
                     if want_blink {
-                        params.push("5".to_string());
+                        s.push_str(";5");
                     }
                     if want_inverse {
-                        params.push("7".to_string());
+                        s.push_str(";7");
                     }
                     if want_hidden {
-                        params.push("8".to_string());
+                        s.push_str(";8");
                     }
                     if want_strikethrough {
-                        params.push("9".to_string());
+                        s.push_str(";9");
                     }
                     if let Some(line) = want_overline_or_script {
-                        params.push(line.to_string());
+                        s.push(';');
+                        s.push_str(line);
                     }
                     if let Some(color) = want_underline_color {
-                        params.push(crate::underline_color_sgr(color));
+                        s.push(';');
+                        crate::push_underline_color_sgr(s, color);
                     }
                     if let Some(rgb) = want_fg_rgb {
-                        params.push(format!("38;2;{};{};{}", rgb[0], rgb[1], rgb[2]));
+                        let _ = write!(s, ";38;2;{};{};{}", rgb[0], rgb[1], rgb[2]);
                     } else if let Some(idx) = want_fg_indexed {
                         if idx < 8 {
-                            params.push(format!("{}", 30 + idx));
+                            let _ = write!(s, ";{}", 30 + idx);
                         } else if idx < 16 {
-                            params.push(format!("{}", 90 + idx - 8));
+                            let _ = write!(s, ";{}", 90 + idx - 8);
                         } else {
-                            params.push(format!("38;5;{idx}"));
+                            let _ = write!(s, ";38;5;{idx}");
                         }
                     }
                     if let Some(rgb) = want_bg_rgb {
-                        params.push(format!("48;2;{};{};{}", rgb[0], rgb[1], rgb[2]));
+                        let _ = write!(s, ";48;2;{};{};{}", rgb[0], rgb[1], rgb[2]);
                     } else if let Some(idx) = want_bg_indexed {
                         if idx < 8 {
-                            params.push(format!("{}", 40 + idx));
+                            let _ = write!(s, ";{}", 40 + idx);
                         } else if idx < 16 {
-                            params.push(format!("{}", 100 + idx - 8));
+                            let _ = write!(s, ";{}", 100 + idx - 8);
                         } else {
-                            params.push(format!("48;5;{idx}"));
+                            let _ = write!(s, ";48;5;{idx}");
                         }
                     }
-                    s.push_str(&format!("\x1b[{}m", params.join(";")));
+                    s.push('m');
                     any_sgr = true;
                 } else if any_sgr {
                     s.push_str("\x1b[0m");
@@ -313,16 +334,14 @@ impl Grid {
             }
 
             if cell.is_complex() {
-                if !self.push_complex_char_at(row, col, &mut s) {
+                if !self.push_complex_char_at(row, col, s) {
                     s.push('\u{FFFD}');
                 }
                 if cell.has_extras()
                     && !extras_empty
                     && let Some(extra) = self.storage.extras.get(CellCoord::new(row, col))
                 {
-                    for &combining in extra.combining() {
-                        s.push(combining);
-                    }
+                    extra.push_combining_text(s);
                 }
             } else {
                 let ch = cell.char();
@@ -331,9 +350,7 @@ impl Grid {
                     && !extras_empty
                     && let Some(extra) = self.storage.extras.get(CellCoord::new(row, col))
                 {
-                    for &combining in extra.combining() {
-                        s.push(combining);
-                    }
+                    extra.push_combining_text(s);
                 }
             }
         }
@@ -341,8 +358,6 @@ impl Grid {
         if any_sgr {
             s.push_str("\x1b[0m");
         }
-
-        Some(s)
     }
 
     /// Get visible row content as a string (for debugging).

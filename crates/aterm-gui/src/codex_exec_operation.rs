@@ -575,9 +575,7 @@ fn arm(ctx: &Arc<crate::SessionCtx>, master: i32, fields: &BTreeMap<&str, &str>)
         return DENIED.into();
     };
     if !matches!(
-        codex_rotation::with_prepared_writer(&env, &receipt, |_, _| codex_renewal::write_receipt(
-            &env, &receipt
-        )),
+        codex_rotation::with_prepared_writer(&env, &receipt, |_, writer| writer.create(&receipt)),
         Ok(Some(()))
     ) {
         // Preparation can become stale before an operation exists. Do not

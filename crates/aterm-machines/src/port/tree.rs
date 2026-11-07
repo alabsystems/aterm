@@ -131,6 +131,12 @@ mod tests {
         let helper = macos.join("helper");
         std::fs::write(&exe, b"").unwrap();
         std::fs::write(&helper, b"").unwrap();
+        // A scratch file takes its folder's group, which can be one we do not belong to (`wheel`
+        // under /private/tmp); the kernel then clears SGID on chmod. Keep the helper in our
+        // effective group before setting it.
+        // SAFETY: getegid reads this process's effective group and has no preconditions.
+        let egid = unsafe { libc::getegid() };
+        std::os::unix::fs::chown(&helper, None, Some(egid)).unwrap();
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o4755)).unwrap();
         std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o2755)).unwrap();
         let link = app.join("Contents/link");
@@ -161,12 +167,10 @@ mod tests {
         let mode = |p: &Path| std::fs::symlink_metadata(p).unwrap().mode() & 0o7777;
         assert_eq!((acls(&exe), acls(&macos), acls(&link)), (1, 1, 1));
         assert_eq!((mode(&exe), mode(&helper)), (0o4755, 0o2755));
-        let (uid, gid) = {
-            let meta = std::fs::metadata(dir.path()).unwrap();
-            (meta.uid(), meta.gid())
-        };
-
-        own(&app, uid, gid, true).unwrap();
+        // The seal must also target a group we can assign, rather than the scratch
+        // folder's inherited group: the helper now belongs to our effective group.
+        let uid = std::fs::metadata(dir.path()).unwrap().uid();
+        own(&app, uid, egid, true).unwrap();
         assert_eq!((acls(&exe), acls(&macos), acls(&link)), (0, 0, 0));
         assert_eq!((mode(&exe), mode(&helper)), (0o755, 0o755));
     }

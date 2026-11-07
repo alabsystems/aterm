@@ -143,6 +143,7 @@ pub mod open_url;
 pub mod outlook;
 pub mod profile;
 pub mod provider_read;
+pub mod quota_view;
 pub mod relaunch;
 pub mod remote_renew;
 pub mod repo_work;

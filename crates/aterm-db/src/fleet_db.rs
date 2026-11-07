@@ -1604,6 +1604,7 @@ fn finish_rekey(dir: &Path, kept: &Path, secret: &[u8]) -> Result<Value> {
         Ok(moved)
     })
     .map_err(rerun)?;
+    crate::alab::import::covered::carry(kept, dir).map_err(rerun)?;
     std::fs::remove_file(kept.join(REKEY_UNFINISHED))?;
     Ok(json!({
         "imported": moved.get("imported").cloned().unwrap_or(Value::Null),
@@ -3030,6 +3031,33 @@ mod tests {
         assert_eq!(summary["tables"]["computers"], json!(1));
         assert_eq!(summary["tables"]["emails"]["total"], json!(1));
         assert_eq!(summary["tables"]["phones"], json!(1));
+    }
+
+    /// The import's record moves with the rows, so the source keys it names stay this replica's.
+    /// NEGATIVE CONTROL: with `finish_rekey` not carrying it: `` left: None ``.
+    #[test]
+    fn the_imports_record_moves_with_a_rekey() {
+        use crate::alab::import::covered;
+        let tmp = aterm_tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("db");
+        let mut db = replica(&dir);
+        put_row(&mut db, "computers", "m1", json!({"label": "m1"})).unwrap();
+        drop(db);
+        let record = covered::Record {
+            covered: false,
+            uncovered: 1,
+            digest: None,
+            epoch: None,
+            at_ms: 1,
+            sources: ["sr-00ab".to_owned()].into_iter().collect(),
+        };
+        covered::write(&dir, &record, &[]).unwrap();
+
+        rekey_with(&dir, ROTATED).unwrap();
+        assert_eq!(
+            covered::read(&dir).unwrap().map(|record| record.sources),
+            Some(record.sources)
+        );
     }
 
     /// Two replicas whose edits to m1 conflict.

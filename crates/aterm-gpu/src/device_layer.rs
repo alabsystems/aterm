@@ -1204,13 +1204,9 @@ pub(crate) fn metal_try_read_back(
 }
 
 /// How long [`metal_stage_readback`] waits for its committed command buffer to reach a terminal
-/// status: a shipped build gives up after five seconds; a build with debug assertions (the tests,
-/// whose `tests/*.rs` binaries link this library without `cfg(test)`, and the dev builds) waits
-/// the one-minute hang detector (`aterm_spec::wait::MUST_HAPPEN`), since a committed command
-/// buffer always ends and a GPU other work loads only slows it.
-#[cfg(all(target_os = "macos", not(any(test, debug_assertions))))]
-const READBACK_HANG: std::time::Duration = std::time::Duration::from_secs(5);
-#[cfg(all(target_os = "macos", any(test, debug_assertions)))]
+/// status: a minute hang detector in every build. A committed command buffer ends, and a GPU
+/// other work loads only slows it; scheduling delay does not prove readback failed.
+#[cfg(target_os = "macos")]
 const READBACK_HANG: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The staging step of [`metal_try_read_back`].
@@ -1234,9 +1230,18 @@ pub(crate) fn metal_stage_readback(
     let mut cb = session.begin()?;
     cb.copy_texture_to_buffer(texture, w, h, &readback, padded)?;
     let submitted = cb.commit();
-    let deadline = aterm_time::Instant::now() + READBACK_HANG;
+    wait_readback(aterm_time::Instant::now(), || submitted.try_outcome())?;
+    Ok((readback, padded))
+}
+
+#[cfg(target_os = "macos")]
+fn wait_readback(
+    started: aterm_time::Instant,
+    mut read: impl FnMut() -> Option<crate::metal::loss::CbOutcome>,
+) -> Result<(), String> {
+    let deadline = started + READBACK_HANG;
     let outcome = loop {
-        if let Some(outcome) = submitted.try_outcome() {
+        if let Some(outcome) = read() {
             break outcome;
         }
         if aterm_time::Instant::now() >= deadline {
@@ -1249,7 +1254,54 @@ pub(crate) fn metal_stage_readback(
     if outcome != crate::metal::loss::CbOutcome::Completed {
         return Err(format!("metal readback failed: {outcome:?}"));
     }
-    Ok((readback, padded))
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod readback_wait_tests {
+    use super::*;
+    use crate::metal::loss::CbOutcome;
+    use std::time::Duration;
+
+    #[test]
+    fn scheduled_readback_can_finish_after_other_gpu_work() {
+        let mut looks = 0;
+        let result = wait_readback(aterm_time::Instant::now() - Duration::from_secs(6), || {
+            looks += 1;
+            if looks == 1 {
+                None
+            } else {
+                Some(CbOutcome::Completed)
+            }
+        });
+        assert_eq!(result, Ok(()));
+        assert_eq!(looks, 2);
+
+        let mut looks = 0;
+        let expired = wait_readback(aterm_time::Instant::now() - Duration::from_secs(61), || {
+            looks += 1;
+            None
+        });
+        assert!(expired.is_err());
+        assert_eq!(looks, 1);
+    }
+
+    #[test]
+    fn only_completed_readback_may_expose_the_buffer() {
+        for outcome in [
+            CbOutcome::Unfinished { status: 3 },
+            CbOutcome::Retryable {
+                code: 2,
+                name: "fixture retryable",
+            },
+            CbOutcome::Lost {
+                code: Some(4),
+                name: "fixture lost",
+            },
+        ] {
+            assert!(wait_readback(aterm_time::Instant::now(), || Some(outcome)).is_err());
+        }
+    }
 }
 
 /// GL arm of `try_read_back`: read `texture`'s `width` x `height` RGBA8

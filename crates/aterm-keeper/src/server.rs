@@ -1746,6 +1746,65 @@ mod tests {
         );
     }
 
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_valid_pending_peer_check_survives_scheduling_delay() {
+        use std::sync::{Mutex, mpsc};
+        static SCRIPTED: aterm_uds::deadline::Gate =
+            aterm_uds::deadline::Gate::new("akk-delayed-valid-peer");
+        for (backdate, admitted) in [
+            (Duration::from_secs(11), true),
+            (HANG + Duration::from_secs(1), false),
+        ] {
+            let scratch = crate::test_scratch_dir("delayed-valid-peer");
+            let mut server = Server::bind(ServeConfig {
+                socket: scratch.path().join("k.sock"),
+                identity: Identity::same_uid(),
+                relaunch: Relauncher::Unavailable,
+                version: "test".into(),
+                test_drop_custody: false,
+            })
+            .unwrap();
+            let (release, held) = mpsc::channel();
+            let (returned, proof) = mpsc::channel();
+            let channels = Mutex::new(Some((held, returned)));
+            server.test_check = Some(Box::new(move || {
+                let (held, returned) = channels.lock().unwrap().take().unwrap();
+                PeerCheck::start_on(&SCRIPTED, HANG, move || {
+                    let result = held
+                        .recv_timeout(HANG)
+                        .map_err(|error| CheckError::Unchecked(error.to_string()));
+                    returned.send(result.clone()).unwrap();
+                    result
+                })
+            }));
+            let dial = CtlStream::connect(server.socket()).unwrap();
+            dial.set_read_timeout(Some(HANG)).unwrap();
+            write_frame(&dial, &hello_app(), None).unwrap();
+            server.accept_all();
+            assert_eq!(server.dialing.len(), 1);
+            server.dialing[0].until -= backdate;
+            server.admit_checked();
+            release.send(()).unwrap();
+            assert_eq!(proof.recv_timeout(HANG).unwrap(), Ok(()));
+            let began = Instant::now();
+            while !server.dialing.is_empty() {
+                assert!(began.elapsed() < HANG, "the check never completed");
+                server.step(10).unwrap();
+            }
+            server.step(0).unwrap();
+            let welcomed = matches!(
+                read_frame(&dial).unwrap(),
+                Some(Incoming {
+                    frame: Frame::Welcome { .. },
+                    ..
+                })
+            );
+            assert_eq!(welcomed, admitted, "{}", server.status_text());
+            assert_eq!(server.refused_dials, u64::from(!admitted));
+        }
+    }
+
     #[test]
     fn a_passed_dial_is_admitted_behind_a_dial_whose_check_still_runs() {
         use std::sync::atomic::{AtomicBool, Ordering};

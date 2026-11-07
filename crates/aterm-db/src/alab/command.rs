@@ -1071,6 +1071,11 @@ fn record_coverage(
             .as_ref()
             .map(|(epoch, _)| aterm_codec::hex::encode_lower(epoch)),
         at_ms: now_ms,
+        sources: sheets
+            .iter()
+            .flat_map(|sheet| sheet.earlier.iter().chain([&sheet.source]))
+            .cloned()
+            .collect(),
     };
     import::covered::write(&replica.dir, &record, &listed)?;
     Ok(record.json(&listed))
@@ -1493,7 +1498,12 @@ fn import(
                      as a source",
                 )
             })?;
-            let read = import::dump_sheets(REPLICA, &replica.dump, mode, &key)?;
+            let mut read = import::dump_sheets(REPLICA, &replica.dump, mode, &key)?;
+            if let Some(record) = import::covered::read(&replica.dir)? {
+                for sheet in &mut read {
+                    sheet.earlier.clone_from(&record.sources);
+                }
+            }
             let at = sheets.len()..sheets.len() + read.len();
             sheets.extend(read);
             Some((replica, at))

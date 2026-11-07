@@ -446,8 +446,10 @@ pub(crate) fn protocol() -> u32 {
     PROTOCOL
 }
 
-/// The socket this thread's client dials: [`socket_path`], or a test's [`Seam::socket`].
-pub(crate) fn dialled_socket() -> PathBuf {
+/// The socket this thread's client dials: [`socket_path`], or a test's [`Seam::socket`]. A watch
+/// of a broker's arrival looks at it and its folder.
+#[must_use]
+pub fn dialled_socket() -> PathBuf {
     #[cfg(any(test, debug_assertions))]
     if let Some(socket) = SEAM.with(|here| here.borrow().socket.clone()) {
         return socket;

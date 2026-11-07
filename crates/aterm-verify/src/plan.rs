@@ -334,7 +334,7 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     for s in &mut planned {
         // Independent build/test lanes would each spend the same CPU grant.
         // Keep every stage and its bounds, but let a managed run spend it once.
-        if ctx.env.build_slot_held.is_some() {
+        if ctx.env.build_slot_held.is_some() || ctx.background {
             s.exclusive = true;
         }
     }
@@ -626,6 +626,18 @@ mod tests {
             union(&short),
             "spec's stage is in neither half"
         );
+    }
+
+    /// A repeatable tree spends its independently admitted stage grants one at a time even
+    /// though it has no outer build slot. NEGATIVE CONTROL: the same ordinary plan retains
+    /// parallel lanes.
+    #[test]
+    fn a_background_plan_is_exclusive_without_an_outer_slot() {
+        let ordinary = ctx(&DEV, Scope::workspace());
+        assert!(plan(&ordinary).iter().any(|stage| !stage.exclusive));
+        let mut background = ctx(&DEV, Scope::workspace());
+        background.background = true;
+        assert!(plan(&background).iter().all(|stage| stage.exclusive));
     }
 
     fn every_check() -> Vec<Check> {

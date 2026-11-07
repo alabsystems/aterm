@@ -736,7 +736,7 @@ where
     let halt = || halt_dispatch(&state, &turn);
     let meter = crate::memory::current();
     let cover = crate::memory::cover();
-    let reservation = crate::current_memory_claim();
+    let reservation = crate::current_resource_claim();
     let queued = Instant::now();
     // Each running binary holds at least one core of the share, so no more run at once.
     let workers = usize::try_from(plan.share)
@@ -748,7 +748,7 @@ where
             scope.spawn(|| {
                 let _metering = crate::memory::metering(meter.clone());
                 let _covering = crate::memory::covering(cover.clone());
-                let _reservation = crate::holding_memory_claim(reservation.clone());
+                let _reservation = crate::holding_resource_claim(reservation.clone());
                 while let Some(b) = admitted(&state, &turn, live, stop) {
                     let _charged = Charged {
                         state: &state,
@@ -1204,13 +1204,13 @@ where
     let next = AtomicUsize::new(0);
     let meter = crate::memory::current();
     let cover = crate::memory::cover();
-    let memory = crate::current_memory_claim();
+    let resources = crate::current_resource_claim();
     std::thread::scope(|scope| {
         for _ in 0..jobs.clamp(1, order.len().max(1)) {
             scope.spawn(|| {
                 let _metering = crate::memory::metering(meter.clone());
                 let _covering = crate::memory::covering(cover.clone());
-                let _reservation = crate::holding_memory_claim(memory.clone());
+                let _reservation = crate::holding_resource_claim(resources.clone());
                 while let Some(&i) = order.get(next.fetch_add(1, Ordering::SeqCst)) {
                     let out = run(i);
                     *answers[i]
@@ -1506,16 +1506,16 @@ fn decide_runs(
 /// marker handed to each child the thread starts ([`crate::memory::cover`]); nothing more with no
 /// claim.
 fn holding(
-    claim: Option<&crate::MemoryClaim>,
+    claim: Option<&crate::ResourceClaim>,
 ) -> (crate::ReservationScope, Option<crate::memory::Covering>) {
     (
-        crate::holding_memory_claim(claim.map(|c| std::sync::Arc::clone(&c.claim))),
-        claim.map(|c| crate::memory::covering(Some(c.cover()))),
+        crate::holding_resource_claim(claim.map(|c| std::sync::Arc::clone(&c.claim))),
+        claim.map(|c| crate::memory::covering(c.cover())),
     )
 }
 
 /// The ladder's line saying what `claim` claimed for the test binaries; none with no claim.
-fn claimed_said(r: &mut Report, claim: Option<&crate::MemoryClaim>) {
+fn claimed_said(r: &mut Report, claim: Option<&crate::ResourceClaim>) {
     if let Some(claim) = claim {
         r.raw(format!("  test binaries' {}", claim.said));
     }
@@ -1525,7 +1525,7 @@ fn claimed_said(r: &mut Report, claim: Option<&crate::MemoryClaim>) {
 /// subprocesses ([`claim_both`]).
 pub(crate) struct Claims {
     /// The memory claim; none for nothing to claim, or a run with no book.
-    pub(crate) memory: Option<crate::MemoryClaim>,
+    pub(crate) resources: Option<crate::ResourceClaim>,
     /// The cores claim, held until the claims go back; none in a run with no book.
     _cores: Option<aterm_capacity::Claim>,
     /// The cores granted: at least one, at most those asked.
@@ -1539,8 +1539,8 @@ pub(crate) struct Claims {
 /// holds cores, and never waits on a run that holds memory and waits for cores.
 ///
 /// # Errors
-/// The NOT RUN row's words: why the memory was not claimed ([`crate::claim_test_memory`]), or
-/// the cores ([`claim_cores`]).
+/// The NOT RUN row's words: why the resources were not claimed
+/// ([`crate::claim_test_resources`]), or the cores ([`claim_cores`]).
 pub(crate) fn claim_both(
     ctx: &crate::Ctx,
     label: &str,
@@ -1551,11 +1551,26 @@ pub(crate) fn claim_both(
     admit: crate::Admitter,
 ) -> Result<Claims, String> {
     drop(held);
-    let memory = crate::claim_test_memory(ctx, label, bytes, what, admit)
+    if ctx.background && ctx.pool.is_none() {
+        let resources = crate::claim_test_resources(ctx, label, bytes, what, asked, admit)
+            .map_err(|why| format!("{label} — {why}"))?;
+        let granted = resources
+            .as_ref()
+            .map_or(asked, |claim| claim.claim.cores().min(asked));
+        if granted == 0 {
+            return Err("subprocess CPU admission granted no cores; no test was run".to_owned());
+        }
+        return Ok(Claims {
+            resources,
+            _cores: None,
+            granted,
+        });
+    }
+    let resources = crate::claim_test_resources(ctx, label, bytes, what, 0, admit)
         .map_err(|why| format!("{label} — {why}"))?;
     let (cores, granted) = claim_cores(ctx, label, asked, admit)?;
     Ok(Claims {
-        memory,
+        resources,
         _cores: cores,
         granted,
     })
@@ -1663,7 +1678,7 @@ pub fn run_tests(
         }
     };
     let granted_cores = claims.granted;
-    let one_at_a_time = claims.memory.as_ref();
+    let one_at_a_time = claims.resources.as_ref();
     let thread_override = (ctx.env.build_slot_held.is_some()
         || ctx.pool.is_some()
         || ctx.test_threads.is_some()
@@ -1850,7 +1865,7 @@ impl RunPlan {
             history: crate::test_history::History::default(),
             fallback_peak: aterm_capacity::cold_claim(None),
             claims: Claims {
-                memory: None,
+                resources: None,
                 _cores: None,
                 granted: share,
             },
@@ -2132,7 +2147,7 @@ pub(crate) fn run_planned(
             .iter()
             .map(|p| (bins[p.index].spec.clone(), p.width)),
     );
-    let claim = claims.memory.as_ref();
+    let claim = claims.resources.as_ref();
     // The binaries' peaks are kept within the claim, and a claim past what can ever be available
     // here, which runs alone, within what can.
     let memory = claim
@@ -2431,9 +2446,12 @@ mod discovery_tests;
 mod tests {
     use super::*;
 
-    /// A scratch ledger and each claim asked of it: of memory or of cores, and whether this
-    /// process held a cores claim as it was asked.
-    type Scratch = Option<(aterm_capacity::Ledger, Vec<(&'static str, bool)>)>;
+    /// A scratch ledger and each claim asked of it: memory, cores, requested admission mode, and
+    /// whether this process held a cores claim as it was asked.
+    type Scratch = Option<(
+        aterm_capacity::Ledger,
+        Vec<(u64, u32, aterm_capacity::Admit, bool)>,
+    )>;
 
     thread_local! {
         /// The scratch ledger [`scratch_admit`] admits in, and the claims asked of it.
@@ -2453,7 +2471,7 @@ mod tests {
                 .expect("the scratch ledger reads")
                 .iter()
                 .any(|r| r.held.is_some_and(|h| h.cores > 0));
-            asked.push((if need.mem > 0 { "memory" } else { "cores" }, cores_held));
+            asked.push((need.mem, need.cores, mode, cores_held));
             crate::admit_in(
                 ledger,
                 &crate::timing_test_machine::Measured::new(&aterm_capacity::Fixed::new(
@@ -2461,7 +2479,14 @@ mod tests {
                 )),
                 aterm_capacity::Pace::default(),
                 need,
-                mode,
+                // Unit tests record Background admission but need not own their harness's
+                // process group. The directly spawned candidate verifier exercises that real
+                // precondition.
+                if mode == aterm_capacity::Admit::Preemptible {
+                    aterm_capacity::Admit::Wait
+                } else {
+                    mode
+                },
                 &mut |_| {},
             )
         })
@@ -2616,22 +2641,28 @@ mod tests {
         let gib = 1_u64 << 30;
         let first =
             claim_both(&ctx, "t", None, 2 * gib, "one", 6, scratch_admit).expect("admitted");
-        assert!(first.memory.is_some());
+        assert!(first.resources.is_some());
         assert_eq!(first.granted, 6);
         let plan = claim_both(&ctx, "t", Some(first), 4 * gib, "plan", 6, scratch_admit)
             .expect("admitted");
         assert_eq!(
             asked(),
             [
-                ("memory", false),
-                ("cores", false),
-                ("memory", false),
-                ("cores", false)
+                (2 * gib, 0, aterm_capacity::Admit::Wait, false),
+                (0, 6, aterm_capacity::Admit::Wait, false),
+                (4 * gib, 0, aterm_capacity::Admit::Wait, false),
+                (0, 6, aterm_capacity::Admit::Wait, false)
             ]
         );
         let beside =
             claim_both(&ctx, "t", None, 2 * gib, "beside", 6, scratch_admit).expect("admitted");
-        assert_eq!(asked(), [("memory", true), ("cores", true)]);
+        assert_eq!(
+            asked(),
+            [
+                (2 * gib, 0, aterm_capacity::Admit::Wait, true),
+                (0, 6, aterm_capacity::Admit::Wait, true)
+            ]
+        );
         drop((plan, beside));
         SCRATCH.set(None);
     }
@@ -2676,14 +2707,63 @@ mod tests {
         let gib = 1_u64 << 30;
         let claims =
             claim_both(&pooled, "t", None, 2 * gib, "one", 5, scratch_admit).expect("admitted");
-        assert!(claims.memory.is_some(), "its memory is claimed as ever");
+        assert!(claims.resources.is_some(), "its memory is claimed as ever");
         assert_eq!(claims.granted, 5, "the pool's slots are its grant");
-        assert_eq!(asked(), [("memory", false)], "and no cores are asked for");
+        assert_eq!(
+            asked(),
+            [(2 * gib, 0, aterm_capacity::Admit::Wait, false)],
+            "and no cores are asked for"
+        );
         drop(claims);
         let unpooled = ctx(None);
         let claims =
             claim_both(&unpooled, "t", None, 2 * gib, "one", 5, scratch_admit).expect("admitted");
-        assert_eq!(asked(), [("memory", false), ("cores", false)]);
+        assert_eq!(
+            asked(),
+            [
+                (2 * gib, 0, aterm_capacity::Admit::Wait, false),
+                (0, 5, aterm_capacity::Admit::Wait, false)
+            ]
+        );
+        drop(claims);
+        SCRATCH.set(None);
+    }
+
+    /// A repeatable tree's test dispatcher asks once for memory and cores together, at
+    /// Background rank, and uses that one claim's actual core grant. NEGATIVE CONTROL: the
+    /// ordinary test above still asks memory and cores separately; restoring that path here
+    /// produces two requests and fails this test.
+    #[test]
+    fn a_background_test_run_claims_memory_and_cores_once() {
+        let tmp = aterm_tempfile::tempdir().expect("scratch");
+        SCRATCH.set(Some((
+            aterm_capacity::Ledger::at(tmp.path().join("ledger")),
+            Vec::new(),
+        )));
+        let mut ctx = crate::Ctx::new(
+            tmp.path().to_path_buf(),
+            crate::Scope::workspace(),
+            crate::EnvSnapshot::default(),
+            tmp.path().join("scratch"),
+        );
+        ctx.background = true;
+        ctx.memory = Some(crate::memory::Book::at(
+            None,
+            Some(48 << 30),
+            Some(40 << 30),
+        ));
+        let gib = 1_u64 << 30;
+        let claims =
+            claim_both(&ctx, "t", None, 2 * gib, "one", 6, scratch_admit).expect("admitted");
+        assert!(claims.resources.is_some());
+        assert!(claims._cores.is_none());
+        assert_eq!(claims.granted, 6);
+        let asked =
+            SCRATCH.with_borrow_mut(|s| std::mem::take(&mut s.as_mut().expect("scratch").1));
+        assert_eq!(
+            asked,
+            [(2 * gib, 6, aterm_capacity::Admit::Preemptible, false)]
+        );
         drop(claims);
         SCRATCH.set(None);
     }

@@ -532,6 +532,46 @@ fn me_facts(glance: Option<aterm_agent::harness::outlook::Glance>) -> FooterFact
     }
 }
 
+/// A WALLED ACCOUNT'S HOVER SAYS OUT ONCE: a store whose `me` read 97% of its week ten minutes
+/// ago and then walled gives the footer's `weekly out` and a glance with no title words of its
+/// own, so the account fact's hover reads `weekly out` once, then what the policy does at the
+/// wall (the move to `alt1`), and never a percentage. Negative control: a glance that titles the
+/// wall `out` (the S1 slice before its review) reads `weekly out (out)`.
+#[test]
+fn a_walled_accounts_hover_says_out_once() {
+    let dir = scratch();
+    let store = accounts::Store::at(dir.path());
+    let (mut state, _) = store.load(NOW).expect("an empty store loads");
+    let week = NOW + 3 * D;
+    let at = NOW - 600;
+    let _ = accounts::note_reading_held(&mut state, "me", &tap(970, week, at, false), at);
+    let _ = accounts::note_wall(&mut state, "me", accounts::WEEK_LIMIT, Some(week), NOW, NOW);
+    store.save(&state).expect("save");
+    set_dir(Some(dir.path()));
+    let roster = roster();
+    let mut memo = OutlookMemo {
+        reads: Some(scratch_reads()),
+        ..OutlookMemo::default()
+    };
+    let outlook = memo
+        .at(Instant::now(), NOW, Some(&roster), false)
+        .expect("an outlook")
+        .clone();
+    let glance = outlook.glance("me", None, true).expect("me's glance");
+    let mut facts = me_facts(Some(glance));
+    if let Some(sub) = facts.subscription.as_mut() {
+        sub.weekly = Some(aterm_agent::harness::profile::WEEKLY_OUT.into());
+    }
+    let (title, _) = crate::claude_facts::fact_title(&facts, None, Fact::Account);
+    assert_eq!(
+        title,
+        "\u{2386} me@example.test \u{b7} Max 20x \u{b7} weekly out \u{b7} \u{2192} alt1 at turn \
+         end \u{b7} click: accounts"
+    );
+    drop(dir);
+    set_dir(None);
+}
+
 /// The roster labels of the Accounts card's items, in order.
 fn item_labels(rows: &[MenuRow]) -> Vec<String> {
     rows.iter()

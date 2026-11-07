@@ -8,7 +8,11 @@ use std::path::Path;
 /// Where the system's zone files are.
 pub const ZONEINFO: &str = "/usr/share/zoneinfo";
 
-/// The local clock's offset from UTC at `unix`, in seconds east of UTC.
+/// The local clock's offset from UTC at `unix`, in seconds east of UTC: on Unix the C library's
+/// rules for this process's zone (`TZ` read again on every call), on Windows the system zone's
+/// rules (`SystemTimeToTzSpecificLocalTime`); `None` for an instant the platform's calls do not
+/// convert, and on every other platform. Every local clock aterm says shares this one reader:
+/// the supervisor's (`limit::local_offset_at`), the usage tap's row and the window's glass.
 #[must_use]
 pub fn local_offset_at(unix: i64) -> Option<i64> {
     imp::local_offset_at(unix)
@@ -442,7 +446,68 @@ mod imp {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+mod imp {
+    /// `FILETIME` (`<minwinbase.h>`): 100 ns ticks since 1601-01-01 UTC, low half first.
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+
+    /// `SYSTEMTIME` (`<minwinbase.h>`): year, month, weekday, day, hour, minute, second,
+    /// millisecond; only ever handed from one conversion to the next, never read here.
+    #[repr(C)]
+    #[derive(Default)]
+    struct SystemTime {
+        _fields: [u16; 8],
+    }
+
+    unsafe extern "system" {
+        fn FileTimeToSystemTime(file: *const FileTime, system: *mut SystemTime) -> i32;
+        fn SystemTimeToTzSpecificLocalTime(
+            zone: *const std::ffi::c_void,
+            utc: *const SystemTime,
+            local: *mut SystemTime,
+        ) -> i32;
+        fn SystemTimeToFileTime(system: *const SystemTime, file: *mut FileTime) -> i32;
+    }
+
+    /// The offset the system zone's rules give the instant `unix`: the instant converted to the
+    /// active zone's local time and back to ticks, the difference in whole seconds. `None` for an
+    /// instant before 1601 or past what `FILETIME` holds, or where a conversion fails.
+    pub(super) fn local_offset_at(unix: i64) -> Option<i64> {
+        const UNIX_EPOCH_TICKS: i64 = 116_444_736_000_000_000;
+        const TICKS_PER_SECOND: i64 = 10_000_000;
+        let ticks = unix
+            .checked_mul(TICKS_PER_SECOND)?
+            .checked_add(UNIX_EPOCH_TICKS)?;
+        let raw = u64::try_from(ticks).ok()?;
+        let utc_file = FileTime {
+            low: raw as u32,
+            high: (raw >> 32) as u32,
+        };
+        let (mut utc, mut local) = (SystemTime::default(), SystemTime::default());
+        let mut local_file = FileTime::default();
+        // SAFETY: every pointer addresses a live, correctly laid out `repr(C)` value of the
+        // type the call documents; a null zone names the active one. Each call writes only its
+        // out parameter.
+        let converted = unsafe {
+            FileTimeToSystemTime(&utc_file, &mut utc) != 0
+                && SystemTimeToTzSpecificLocalTime(std::ptr::null(), &utc, &mut local) != 0
+                && SystemTimeToFileTime(&local, &mut local_file) != 0
+        };
+        if !converted {
+            return None;
+        }
+        let local_ticks =
+            i64::try_from((u64::from(local_file.high) << 32) | u64::from(local_file.low)).ok()?;
+        Some((local_ticks - ticks).div_euclid(TICKS_PER_SECOND))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 mod imp {
     pub(super) fn local_offset_at(_unix: i64) -> Option<i64> {
         None

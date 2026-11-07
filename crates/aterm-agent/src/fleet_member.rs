@@ -7861,6 +7861,23 @@ struct RegistryTarget {
     transport: String,
 }
 
+/// How long a label's registry read may run ([`aterm_db::alab::Registry::view_until`]). A person's
+/// command waits on it, and on a loaded Mac, or one whose Commons is a successor home that reads
+/// its predecessors beside its own custody, it takes seconds; each wait for a holder stays the
+/// ordinary admission's. A drive's own connection budget starts after it.
+const REGISTRY_READ: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The refusal of a label this Mac's registry could not be read for, saying what to do: a label
+/// names a Mac only where the registry and the signed seats agree (one-mesh B2), so the word is
+/// read no other way, while a node a book holds needs no registry.
+fn registry_unread(word: &str, why: &dyn std::fmt::Display) -> String {
+    format!(
+        "{word}: registry unread: {why}; a label names a Mac only where this Mac's registry and \
+         the signed seats agree, so nothing was done: try again, or name the Mac by the node \
+         `aterm fleet peers` lists for it (`aterm db commons-status` shows this Mac's Commons)"
+    )
+}
+
 fn registry_target(places: &Places, word: &str) -> Result<Option<RegistryTarget>, String> {
     let explicit = member::is_node_id(word);
     let label = if explicit { None } else { registry_label(word) };
@@ -7872,9 +7889,12 @@ fn registry_target(places: &Places, word: &str) -> Result<Option<RegistryTarget>
         return Ok(None);
     };
     let registry = (!explicit)
-        .then(|| aterm_db::alab::Registry::at(paths.clone()).view())
+        .then(|| {
+            aterm_db::alab::Registry::at(paths.clone())
+                .view_until(std::time::Instant::now() + REGISTRY_READ)
+        })
         .transpose()
-        .map_err(|why| format!("{word}: registry unread: {why}"))?;
+        .map_err(|why| registry_unread(word, &why))?;
     if registry.as_ref().is_some_and(|view| !view.complete) {
         return Err(format!(
             "{word}: registry history incomplete; use a node id"
@@ -8103,7 +8123,7 @@ fn resolve_registry_label(
                 .is_none_or(aterm_db::typed::cell::Field::conflicted)
     }) {
         return Err(format!(
-            "{}; label binding is missing or conflicted",
+            "{}; label binding is missing or conflicted; use a node id",
             sides()
         ));
     }

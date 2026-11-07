@@ -1721,15 +1721,18 @@ THE FOOTER
   <bar> 42% left ♻ <reset> · 5h 62% left · <outlook>` (the 5-hour part only for a figure
   read now). The bar's `━` is used, `╍` the use expected by the week's reset at today's
   pace and `─` left (`┽` where use will stand at the reset). The outlook is
-  `continuous 7d`, `⧗ stop ~<from>–<to>` when the rotation runs out before a reset, or
-  `continuous to ~<when>, then <label> ?` when it leans on an account aterm has never
-  read. It replays the rotation's own policy over what aterm already observed, at most
-  once a minute and off the main thread; it never probes, alerts or moves anything. Its
-  times are said on the local clock as it will read then. Narrow rules drop the 5-hour
-  part, shorten the words, then drop the bar before the name is cut; the narrowest keep
-  a stop beside the name alone. A pane whose profile the account gate refused shows no
-  outlook. Clicking the unit opens the Accounts card: each account's bar and freshness,
-  and the week's chain, read from what the footer holds (no file is read).
+  `continuous 7d`, `╳ ~<from>–<to>` when every account runs out (ending at the reset
+  that resumes the work, `╳ from ~<from>` when none does within a week past the 7 days),
+  or `continuous to ~<when>, then <label> ?` when it leans on an account aterm has never
+  read. A weekly wall reads `weekly out`, never a percentage. It replays the rotation's
+  own policy over what aterm already observed, at most once a minute and off the main
+  thread; it never probes, alerts or moves anything. Its times are said on the local
+  clock as it will read then, a forecast to 10 minutes within 6 hours, to 30 within a
+  day, to the hour beyond. Narrow rules drop the 5-hour part, shorten the words, then
+  drop the bar before the name is cut; the narrowest keep a stop beside the name alone.
+  A pane whose profile the account gate refused shows no outlook. Clicking the unit
+  opens the Accounts card: each account's bar and freshness, and the week's chain, read
+  from what the footer holds (no file is read).
   Settings ▸ Harness shows the supervised sessions, what the harness decided for you,
   a 7-day comparison of the Autopilot modes, and every `[harness]` key. Its WHAT THE
   HARNESS DID counts today and the last 7 days: `Forced continues` (the agent said it
@@ -3244,13 +3247,13 @@ TAKE OVER, HAND BACK AND HOLD COST
   `sudo` are refused across the instance, so no agent can click Hand Back itself.
 
 DESKTOP NOTICES
-  aterm posts no automatic desktop notice, whatever `desktop_alerts` says: a need waits
-  where this page says it shows. A program's own notification reaches the desktop when
-  `allow_notifications` admits it. On macOS an aterm.app also needs macOS's yes, and only
-  your own click or key on Allow programs to show desktop notifications in Settings ▸
-  Security asks for it. A line in `aterm.toml`, `aterm ctl settings set`, `aterm ctl act`
-  and a screen reader's press do not ask: a program's notice is then held until you turn
-  the row off and on with a click or key.
+  aterm posts no automatic desktop notice: a need waits where this page says it shows.
+  A program's own notification reaches the desktop when `allow_notifications` admits it.
+  On macOS an aterm.app also needs macOS's yes, and only your own click or key on Allow
+  programs to show desktop notifications in Settings ▸ Security asks for it. A line in
+  `aterm.toml`, `aterm ctl settings set`, `aterm ctl act` and a screen reader's press do
+  not ask: a program's notice is then held until you turn the row off and on with a click
+  or key.
 
 FOR SCRIPTS AND AGENTS
   aterm ctl @<sid> status    `needs=`, `hold_by=`, `typed_by=`, `typed_ms=`

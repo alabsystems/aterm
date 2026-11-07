@@ -2882,10 +2882,12 @@ fn reclaim_selected_on<'policy>(
             fence.note(&cache.root, super::KeepReason::InventoryUnavailable);
             continue;
         };
-        // A missing or deeper lock is uncertainty, not an idle-cache witness.
-        if seen.locks.is_empty()
-            || super::locks_under(&cache.root).ok().as_ref() != Some(&seen.locks)
-        {
+        // A complete inventory without Cargo locks cannot witness an idle cache.
+        if seen.locks.is_empty() {
+            fence.note(&cache.root, super::KeepReason::NoCargoLocks);
+            continue;
+        }
+        if super::locks_under(&cache.root).ok().as_ref() != Some(&seen.locks) {
             fence.note(&cache.root, super::KeepReason::InventoryChanged);
             continue;
         }
@@ -4324,6 +4326,60 @@ mod tests {
                 b"reusable output"
             );
         }
+    }
+
+    #[test]
+    fn a_registered_cache_without_cargo_locks_is_kept_until_they_exist() {
+        let world = World::new();
+        assert!(create_checked(&world.home, &world.target, &world.owner).unwrap());
+        let marker = std::fs::read(world.target.join(MARKER)).unwrap();
+        let receipt = std::fs::read(world.path()).unwrap();
+        let original = identity(&world.target).unwrap();
+        std::fs::remove_dir_all(&world.owner).unwrap();
+        let clear = |_: &[PathBuf], _: &[u32]| Ok(aterm_uds::holders::PathScan::default());
+        let reporting = super::super::fence::Fence::new(&clear).with_reporting();
+        let now = world.later();
+        let removed = reclaim_on(
+            &world.home,
+            now,
+            super::super::ReclaimAfter::CALM,
+            None,
+            &mut |_, _| panic!("an unbuilt cache grants no removal intent"),
+            &reporting,
+        );
+        assert!(removed.is_empty());
+        assert_eq!(identity(&world.target).as_ref(), Some(&original));
+        assert_eq!(std::fs::read(world.target.join(MARKER)).unwrap(), marker);
+        assert_eq!(std::fs::read(world.path()).unwrap(), receipt);
+        assert_eq!(
+            reporting.retained(),
+            [super::super::RetainedCheck {
+                path: world.target.clone(),
+                reason: super::super::KeepReason::NoCargoLocks,
+            }]
+        );
+        assert!(plan(&world.home, now).is_empty());
+
+        // The same registration and gone owner are eligible once Cargo left its lock.
+        std::fs::create_dir_all(world.target.join("debug/deps")).unwrap();
+        std::fs::write(world.target.join("debug/deps/output"), b"reusable output").unwrap();
+        std::fs::write(world.target.join("debug/.cargo-lock"), b"").unwrap();
+        let mut asked = Vec::new();
+        let removed = reclaim_on(
+            &world.home,
+            now,
+            super::super::ReclaimAfter::CALM,
+            None,
+            &mut |path, why| {
+                asked.push((path.to_path_buf(), why));
+                true
+            },
+            &super::super::fence::Fence::new(&clear),
+        );
+        assert_eq!(asked.len(), 1);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].0, world.target);
+        assert!(!world.target.exists());
     }
 
     #[test]

@@ -2879,3 +2879,278 @@ fn a_semicolon_joined_landing_park_gets_go_ahead_under_cruise_and_land() {
         "NEGATIVE CONTROL: checks-only semicolon park on a clean repo does not claim Park::lands: {a:?}"
     );
 }
+
+// THE PARK READS THE NEEDS FOLD'S WORDS (DESIGN-harness-autopilot §15.6: "a line the go-ahead
+// answers never goes up"): the needs fold reads a reply's lines whole (the reader's measured wrap
+// joins, `said_lines` and `turn_lines`, where they hold the rows' words), and the go-ahead's park
+// reads the same words ([`TurnEndReading::needs_said`]), so every line it answers is a line the
+// fold stands, matched exactly by the menu bar (`Needs::less`).
+
+/// A reply whose one NEEDS YOU line Ink wrapped before a capital that the go-ahead reader's own
+/// view does not join (`… with the fix` above `Claude Code needs.`), as its measured lines hold it.
+const WRAPPED_WHOLE: &str = "Committed on my branch.\nNEEDS YOU: say \"rerun the checks\" so I can \
+                             build and test my branch and push it to main with the fix Claude \
+                             Code needs.";
+
+/// [`WRAPPED_WHOLE`] as the screen draws it, a line a row.
+const WRAPPED_ROWS: &str = "Committed on my branch.\nNEEDS YOU: say \"rerun the checks\" so I can \
+                            build and test my branch and push it to main with the fix\nClaude \
+                            Code needs.";
+
+/// A Land point on [`WRAPPED_ROWS`], the reader's measured lines ([`WRAPPED_WHOLE`]) read where
+/// `measured`.
+fn wrapped_point(measured: bool) -> TurnEndReading {
+    TurnEndReading {
+        said_lines: measured.then(|| WRAPPED_WHOLE.to_string()),
+        ..land(idle(WRAPPED_ROWS, Some(3 * MIN)))
+    }
+}
+
+/// Whether `a` types the `Needs on screen` ack.
+fn acks(a: &TurnEndAction) -> bool {
+    matches!(a, TurnEndAction::Type { text, .. } if text.contains(NEEDS_ACK))
+}
+
+/// [`judged`] at each wait's end on the same point until an act or nothing, every decision on
+/// the way keeping the menu bar empty.
+fn until_judged(
+    st: &mut TurnEndState,
+    r: &TurnEndReading,
+    mut now: Instant,
+) -> (TurnEndAction, Instant) {
+    let same = TurnEndReading {
+        worked: None,
+        ..r.clone()
+    };
+    let mut a = judged(st, r, now);
+    for _ in 0..10 {
+        let TurnEndAction::WaitUntil { until, .. } = a else {
+            break;
+        };
+        assert!(st.shown_needs().is_empty(), "through the wait: {a:?}");
+        now = until;
+        a = judged(st, &same, now);
+    }
+    (a, now)
+}
+
+/// LAND'S INSTRUCTION OVER A MEASURED WRAP KEEPS ITS LINE OFF: the fold stands the measured
+/// lines' whole line, and the park the instruction answers is that line, not its first row, so
+/// the line never goes up, the instruction owes it no ack, and the next reply, which names no
+/// need, leaves it off. CONTROL: the rows alone, where the fold and the park both read the first
+/// row as the line.
+#[test]
+fn lands_instruction_over_a_measured_wrap_keeps_its_line_off() {
+    const NEXT: &str = "Built, tested and pushed the branch; the docs are next.";
+    for measured in [false, true] {
+        let mut st = TurnEndState::default();
+        let r = wrapped_point(measured);
+        let park = r.go_ahead().map(|p| p.needs);
+        let a = judged(&mut st, &r, t0());
+        assert_eq!(a.rule_id(), Some(RULE_LAND), "measured={measured}: {a:?}");
+        assert!(
+            st.shown_needs().is_empty() && !acks(&a),
+            "measured={measured}: the instruction answers the park {park:?}, yet the menu bar \
+             shows {:?} (standing {:?}) and it acks {}",
+            st.shown_needs(),
+            st.standing_needs(),
+            acks(&a)
+        );
+        let _ = judged(&mut st, &land(idle(NEXT, Some(3 * MIN))), t0() + 4 * MIN);
+        assert!(
+            st.shown_needs().is_empty(),
+            "measured={measured}: after the next reply the menu bar shows {:?}",
+            st.shown_needs()
+        );
+    }
+}
+
+/// THE GO-AHEAD OVER A MEASURED WRAP KEEPS ITS LINE OFF: after Land's instruction the agent parks
+/// again on the same line; the go-ahead answers the line the fold stands, so it stays off through
+/// the back-off and the answer says no `Needs on screen`. CONTROL: the rows alone.
+#[test]
+fn the_go_ahead_over_a_measured_wrap_keeps_its_line_off() {
+    for measured in [false, true] {
+        let mut st = TurnEndState::default();
+        let a = judged(&mut st, &wrapped_point(measured), t0());
+        assert_eq!(a.rule_id(), Some(RULE_LAND), "measured={measured}: {a:?}");
+        let (a, _) = until_judged(&mut st, &wrapped_point(measured), t0() + 4 * MIN);
+        let text = go_ahead_text(&a);
+        assert!(
+            st.shown_needs().is_empty() && !text.contains(NEEDS_ACK),
+            "measured={measured}: the menu bar shows {:?} and the answer says {text:?}",
+            st.shown_needs()
+        );
+    }
+}
+
+/// A PARK IN AN EARLIER MESSAGE READ WHOLE ABOVE THE SCREEN KEEPS ITS LINE OFF: the screen shows
+/// the turn's last words alone, and the turn, read whole from the history, holds an earlier
+/// message whose NEEDS YOU line Claude Code wrapped before a capital, its measured lines
+/// (`turn_lines`) joining the wrap. The fold stands that whole line and the park reads it there,
+/// so Land's instruction and then the go-ahead answer it, and the line stays off. CONTROL: the
+/// earlier message's rows alone.
+#[test]
+fn a_park_in_an_earlier_message_read_whole_above_the_screen_keeps_its_line_off() {
+    const LAST: &str = "Fetched main again; nothing moved.";
+    for measured in [false, true] {
+        let r = TurnEndReading {
+            turn_said: Some(WRAPPED_ROWS.to_string()),
+            turn_lines: measured.then(|| WRAPPED_WHOLE.to_string()),
+            ..land(idle(LAST, Some(3 * MIN)))
+        };
+        let mut st = TurnEndState::default();
+        let a = judged(&mut st, &r, t0());
+        assert_eq!(a.rule_id(), Some(RULE_LAND), "measured={measured}: {a:?}");
+        assert!(
+            st.shown_needs().is_empty(),
+            "measured={measured}: the instruction answers the park {:?}, yet the menu bar shows \
+             {:?} (standing {:?})",
+            r.go_ahead().map(|p| p.needs),
+            st.shown_needs(),
+            st.standing_needs()
+        );
+        let (a, _) = until_judged(&mut st, &r, t0() + 4 * MIN);
+        assert!(
+            is_go_ahead(&a) && st.shown_needs().is_empty(),
+            "measured={measured}: {a:?}, the menu bar shows {:?} (standing {:?})",
+            st.shown_needs(),
+            st.standing_needs()
+        );
+    }
+}
+
+/// The report of [`real_wrap_screen`].
+const REAL_REPORT: &str = "Committed the parser fix on my branch.";
+
+/// A park whose line a 120-column pane wraps before `Claude`, which the go-ahead view does not
+/// join.
+const REAL_NEED_CAP: &str = "say \"rerun the checks\" so I can build and test my parser branch \
+                             and push it to main with the small fix Claude Code needs.";
+
+/// [`REAL_NEED_CAP`] with its last words lowercase, wrapped before `harness`, which every reader
+/// joins.
+const REAL_NEED_LOW: &str = "say \"rerun the checks\" so I can build and test my parser branch \
+                             and push it to main with the small fix the harness needs.";
+
+/// A real Claude Code screen of a 120-column pane: the report, then `NEEDS YOU: {need}`
+/// Ink-wrapped in the message's 118 cells; with the rows it wrapped to.
+fn real_wrap_screen(need: &str) -> (Vec<String>, Vec<String>) {
+    use aterm_phase::prompt::fixtures as f;
+    let wrapped = f::ink_wrap(&format!("NEEDS YOU: {need}"), 118);
+    let mut drawn = vec![format!("⏺ {REAL_REPORT}")];
+    drawn.extend(wrapped.iter().map(|l| format!("  {l}")));
+    drawn.extend(["", "✻ Worked for 12m 2s · done 4:24 PM", ""].map(str::to_string));
+    let mut r = f::rows(&drawn.iter().map(String::as_str).collect::<Vec<_>>());
+    r.extend(f::composer(
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+    ));
+    (r, wrapped)
+}
+
+/// [`real_wrap_screen`] read by the real reader ([`TurnEndReading::of`]) under `autopilot`.
+fn real_wrap_reading(need: &str, autopilot: Autopilot) -> TurnEndReading {
+    let (rows, _) = real_wrap_screen(need);
+    let read = aterm_phase::read(Some("claude"), &rows, None);
+    assert_eq!(read.program, aterm_phase::Program::Claude, "{rows:#?}");
+    TurnEndReading {
+        autopilot,
+        ..TurnEndReading::of(&read, &rows, false, Some(3 * MIN), None, None)
+    }
+}
+
+/// THE PARK READS THE READER'S MEASURED WRAP AS THE FOLD DOES: on a real screen whose need Claude
+/// Code wrapped before a capital, the reader's measured lines join the wrap (`said_lines`), and
+/// the park answers that whole line: the fold and the park read one line, and Cruise's go-ahead
+/// keeps it off with no ack. CONTROL: the same need wrapped before a lowercase word, which every
+/// reader joins.
+#[test]
+fn the_park_reads_the_readers_measured_wrap_as_the_fold_does() {
+    let (rows, wrapped) = real_wrap_screen(REAL_NEED_CAP);
+    assert!(
+        wrapped.len() == 2 && wrapped[1].starts_with("Claude"),
+        "the pane wraps before a capital: {wrapped:#?}"
+    );
+    let low = real_wrap_screen(REAL_NEED_LOW).1;
+    assert!(
+        low.len() == 2 && low[1].starts_with(char::is_lowercase),
+        "CONTROL: before a lowercase word: {low:#?}"
+    );
+    for need in [REAL_NEED_LOW, REAL_NEED_CAP] {
+        let r = real_wrap_reading(need, Autopilot::Cruise);
+        let mut folded = TurnEndState::default();
+        folded.observe(&r, t0());
+        assert_eq!(folded.standing_needs(), [need], "{rows:#?}");
+        let park = r.go_ahead().expect("the reply parks").needs;
+        assert_eq!(
+            park,
+            folded.standing_needs(),
+            "the park reads the fold's line"
+        );
+        let mut st = TurnEndState::default();
+        let a = judged(&mut st, &r, t0());
+        let text = go_ahead_text(&a);
+        assert!(
+            st.shown_needs().is_empty() && !text.contains(NEEDS_ACK),
+            "{need}: the menu bar shows {:?} and the answer says {text:?}",
+            st.shown_needs()
+        );
+    }
+}
+
+/// LAND'S INSTRUCTION OVER A REAL WRAPPED PARK KEEPS ITS LINE OFF, the reader's measured lines
+/// read. CONTROL: the need wrapped before a lowercase word.
+#[test]
+fn lands_instruction_over_a_real_wrapped_park_keeps_its_line_off() {
+    for need in [REAL_NEED_LOW, REAL_NEED_CAP] {
+        let mut st = TurnEndState::default();
+        let r = real_wrap_reading(need, Autopilot::Land);
+        let a = judged(&mut st, &r, t0());
+        assert_eq!(a.rule_id(), Some(RULE_LAND), "{need}: {a:?}");
+        assert!(
+            st.shown_needs().is_empty() && !acks(&a),
+            "{need}: the menu bar shows {:?}, acks {}",
+            st.shown_needs(),
+            acks(&a)
+        );
+    }
+}
+
+/// THE PARK JUDGES A WRAPPED NEED ON ALL OF ITS WORDS (`needs::GoAheadView::needs`): a need whose
+/// first row parks but whose whole line, as the fold stands it, parks nothing (`… that changes`
+/// above `TurnEndState::observe, then push it to main.`) gets no go-ahead on its first row: the
+/// line stands as the person's, and shows. CONTROL: the same need without the words that keep it
+/// from parking gets the go-ahead, and its line stays off.
+#[test]
+fn the_park_judges_a_wrapped_need_on_all_of_its_words() {
+    const PARKS_NOTHING: &str = "say \"rerun the checks\" so I can build and test my branch with \
+                                 the fix to the needs fold that changes TurnEndState::observe, \
+                                 then push it to main.";
+    const PARKS: &str = "say \"rerun the checks\" so I can build and test my branch with the fix \
+                         to the needs fold that changes the observer, then push it to main.";
+    let (rows, wrapped) = real_wrap_screen(PARKS_NOTHING);
+    assert!(
+        wrapped.len() == 2 && wrapped[1].starts_with("TurnEndState"),
+        "the pane wraps before a capital: {wrapped:#?}"
+    );
+    let mut st = TurnEndState::default();
+    let a = judged(&mut st, &real_wrap_reading(PARKS, Autopilot::Cruise), t0());
+    assert!(
+        is_go_ahead(&a) && st.shown_needs().is_empty(),
+        "CONTROL: {a:?}, the menu bar shows {:?}",
+        st.shown_needs()
+    );
+    let r = real_wrap_reading(PARKS_NOTHING, Autopilot::Cruise);
+    let mut st = TurnEndState::default();
+    let a = judged(&mut st, &r, t0());
+    assert!(
+        !is_go_ahead(&a) && st.shown_needs() == [PARKS_NOTHING],
+        "a go-ahead on the need's first row: {a:?}, the menu bar shows {:?}",
+        st.shown_needs()
+    );
+    assert_eq!(
+        r.go_ahead(),
+        None,
+        "the whole line parks nothing: {rows:#?}"
+    );
+}

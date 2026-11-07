@@ -332,9 +332,9 @@ pub(crate) struct Host {
     /// The attempt whose result may change the install's state. Kept after its terminal leaves,
     /// so an older child's delayed status cannot become current again.
     pub(crate) developer_tools_attempt: Option<u64>,
-    /// Whether aterm asked for the tools by itself for this account on this build, its tab or
-    /// the package follow-up's `aterm init` ([`crate::clt_install::Mark`]): aterm asks by itself
-    /// once per account and build, so an update retries it once.
+    /// The account-wide hold on automatic administrator-password prompts, shared by Mac Setup
+    /// and the package follow-up's `aterm init` ([`crate::clt_install::Mark`]). Updates preserve
+    /// a consumed episode; a person can explicitly retry.
     pub(crate) developer_tools_mark: crate::clt_install::Mark,
     /// What this Mac shows of an install under way ([`crate::clt_install::installing_now`]), probed
     /// live at a dispatch boundary; none in a headless instance or a test, which never look at

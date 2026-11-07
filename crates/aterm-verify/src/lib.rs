@@ -1241,8 +1241,35 @@ fn admit_in(
             Some(why) => say(&format!("{line}; it claims {why}")),
             None => say(line),
         },
-        &stopping,
+        &|| stopping() || background_waiter_arrived(ledger, mode),
     )
+}
+
+/// Whether repeatable work reached a stage boundary after foreground work queued. A Background
+/// stage must end its admission instead of waiting while the same run retains its whole-run disk
+/// claim: the foreground disk waiter may need that claim to end before it can start. A failed
+/// ledger read supplies no authority to keep repeatable work running.
+fn background_waiter_arrived(ledger: &aterm_capacity::Ledger, mode: aterm_capacity::Admit) -> bool {
+    mode == aterm_capacity::Admit::Preemptible
+        && ledger.list().map_or(true, |rows| {
+            rows.iter().any(|row| {
+                row.need.rank == aterm_capacity::Rank::Release
+                    || (row.need.rank == aterm_capacity::Rank::Ordinary && row.held.is_none())
+            })
+        })
+}
+
+/// A whole-tree Background candidate's disk is Background too. It may finish its current stage,
+/// but cannot enter the lane ahead of foreground work and a Release may end it immediately.
+const fn run_admit_mode(
+    background: bool,
+    requested: aterm_capacity::Admit,
+) -> aterm_capacity::Admit {
+    if background {
+        aterm_capacity::Admit::Preemptible
+    } else {
+        requested
+    }
 }
 
 thread_local! {
@@ -1317,8 +1344,8 @@ impl Quiet {
 thread_local! {
     /// The quiet reservation of this stage or bounded worker.
     static QUIET_CLAIM: RefCell<Option<Arc<aterm_capacity::Claim>>> = const { RefCell::new(None) };
-    /// The actual stage memory reservation retained by every supported worker handoff.
-    static MEMORY_CLAIM: RefCell<Option<Arc<aterm_capacity::Claim>>> = const { RefCell::new(None) };
+    /// The actual stage resource reservation retained by every supported worker handoff.
+    static RESOURCE_CLAIM: RefCell<Option<Arc<aterm_capacity::Claim>>> = const { RefCell::new(None) };
 }
 
 /// The quiet reservation of this thread, captured before a bounded worker starts.
@@ -1343,12 +1370,12 @@ fn holding_quiet_claim(claim: Option<Arc<aterm_capacity::Claim>>) -> Reservation
     holding_claim(&QUIET_CLAIM, claim)
 }
 
-fn current_memory_claim() -> Option<Arc<aterm_capacity::Claim>> {
-    MEMORY_CLAIM.with(|claim| claim.borrow().clone())
+fn current_resource_claim() -> Option<Arc<aterm_capacity::Claim>> {
+    RESOURCE_CLAIM.with(|claim| claim.borrow().clone())
 }
 
-fn holding_memory_claim(claim: Option<Arc<aterm_capacity::Claim>>) -> ReservationScope {
-    holding_claim(&MEMORY_CLAIM, claim)
+fn holding_resource_claim(claim: Option<Arc<aterm_capacity::Claim>>) -> ReservationScope {
+    holding_claim(&RESOURCE_CLAIM, claim)
 }
 
 fn holding_claim(
@@ -1750,21 +1777,33 @@ fn held_note(
     ))
 }
 
-/// A stage's memory claim in this user's capacity ledger ([`claim_memory`]), or a test run's for
-/// its binaries ([`claim_test_memory`]), held until the stage and its supported workers end, and
-/// what it did for the stage's time line.
-pub(crate) struct MemoryClaim {
+/// A stage's resource claim in this user's capacity ledger ([`claim_memory`]), or a test run's
+/// for its binaries ([`claim_test_resources`]), held until the stage and its supported workers
+/// end, and what it did for the stage's time line. Ordinary stages ask only for memory;
+/// repeatable Background stages ask for memory and CPU together.
+pub(crate) struct ResourceClaim {
     /// The actual admitted claim, shared with supported workers until they finish.
     pub(crate) claim: Arc<aterm_capacity::Claim>,
     /// What it claimed, why, and how it was admitted.
     pub(crate) said: String,
 }
 
-impl MemoryClaim {
+impl ResourceClaim {
     /// The cover marker its stage's children are handed ([`memory::cover`]).
-    pub(crate) fn cover(&self) -> std::sync::Arc<str> {
-        std::sync::Arc::from(self.claim.record().cover_marker())
+    pub(crate) fn cover(&self) -> Option<std::sync::Arc<str>> {
+        (self.claim.record().need.mem > 0)
+            .then(|| std::sync::Arc::from(self.claim.record().cover_marker()))
     }
+}
+
+/// The CPU width a repeatable tree stage asks for. A caller's smaller explicit build ceiling is
+/// retained; otherwise the host's parallelism is the upper bound. Capacity may grant less.
+fn background_cores(ctx: &Ctx) -> Option<u32> {
+    ctx.background.then(|| {
+        ctx.build_jobs_ceiling()
+            .unwrap_or_else(|| ctx.cores())
+            .max(1)
+    })
 }
 
 /// How `claim`, admitted as `mode` says, came to be admitted, for its stage's time line: by
@@ -1829,17 +1868,42 @@ fn claim_memory(
     ctx: &Ctx,
     spec: &plan::StageSpec,
     admit: Admitter,
-) -> Result<Option<MemoryClaim>, String> {
-    let Some(book) = ctx.memory.as_ref().filter(|_| spec.mem > 0) else {
+) -> Result<Option<ResourceClaim>, String> {
+    let Some(book) = ctx.memory.as_ref() else {
         return Ok(None);
     };
+    let cores = background_cores(ctx).unwrap_or(0);
+    if spec.mem == 0 {
+        if cores == 0 || memory::dispatched(spec.id) {
+            return Ok(None);
+        }
+        return claim_bytes(
+            ctx,
+            &spec.title,
+            0,
+            "its CPU share",
+            book.budget(),
+            cores,
+            admit,
+        )
+        .map(Some);
+    }
     let need = book.need(spec, &memory::Key::of_stage(spec, ctx));
     let why = match &spec.part {
         Some(part) => format!("{} {}", aterm_capacity::size(spec.mem), part.said),
         None if need.bytes == spec.mem => need.to_string(),
         None => aterm_capacity::size(spec.mem),
     };
-    claim_bytes(ctx, &spec.title, spec.mem, &why, book.budget(), admit).map(Some)
+    claim_bytes(
+        ctx,
+        &spec.title,
+        spec.mem,
+        &why,
+        book.budget(),
+        cores,
+        admit,
+    )
+    .map(Some)
 }
 
 /// Claim `bytes` for a test run's binaries (`what` says which: the most its plan's hold at once,
@@ -1849,18 +1913,19 @@ fn claim_memory(
 ///
 /// # Errors
 /// Why no binary ran, as [`claim_memory`] says.
-pub(crate) fn claim_test_memory(
+pub(crate) fn claim_test_resources(
     ctx: &Ctx,
     title: &str,
     bytes: u64,
     what: &str,
+    cores: u32,
     admit: Admitter,
-) -> Result<Option<MemoryClaim>, String> {
-    let Some(book) = ctx.memory.as_ref().filter(|_| bytes > 0) else {
+) -> Result<Option<ResourceClaim>, String> {
+    let Some(book) = ctx.memory.as_ref().filter(|_| bytes > 0 || cores > 0) else {
         return Ok(None);
     };
     let why = format!("{} {what}", aterm_capacity::size(bytes));
-    claim_bytes(ctx, title, bytes, &why, book.budget(), admit).map(Some)
+    claim_bytes(ctx, title, bytes, &why, book.budget(), cores, admit).map(Some)
 }
 
 /// Claim `bytes` for `title` (`why` says what for) in this user's capacity ledger, admitted by
@@ -1871,20 +1936,26 @@ fn claim_bytes(
     bytes: u64,
     why: &str,
     budget: u64,
+    cores: u32,
     admit: Admitter,
-) -> Result<MemoryClaim, String> {
+) -> Result<ResourceClaim, String> {
     if let Some(why) = ended(ctx) {
         return Err(why);
     }
-    let mode = ctx.quiet.unwrap_or(aterm_capacity::Admit::Wait);
+    let mode = if ctx.background {
+        aterm_capacity::Admit::Preemptible
+    } else {
+        ctx.quiet.unwrap_or(aterm_capacity::Admit::Wait)
+    };
     let ask = |alone: bool| {
         let need = aterm_capacity::Need::new(format!("verify {title}"))
             .mem(bytes)
-            .covers()
+            .cores(cores)
             .ends_when_stuck(STUCK_ENDS);
+        let need = if bytes > 0 { need.covers() } else { need };
         if alone { need.alone() } else { need }
     };
-    let beyond = bytes >= budget;
+    let beyond = bytes > 0 && bytes >= budget;
     let saying = claiming(why.to_owned());
     let mut admitted = admit(ask(beyond), mode);
     if !beyond && matches!(admitted, Err(aterm_capacity::Error::Never(_))) {
@@ -1897,15 +1968,22 @@ fn claim_bytes(
              alone",
             aterm_capacity::size(budget)
         )
+    } else if cores > 0 && bytes > 0 {
+        format!("claimed {why} and up to {cores} cores")
+    } else if cores > 0 {
+        format!("claimed up to {cores} cores")
     } else {
         format!("claimed {why}")
     };
     match admitted {
         Ok(claim) => {
             let how = admitted_how(&claim, mode);
-            Ok(MemoryClaim {
+            Ok(ResourceClaim {
                 claim: Arc::new(claim),
-                said: format!("memory: {what}{how}"),
+                said: format!(
+                    "{}: {what}{how}",
+                    if cores > 0 { "resources" } else { "memory" }
+                ),
             })
         }
         Err(aterm_capacity::Error::Stopped { .. }) if ctx.halted().is_some() => {
@@ -1976,12 +2054,13 @@ fn staged(
             return Err("background sample yielded to foreground work".into());
         }
         let claim = claim_memory(ctx, spec, seams.admit_memory)?;
-        let _reservation = holding_memory_claim(claim.as_ref().map(|held| Arc::clone(&held.claim)));
+        let _reservation =
+            holding_resource_claim(claim.as_ref().map(|held| Arc::clone(&held.claim)));
         if let Some(why) = ended(ctx) {
             return Err(why);
         }
         let _metering = memory::metering(meter.clone());
-        let _covering = memory::covering(claim.as_ref().map(MemoryClaim::cover));
+        let _covering = memory::covering(claim.as_ref().and_then(ResourceClaim::cover));
         let begun = Instant::now();
         let from = aterm_capacity::Live.read(None);
         on_started();
@@ -2547,6 +2626,20 @@ fn open_log(chosen: Option<&Path>, cwd: &Path, ctx: &Ctx) -> Option<(PathBuf, st
     }
 }
 
+/// Only names the default writer can produce belong to its retention quota.
+fn is_run_log(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let Some((secs, pid)) = name.strip_suffix(".log").and_then(|s| s.split_once('-')) else {
+        return false;
+    };
+    let (Ok(secs), Ok(pid)) = (secs.parse::<u64>(), pid.parse::<u32>()) else {
+        return false;
+    };
+    pid != 0 && name == format!("{secs}-{pid}.log")
+}
+
 fn prune_logs(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -2554,6 +2647,7 @@ fn prune_logs(dir: &Path) {
     let mut logs: Vec<(std::time::SystemTime, PathBuf)> = entries
         .flatten()
         .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter(|e| is_run_log(&e.file_name()))
         .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
         .collect();
     if logs.len() < LOGS_KEPT {
@@ -2803,7 +2897,11 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         .with_test_threads(parsed.test_threads)
         .with_passed_binaries(passed_binaries)
         .with_events(events)
-        .with_quiet(Some(parsed.admit))
+        .with_quiet(Some(if parsed.background {
+            aterm_capacity::Admit::Preemptible
+        } else {
+            parsed.admit
+        }))
         .with_memory(memory::Book::live())
         .with_test_history(
             aterm_types::dirs::account_state_dir()
@@ -2827,7 +2925,7 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         eprintln!("verify: {line}");
     }
     #[cfg(unix)]
-    let disk = match disk::admit(&ctx, parsed.admit) {
+    let disk = match disk::admit(&ctx, run_admit_mode(parsed.background, parsed.admit)) {
         Ok(held) => held,
         Err(why) => {
             if let Some(record) = &ctx.runs {
@@ -2840,9 +2938,7 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         }
     };
     let log = open_log(parsed.log.as_deref(), cwd, &ctx);
-    let log_shown = log
-        .as_ref()
-        .map(|(path, _)| path.strip_prefix(cwd).unwrap_or(path).display().to_string());
+    let log_shown = log.as_ref().map(|(path, _)| path.display().to_string());
     let mut sink = std::io::sink();
     let mut log_file = log.as_ref().and_then(|(_, f)| f.try_clone().ok());
     let log_writer: &mut (dyn Write + Send) = match log_file.as_mut() {
@@ -3116,6 +3212,115 @@ mod memory_claim_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_log_retention_preserves_unrelated_files_and_removes_only_old_run_logs() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let write_at = |name: &str, seconds: u64| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, name).unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds))
+                .unwrap();
+            path
+        };
+        let unrelated: Vec<_> = [
+            "notes.txt",
+            "chosen.log",
+            "1-0.log",
+            "1-2-3.log",
+            "1-.log",
+            "01-2.log",
+            "1-02.log",
+            "+1-2.log",
+            "1-+2.log",
+            "18446744073709551616-1.log",
+            "1-4294967296.log",
+        ]
+        .into_iter()
+        .map(|name| (write_at(name, 1), name))
+        .collect();
+        let logs: Vec<_> = (0..LOGS_KEPT + 4)
+            .map(|i| write_at(&format!("1700000000-{}.log", i + 1), 100 + i as u64))
+            .collect();
+
+        prune_logs(dir.path());
+
+        for (path, bytes) in unrelated {
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("unrelated file preserved"),
+                bytes,
+                "{}",
+                path.display()
+            );
+        }
+        let removed = logs.len() + 1 - LOGS_KEPT;
+        for (i, path) in logs.iter().enumerate() {
+            assert_eq!(path.exists(), i >= removed, "{}", path.display());
+        }
+        write_at("1700000001-123.log", 200);
+        assert_eq!(
+            logs.iter().filter(|path| path.exists()).count() + 1,
+            LOGS_KEPT,
+            "the oldest generated logs were removed to reserve one incoming slot"
+        );
+    }
+
+    #[test]
+    fn background_runs_admit_their_disk_as_background() {
+        assert_eq!(
+            run_admit_mode(true, aterm_capacity::Admit::Wait),
+            aterm_capacity::Admit::Preemptible
+        );
+        assert_eq!(
+            run_admit_mode(false, aterm_capacity::Admit::Wait),
+            aterm_capacity::Admit::Wait,
+            "negative control: an ordinary verifier keeps its requested mode"
+        );
+        assert_eq!(
+            run_admit_mode(false, aterm_capacity::Admit::Now),
+            aterm_capacity::Admit::Now,
+            "negative control: --admit now remains an ordinary override"
+        );
+    }
+
+    #[test]
+    fn a_foreground_waiter_ends_a_background_stage_admission() {
+        use aterm_capacity::{Admit, Fixed, Ledger, Need, Pace, Reading, Waiter};
+
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let ledger = Ledger::at(dir.path().join("ledger"));
+        let machine = Fixed::new(Reading::of_gib(48, 40, 14));
+        let holder = aterm_capacity::admit_with(
+            &ledger,
+            &machine,
+            Need::new("ordinary holder").cores(14),
+            Admit::Wait,
+            Pace::default(),
+            &mut |_| {},
+        )
+        .expect("ordinary holder");
+        assert!(
+            !background_waiter_arrived(&ledger, Admit::Preemptible),
+            "running foreground work is not a stage-boundary request"
+        );
+
+        let waiter = Waiter::enter(
+            &ledger,
+            &machine,
+            Need::new("ordinary disk waiter").cores(14),
+        )
+        .expect("ordinary waiter");
+        assert!(background_waiter_arrived(&ledger, Admit::Preemptible));
+        assert!(
+            !background_waiter_arrived(&ledger, Admit::Wait),
+            "negative control: ordinary admission never self-cancels"
+        );
+        drop((waiter, holder));
+    }
 
     #[cfg(unix)]
     #[test]

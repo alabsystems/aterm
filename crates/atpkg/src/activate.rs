@@ -1250,7 +1250,8 @@ mod tests {
             "tombstone is executable"
         );
 
-        let out = std::process::Command::new(&shim).output().unwrap();
+        let out = aterm_spec::wait::past_text_busy(|| aterm_uds::spawnfd::command(&shim).output())
+            .unwrap();
         assert!(!out.status.success(), "tombstone shim exits nonzero");
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(
@@ -1895,15 +1896,20 @@ mod tests {
             std::fs::write(path, body).unwrap();
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
         };
+        // A fixture the twin execs, run once past Linux's busy refusal first.
+        let fixture = |path: &Path, body: &str| {
+            exe(path, body);
+            crate::testdir::settled(path);
+        };
         let target = layout.build_dir("claude", 2026091601).join("bin/claude");
-        exe(&target, "#!/bin/sh\necho \"store: $*\"\nexit 0\n");
+        fixture(&target, "#!/bin/sh\necho \"store: $*\"\nexit 0\n");
         let path_dir = layout.prefix.join("older-path");
-        exe(
+        fixture(
             &path_dir.join("atpkg"),
             "#!/bin/sh\necho \"atpkg: unknown verb $1\" >&2\nexit 2\n",
         );
         let embedded = layout.prefix.join("bundle/atpkg");
-        exe(&embedded, "#!/bin/sh\necho \"co-located: $*\"\nexit 0\n");
+        fixture(&embedded, "#!/bin/sh\necho \"co-located: $*\"\nexit 0\n");
         let render = |atpkg: &Path| {
             platform::sh_shim_content_twin(
                 &target,
@@ -1921,11 +1927,13 @@ mod tests {
         let run = |body: &str, args: &[&str]| {
             let twin = layout.prefix.join("twin-under-test");
             exe(&twin, body);
-            let out = std::process::Command::new(&twin)
-                .args(args)
-                .env("PATH", &path_dir)
-                .output()
-                .unwrap();
+            let out = aterm_spec::wait::past_text_busy(|| {
+                aterm_uds::spawnfd::command(&twin)
+                    .args(args)
+                    .env("PATH", &path_dir)
+                    .output()
+            })
+            .unwrap();
             (
                 out.status.code(),
                 String::from_utf8_lossy(&out.stdout).into_owned(),

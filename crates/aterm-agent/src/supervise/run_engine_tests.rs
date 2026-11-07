@@ -5352,6 +5352,90 @@ fn a_bare_clock_time_is_placed_on_the_day_the_transcript_names() {
     }
 }
 
+/// A reply the title runs beside a background shell's pill is the act taken (R6): Claude Code
+/// under a status line draws its reply with no busy sign, so its frame reads as the shell's
+/// break, and the loop's own act would stand untaken (`background held why=act-untaken`) where
+/// the title runs. NEGATIVE CONTROL: the same frame sent with no title is that break, the act
+/// untaken.
+#[test]
+fn a_reply_the_title_runs_beside_a_shell_is_the_act_taken() {
+    use aterm_phase::prompt::fixtures::{STATUSLINE_MIDREPLY_2_1_311, screen};
+    let ended = || {
+        let mut r = rows(&[
+            "⏺ Fixed the parser; the suite is green.",
+            "",
+            "✻ Worked for 3m 2s · done 4:24 PM",
+            "",
+        ]);
+        r.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
+        r
+    };
+    let bg = || {
+        let mut r = rows(&[
+            "⏺ Waiting for the build.",
+            "",
+            "✻ Crunched for 9m 27s · done 11:07 AM · 1 shell still running",
+            "",
+        ]);
+        r.extend(composer("  ⏵⏵ auto mode on · 1 shell · ← for agents"));
+        r
+    };
+    let shells: Vec<String> = screen(STATUSLINE_MIDREPLY_2_1_311)
+        .into_iter()
+        .map(|r| r.replace("(shift+tab to cycle)", "(shift+tab to cycle) · 2 shells"))
+        .collect();
+    assert_eq!(
+        aterm_phase::phase::background_wait(&shells),
+        Some("a shell running"),
+        "fixture guard: the frame alone reads as the shell's break"
+    );
+    let run = |title: Option<&str>| {
+        let host = Arc::new(TestHost::default());
+        host.wants.store(true, Ordering::SeqCst);
+        host.deaf_for.store(1, Ordering::SeqCst);
+        let (jdir, journal) = journal_file("title-act-taken");
+        let mut m = Mock::new(vec![busy_screen(), ended(), shells.clone(), bg()]);
+        if let Some(title) = title {
+            m.screen_titles.insert(2, title.to_string());
+        }
+        m.turn_releases = Some(1);
+        m.vanish_after = Some(3);
+        let opts = SuperviseOpts {
+            policy: SupervisorConfig {
+                answer_questions: false,
+                ..SupervisorConfig::default()
+            },
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            journal: Some(journal.clone()),
+            ..auto(30)
+        };
+        let _ = watch_lines_with(&mut m, &opts, |s| s.set_background_settle(Duration::ZERO));
+        let (records, _) = journal_records(&journal);
+        let _ = std::fs::remove_dir_all(&jdir);
+        let lines: Vec<String> = records.into_iter().map(|r| r.line).collect();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("CONTINUED ") && l.contains("keep going")),
+            "the loop's own act: {lines:#?}"
+        );
+        let withheld = host.withheld.lock().unwrap().clone();
+        (host.backgrounds.load(Ordering::SeqCst), lines, withheld)
+    };
+    let (offered, lines, withheld) = run(Some("◐ Claude Code"));
+    assert!(
+        offered > 0,
+        "the break after the reply: {withheld:?} {lines:#?}"
+    );
+    assert!(!withheld.contains(&Guard::ActUntaken), "{withheld:?}");
+    let (offered, lines, withheld) = run(None);
+    assert_eq!(offered, 0, "CONTROL: {lines:#?}");
+    assert!(
+        withheld.contains(&Guard::ActUntaken),
+        "CONTROL: {withheld:?}"
+    );
+}
+
 #[test]
 fn a_break_after_the_loops_own_taken_act_is_offered_to_the_host() {
     let ended = || {

@@ -131,6 +131,10 @@ impl direct::Direct for AnswersHello {
         Ok("a stand-in allowance".into())
     }
 
+    fn record(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
     fn serve(&self, stream: CtlStream) {
         let hello = Frame::Hello {
             protocol: PROTOCOL,

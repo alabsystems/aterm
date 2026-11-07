@@ -12,7 +12,11 @@ mod marker;
 #[path = "artifact_service.rs"]
 mod service;
 
-pub(super) const LOOKUP_BUDGET: Duration = Duration::from_secs(5);
+// Replacing an unfinished same-key build needs a complete use observation.
+// Scheduling delay is no evidence that its original identity or custody changed.
+pub(super) const OBSERVATION_HANG: Duration = Duration::from_secs(60);
+// Optional pruning can leave old entries for the next pass without refusing a build.
+pub(super) const PRUNE_BUDGET: Duration = Duration::from_secs(5);
 #[cfg(any(target_os = "macos", test))]
 const MAX_UNITS: usize = 1024;
 
@@ -25,7 +29,7 @@ struct Reference {
 /// Deletion is optional. Every unreadable use is a reason to retain, including when a
 /// damaged same-key entry would otherwise be replaced by the next build.
 pub(super) fn remove_unused(dir: &Path) -> Result<bool, String> {
-    remove_unused_until(dir, Instant::now() + LOOKUP_BUDGET)
+    remove_unused_until(dir, Instant::now() + OBSERVATION_HANG)
 }
 
 pub(super) fn remove_unused_until(dir: &Path, deadline: Instant) -> Result<bool, String> {
@@ -428,6 +432,30 @@ mod tests {
         );
         assert_eq!(count, 2);
         assert!(dir.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_complete_observation_after_a_scheduling_delay_can_remove_unused_bytes() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        for (elapsed, completes) in [(6, true), (61, false)] {
+            let dir = artifact(root.path(), &format!("entry-{elapsed}"));
+            let started = Instant::now() - Duration::from_secs(elapsed);
+            let mut reads = 0;
+            let result = remove_observed(&dir, started + OBSERVATION_HANG, || {
+                reads += 1;
+                Ok(vec![])
+            });
+            if completes {
+                assert!(result.unwrap());
+                assert_eq!(reads, 2);
+                assert!(!dir.exists());
+            } else {
+                assert!(result.is_err());
+                assert_eq!(reads, 0);
+                assert!(dir.exists());
+            }
+        }
     }
 
     #[test]

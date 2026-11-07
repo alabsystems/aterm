@@ -1800,8 +1800,11 @@ fn command_line_tools() -> Option<aterm_machines::init_clt::CommandLineTools> {
 /// macOS's first check of the compiler, which a slow network stretches past the 5 s a status
 /// read waits; under that bound the tools there read as unknown, and the tab ended on "could not
 /// verify the developer tools" with setup's one password unasked (E3's lossy row, 2026-11-05).
-/// Setup judges the selected tools with their default SDK, independently of an inherited
-/// `SDKROOT` chosen for a build. Ordinary build probes retain that override.
+/// Setup judges the system-selected tools with their default SDK and deployment target,
+/// independently of an inherited `DEVELOPER_DIR`, `SDKROOT` or `MACOSX_DEPLOYMENT_TARGET`
+/// chosen for a build. Its compiler commands start without the project's environment, so
+/// header search paths and other compiler configuration cannot masquerade as broken tools.
+/// Ordinary build probes retain that environment and those overrides.
 #[cfg(target_os = "macos")]
 fn base_clt_probe(path: Option<&std::ffi::OsStr>) -> atpkg::prereq::CcVerdict {
     base_clt_probe_on(path, atpkg::prereq::CcHost::waited_on())
@@ -1812,7 +1815,10 @@ fn base_clt_probe_on(
     path: Option<&std::ffi::OsStr>,
     mut host: atpkg::prereq::CcHost,
 ) -> atpkg::prereq::CcVerdict {
+    host.developer_dir_override = None;
     host.sdkroot_override = None;
+    host.deployment_target_override = None;
+    host.inherit_environment = false;
     atpkg::prereq::probe_with(path, &host)
 }
 

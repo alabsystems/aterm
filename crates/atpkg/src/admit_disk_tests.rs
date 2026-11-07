@@ -2114,8 +2114,8 @@ fn standin_works() {
 
 /// Run by [`standin_holds_a_metered_claim`] as its child that only keeps its books, as an idle Go
 /// runtime does (lima's `limactl shell`, which on this Mac used 55 µs of CPU time in a minute):
-/// wakes every [`METER_PACE`] and spins for 50 µs, until its parent is gone (twice the hang
-/// detector at most).
+/// wakes every [`METER_PACE`] and spins for [`tick_spin`], until its parent is gone (twice the
+/// hang detector at most).
 #[cfg(unix)]
 #[test]
 fn standin_ticks() {
@@ -2124,13 +2124,31 @@ fn standin_ticks() {
     }
     let parent = std::os::unix::process::parent_id();
     let until = std::time::Instant::now() + MUST_HAPPEN * 2;
+    let spin = tick_spin();
     let mut n = 0u64;
     while std::os::unix::process::parent_id() == parent && std::time::Instant::now() < until {
         std::thread::sleep(METER_PACE);
         let woke = std::time::Instant::now();
-        while woke.elapsed() < Duration::from_micros(50) {
+        while woke.elapsed() < spin {
             n = std::hint::black_box(n.wrapping_mul(31).wrapping_add(1));
         }
+    }
+}
+
+/// How long [`standin_ticks`] spins at each wake: 50 µs, about the CPU time an idle Go runtime
+/// spends in a minute (above); on Linux, whose sweep reads CPU time in the kernel's clock ticks
+/// (`/proc/<pid>/stat`, 10 ms at 100 Hz) and so never sees 50 µs move it, one tick, so the
+/// child's CPU time moves between every two reads there too: two ticks a second, a fiftieth of a
+/// core at 100 Hz, far under the quarter of one ([`aterm_toolchain::stall::BUSY`]) that is
+/// progress.
+#[cfg(unix)]
+fn tick_spin() -> Duration {
+    let least = Duration::from_micros(50);
+    if cfg!(target_os = "linux") {
+        let hz = u32::try_from(aterm_sysprobe::jobs::linux::clock_ticks()).unwrap_or(100);
+        least.max(Duration::from_secs(1) / hz.max(1))
+    } else {
+        least
     }
 }
 
@@ -2142,11 +2160,13 @@ fn standin_ticks() {
 /// sweep with this user's waits, as `stall::tree_work`), every two meter walks, each read
 /// standing for a minute of the stall's injected clock and judged busy over the time between
 /// reads (`Stall::over`, a minute's), the first two are called stuck at the bound, though the
-/// meter's walks moved the holder's CPU time and the ticks its child's at most reads (each
-/// reported, with the largest share of a core the tree was runnable between reads); the third
-/// is never stuck. NEGATIVE CONTROLS: the rule before any audit, any change of the tree's CPU
-/// time progress, never calls the first two stuck; the rule before this one, any change of a
-/// descendant's CPU time progress, never calls the holder with the ticking child stuck.
+/// meter's walks moved the holder's CPU time (on Linux, which reads it in clock ticks, at only
+/// some reads: 3 to 6 of 17 in four runs on 2026-11-07, never fifteen apart) and the ticks its
+/// child's at most reads (each reported, with the largest share of a core the tree was runnable
+/// between reads, and [`tick_spin`]); the third is never stuck. NEGATIVE CONTROLS: the rule
+/// before any audit, any change of the tree's CPU time progress, never calls the first two
+/// stuck; the rule before this one, any change of a descendant's CPU time progress, never calls
+/// the holder with the ticking child stuck.
 #[cfg(unix)]
 #[test]
 fn a_holder_that_only_keeps_its_books_is_stuck_and_one_whose_child_works_is_not() {
@@ -2279,7 +2299,11 @@ fn a_holder_that_only_keeps_its_books_is_stuck_and_one_whose_child_works_is_not(
             child_rule[i].read(m, work.cpu_ns.saturating_sub(own));
         }
     }
-    eprintln!("18 reads in {:?}", t0.elapsed());
+    eprintln!(
+        "18 reads in {:?}; the ticking child spins {:?} a wake",
+        t0.elapsed(),
+        tick_spin()
+    );
     for (i, kind) in kinds.iter().enumerate() {
         eprintln!(
             "child {kind:?}: stuck at minute {:?}; runnable at most {:.1}% of a core between \

@@ -98,9 +98,15 @@ impl Lab {
     }
 }
 
-/// `m22` and `m7`, and `m7` lets in each of `names`; every home then holds every record.
-fn lab_homes(names: &[&'static str]) -> (TwoMacs, BTreeMap<&'static str, Paths>) {
-    let macs = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
+/// What builds a lab of two Macs from its entries: [`two_macs`] or [`fresh_two_macs`].
+type BuildLab = fn(&[(Audience, &str, &[u8])]) -> TwoMacs;
+
+/// `m22` and `m7` of `build`, and `m7` lets in each of `names`; every home then holds every
+/// record. `build` is [`two_macs`], whose `m22` and `m7` hold the keys every such lab of the
+/// process holds, or [`fresh_two_macs`] for a lab a search tries until its keys rank as a shape
+/// fixes: on [`two_macs`] only the keys of `names` change from try to try.
+fn lab_homes(build: BuildLab, names: &[&'static str]) -> (TwoMacs, BTreeMap<&'static str, Paths>) {
+    let macs = build(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
     let mut homes = BTreeMap::from([("m22", macs.m22.clone()), ("m7", macs.m7.clone())]);
     for name in names {
         let (paths, _, _) = let_in_by(&macs, &macs.m7, name, name);
@@ -328,7 +334,7 @@ impl GapShapes {
     /// D's gap.
     fn old_mint(under: bool) -> (Lab, Vec<Record>, usize) {
         for _ in 0..SEARCH {
-            let (macs, homes) = lab_homes(&["m40", "m41"]);
+            let (macs, homes) = lab_homes(fresh_two_macs, &["m40", "m41"]);
             let top = |d: &str| {
                 homes
                     .iter()
@@ -433,7 +439,7 @@ impl GapShapes {
 
     /// `Churn`'s lab: A m7, B m22, C m40, and D a Mac asking B on the home LAN.
     fn churn() -> (Lab, Churn) {
-        let (macs, homes) = lab_homes(&["m40"]);
+        let (macs, homes) = lab_homes(two_macs, &["m40"]);
         let (d_home, request, _) = newcomer(macs.root.path(), &homes["m22"], "d");
         let d = Seat {
             actor: request.binding().actor(),
@@ -1592,9 +1598,9 @@ fn a_duplicate_heal_is_admitted_changes_no_recipient_set_and_is_counted() {
 /// ([`log_entries::close_wrap_gaps`], with its own roster reads) runs at each step of an injected
 /// clock, and every record reaches every home before the next step: nothing heals before the
 /// batch settles, which is at once where its last `Wrap` sorts above every gap (one-mesh §11 H2;
-/// the homes' keys are fresh, so a run meets that about once in 30) and else at the settle
-/// grace, then each of the 85 gaps (the 84 and m41) gets one `Wrap`, signed by the holder its
-/// rank puts first, and later steps sign nothing. m41 cannot open epoch 2 until healed, so it
+/// the homes' keys vary from run to run, so a run meets that about once in 30) and else at the
+/// settle grace, then each of the 85 gaps (the 84 and m41) gets one `Wrap`, signed by the holder
+/// its rank puts first, and later steps sign nothing. m41 cannot open epoch 2 until healed, so it
 /// heals nothing; the 84 seats have no home, so they never look.
 ///
 /// NEGATIVE CONTROL: with `OLD_GAP_RULE` on (0.154.0 read an omission the minter knew as a
@@ -1607,7 +1613,7 @@ fn the_eighty_eight_to_three_drop_heals_on_real_homes() {
     use crate::commons::binding::Request;
     use crate::membership_log::{Entrant, Evidence};
 
-    let (macs, homes) = lab_homes(&["m40", "m41"]);
+    let (macs, homes) = lab_homes(two_macs, &["m40", "m41"]);
     let m22 = &homes["m22"];
     let trust = member_key(m22).0.trust();
     for tag in 100..184u8 {

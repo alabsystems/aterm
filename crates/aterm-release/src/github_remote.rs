@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Typed operator GitHub reads through agh. This boundary never runs a caller's
-//! Git argv, synthesizes credentials or identity, or starts a remote write.
-//! An origin refresh records only its admitted main in the checkout's tracking
-//! ref by expected-old CAS; other reads preserve source refs. Recorded routing
-//! loads the identity already configured.
+//! Typed operator GitHub transport through agh. This boundary never runs a
+//! caller's Git argv or synthesizes credentials or identity. Reads import exact
+//! objects; writes name their expected old ref. An origin refresh records only
+//! its admitted main in the checkout's tracking ref by expected-old CAS; other
+//! reads preserve source refs. Recorded routing loads the configured identity.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -28,6 +28,12 @@ pub(crate) struct FetchedOrigin {
     pub(crate) main: String,
     pub(crate) tags: String,
 }
+
+#[path = "github_remote/write.rs"]
+mod write;
+pub(crate) use write::RefWrite;
+#[cfg(all(test, unix))]
+pub(crate) use write::claim_fixture;
 
 pub(crate) struct Remote {
     client: Github,

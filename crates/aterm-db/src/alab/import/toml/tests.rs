@@ -437,3 +437,50 @@ fn a_wrapped_file_reads_as_the_harness_reads_it() {
     let err = mailbox_sheet("ai-mailbox.toml", b"password = \"synthetic-pass-12").unwrap_err();
     assert!(!err.to_string().contains("synthetic"));
 }
+
+/// A protected login holds no mailbox, so a file's entry for it seals nothing: each field it gives
+/// is refused by name, its login too, and the file stays uncovered, an entry giving only its login
+/// as well.
+/// NEGATIVE CONTROL: with `mailbox_toml` not asking `guarded`, the mailbox's second password is
+/// sealed: `` assertion failed: !plan.rows.iter().flatten().any(… ``. With the guard skipping the
+/// login: `` left: [Some("mailbox_password"), Some("totp_secret")] ``.
+#[test]
+fn a_protected_login_takes_no_mailbox_from_a_file() {
+    let login = keys::address_pk("owner@proton.example").unwrap();
+    let mut book = Book::new();
+    book.write(
+        2,
+        &[],
+        vec![
+            crate::typed::grid::tests::put(&ADDRESS, &login, "addr", json!("owner@proton.example")),
+            crate::typed::grid::tests::put(&ADDRESS, &login, "protected", json!(true)),
+            crate::typed::grid::tests::put(&ADDRESS, &login, "row", json!("live")),
+        ],
+    );
+    let text = "user = \"owner@proton.example\"\nmailbox_password = \"synthetic-pass-22\"\n\
+                totp_secret = \"JBSWY3DPEHPK3PXP\"\n";
+    let sheets = [sheet(text)];
+    let plan = planned(&sheets, &book.cells());
+    assert!(
+        !plan
+            .rows
+            .iter()
+            .flatten()
+            .any(|c| c.collection == MAILBOX.name),
+        "{:?}",
+        plan.rows
+    );
+    let refused: Vec<Option<&str>> = plan
+        .findings
+        .iter()
+        .filter(|f| f.kind == Kind::ProtectedSecret)
+        .map(|f| f.column.as_deref())
+        .collect();
+    assert_eq!(
+        refused,
+        vec![Some("mailbox_password"), Some("totp_secret"), Some("user")]
+    );
+    assert!(!uncovered(&sheets, &book.cells()).is_empty());
+    let alone = [sheet("user = \"owner@proton.example\"\n")];
+    assert!(!uncovered(&alone, &book.cells()).is_empty());
+}

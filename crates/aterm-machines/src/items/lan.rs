@@ -45,7 +45,8 @@ pub struct Table {
     /// `true` installs the root LAN broker from the app bundle this aterm runs from
     /// ([`LanBroker`]).
     pub broker: Option<bool>,
-    /// Only the built-in accepted root transaction retains launch/readiness custody.
+    /// The built-in root transaction may refresh unadmitted snapshots after operational
+    /// staging failures. Ordinary baselines return those failures without rebasing their source.
     #[serde(skip)]
     pub(crate) retained_root_run: bool,
 }
@@ -337,7 +338,13 @@ impl<'a> Installing<'a> {
         published.finish(sys)?;
         current().map_err(StageError::Lost)?;
         published.check(sys)?;
-        let observed = readiness(sys);
+        // Publishing a new image still owes its initial launch: an older process
+        // with a compatible protocol cannot complete this transaction before that.
+        let observed = if self.launched {
+            readiness(sys)
+        } else {
+            Readiness::Start
+        };
         current().map_err(StageError::Lost)?;
         published.check(sys)?;
         let why = match observed {
@@ -418,7 +425,11 @@ impl LanBroker {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = why;
     }
 
-    fn retained(&self, sys: &dyn System, source: &Path) -> Result<(), String> {
+    /// Keep the authenticated root process through publication and strict readiness.
+    /// Launch and protocol I/O retain their existing per-call deadlines. The retry rate is
+    /// capped, with no total wait limit.
+    /// Stop or lost custody ends the transaction.
+    fn apply_owned(&self, sys: &dyn System, source: &Path) -> Result<(), String> {
         use aterm_secrets::converge::{Last, RunnerRetry};
         let pid = std::process::id();
         let start = sys
@@ -446,16 +457,14 @@ impl LanBroker {
                 Ok(None) => return Ok(()),
                 Ok(Some(why)) => why,
                 Err(error) => {
-                    if !installing.retry(&error) {
+                    if !self.retained_root_run || !installing.retry(&error) {
                         return Err(error.to_string());
                     }
                     error.to_string()
                 }
             };
             if said.as_ref() != Some(&why) {
-                aterm_log::warn!(
-                    "LAN broker: {why}; retaining the accepted root setup for recovery"
-                );
+                aterm_log::warn!("LAN broker: {why}; retaining this root transaction for recovery");
                 said = Some(why);
             }
             // RunnerRetry supplies the existing capped rate. The wait is local
@@ -546,36 +555,6 @@ impl LanBroker {
             retired: Some(owner),
         })
     }
-
-    fn single(&self, sys: &dyn System, source: &Path) -> Result<(), StageError> {
-        let current = || {
-            if sys.stopped().is_some() {
-                self.note(Some(crate::init_clt::Unfinished::Stopped));
-                return Err("root setup was stopped".into());
-            }
-            if sys.euid() != 0 {
-                return Err("the LAN broker image needs root custody".into());
-            }
-            Ok(())
-        };
-        current().map_err(StageError::Lost)?;
-        let before = Before::read(sys)?;
-        let prepared = self.prepare(sys, source, &current)?;
-        before.check(sys)?;
-        prepared.source_current(sys, source)?;
-        sys.check_app_copy(&prepared.path)
-            .map_err(StageError::Check)?;
-        current().map_err(StageError::Lost)?;
-        prepared.source_current(sys, source)?;
-        before.check(sys)?;
-        let mut published = self.publish(sys, source, prepared, &before)?;
-        current().map_err(StageError::Lost)?;
-        published.finish(sys)?;
-        current().map_err(StageError::Lost)?;
-        published.check(sys)?;
-        super::aterm::start_system_job(sys, Path::new(lan::PLIST_PATH), lan::LABEL)
-            .map_err(StageError::Lost)
-    }
 }
 
 impl Item for LanBroker {
@@ -626,19 +605,14 @@ impl Item for LanBroker {
                 from: "installed, not serving".into(),
                 to,
             },
-            Readiness::Pending(why) if self.retained_root_run => Probe::Change { from: why, to },
-            Readiness::Pending(why) => Probe::Unusable { why },
+            Readiness::Pending(why) => Probe::Change { from: why, to },
         }
     }
 
     fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
         self.note(Some(crate::init_clt::Unfinished::Other));
         let source = sys.running_app().ok_or(NO_BUNDLE)?;
-        let result = if self.retained_root_run {
-            self.retained(sys, &source)
-        } else {
-            self.single(sys, &source).map_err(|error| error.to_string())
-        };
+        let result = self.apply_owned(sys, &source);
         if result.is_ok() {
             self.note(None);
         }
@@ -699,6 +673,7 @@ mod tests {
 
     fn from_app() -> Fake {
         let mut sys = Fake::root();
+        sys.born(std::process::id(), 123);
         sys.running_app = Some(PathBuf::from(SOURCE));
         sys.file(SOURCE_EXE, &this_build());
         sys.stat_of(
@@ -723,11 +698,6 @@ mod tests {
                 },
             );
         }
-        sys.on_lan_broker(Ok(lan::BrokerHello {
-            protocol: lan::PROTOCOL,
-            build: aterm_stamp::build_id(),
-            direct: None,
-        }));
         sys
     }
 
@@ -739,8 +709,8 @@ mod tests {
     #[test]
     fn the_broker_is_cloned_sealed_swapped_then_started() {
         let sys = from_app();
-        // The missing files need no launchctl read; apply finds no loaded job,
-        // then the post-probe hears the running broker's strict hello.
+        // The missing files need no launchctl read; the new job has a PID before
+        // its socket is ready. Only the final strict hello completes the apply.
         sys.on(PRINT, Ran::exit(113, "Could not find service"))
             .on(PRINT, Ran::ok("system/systems.alab.aterm-lan = {\n\tpid = 77\n}\n"))
             .on("/bin/launchctl enable system/systems.alab.aterm-lan", Ran::ok(""))
@@ -749,6 +719,22 @@ mod tests {
                 Ran::ok(""),
             )
             .on("/bin/launchctl kickstart system/systems.alab.aterm-lan", Ran::ok(""));
+        sys.on_lan_broker(Err("launchd has a PID, but its socket is not bound".into()))
+            .on_lan_broker(Ok(lan::BrokerHello {
+                protocol: lan::PROTOCOL,
+                build: aterm_stamp::build_id(),
+                direct: Some("an allowed direct path is not the installed helper".into()),
+            }))
+            .on_lan_broker(Ok(lan::BrokerHello {
+                protocol: lan::PROTOCOL + 1,
+                build: aterm_stamp::build_id(),
+                direct: None,
+            }))
+            .on_lan_broker(Ok(lan::BrokerHello {
+                protocol: lan::PROTOCOL,
+                build: aterm_stamp::build_id(),
+                direct: None,
+            }));
         let ctx = ctx(&[]);
         assert!(matches!(
             LanBroker::default().probe(&sys, &ctx),
@@ -757,6 +743,32 @@ mod tests {
         let item = LanBroker::default();
         item.apply(&sys, &ctx).unwrap();
         let calls = sys.calls();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.as_str() == "installed LAN broker hello")
+                .count(),
+            4,
+            "ordinary apply returned before the installed broker answered its strict protocol"
+        );
+        for prefix in [
+            "clone ",
+            "root-own -R ",
+            "check staged app ",
+            "exchange ",
+            "/bin/launchctl bootstrap ",
+            "/bin/launchctl kickstart ",
+        ] {
+            assert_eq!(
+                calls.iter().filter(|call| call.starts_with(prefix)).count(),
+                1,
+                "readiness retains one publication and initial launch: {prefix}: {calls:?}"
+            );
+        }
+        assert!(
+            calls.iter().any(|call| call.starts_with("sleep ")),
+            "unready strict hellos yield through the owned retry budget"
+        );
         let at = |prefix: &str| {
             calls
                 .iter()
@@ -819,9 +831,31 @@ mod tests {
                 .any(|call| call.starts_with("exchange ") || call.starts_with("/bin/launchctl"))
         );
 
-        // Published files are not a running broker: a transient bootstrap
-        // failure leaves the files current, while the actual item still owes
-        // launchd work to the root run that owns this installation.
+        // Ordinary baselines return an operational staging failure without
+        // retrying a new snapshot or publishing an unchecked image.
+        let unchecked = from_app();
+        unchecked.app_check(|_, _| Err(CheckError::Unchecked("trust service unavailable".into())));
+        let why = LanBroker::default().apply(&unchecked, &ctx).unwrap_err();
+        assert!(why.contains("trust service unavailable"), "{why}");
+        let calls = unchecked.calls();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.starts_with("clone "))
+                .count(),
+            1
+        );
+        assert!(
+            !calls.iter().any(|call| {
+                call.starts_with("exchange ")
+                    || call.starts_with("/bin/launchctl")
+                    || call.starts_with("sleep ")
+            }),
+            "{calls:?}"
+        );
+
+        // Published files are not a running broker. Stop during a launch failure
+        // retains the publication but cannot turn that failure into success.
         let failed = from_app();
         failed
             .on(PRINT, Ran::exit(113, "Could not find service"))
@@ -830,8 +864,20 @@ mod tests {
                 "/bin/launchctl bootstrap system /Library/LaunchDaemons/systems.alab.aterm-lan.plist",
                 Ran::exit(5, "transient bootstrap failure"),
             );
+        failed.on_sleep(|sys, _| {
+            sys.stop_now();
+        });
         let why = LanBroker::default().apply(&failed, &ctx).unwrap_err();
-        assert!(why.contains("transient bootstrap failure"), "{why}");
+        assert!(why.contains("stopped"), "{why}");
+        let calls = failed.calls();
+        for prefix in ["clone ", "exchange ", "/bin/launchctl bootstrap "] {
+            assert_eq!(
+                calls.iter().filter(|call| call.starts_with(prefix)).count(),
+                1,
+                "{calls:?}"
+            );
+        }
+        assert!(calls.iter().any(|call| call.starts_with("sleep ")));
         let published = reading(&failed).unwrap().unwrap();
         assert!(published.current());
         assert!(
@@ -876,6 +922,11 @@ mod tests {
     #[test]
     fn a_running_broker_is_replaced_by_exchange_and_restarted() {
         let sys = from_app();
+        sys.on_lan_broker(Ok(lan::BrokerHello {
+            protocol: lan::PROTOCOL,
+            build: aterm_stamp::build_id(),
+            direct: None,
+        }));
         sys.stat_of(
             lan::IMAGE_BUNDLE,
             crate::port::Stat {
@@ -929,5 +980,44 @@ mod tests {
         let bootstrap = calls.iter().position(|c| c.contains("bootstrap")).unwrap();
         assert!(bootout < bootstrap, "{calls:?}");
         assert_eq!(sys.written(lan::IMAGE_EXECUTABLE), Some(this_build()));
+
+        // A later socket outage leaves the installed files and PID current. The
+        // ordinary engine must still enter apply and wait for a strict hello.
+        sys.on_lan_broker(Err(
+            "the current broker socket is temporarily unavailable".into()
+        ));
+        // Retire the previous successful observation; the engine's first hello is the outage.
+        assert!(matches!(
+            LanBroker::default().probe(&sys, &ctx),
+            Probe::Ok { .. }
+        ));
+        let available = std::sync::Once::new();
+        sys.on_sleep(move |sys, _| {
+            available.call_once(|| {
+                sys.on_lan_broker(Ok(lan::BrokerHello {
+                    protocol: lan::PROTOCOL,
+                    build: aterm_stamp::build_id(),
+                    direct: None,
+                }));
+            });
+        });
+        let items: Vec<Box<dyn Item>> = vec![Box::new(LanBroker::default())];
+        let rows = crate::engine::run(
+            &items,
+            crate::model::Mode::Apply,
+            &sys,
+            &ctx,
+            &mut crate::engine::NoJournal,
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome, crate::model::Outcome::Changed);
+        let calls = sys.calls();
+        for prefix in ["clone ", "/bin/launchctl bootstrap "] {
+            assert_eq!(
+                calls.iter().filter(|call| call.starts_with(prefix)).count(),
+                2,
+                "the engine repairs the unready current install once: {calls:?}"
+            );
+        }
     }
 }

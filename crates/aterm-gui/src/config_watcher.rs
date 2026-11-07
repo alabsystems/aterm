@@ -522,16 +522,12 @@ fn theme_holds(directory: &std::path::Path, candidates: &[std::path::PathBuf]) -
         .collect()
 }
 
-/// The longest a failure no edit ends waits for its next look ([`Retry`]).
-const RETRY_MOST: Duration = Duration::from_secs(10);
-
-/// When a step whose last failure no edit ends ([`ends_with_no_edit`]) looks again: after
-/// [`POLL_INTERVAL`], then twice as long each time it fails so, up to [`RETRY_MOST`]. A success,
-/// or a failure an edit ends, sets no clock.
+/// When a step whose last failure can end with no event ([`ends_with_no_edit`]) looks again:
+/// [`POLL_INTERVAL`] after the step ended, each time it fails so, as the stat clock before the
+/// events looked. A success, or a failure an edit ends, sets no clock.
 #[derive(Default)]
 struct Retry {
     at: Option<Instant>,
-    every: Duration,
 }
 
 impl Retry {
@@ -539,38 +535,34 @@ impl Retry {
         self.at.is_some_and(|at| now >= at)
     }
 
-    fn after(&mut self, now: Instant, failure: Option<WatchFailureKind>) {
-        if failure.is_some_and(ends_with_no_edit) {
-            self.every = if self.at.is_some() {
-                self.every.saturating_mul(2).min(RETRY_MOST)
-            } else {
-                POLL_INTERVAL
-            };
-            self.at = Some(now + self.every);
-        } else {
-            self.at = None;
-        }
+    fn after(&mut self, ended: Instant, failure: Option<WatchFailureKind>) {
+        self.at = failure
+            .is_some_and(ends_with_no_edit)
+            .then(|| ended + POLL_INTERVAL);
     }
 }
 
 /// Whether a failure of `kind` can end with no event the watch hears, so the step looks again on
-/// a clock: a refusal or an I/O error (a privacy grant lifts one unseen). An edit ends the rest,
-/// and its event wakes the step: bytes that do not read, a file too large or not a file, a
-/// binding through an unsafe link, or a change made as it read.
+/// a clock: a refusal or an I/O error (a privacy grant, or a `chmod` macOS tells no folder of,
+/// lifts one unseen), and a theme scan that changed as it read, whose stamp covers files no key
+/// holds (one past the catalog's cap, or one a built-in shadows), written in place where only
+/// their folder listens. An edit ends the rest, and its event wakes the step: bytes that do not
+/// read, a file too large or not a file, a binding through an unsafe link, or a change made as
+/// the config, every file of which a key holds, read.
 const fn ends_with_no_edit(kind: WatchFailureKind) -> bool {
     match kind {
         WatchFailureKind::ConfigUnreadable
         | WatchFailureKind::ThemeDirectoryUnreadable
         | WatchFailureKind::ThemeEntryUnreadable
-        | WatchFailureKind::ThemeFileUnavailable => true,
+        | WatchFailureKind::ThemeFileUnavailable
+        | WatchFailureKind::ThemeChangedWhileScanning => true,
         WatchFailureKind::ConfigInvalidUtf8
         | WatchFailureKind::ConfigInvalidToml
         | WatchFailureKind::ConfigTooLarge
         | WatchFailureKind::ConfigNotRegular
         | WatchFailureKind::ConfigChangedWhileReading
         | WatchFailureKind::ConfigUnsafeBinding
-        | WatchFailureKind::ConfigPreparationFailed
-        | WatchFailureKind::ThemeChangedWhileScanning => false,
+        | WatchFailureKind::ConfigPreparationFailed => false,
     }
 }
 
@@ -683,6 +675,8 @@ fn watch(
     let mut themes_owed = deaf.is_none();
     let mut config_owed = false;
     let mut tells = Vec::new();
+    // When the last step that looked ended, until the rest after it.
+    let mut looked: Option<Instant> = None;
     loop {
         if forget_after_commit(repost, &mut last_harness) {
             config_failure.forget();
@@ -771,9 +765,11 @@ fn watch(
                     }
                 }
             }
-            config_retry.after(now, failed);
+            let ended = ears.now();
+            looked = Some(ended);
+            config_retry.after(ended, failed);
             if let Some(clock) = deaf.as_mut() {
-                clock.config_at = now + POLL_INTERVAL;
+                clock.config_at = ended + POLL_INTERVAL;
             }
             held.hold(ears, Owes::Config, config_holds(path, &feed_paths));
         }
@@ -841,9 +837,11 @@ fn watch(
                     }
                 }
             };
-            theme_retry.after(now, sample.as_ref().err().copied());
+            let ended = ears.now();
+            looked = Some(ended);
+            theme_retry.after(ended, sample.as_ref().err().copied());
             if let Some(clock) = deaf.as_mut() {
-                clock.themes.observed(now, sample);
+                clock.themes.observed(ended, sample);
             }
             held.hold(
                 ears,
@@ -852,6 +850,10 @@ fn watch(
             );
         }
 
+        // Each clock counts from its own step's end, and none comes sooner than POLL_INTERVAL
+        // after the last look: a look slower than its interval (a share answering slowly) still
+        // rests between looks, as the stat clock before the events slept after each.
+        let last = looked.take();
         let until = earliest([
             config_retry.at,
             theme_retry.at,
@@ -861,7 +863,8 @@ fn watch(
             deaf.as_ref()
                 .filter(|_| theme_dir.is_some())
                 .map(|clock| clock.themes.next_poll),
-        ]);
+        ])
+        .map(|at| last.map_or(at, |last| at.max(last + POLL_INTERVAL)));
         let Some(woke) = ears.wait(until, &mut tells) else {
             return;
         };
@@ -2874,7 +2877,9 @@ pub(crate) mod tests {
     /// files and returns what it tells; one that tells nothing lets the rest run out. The watch
     /// ends at the script's end.
     struct Script {
-        now: std::time::Instant,
+        now: std::cell::Cell<std::time::Instant>,
+        /// How long each look takes: every [`super::Ears::now`] the watcher asks is a step's end.
+        taken: std::time::Duration,
         deaf: bool,
         held: std::collections::BTreeMap<u64, super::Hold>,
         keys: std::collections::BTreeSet<u64>,
@@ -2888,7 +2893,8 @@ pub(crate) mod tests {
     impl Script {
         fn new(deaf: bool, turns: Vec<Turn>) -> Self {
             Self {
-                now: std::time::Instant::now(),
+                now: std::cell::Cell::new(std::time::Instant::now()),
+                taken: std::time::Duration::ZERO,
                 deaf,
                 held: std::collections::BTreeMap::new(),
                 keys: std::collections::BTreeSet::new(),
@@ -2942,7 +2948,9 @@ pub(crate) mod tests {
         }
 
         fn now(&self) -> std::time::Instant {
-            self.now
+            let ended = self.now.get() + self.taken;
+            self.now.set(ended);
+            ended
         }
 
         fn wait(
@@ -2950,15 +2958,17 @@ pub(crate) mod tests {
             until: Option<std::time::Instant>,
             tells: &mut Vec<super::Tell>,
         ) -> Option<std::time::Instant> {
+            let now = self.now.get();
             self.rests
-                .push(until.map(|until| until.saturating_duration_since(self.now)));
+                .push(until.map(|until| until.saturating_duration_since(now)));
             let turn = self.turns.pop_front()?;
             let told = turn(self);
             if told.is_empty() {
-                self.now = until.expect("a rest no clock ends and nothing tells never ends");
+                let until = until.expect("a rest no clock ends and nothing tells never ends");
+                self.now.set(until.max(now));
             }
             tells.extend(told);
-            Some(self.now)
+            Some(self.now.get())
         }
     }
 
@@ -3084,7 +3094,7 @@ pub(crate) mod tests {
                             1,
                             "a tell that moved no stamp reads nothing"
                         );
-                        rewrite(&edited, "font_px = 16\n");
+                        rewrite(&edited, "font_px = 16 # edited\n");
                         s.on(&edited)
                     }
                 }),
@@ -3094,13 +3104,14 @@ pub(crate) mod tests {
                     move |s: &mut Script| {
                         assert_eq!(
                             seen.reads().last().map(String::as_str),
-                            Some("font_px = 16\n")
+                            Some("font_px = 16 # edited\n")
                         );
                         assert_eq!(s.rest(), None);
-                        #[cfg(unix)]
-                        after_ctime_tick(&file);
-                        std::fs::write(&file, "foreground = #101010\nbackground = #ffffff\n")
-                            .unwrap();
+                        std::fs::write(
+                            &file,
+                            "foreground = #101010\nbackground = #ffffff\ncursor = #303030\n",
+                        )
+                        .unwrap();
                         s.on(&file)
                     }
                 }),
@@ -3177,11 +3188,13 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// A refusal no edit ends (a file its user cannot read) is looked at again on a clock that
-    /// backs off to its most; once readable, the config is read and the watcher rests untimed.
+    /// A refusal no edit ends (a file its user cannot read) is looked at again every
+    /// [`POLL_INTERVAL`], as the stat clock before the events looked, so a `chmod` macOS tells no
+    /// folder of is read within one; once readable, the config is read and the watcher rests
+    /// untimed.
     #[cfg(unix)]
     #[test]
-    fn a_refusal_no_edit_ends_is_looked_at_again_backing_off() {
+    fn a_refusal_no_edit_ends_is_looked_at_again_every_poll_interval() {
         use std::os::unix::fs::PermissionsExt as _;
         aterm_uds::host::could_not_run_as_root("a config of mode 000");
         let dir = watch_scratch("refused");
@@ -3222,16 +3235,16 @@ pub(crate) mod tests {
             [
                 None,
                 ms(500),
-                ms(1000),
-                ms(2000),
-                ms(4000),
-                ms(8000),
-                ms(10_000),
-                ms(10_000),
-                ms(10_000),
+                ms(500),
+                ms(500),
+                ms(500),
+                ms(500),
+                ms(500),
+                ms(500),
+                ms(500),
                 None,
             ],
-            "no clock, then one that backs off from the refusal, then none again"
+            "no clock, then the poll interval's while refused, then none again"
         );
         assert!(
             posts
@@ -3353,7 +3366,7 @@ pub(crate) mod tests {
                     let config = config.clone();
                     move |s: &mut Script| {
                         assert_eq!(s.rest(), Some(POLL_INTERVAL));
-                        rewrite(&config, "font_px = 17\n");
+                        rewrite(&config, "font_px = 17 # edited\n");
                         Vec::new()
                     }
                 }),
@@ -3368,7 +3381,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             posts.reads().last().map(String::as_str),
-            Some("font_px = 17\n")
+            Some("font_px = 17 # edited\n")
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -3388,7 +3401,7 @@ pub(crate) mod tests {
                     let config = config.clone();
                     move |s: &mut Script| {
                         assert_eq!(s.rest(), Some(POLL_INTERVAL));
-                        rewrite(&config, "font_px = 19\n");
+                        rewrite(&config, "font_px = 19 # edited\n");
                         Vec::new()
                     }
                 }),
@@ -3407,7 +3420,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             posts.reads().last().map(String::as_str),
-            Some("font_px = 19\n")
+            Some("font_px = 19 # edited\n")
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -3447,44 +3460,69 @@ pub(crate) mod tests {
         assert!(!ears.deaf());
     }
 
-    /// The retry clock: none for a success or a failure an edit ends, and from
-    /// [`POLL_INTERVAL`] doubling to its most while the failure no edit ends goes on.
+    /// The retry clock: none for a success or a failure an edit ends, and [`POLL_INTERVAL`] after
+    /// each step while a failure that can end unheard goes on, a theme scan that changed as it
+    /// read among them.
     #[test]
-    fn the_retry_clock_backs_off_only_for_a_failure_no_edit_ends() {
+    fn the_retry_clock_runs_only_for_a_failure_that_can_end_unheard() {
         let start = std::time::Instant::now();
         let mut retry = super::Retry::default();
         retry.after(start, Some(WatchFailureKind::ConfigInvalidUtf8));
         assert_eq!(retry.at, None);
-        let mut waits = Vec::new();
         let mut now = start;
-        for _ in 0..7 {
-            retry.after(now, Some(WatchFailureKind::ConfigUnreadable));
+        for kind in [
+            WatchFailureKind::ConfigUnreadable,
+            WatchFailureKind::ConfigUnreadable,
+            WatchFailureKind::ThemeChangedWhileScanning,
+            WatchFailureKind::ThemeEntryUnreadable,
+        ] {
+            retry.after(now, Some(kind));
             let at = retry.at.unwrap();
-            waits.push(at - now);
+            assert_eq!(at - now, POLL_INTERVAL, "{kind:?}");
             assert!(!retry.due(at - std::time::Duration::from_nanos(1)) && retry.due(at));
             now = at;
         }
-        let s = std::time::Duration::from_millis;
-        assert_eq!(
-            waits,
-            [
-                s(500),
-                s(1000),
-                s(2000),
-                s(4000),
-                s(8000),
-                super::RETRY_MOST,
-                super::RETRY_MOST
-            ]
-        );
         retry.after(now, None);
         assert_eq!(retry.at, None, "a success");
-        retry.after(now, Some(WatchFailureKind::ThemeEntryUnreadable));
-        assert_eq!(
-            retry.at,
-            Some(now + POLL_INTERVAL),
-            "a new failure starts again"
+        retry.after(now, Some(WatchFailureKind::ConfigChangedWhileReading));
+        assert_eq!(retry.at, None, "a config edit's own event ends it");
+    }
+
+    /// A deaf watcher rests a whole [`POLL_INTERVAL`] after each look, however long the look
+    /// took: each clock counts from its own step's end, and none comes sooner than that interval
+    /// after the last look, so looks slower than their interval do not run back to back.
+    /// NEGATIVE CONTROL: dropping the floor and counting the clocks from the wake (`now` for
+    /// `ended`) leaves three-second looks no rest, and a rest reads zero.
+    #[test]
+    fn a_deaf_watcher_rests_after_each_slow_look() {
+        let dir = watch_scratch("deaf-slow");
+        let config = dir.join("aterm.toml");
+        crate::test_scratch::write_config(&config, "font_px = 14\n");
+        let themes = dir.join("themes");
+        std::fs::create_dir(&themes).unwrap();
+        let posts = Posts::default();
+        let mut turns: Vec<Turn> = Vec::new();
+        for _ in 0..6 {
+            turns.push(Box::new(|_: &mut Script| Vec::new()));
+        }
+        let mut script = Script::new(true, turns);
+        script.taken = std::time::Duration::from_secs(3);
+        run_watch(
+            Some(&config),
+            Some(&themes),
+            &mut script,
+            &posts,
+            &super::Repost::new(),
         );
+        assert_eq!(script.rests.len(), 7);
+        for rest in &script.rests {
+            assert!(
+                rest.is_some_and(|rest| rest >= POLL_INTERVAL),
+                "every rest is a whole interval: {:?}",
+                script.rests
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// The watcher over this platform's file events reads an edit it hears, and ends once the

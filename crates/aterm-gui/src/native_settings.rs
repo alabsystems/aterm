@@ -9408,7 +9408,6 @@ fn raw_bool_value(config: &Config, key: &str) -> Option<bool> {
         "predictive_echo_editing" => config.predictive_echo_editing,
         "option_as_meta" => config.option_as_meta,
         "focus_boost" => config.focus_boost,
-        "desktop_alerts" => config.desktop_alerts,
         "allow_osc52_query" => config.allow_osc52_query,
         "allow_window_ops" => config.allow_window_ops,
         "allow_notifications" => config.allow_notifications,

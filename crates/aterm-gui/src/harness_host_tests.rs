@@ -33518,6 +33518,7 @@ impl TapWorld {
             &vars,
             Some(&self.rl()),
             self.clock(),
+            |_| Some(0),
             &mut out,
         );
         let file = self

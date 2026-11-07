@@ -505,7 +505,7 @@ fn prune(store: &Path, keep: &[&str]) {
     let Ok(entries) = std::fs::read_dir(store) else {
         return;
     };
-    let deadline = std::time::Instant::now() + in_use::LOOKUP_BUDGET;
+    let deadline = std::time::Instant::now() + in_use::PRUNE_BUDGET;
     for entry in entries.flatten() {
         let name = entry.file_name();
         if keep.iter().any(|k| name.as_os_str() == *k) {

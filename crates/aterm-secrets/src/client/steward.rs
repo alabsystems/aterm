@@ -313,10 +313,21 @@ pub(super) fn member_is_denied_in_roster(
     )
 )]
 pub fn local_recipient_denied_in_roster(paths: &Paths) -> bool {
+    local_recipient_denial_observed(paths).unwrap_or(true)
+}
+
+/// [`local_recipient_denied_in_roster`] for a caller that may observe again: a vault writer that
+/// holds the state lock at this moment is [`crate::ErrorKind::VaultBusy`], not a denial, so a read
+/// that meets one can retry rather than report that this Mac's authorization changed. Every other
+/// answer is the boolean's, an unreadable or unsafe state still denying. It never waits.
+///
+/// # Errors
+/// A vault writer holds the state lock ([`crate::ErrorKind::VaultBusy`]); nothing was judged.
+pub fn local_recipient_denial_observed(paths: &Paths) -> crate::Result<bool> {
     // Noncurrent membership must still consult authenticated denial evidence.
     match load_state(paths) {
         Ok(state) => match state.membership {
-            Stored::Revoked => return true,
+            Stored::Revoked => return Ok(true),
             Stored::None | Stored::Pending | Stored::Plain
                 if state.digest.is_none()
                     && state.records_digest.is_none()
@@ -325,26 +336,28 @@ pub fn local_recipient_denied_in_roster(paths: &Paths) -> bool {
             {
                 // Missing data is unseeded only without crossing or layout witnesses.
                 // Observe that absence without repairing the materialization lock.
-                return !(matches!(fsx::kind(&paths.crossed_file()), Ok(fsx::Kind::Missing))
-                    && crate::records_storage::absent(&paths.records_file()).unwrap_or(false));
+                return Ok(
+                    !(matches!(fsx::kind(&paths.crossed_file()), Ok(fsx::Kind::Missing))
+                        && crate::records_storage::absent(&paths.records_file()).unwrap_or(false)),
+                );
             }
             Stored::None | Stored::Pending | Stored::Plain | Stored::In => {}
         },
-        Err(_) => return true,
+        Err(_) => return Ok(true),
     }
     if StateLock::narrow_owned(paths).is_err() {
-        return true;
+        return Ok(true);
     }
-    match StateLock::observe_classified(paths) {
+    Ok(match StateLock::observe_classified(paths) {
         Ok(StateObservation::Held(lock)) => local_recipient_denied_in_roster_held(paths, &lock),
         Ok(StateObservation::Absent) => match config(paths) {
             Ok(None) => false,
             Ok(Some(config)) if config.signer.is_none() => false,
-            Ok(Some(_)) => true,
-            Err(_) => true,
+            Ok(Some(_)) | Err(_) => true,
         },
-        Ok(StateObservation::Busy) | Err(_) => true,
-    }
+        Ok(StateObservation::Busy) => return Err(super::vault_busy()),
+        Err(_) => true,
+    })
 }
 
 pub(super) fn local_recipient_denied_in_roster_held(paths: &Paths, lock: &StateLock) -> bool {

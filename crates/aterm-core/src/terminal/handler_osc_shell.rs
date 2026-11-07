@@ -541,9 +541,7 @@ impl super::Terminal {
         let _ = write!(out, "\x1b[{};1H\x1b[J", top + 1);
         for r in top..=cursor.row {
             let _ = write!(out, "\x1b[{};1H", r + 1);
-            if let Some(text) = alt.row_ansi_text_screen(r) {
-                out.push_str(&text);
-            }
+            let _ = alt.push_row_ansi_text_screen(r, &mut out);
             out.push_str("\x1b[0m");
         }
         if left > 0 {

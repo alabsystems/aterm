@@ -1783,6 +1783,19 @@ impl Bootstrap {
         .map(Option::flatten)
     }
 
+    /// [`Self::access_in`] for a caller that may observe again: a vault writer that holds the
+    /// state lock at this moment is [`crate::ErrorKind::VaultBusy`], not "no access".
+    ///
+    /// # Errors
+    /// As [`Self::access_in`], or a vault writer holds the state lock
+    /// ([`crate::ErrorKind::VaultBusy`]).
+    pub fn access_observed_in(&self, journal: &Journal) -> Result<Option<super::roster::Access>> {
+        client::with_roster_observation_or_busy(&self.paths, |observation| {
+            self.access_in_observed(journal, observation.state_lock())
+        })
+        .map(Option::flatten)
+    }
+
     pub(crate) fn access_in_held(
         &self,
         journal: &Journal,

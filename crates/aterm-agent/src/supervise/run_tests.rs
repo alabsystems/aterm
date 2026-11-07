@@ -226,6 +226,10 @@ struct Mock {
     attentions: usize,
     attention_kind: Option<String>,
     screen_cols: BTreeMap<usize, usize>,
+    /// The window title the host sends with each screen's rows (`text --json`'s `"title"`), by
+    /// screen; a screen not named sends none, as an older host does. The host's own reader word
+    /// and its log read the title as the screen's ([`Self::host_phase`]).
+    screen_titles: BTreeMap<usize, String>,
     cursor_on_caret: bool,
     /// The first this many `text` reads find the cursor off the caret (row 10), later ones on
     /// it; the move bumps no content seq.
@@ -976,8 +980,8 @@ impl Mock {
             return (self.agent, String::new());
         }
         let next = (self.served < self.screens.len() && !self.held())
-            .then(|| worker_phase(&self.screens[self.served]));
-        let mut phase = worker_phase(self.last_served());
+            .then(|| self.host_phase(self.served));
+        let mut phase = self.host_phase(self.served.saturating_sub(1));
         let at = self.served;
         let log = self.log.as_mut().expect("the log");
         let mut need = "-";
@@ -1055,7 +1059,7 @@ impl Mock {
         let mut slept = 0;
         while self.served + 1 < self.screens.len()
             && !self.held()
-            && worker_phase(&self.screens[self.served]) == Phase::Busy
+            && self.host_phase(self.served) == Phase::Busy
         {
             self.served += 1;
             self.seq += 1;
@@ -1072,7 +1076,7 @@ impl Mock {
             }
         }
         let next = (self.served < self.screens.len() && !self.held())
-            .then(|| worker_phase(&self.screens[self.served]));
+            .then(|| self.host_phase(self.served));
         let at = self.served;
         if let Some(log) = self.log.as_mut() {
             log.slept += slept;
@@ -1136,6 +1140,7 @@ impl Mock {
             attentions: 0,
             attention_kind: None,
             screen_cols: BTreeMap::new(),
+            screen_titles: BTreeMap::new(),
             cursor_on_caret: false,
             caret_after_reads: None,
             cursor_home_after: None,
@@ -1720,6 +1725,18 @@ impl Mock {
         &self.screens[self.served.saturating_sub(1).min(self.screens.len() - 1)]
     }
 
+    /// Screen `i`'s phase as the host's reader reads it: its rows, beside the title it sends
+    /// with them ([`Self::screen_titles`]), as a host whose agent verdict reads the title does.
+    fn host_phase(&self, i: usize) -> Phase {
+        let i = i.min(self.screens.len() - 1);
+        let runs = self
+            .screen_titles
+            .get(&i)
+            .filter(|t| !t.is_empty())
+            .map(|t| aterm_phase::phase::title_runs(t));
+        aterm_phase::phase::worker_phase_seen(&self.screens[i], runs)
+    }
+
     pub(super) fn history_served(&mut self) {
         self.scrollback.get_or_insert_with(Vec::new);
         self.alt_screen.get_or_insert(false);
@@ -2001,6 +2018,10 @@ impl Mock {
         }
         if self.open_on.contains(&i) {
             human.push_str(",\"frame\":\"open\"");
+        }
+        if let Some(title) = self.screen_titles.get(&i) {
+            let title = title.replace('\\', "\\\\").replace('"', "\\\"");
+            human.push_str(&format!(",\"title\":\"{title}\""));
         }
         format!(
             "{{\"rows\":[{}],\"cursor\":{{\"row\":{cursor_row},\"col\":{composer_col},\"visible\":true,\"style\":\"block\"}},\"dims\":{{\"rows\":{},\"cols\":{}}},\"seq\":{}{generation}{human}{first}}}\n",
@@ -4685,12 +4706,16 @@ fn title_run_over(
     title_run_on(title_mock(screens, titles, refused), transcript_over)
 }
 
-/// [`title_run`], each short settle standing still its whole [`SETTLE_CAP`] before it answers, so
-/// a held reply is read about every 1.5 s, as one a program keeps drawing is.
+/// [`title_run`], each short settle standing still its whole [`SETTLE_CAP`] ([`paced`]).
 fn title_run_paced(screens: Vec<Vec<String>>, titles: &[&str]) -> TitleRun {
-    let mut m = title_mock(screens, titles, false);
+    title_run_on(paced(title_mock(screens, titles, false)), None)
+}
+
+/// `m` with each short settle standing still its whole [`SETTLE_CAP`] before it answers, so a held
+/// reply is read about every 1.5 s, as one a program keeps drawing is.
+fn paced(mut m: Mock) -> Mock {
     m.idle_after = std::iter::repeat_n(SETTLE_CAP, 400).collect();
-    title_run_on(m, None)
+    m
 }
 
 fn title_mock(screens: Vec<Vec<String>>, titles: &[&str], refused: bool) -> Mock {
@@ -4812,6 +4837,456 @@ fn needs_said(rows: &[String]) -> usize {
         .reader()
         .said_tail(rows)
         .map_or(0, |t| t.matches("NEEDS YOU:").count())
+}
+
+/// [`title_mock`] for a host that sends the title with its rows ([`Mock::screen_titles`]):
+/// screen `i` under `titles[i]` (the last standing after them), none asked with `title`.
+fn snapshot_mock(screens: Vec<Vec<String>>, titles: &[&str]) -> Mock {
+    let n = screens.len();
+    let mut m = title_mock(screens, &[], false);
+    m.screen_titles = (0..n)
+        .map(|i| (i, titles[i.min(titles.len() - 1)].to_string()))
+        .collect();
+    m
+}
+
+/// The run of a status-line reply whose host sends the title with its rows ([`snapshot_mock`]),
+/// a log kept where `log` says so.
+fn snapshot_run(screens: Vec<Vec<String>>, titles: &[&str], log: bool) -> TitleRun {
+    let mut m = snapshot_mock(screens, titles);
+    if log {
+        m.log = Some(LogWorld::new());
+    }
+    title_run_on(m, None)
+}
+
+/// [`snapshot_run`] with no log, each short settle standing still its whole [`SETTLE_CAP`]
+/// ([`paced`]).
+fn snapshot_run_paced(screens: Vec<Vec<String>>, titles: &[&str]) -> TitleRun {
+    title_run_on(paced(snapshot_mock(screens, titles)), None)
+}
+
+/// `rows`, a status-line reply, its reply `lines` rows longer above the blank row over the
+/// composer: a reply the program still draws.
+fn reply_grown(rows: &[String], lines: usize) -> Vec<String> {
+    let mut rows = rows.to_vec();
+    let top = aterm_phase::phase::composer_rules(&rows)
+        .expect("a composer")
+        .0;
+    for k in 0..lines {
+        rows.insert(
+            top - 1,
+            format!("    placeholder words of the reply, line {k}."),
+        );
+    }
+    rows
+}
+
+/// `rows`, a status-line reply, its status line (`  lab status line`) refreshed to say `k`: the
+/// screen moves and the reply does not.
+fn status_refreshed(rows: &[String], k: usize) -> Vec<String> {
+    let mut rows = rows.to_vec();
+    let line = rows
+        .iter_mut()
+        .find(|r| r.trim_end() == "  lab status line")
+        .expect("the status line");
+    *line = format!("  lab status line {k}");
+    rows
+}
+
+/// A host that sends the title with the rows (`text --json`'s `"title"`) is read by it, with no
+/// `title` call: a status-line reply under `◑`/`◐` reads Busy, and the turn ends on the frame
+/// drawn after the title rests, all four NEEDS YOU lines in it. NEGATIVE CONTROL: the same
+/// frames sent with an empty title end on the first mid-reply read, as the screen alone reads it.
+#[test]
+fn a_title_sent_with_the_rows_holds_a_status_line_reply_with_no_title_call() {
+    use aterm_phase::prompt::fixtures::{
+        STATUSLINE_LAST_LINE_HELD_2_1_311, STATUSLINE_MIDREPLY_2_1_311,
+        STATUSLINE_REPLY_DONE_2_1_311, screen,
+    };
+    let mid = screen(STATUSLINE_MIDREPLY_2_1_311);
+    let held = screen(STATUSLINE_LAST_LINE_HELD_2_1_311);
+    let done = screen(STATUSLINE_REPLY_DONE_2_1_311);
+    let frames = vec![mid.clone(), mid.clone(), held.clone(), done.clone()];
+    let titles = [
+        "◑ Claude Code",
+        "◐ Claude Code",
+        "✳ Claude Code",
+        "✳ Claude Code",
+    ];
+    for log in [false, true] {
+        let r = snapshot_run(frames.clone(), &titles, log);
+        assert_eq!(
+            (r.turn.phase.clone(), &r.turn.screen.rows, r.turn.timed_out),
+            (Phase::Idle, &done, false),
+            "log {log}: {:#?}",
+            r.requests
+        );
+        assert_eq!(needs_said(&r.turn.screen.rows), 4);
+        assert_eq!(title_reads(&r.requests), 0, "log {log}: {:#?}", r.requests);
+        assert!(r.noted.is_empty(), "{:#?}", r.noted);
+    }
+    let r = snapshot_run(frames, &[""], false);
+    assert_eq!(
+        (r.turn.phase.clone(), &r.turn.screen.rows),
+        (Phase::Idle, &mid),
+        "CONTROL: {:#?}",
+        r.requests
+    );
+    assert_eq!(title_reads(&r.requests), 0, "CONTROL: {:#?}", r.requests);
+}
+
+/// Claude Code's critical-memory banner beside a status-line reply is no end of it: the loop holds
+/// the reply while its title runs, waits out the frame still holding its last line back under the
+/// title already at rest, and ends the turn on its done frame, all four NEEDS YOU lines in it and
+/// the banner its wall, so the memory restart a turn's end takes never cuts the reply short.
+/// NEGATIVE CONTROL: the same frames sent with an empty title end on the first mid-reply read,
+/// where the banner would be acted on.
+#[test]
+fn the_memory_banner_beside_a_status_line_reply_holds_it_to_its_end() {
+    use aterm_phase::prompt::fixtures::{
+        MEMORY_BANNER_IDLE, STATUSLINE_LAST_LINE_HELD_2_1_311, STATUSLINE_MIDREPLY_2_1_311,
+        STATUSLINE_REPLY_DONE_2_1_311, screen,
+    };
+    let banner = screen(MEMORY_BANNER_IDLE)
+        .into_iter()
+        .find(|r| r.trim_start().starts_with("Critical memory usage ("))
+        .expect("the banner row");
+    let with_banner = |text: &str| {
+        let mut rows = screen(text);
+        let top = aterm_phase::phase::composer_rules(&rows)
+            .expect("a composer")
+            .0;
+        rows.insert(top, banner.clone());
+        rows
+    };
+    let mid = with_banner(STATUSLINE_MIDREPLY_2_1_311);
+    let held = with_banner(STATUSLINE_LAST_LINE_HELD_2_1_311);
+    let done = with_banner(STATUSLINE_REPLY_DONE_2_1_311);
+    assert_eq!(
+        aterm_phase::wall(&mid).map(|w| w.kind),
+        Some(aterm_phase::WallKind::Memory),
+        "fixture guard: the banner reads"
+    );
+    let frames = vec![mid.clone(), held.clone(), held, done.clone()];
+    let titles = [
+        "◑ Claude Code",
+        "◐ Claude Code",
+        "✳ Claude Code",
+        "✳ Claude Code",
+    ];
+    for log in [false, true] {
+        let r = snapshot_run(frames.clone(), &titles, log);
+        assert_eq!(
+            (r.turn.phase.clone(), &r.turn.screen.rows, r.turn.timed_out),
+            (Phase::Idle, &done, false),
+            "log {log}: {:#?}",
+            r.requests
+        );
+        assert_eq!(needs_said(&r.turn.screen.rows), 4);
+    }
+    let r = snapshot_run(frames, &[""], false);
+    assert_eq!(
+        (r.turn.phase.clone(), &r.turn.screen.rows),
+        (Phase::Idle, &mid),
+        "CONTROL: {:#?}",
+        r.requests
+    );
+}
+
+/// A turn only the title runs shows no busy row to wait gone (R7): where the host keeps a log
+/// its wait is `await log close=turn,need,kind=agent`, which the end of the run wakes, and where
+/// it keeps none, the short settle (`await idle 500`). NEGATIVE CONTROL: the title sent empty
+/// waits on neither, its first read the end.
+#[test]
+fn a_turn_only_the_title_runs_waits_on_the_log_where_the_host_keeps_one() {
+    use aterm_phase::prompt::fixtures::{
+        STATUSLINE_MIDREPLY_2_1_311, STATUSLINE_REPLY_DONE_2_1_311, screen,
+    };
+    let mid = screen(STATUSLINE_MIDREPLY_2_1_311);
+    let done = screen(STATUSLINE_REPLY_DONE_2_1_311);
+    let frames = vec![mid.clone(), mid.clone(), done.clone()];
+    let titles = ["◐ Claude Code", "◑ Claude Code", "✳ Claude Code"];
+    let log_waits = |r: &TitleRun| {
+        r.requests
+            .iter()
+            .filter(|q| q.starts_with("await log close=turn,need,kind=agent "))
+            .count()
+    };
+    let settles = |r: &TitleRun| {
+        r.requests
+            .iter()
+            .filter(|q| q.starts_with("await idle 500"))
+            .count()
+    };
+    let r = snapshot_run(frames.clone(), &titles, true);
+    assert_eq!(
+        (r.turn.phase.clone(), &r.turn.screen.rows),
+        (Phase::Idle, &done),
+        "{:#?}",
+        r.requests
+    );
+    assert!(
+        log_waits(&r) >= 1,
+        "the log wakes the run's end: {:#?}",
+        r.requests
+    );
+    assert!(
+        r.requests
+            .iter()
+            .filter(|q| q.starts_with("await gone"))
+            .count()
+            <= 1,
+        "no busy row is waited gone after the first wait: {:#?}",
+        r.requests
+    );
+    let r = snapshot_run(frames.clone(), &titles, false);
+    assert_eq!(
+        (r.turn.phase.clone(), &r.turn.screen.rows),
+        (Phase::Idle, &done),
+        "{:#?}",
+        r.requests
+    );
+    assert_eq!(log_waits(&r), 0, "{:#?}", r.requests);
+    assert!(
+        settles(&r) >= 1,
+        "the short settle where no log is: {:#?}",
+        r.requests
+    );
+    for log in [true, false] {
+        let r = snapshot_run(frames.clone(), &[""], log);
+        assert_eq!(
+            (r.turn.phase.clone(), &r.turn.screen.rows),
+            (Phase::Idle, &mid),
+            "CONTROL log {log}: {:#?}",
+            r.requests
+        );
+        assert_eq!(log_waits(&r), 0, "CONTROL log {log}: {:#?}", r.requests);
+    }
+}
+
+/// [`TITLE_HOLD`] for a turn only the title runs counts from its reply's last change
+/// ([`ScreenReader::said_tail`]): a reply that keeps drawing past it is held to its end, and one
+/// unchanged that long under a running title is read as its screen shows it, the hold's NOTE
+/// said, whether its screen stands still or its status line keeps refreshing (a host that sends
+/// the title with its rows reads that reply here, never in the idle read's hold). NEGATIVE
+/// CONTROLS: a spinner frame is no title-only run, so the hold never decides it; with no title
+/// the standing screen is read at once.
+#[test]
+fn a_title_only_run_holds_while_its_reply_changes_and_ends_when_it_stands_past_the_hold() {
+    use aterm_phase::prompt::fixtures::{
+        STATUSLINE_MIDREPLY_2_1_311, STATUSLINE_REPLY_DONE_2_1_311, screen,
+    };
+    let mid = screen(STATUSLINE_MIDREPLY_2_1_311);
+    let done = screen(STATUSLINE_REPLY_DONE_2_1_311);
+    let reader = aterm_phase::Program::Claude.reader();
+    let titled = |rows: &Vec<String>| Screen {
+        rows: rows.clone(),
+        title: Some("◐ Claude Code".to_string()),
+        ..Screen::default()
+    };
+    // `mid` standing at one seq under `title`, read every 1.5 s.
+    let standing = |title: &str| {
+        let mut m = paced(snapshot_mock(vec![mid.clone()], &[title]));
+        m.screen_gens.insert(0, (1, 500));
+        title_run_on(m, None)
+    };
+    let mut frames: Vec<_> = (1..=60).map(|k| reply_grown(&mid, k)).collect();
+    for rows in &frames {
+        assert!(super::title_run(reader, &titled(rows)), "fixture guard");
+    }
+    frames.push(done.clone());
+    let mut titles = vec!["◐ Claude Code"; 60];
+    titles.push("✳ Claude Code");
+    let r = snapshot_run_paced(frames, &titles);
+    assert_eq!(
+        (r.turn.phase.clone(), &r.turn.screen.rows, r.turn.timed_out),
+        (Phase::Idle, &done, false),
+        "{:#?}",
+        r.requests
+    );
+    assert!(r.took > TITLE_HOLD, "drawn past the hold: {:?}", r.took);
+    assert!(r.noted.is_empty(), "{:#?}", r.noted);
+    let r = standing("◐ Claude Code");
+    assert_eq!(
+        (r.turn.phase.clone(), &r.turn.screen.rows, r.turn.timed_out),
+        (Phase::Idle, &mid, false),
+        "{:#?}",
+        r.requests
+    );
+    assert!(
+        r.took >= TITLE_HOLD && r.took < TITLE_HOLD + Duration::from_secs(5),
+        "{:?}",
+        r.took
+    );
+    assert!(
+        r.noted
+            .iter()
+            .any(|n| n.contains("the agent's title still said its run goes on")),
+        "{:#?}",
+        r.noted
+    );
+    // The reply unchanged while only its status line refreshes, a new seq at every read: the
+    // screen moves and the reply does not, so the hold ends at TITLE_HOLD all the same.
+    let statused: Vec<_> = (1..=70).map(|k| status_refreshed(&mid, k)).collect();
+    for rows in &statused {
+        assert!(super::title_run(reader, &titled(rows)), "fixture guard");
+        assert_eq!(
+            reader.said_tail(rows),
+            reader.said_tail(&mid),
+            "fixture guard"
+        );
+    }
+    let r = snapshot_run_paced(statused, &["◐ Claude Code"]);
+    assert_eq!(
+        (r.turn.phase.clone(), r.turn.timed_out),
+        (Phase::Idle, false),
+        "{:#?}",
+        r.noted
+    );
+    assert!(
+        r.took >= TITLE_HOLD && r.took < TITLE_HOLD + Duration::from_secs(5),
+        "{:?}",
+        r.took
+    );
+    assert_eq!(r.noted.len(), 1, "{:#?}", r.noted);
+    assert!(
+        r.noted[0].contains("the agent's title still said its run goes on, its reply unchanged"),
+        "{:#?}",
+        r.noted
+    );
+    let spinning = Screen {
+        rows: busy_screen(),
+        title: Some("◐ Claude Code".to_string()),
+        ..Screen::default()
+    };
+    assert!(
+        !super::title_run(reader, &spinning),
+        "a spinner frame shows its own run"
+    );
+    let r = standing("");
+    assert_eq!(
+        (r.turn.phase.clone(), &r.turn.screen.rows),
+        (Phase::Idle, &mid),
+        "CONTROL: {:#?}",
+        r.requests
+    );
+    assert!(r.took < Duration::from_secs(5), "CONTROL: {:?}", r.took);
+}
+
+/// Never stuck busy in the loop: a turn the screen shows over (its done row), a box, a limit, a
+/// context wall and an interrupted turn each read as their screen reads them under a running
+/// title, as with none sent.
+#[test]
+fn a_finished_turn_reads_as_its_screen_under_a_running_title_in_the_loop() {
+    use aterm_phase::prompt::fixtures as f;
+    let done = f::screen(f::STATUSLINE_REPLY_DONE_2_1_311);
+    let interrupted: Vec<String> = done
+        .iter()
+        .take_while(|r| !r.starts_with("  NEEDS YOU:"))
+        .cloned()
+        .chain(["  ⎿  Interrupted · What should Claude do instead?", ""].map(str::to_string))
+        .chain(done.iter().skip_while(|r| !r.starts_with('─')).cloned())
+        .collect();
+    let mut m = Mock::new(vec![done.clone()]);
+    let s = session(&mut m, None);
+    let phase = |rows: &[String], title: Option<&str>| {
+        s.turn_of(Screen {
+            rows: rows.to_vec(),
+            title: title.map(str::to_string),
+            ..Screen::default()
+        })
+        .phase
+    };
+    for (name, rows) in [
+        ("done", done.clone()),
+        ("interrupted", interrupted),
+        ("box", f::screen(f::BOX_BASH_TOUCH)),
+        ("limit", f::screen(f::LIMIT_OPTIONS_DIALOG)),
+        ("context wall", f::screen(f::CONTEXT_WALL_MEASURED)),
+    ] {
+        let alone = phase(&rows, None);
+        assert_ne!(alone, Phase::Busy, "fixture guard: {name}");
+        for run in ["◐ Claude Code", "◑ Claude Code"] {
+            assert_eq!(phase(&rows, Some(run)), alone, "{name} under {run}");
+        }
+    }
+}
+
+/// An Esc interrupt is an end the program drew: a turn the title ran, stopped with Esc and read
+/// under the title already at rest, is judged on the interrupt's own read, never on the frame
+/// after it (a feedback survey, the next turn). NEGATIVE CONTROL: the same run with the reply's
+/// last line still held back in the interrupt's place takes the one settle a reply read just
+/// after its title rested needs, and ends on the frame after it.
+#[test]
+fn an_interrupt_under_a_rested_title_decides_as_read() {
+    use aterm_phase::prompt::fixtures::{
+        STATUSLINE_LAST_LINE_HELD_2_1_311, STATUSLINE_MIDREPLY_2_1_311,
+        STATUSLINE_REPLY_DONE_2_1_311, screen,
+    };
+    let mid = screen(STATUSLINE_MIDREPLY_2_1_311);
+    let held = screen(STATUSLINE_LAST_LINE_HELD_2_1_311);
+    let done = screen(STATUSLINE_REPLY_DONE_2_1_311);
+    let interrupted: Vec<String> = done
+        .iter()
+        .take_while(|r| !r.starts_with("  NEEDS YOU:"))
+        .cloned()
+        .chain(["  ⎿  Interrupted · What should Claude do instead?", ""].map(str::to_string))
+        .chain(done.iter().skip_while(|r| !r.starts_with('─')).cloned())
+        .collect();
+    let reader = aterm_phase::Program::Claude.reader();
+    assert!(reader.interrupted(&interrupted), "fixture guard");
+    assert!(
+        !reader.end_drawn(&interrupted),
+        "fixture guard: no done row"
+    );
+    assert!(!reader.interrupted(&held), "fixture guard");
+    let titles = ["◐ Claude Code", "✳ Claude Code"];
+    for log in [false, true] {
+        let r = snapshot_run(
+            vec![mid.clone(), interrupted.clone(), done.clone()],
+            &titles,
+            log,
+        );
+        assert_eq!(
+            (r.turn.phase.clone(), &r.turn.screen.rows, r.turn.timed_out),
+            (Phase::Idle, &interrupted, false),
+            "log {log}: {:#?}",
+            r.requests
+        );
+        assert!(r.noted.is_empty(), "{:#?}", r.noted);
+        let r = snapshot_run(vec![mid.clone(), held.clone(), done.clone()], &titles, log);
+        assert_eq!(
+            (r.turn.phase.clone(), &r.turn.screen.rows),
+            (Phase::Idle, &done),
+            "CONTROL log {log}: {:#?}",
+            r.requests
+        );
+    }
+}
+
+/// `aterm drive phase` of a status-line reply under a running title says it is busy, and why
+/// (`reason title: running`, R9). NEGATIVE CONTROLS: the rest glyph and no title read it idle.
+#[test]
+fn drive_phase_names_a_turn_only_the_title_runs() {
+    use aterm_phase::prompt::fixtures::{STATUSLINE_MIDREPLY_2_1_311, screen};
+    let mid = screen(STATUSLINE_MIDREPLY_2_1_311);
+    let mut m = Mock::new(vec![mid.clone()]);
+    let s = session(&mut m, None);
+    let read = |title: Option<&str>| {
+        let turn = s.turn_of(Screen {
+            rows: mid.clone(),
+            title: title.map(str::to_string),
+            ..Screen::default()
+        });
+        render_phase(&turn, by_screen(&turn), &[])
+    };
+    for run in ["◐ Claude Code", "◑ Claude Code"] {
+        assert_eq!(read(Some(run)), "busy\nreason title: running\n", "{run}");
+    }
+    for quiet in [Some("✳ Claude Code"), Some(""), None] {
+        assert_eq!(read(quiet), "idle\n", "{quiet:?}");
+    }
 }
 
 /// ATERM-KI-1027-3. Under a status line (aterm's usage tap is one) Claude Code draws its reply
@@ -5020,7 +5495,9 @@ fn a_wait_taken_up_again_keeps_the_run_an_earlier_wait_saw() {
 /// never from the first held read: a status-line reply, alone or beside an agents panel, is held
 /// while its text grows past the hold and ends on the done frame, all four NEEDS YOU lines in
 /// it. A hold is spent only on the reply it held: a reply that stood unchanged until the read
-/// that would have spent the hold, and grew there, is held again from that change. NEGATIVE
+/// that would have spent the hold, and grew there, is held again from that change, and so is
+/// one an agents panel left and came back over a minute later, longer, the reply drawn between
+/// read only on its title (`Next::Run`). NEGATIVE
 /// CONTROLS: the same reply unchanged while only its status line, or only the panel's elapsed
 /// timer, moves under the running title notes the hang at [`TITLE_HOLD`], as any read that moves
 /// the screen would never; so does the reply left standing at that read.
@@ -5034,20 +5511,7 @@ fn a_title_hold_counts_from_the_replys_last_change_not_its_first_hold() {
     let held = screen(STATUSLINE_LAST_LINE_HELD_2_1_311);
     let done = screen(STATUSLINE_REPLY_DONE_2_1_311);
     let reader = aterm_phase::Program::Claude.reader();
-    // The reply `lines` rows longer, above the blank row over the composer.
-    let grown = |lines: usize| {
-        let mut rows = mid.clone();
-        let top = aterm_phase::phase::composer_rules(&rows)
-            .expect("a composer")
-            .0;
-        for k in 0..lines {
-            rows.insert(
-                top - 1,
-                format!("    placeholder words of the reply, line {k}."),
-            );
-        }
-        rows
-    };
+    let grown = |lines: usize| reply_grown(&mid, lines);
     let paneled = |rows: Vec<String>, secs: usize| {
         let mut rows = rows;
         rows.extend([
@@ -5060,15 +5524,7 @@ fn a_title_hold_counts_from_the_replys_last_change_not_its_first_hold() {
         ]);
         rows
     };
-    let restatused = |k: usize| {
-        let mut rows = mid.clone();
-        let line = rows
-            .iter_mut()
-            .find(|r| r.trim_end() == "  lab status line")
-            .expect("the status line");
-        *line = format!("  lab status line {k}");
-        rows
-    };
+    let restatused = |k: usize| status_refreshed(&mid, k);
     let growing: Vec<_> = (1..=70).map(grown).collect();
     let panel_growing: Vec<_> = (1..=70).map(|k| paneled(grown(k), 20 + k)).collect();
     let statused: Vec<_> = (1..=70).map(restatused).collect();
@@ -5121,6 +5577,37 @@ fn a_title_hold_counts_from_the_replys_last_change_not_its_first_hold() {
         r.noted
     );
     assert!(r.took > TITLE_HOLD, "drawn past the hold: {:?}", r.took);
+    assert!(r.noted.is_empty(), "{:#?}", r.noted);
+    // A hold that stood past TITLE_HOLD is spent only on the reply it held, across a run only
+    // the title shows: the panel row goes, the reply draws on under its title alone for over a
+    // minute (`Next::Run`, which keeps the idle read's hold), and the panel comes back over the
+    // longer reply, the held read's instant by then past the hold.
+    assert!(aterm_phase::phase::delegated_shown(&panel_ticking[0]));
+    let mut frames = vec![paneled(mid.clone(), 20)];
+    frames.extend((1..=45).map(grown));
+    let back = paneled(grown(46), 66);
+    frames.extend([back.clone(), done.clone()]);
+    let titled = |rows: &Vec<String>| Screen {
+        rows: rows.clone(),
+        title: Some("◐ Claude Code".to_string()),
+        ..Screen::default()
+    };
+    for rows in &frames[1..=45] {
+        assert!(super::title_run(reader, &titled(rows)), "fixture guard");
+    }
+    for rows in [&frames[0], &back] {
+        assert_eq!(super::phase_of(reader, &titled(rows)), Phase::Idle);
+        assert!(!reader.frame_torn(rows));
+    }
+    assert_ne!(reader.said_tail(&frames[0]), reader.said_tail(&back));
+    let r = snapshot_run_paced(frames, &["◐ Claude Code"]);
+    assert_eq!(
+        (r.turn.phase.clone(), &r.turn.screen.rows, r.turn.timed_out),
+        (Phase::Idle, &done, false),
+        "{:#?}",
+        r.noted
+    );
+    assert!(r.took > TITLE_HOLD, "held past the hold: {:?}", r.took);
     assert!(r.noted.is_empty(), "{:#?}", r.noted);
     let hang = |r: &TitleRun, name: &str| {
         assert_eq!(

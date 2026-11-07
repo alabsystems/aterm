@@ -10,20 +10,49 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// Network waits are bounded and cancellable when the claim is handed off. The sampler
-/// never calls this runner, so no network wait can hide the holder's local progress.
+/// A stopped monitor starts no further remote operation. An in-flight native write
+/// settles under its existing deadline and durable intent before the worker joins;
+/// killing a transport child cannot establish whether its write took effect.
+/// The separate sampler keeps local progress observable throughout that wait.
 struct Network<'a> {
-    repo: &'a Path,
+    repo: PathBuf,
+    remote: crate::github_remote::Remote,
     stopped: &'a AtomicBool,
+}
+
+/// The claim protocol has three remote operations, separate from local object Git.
+trait ClaimStore: GitRunner {
+    fn ref_oid(&self, name: &str) -> Result<Option<String>, String>;
+    fn import(&self, oid: &str) -> Result<(), String>;
+    fn compare_and_swap(&self, name: &str, before: &str, after: &str) -> Write;
+}
+
+impl<'a> Network<'a> {
+    fn new(repo: &Path, stopped: &'a AtomicBool) -> Result<Self, String> {
+        if stopped.load(Ordering::SeqCst) {
+            return Err("fleet claim monitor stopped".into());
+        }
+        Ok(Self {
+            repo: repo.into(),
+            remote: crate::github_remote::Remote::origin(repo)?,
+            stopped,
+        })
+    }
+
+    fn running(&self) -> Result<(), String> {
+        if self.stopped.load(Ordering::SeqCst) {
+            Err("fleet claim monitor stopped".into())
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl GitRunner for Network<'_> {
     fn git(&self, args: &[&str]) -> crate::ledger::Result<crate::ledger::RunOut> {
-        let mut cmd = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"));
-        crate::credential_wait::ask_no_one(&mut cmd)
-            .arg("-C")
-            .arg(self.repo)
-            .args(args);
+        self.running().map_err(crate::ledger::Error::new)?;
+        let mut cmd = crate::ledger::object_git(&self.repo);
+        cmd.args(["-c", "protocol.allow=never"]).args(args);
         let out = aterm_uds::deadline::output_until_from_unless(
             &mut cmd,
             aterm_uds::spawnfd::Stdio::null(),
@@ -42,7 +71,38 @@ impl GitRunner for Network<'_> {
         args: &[&str],
         input: &[u8],
     ) -> crate::ledger::Result<crate::ledger::RunOut> {
-        GitCli::new(self.repo).git_input(args, input)
+        self.running().map_err(crate::ledger::Error::new)?;
+        // Object creation keeps Git's recorded author and committer context.
+        // object_git deliberately drops it along with inherited Git routing.
+        let mut local = vec!["-c", "protocol.allow=never"];
+        local.extend_from_slice(args);
+        GitCli::new(&self.repo).git_input(&local, input)
+    }
+}
+
+impl ClaimStore for Network<'_> {
+    fn ref_oid(&self, name: &str) -> Result<Option<String>, String> {
+        self.running()?;
+        self.remote.get(name)
+    }
+
+    fn import(&self, oid: &str) -> Result<(), String> {
+        self.running()?;
+        self.remote.fetch_exact(oid)
+    }
+
+    fn compare_and_swap(&self, name: &str, before: &str, after: &str) -> Write {
+        if let Err(error) = self.running() {
+            return Write::Offline(error);
+        }
+        match self
+            .remote
+            .write_ref(name, (!before.is_empty()).then_some(before), after)
+        {
+            Ok(crate::github_remote::RefWrite::Written) => Write::Written(after.into()),
+            Ok(crate::github_remote::RefWrite::Conflict) => Write::Race,
+            Err(error) => Write::Offline(error),
+        }
     }
 }
 
@@ -104,18 +164,11 @@ fn reference(version: &str) -> Result<String, String> {
     Ok(format!("refs/aterm-release/line/{version}"))
 }
 
-fn remote(git: &dyn GitRunner, name: &str) -> Result<Option<(String, State)>, String> {
-    let listed =
-        git_ok(git, &["ls-remote", "--refs", "origin", name]).map_err(|e| e.to_string())?;
-    let Some(sha) = listed
-        .stdout_utf8()
-        .split_whitespace()
-        .next()
-        .map(str::to_owned)
-    else {
+fn remote(git: &dyn ClaimStore, name: &str) -> Result<Option<(String, State)>, String> {
+    let Some(sha) = git.ref_oid(name)? else {
         return Ok(None);
     };
-    git_ok(git, &["fetch", "--no-tags", "origin", &sha]).map_err(|e| e.to_string())?;
+    git.import(&sha)?;
     state_at(git, name, &sha).map(|state| Some((sha, state)))
 }
 
@@ -171,27 +224,12 @@ enum Write {
     Offline(String),
 }
 
-fn replace(git: &dyn GitRunner, name: &str, previous: &str, state: &State) -> Write {
+fn replace(git: &dyn ClaimStore, name: &str, previous: &str, state: &State) -> Write {
     let sha = match commit(git, previous, state) {
         Ok(sha) => sha,
         Err(e) => return Write::Offline(e),
     };
-    let out = match git.git(&[
-        "push",
-        &format!("--force-with-lease={name}:{previous}"),
-        "origin",
-        &format!("{sha}:{name}"),
-    ]) {
-        Ok(out) => out,
-        Err(e) => return Write::Offline(e.to_string()),
-    };
-    if out.success() {
-        Write::Written(sha)
-    } else if crate::ledger::lost_race(&out.stderr_utf8()) {
-        Write::Race
-    } else {
-        Write::Offline(out.stderr_utf8())
-    }
+    git.compare_and_swap(name, previous, &sha)
 }
 
 fn local_observation(state: &State, directory: &Path) -> Observation {
@@ -252,14 +290,7 @@ fn now() -> u64 {
 pub fn existing(repo: &Path, version: &str) -> Result<Option<crate::line::Line>, String> {
     let name = reference(version)?;
     let stopped = AtomicBool::new(false);
-    remote(
-        &Network {
-            repo,
-            stopped: &stopped,
-        },
-        &name,
-    )
-    .map(|old| old.map(|(_, state)| state.line))
+    remote(&Network::new(repo, &stopped)?, &name).map(|old| old.map(|(_, state)| state.line))
 }
 
 /// A read cannot take ownership, but must steer preflight to the saved candidate so an
@@ -371,10 +402,7 @@ impl Lease {
         };
         let name = reference(&line.version)?;
         let stopped = AtomicBool::new(false);
-        let git = Network {
-            repo,
-            stopped: &stopped,
-        };
+        let git = Network::new(repo, &stopped)?;
         loop {
             let old = remote(&git, &name)?;
             if let Some((_, state)) = &old {
@@ -454,17 +482,21 @@ impl Lease {
 
     /// The public cut calls this even when no new row completed.
     fn write(&mut self, stopped: &AtomicBool) -> Result<bool, String> {
-        let git = Network {
-            repo: &self.repo,
-            stopped,
+        let git = match Network::new(&self.repo, stopped) {
+            Ok(git) => git,
+            Err(_) => return Ok(false),
         };
-        match replace(&git, &self.name, &self.sha, &self.state) {
+        self.write_with(&git)
+    }
+
+    fn write_with(&mut self, git: &dyn ClaimStore) -> Result<bool, String> {
+        match replace(git, &self.name, &self.sha, &self.state) {
             Write::Written(sha) => {
                 self.sha = sha;
                 Ok(true)
             }
             Write::Offline(_) => Ok(false),
-            Write::Race => match remote(&git, &self.name) {
+            Write::Race => match remote(git, &self.name) {
                 Ok(Some((sha, state))) if state.holder == self.state.holder => {
                     self.sha = sha;
                     Ok(false)
@@ -1024,19 +1056,30 @@ mod tests {
         writer.join().unwrap();
     }
 
-    fn repository(root: &Path, name: &str, origin: &Path) -> GitCli {
+    #[cfg(unix)]
+    fn repository(root: &Path, name: &str, origin: &Path) -> Network<'static> {
+        static RUNNING: AtomicBool = AtomicBool::new(false);
         let path = root.join(name);
         std::fs::create_dir(&path).unwrap();
-        let git = GitCli::new(path);
+        let git = GitCli::new(&path);
         for args in [
             vec!["init"],
             vec!["config", "user.name", "Andrew Yates"],
             vec!["config", "user.email", "test@example.invalid"],
-            vec!["remote", "add", "origin", origin.to_str().unwrap()],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/fixture/app.git",
+            ],
         ] {
             git_ok(&git, &args).unwrap();
         }
-        git
+        Network {
+            remote: crate::github_remote::claim_fixture(&path, origin),
+            repo: path,
+            stopped: &RUNNING,
+        }
     }
 
     #[cfg(unix)]
@@ -1086,6 +1129,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn two_macs_have_one_holder_and_stalled_cut_is_not_lost() {
         let dir = aterm_tempfile::tempdir().unwrap();
@@ -1147,11 +1191,16 @@ mod tests {
         assert_eq!(holder.sha, first);
         git_ok(
             &a,
-            &["remote", "set-url", "origin", origin.to_str().unwrap()],
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/fixture/app.git",
+            ],
         )
         .unwrap();
         assert_eq!(
-            holder.write(&stopped),
+            holder.write_with(&a),
             Ok(true),
             "the same candidate continues once transport returns"
         );
@@ -1178,7 +1227,7 @@ mod tests {
         };
         assert_eq!(replace(&a, &name, &first, &initial), Write::Race);
         assert!(
-            holder.write(&stopped).is_err(),
+            holder.write_with(&a).is_err(),
             "positive ownership loss stops the old holder"
         );
         assert_eq!(
@@ -1191,12 +1240,61 @@ mod tests {
         let stale = commit(&a, &new, &initial).unwrap();
         git_ok(
             &a,
-            &["push", "--force", "origin", &format!("{stale}:{name}")],
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "push",
+                "--force",
+                origin.to_str().unwrap(),
+                &format!("{stale}:{name}"),
+            ],
         )
         .unwrap();
         assert_eq!(remote(&b, &name).unwrap().unwrap().1.holder, initial.holder);
         println!(
             "B6 measured: before holders/version={baseline_holders}; after holders/version=1; unfenced stale overwrite=1; leased stale overwrite=0; stalled adoptions=1; cuts lost=0"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stopped_or_retargeted_monitor_cannot_publish_a_claim() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let origin = dir.path().join("origin.git");
+        std::fs::create_dir(&origin).unwrap();
+        git_ok(&GitCli::new(&origin), &["init", "--bare"]).unwrap();
+        let initial = repository(dir.path(), "writer", &origin);
+        let stopped = AtomicBool::new(true);
+        let writer = Network {
+            repo: initial.repo,
+            remote: initial.remote,
+            stopped: &stopped,
+        };
+        let name = reference("0.156.0").unwrap();
+        assert!(matches!(
+            replace(&writer, &name, "", &state("m3", 1)),
+            Write::Offline(_)
+        ));
+        stopped.store(false, Ordering::SeqCst);
+        git_ok(
+            &writer,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/foreign/app.git",
+            ],
+        )
+        .unwrap();
+        assert!(matches!(
+            replace(&writer, &name, "", &state("m3", 1)),
+            Write::Offline(_)
+        ));
+        assert!(
+            git_ok(&GitCli::new(&origin), &["for-each-ref"])
+                .unwrap()
+                .stdout
+                .is_empty()
         );
     }
 }

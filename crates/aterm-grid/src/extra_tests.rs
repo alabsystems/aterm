@@ -345,10 +345,16 @@ fn underline_color_u32_roundtrip() {
     assert_eq!(extra.underline_color(), None);
     assert!(!extra.has_data());
 
-    assert_eq!(crate::underline_color_sgr(0x00_000009), "58:5:9");
-    assert_eq!(crate::underline_color_sgr(0x02_000005), "58:5:5");
-    assert_eq!(crate::underline_color_sgr(0x01_FF8040), "58:2::255:128:64");
-    assert_eq!(crate::underline_color_sgr(0xFF_000000), "59");
+    for (packed, encoded) in [
+        (0x00_000009, "58:5:9"),
+        (0x02_000005, "58:5:5"),
+        (0x01_FF8040, "58:2::255:128:64"),
+        (0xFF_000000, "59"),
+    ] {
+        let mut text = String::from("prefix");
+        crate::push_underline_color_sgr(&mut text, packed);
+        assert_eq!(text.strip_prefix("prefix"), Some(encoded));
+    }
 }
 
 #[test]

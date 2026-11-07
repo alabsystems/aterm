@@ -1,0 +1,1857 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! The quota view (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §2, §5.1): line E's quota
+//! row and the Accounts card's chart and lanes, painted from one [`Outlook`].
+//!
+//! It is pure. Every instant it says comes from the outlook (its `as_of`, its passes, its rows'
+//! readings), and nothing here reads a clock, a file or a setting.
+//!
+//! [`Outlook::quota`] builds a [`QuotaView`]:
+//! - the named accounts, at most three, in roster order, this tab's and the carrier always among
+//!   them, the rest folded and never dropped ([`Named`], §2.5);
+//! - one rolling chart over [now − 1 d, now + 7 d) ([`Chart`], §2.2): this tab's account as read
+//!   on this Mac, `▕` for now, then the projected fill of whichever account carries the work,
+//!   with its milestones;
+//! - one burn-up lane per named account for the card ([`Burn`]);
+//! - the tail's two phrases ([`Tail`], §2.3), the hover title and the spoken words (§2.6).
+//!
+//! [`QuotaView::lay`] fits the row to a room by the ladder of §2.4. [`QuotaView::fallback`] gives
+//! line D's words-only unit, for a pane whose line E is not the glass's (§1.2, §5.2).
+
+use std::ops::Range;
+
+use super::accounts::{self, Class};
+use super::outlook::{
+    self, Basis, Figure, Knot, Offsets, Outlook, Pass, PassKind, Read, RowOutlook, Stop, StopEnd,
+    Verdict, Window, round_down, round_up, spoken_when, when,
+};
+
+const DAY: i64 = 86_400;
+const WEEK: i64 = accounts::WEEK_WINDOW_S;
+
+/// The chart's grains, finest first, in cells a day (§2.2): 2 to 8 hours a cell. Twelve is the
+/// calm budget, and no rung is finer.
+pub const PER_DAY: [u8; 5] = [12, 8, 6, 4, 3];
+/// The most accounts the row names (§2.5); the others fold into `+N` and are never dropped.
+pub const NAMED_MAX: usize = 3;
+/// A name is cut to this many cells, its last an ellipsis (§2.5). A name is a roster label, whose
+/// grammar ([`accounts::label_refusal`], `[a-z0-9][a-z0-9._-]{0,63}`, held by the roster reader
+/// and the lab's roster writer alike) admits only ASCII, one cell a character, so a name's
+/// characters are its cells, and so are [`THIS_LOGIN`]'s.
+pub const NAME_CELLS: usize = 12;
+/// The blanks between the row's groups (§4.3).
+pub const GROUP_GAP: usize = 2;
+/// Case (d)'s short words (§1.3): this tab's week has no figure yet.
+pub const NO_FIGURE: &str = "no week figure yet";
+/// Case (d)'s full words.
+pub const NO_FIGURE_FULL: &str = "no week figure yet \u{b7} Claude reports it with its next reply";
+/// The name of a login the roster cannot name (§2.5).
+pub const THIS_LOGIN: &str = "this login";
+
+/// `▕` (U+2595): the now cell, between the measured past and the projected future.
+pub const NOW_MARK: char = '\u{2595}';
+/// `╳` (U+2573): a projected gap, every account out.
+pub const GAP_MARK: char = '\u{2573}';
+/// `→`: the work moves to another account.
+pub const HANDOFF_MARK: char = '\u{2192}';
+/// `↺` (U+21BA): a vendor reset.
+pub const RESET_MARK: char = '\u{21ba}';
+/// `$`: the work spends usage credits.
+pub const CREDITS_MARK: char = '$';
+/// `┄` (U+2504): the future is not projected (an unread account the chain reaches, or no pace).
+pub const UNKNOWN_MARK: char = '\u{2504}';
+/// `⧗`: the work waits at a limit now.
+pub const WAIT_MARK: char = '\u{29d7}';
+
+const SEP: &str = " \u{b7} ";
+
+/// The quota view of one pane ([`Outlook::quota`]): what line E and the Accounts card draw. It
+/// hashes into the footer's fingerprint; `as_of` is the outlook's instant, never a raw clock.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct QuotaView {
+    /// The outlook's instant.
+    pub as_of: i64,
+    /// The named accounts, at most [`NAMED_MAX`], in roster order.
+    pub named: Vec<Named>,
+    /// Every other roster row's label, in roster order: folded into `+N`, never dropped.
+    pub folded: Vec<String>,
+    /// Line E's chart and the card's work row.
+    pub chart: Chart,
+    /// The card's lanes: one burn-up per named roster account.
+    pub lanes: Vec<Burn>,
+    /// The tail's two phrases.
+    pub tail: Tail,
+    /// The hover title of the lead and the tail.
+    pub title: String,
+    /// What a reader hears: no box, block, legacy-computing or braille glyph.
+    pub spoken: String,
+}
+
+/// A named account (§2.5).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Named {
+    /// Its roster label ([`THIS_LOGIN`] for a login the roster cannot name), uncut.
+    pub label: String,
+    /// It is this tab's account.
+    pub this_tab: bool,
+    /// It carries the work now.
+    pub carrier: bool,
+    /// Its week's figure.
+    pub figure: Figure,
+    /// Its week's vendor reset, where one is ahead.
+    pub reset: Option<i64>,
+    /// Its plan's title (`Max 20x`), where seen.
+    pub plan: Option<String>,
+}
+
+/// The rolling chart over [now − 1 d, now + 7 d) (§2.2), drawn by [`Chart::cells`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Chart {
+    /// Now: the `▕` between the past and the future.
+    pub now: i64,
+    /// This tab's account's week as read on this Mac, oldest first: the last reading before the
+    /// span, those inside it, and the lead's own figure at now.
+    pub past: Vec<Read>,
+    /// The work's accounts, in order: whichever carries it, with its fill.
+    pub runs: Vec<Run>,
+    /// The projected stops: from, to (the chart's end past it for one nothing ends), and whether
+    /// usage credits carry the work through it.
+    pub stops: Vec<(i64, i64, bool)>,
+    /// The milestones, in time order.
+    pub marks: Vec<(i64, Mark)>,
+    /// From here the future is not projected (`┄`): a lean, a cut replay, or no projection.
+    pub unknown_from: Option<i64>,
+    /// Each local midnight inside the span (for the GUI's hairlines).
+    pub midnights: Vec<i64>,
+}
+
+/// One account carrying the work over `[from, to]`, its fill of its own week at its knots.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Run {
+    /// The account.
+    pub label: String,
+    /// From.
+    pub from: i64,
+    /// To.
+    pub to: i64,
+    /// Its fill: at `from` and `to`, and wherever it changes course between; linear between,
+    /// and a drop (its reset) is two knots at one instant.
+    pub knots: Vec<Knot>,
+}
+
+impl Run {
+    /// Its fill at `t`, in tenths: from the left within `(from, to]` (before a drop at `t`), from
+    /// the right at `from`; `None` outside the run or where the replay does not know it.
+    #[must_use]
+    pub fn at(&self, t: i64) -> Option<u16> {
+        if t < self.from || t > self.to {
+            return None;
+        }
+        fill_at(&self.knots, t, t > self.from).flatten()
+    }
+}
+
+/// A milestone on the chart.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Mark {
+    /// `↺`: a vendor reset of the account the chart draws at that instant.
+    Reset,
+    /// `→name`: the work moves to this account.
+    Handoff(String),
+    /// `→name?`: the work moves to this account, which aterm cannot read; `┄` follows.
+    Lean(String),
+}
+
+/// One cell of a chart or a lane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Cell {
+    /// Nothing to draw: before the first reading, across an epoch.
+    Blank,
+    /// A measured level, 1 to 8: `▁…█` (U+2581–2588), an area.
+    Read(u8),
+    /// A projected level, 1 to 8: a one-eighth line, `▁ 🭻 🭺 🭹 🭸 🭷 🭶 ▔`.
+    Ahead(u8),
+    /// `▕`, the now cell.
+    Now,
+    /// `╳`, a stop.
+    Gap,
+    /// `→`, a hand-off.
+    Handoff,
+    /// `↺`, a vendor reset.
+    Reset,
+    /// `$`, usage credits.
+    Credits,
+    /// `┄`, not projected.
+    Unknown,
+    /// One character of the name after a `→`.
+    Name(char),
+}
+
+impl Cell {
+    /// Its glyph (§1.3, §2.2): every block and line lies in the renderer's procedural set.
+    #[must_use]
+    pub fn glyph(self) -> char {
+        match self {
+            Cell::Blank => ' ',
+            Cell::Read(l) => char::from_u32(0x2580 + u32::from(l.clamp(1, 8))).unwrap_or(' '),
+            Cell::Ahead(l) => match l {
+                0 | 1 => '\u{2581}',
+                8.. => '\u{2594}',
+                l => char::from_u32(0x1fb7b - (u32::from(l) - 2)).unwrap_or(' '),
+            },
+            Cell::Now => NOW_MARK,
+            Cell::Gap => GAP_MARK,
+            Cell::Handoff => HANDOFF_MARK,
+            Cell::Reset => RESET_MARK,
+            Cell::Credits => CREDITS_MARK,
+            Cell::Unknown => UNKNOWN_MARK,
+            Cell::Name(c) => c,
+        }
+    }
+
+    /// Its ink (§1.3).
+    #[must_use]
+    pub const fn role(self) -> Role {
+        match self {
+            Cell::Blank | Cell::Now => Role::Quiet,
+            Cell::Read(_) => Role::Mark,
+            Cell::Ahead(_) => Role::Line,
+            Cell::Gap | Cell::Credits => Role::Warn,
+            Cell::Handoff | Cell::Reset => Role::Lit,
+            Cell::Unknown => Role::Track,
+            Cell::Name(_) => Role::Value,
+        }
+    }
+}
+
+/// One account's own vendor week for the card: read, then projected, ending at its reset.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Burn {
+    /// The account.
+    pub label: String,
+    /// Its week began (`renews` − 7 d).
+    pub start: i64,
+    /// Its week resets; at or before now where no reset is known ahead (nothing projected).
+    pub renews: i64,
+    /// Its week's readings on this Mac, oldest first.
+    pub read: Vec<Read>,
+    /// The replay's fill of it from now to `renews`.
+    pub ahead: Vec<Knot>,
+    /// It is out from here to its reset (`▔`).
+    pub out_at: Option<i64>,
+}
+
+/// A part's ink; the GUI maps each to a `GlassInks` token. A warn part is always bold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Role {
+    /// This tab's name and figure, `→`, `↺`.
+    Lit,
+    /// Other names and figures, times, names inside the chart.
+    Value,
+    /// `used`, `·`, `+N`, `by`, `▕`, case (d)'s words.
+    Quiet,
+    /// The measured levels.
+    Mark,
+    /// The projected line.
+    Line,
+    /// `╳`, `⧗`, `$` and their words.
+    Warn,
+    /// `┄`.
+    Track,
+}
+
+/// Line E as cells ([`QuotaView::lay`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct QuotaLine {
+    /// Each cell: its character, its ink, bold.
+    pub cells: Vec<(char, Role, bool)>,
+    /// The lead's cells.
+    pub lead: Range<usize>,
+    /// The chart's cells (`8k + 1`, empty at the narrowest rung).
+    pub chart: Range<usize>,
+    /// The tail's cells.
+    pub tail: Range<usize>,
+    /// The chart's cells a day (0 where none is drawn), for [`Chart::span_of`].
+    pub per_day: u8,
+}
+
+impl QuotaLine {
+    /// Its text.
+    #[must_use]
+    pub fn text(&self) -> String {
+        self.cells.iter().map(|(c, _, _)| *c).collect()
+    }
+
+    /// The text of `range`.
+    #[must_use]
+    pub fn text_of(&self, range: &Range<usize>) -> String {
+        self.cells
+            .get(range.clone())
+            .unwrap_or_default()
+            .iter()
+            .map(|(c, _, _)| *c)
+            .collect()
+    }
+
+    fn clear(&mut self) {
+        self.cells.clear();
+        self.lead = 0..0;
+        self.chart = 0..0;
+        self.tail = 0..0;
+        self.per_day = 0;
+    }
+
+    fn put(&mut self, text: &str, role: Role, bold: bool) {
+        let bold = bold || role == Role::Warn;
+        self.cells.extend(text.chars().map(|c| (c, role, bold)));
+    }
+
+    fn gap(&mut self) {
+        for _ in 0..GROUP_GAP {
+            self.cells.push((' ', Role::Quiet, false));
+        }
+    }
+}
+
+/// The tail (§2.3): at most two phrases.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Tail {
+    /// Phrase 1, this tab's account: `~98% by ↺ Sat 10:00`, short `↺ Sat 10:00`. None where no
+    /// reset is ahead, or where the work waits at a wall until this very reset (phrase 2's
+    /// `⧗ until Sat 10:00` says it).
+    pub own: Option<Own>,
+    /// Phrase 2: the verdict, or case (d)'s words.
+    pub verdict: Option<Phrase>,
+}
+
+/// Phrase 1 (§2.3).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Own {
+    /// The curve at the reset, whole percent, at most 99 (`~98%`): none where the account fills
+    /// or is left before its reset, or nothing is projected (the full form is the short one).
+    pub by_reset: Option<u16>,
+    /// The reset's words (`Sat 10:00`), exact.
+    pub reset: String,
+}
+
+/// Phrase 2 (§2.3).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Phrase {
+    /// The full form (`╳ ~Thu 12 Nov 05:00–Sat 14 Nov 10:00`).
+    pub full: String,
+    /// The short form (`╳ ~Thu 12 Nov 05:00`).
+    pub short: String,
+    /// Its ink: warn for `╳`, `⧗`, `$`.
+    pub ink: Role,
+    /// A stop, a wall, a lean or credits: it stays, at least short, while any figure shows.
+    pub kept: bool,
+}
+
+/// One run of a fallback unit's words with its ink ([`QuotaView::fallback`]).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Piece {
+    /// The words.
+    pub text: String,
+    /// Their ink.
+    pub role: Role,
+    /// Bold (a warn piece always is).
+    pub bold: bool,
+}
+
+impl Piece {
+    fn new(text: impl Into<String>, role: Role) -> Piece {
+        Piece {
+            text: text.into(),
+            role,
+            bold: role == Role::Warn,
+        }
+    }
+}
+
+/// The lead forms of §2.4.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lead {
+    /// Every named account with its figure, then `+N` for the folded rows.
+    Full,
+    /// This tab's name and figure, then `+N` for every other row.
+    Fold,
+    /// This tab's name and figure alone.
+    Tab,
+}
+
+/// The tail forms of §2.3.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TailForm {
+    /// Phrase 1 full · phrase 2 full.
+    T0,
+    /// Phrase 1 short · phrase 2 short.
+    T1,
+    /// Phrase 2 short alone, else phrase 1 short.
+    T2,
+}
+
+/// The ladder of §2.4, widest first: the lead, the chart's cells a day (0, none) and the tail.
+const LADDER: [(Lead, u8, TailForm); 10] = [
+    (Lead::Full, 12, TailForm::T0),
+    (Lead::Full, 8, TailForm::T0),
+    (Lead::Full, 8, TailForm::T1),
+    (Lead::Full, 6, TailForm::T1),
+    (Lead::Fold, 6, TailForm::T1),
+    (Lead::Fold, 4, TailForm::T1),
+    (Lead::Fold, 4, TailForm::T2),
+    (Lead::Fold, 3, TailForm::T2),
+    (Lead::Tab, 3, TailForm::T2),
+    (Lead::Tab, 0, TailForm::T2),
+];
+
+/// The level of `x10` tenths used (§2.2): `clamp(round(x·8/100), 1, 7)`, and 8 only at 1000 (a
+/// reading of 100, or a projected fill), so 63% and 98% are levels 5 and 7.
+#[must_use]
+pub fn level(x10: u16) -> u8 {
+    if x10 >= 1000 {
+        8
+    } else {
+        u8::try_from(((u32::from(x10) * 8 + 500) / 1000).clamp(1, 7)).unwrap_or(7)
+    }
+}
+
+/// A name cut to [`NAME_CELLS`] cells, its last an ellipsis.
+#[must_use]
+pub fn cut(name: &str) -> String {
+    if name.chars().count() <= NAME_CELLS {
+        return name.to_owned();
+    }
+    let mut out: String = name.chars().take(NAME_CELLS - 1).collect();
+    out.push('\u{2026}');
+    out
+}
+
+/// Whole percent, half up, at most 99: a curve under 100 is never said `100%`.
+fn whole_under_full(x10: u16) -> u16 {
+    ((x10.min(1000) + 5) / 10).min(99)
+}
+
+/// The fill of `knots` at `t`, linear between them: from the left (`left`, before a drop at `t`)
+/// or from the right (after it). `None` outside the knots; `Some(None)` where unknown.
+fn fill_at(knots: &[Knot], t: i64, left: bool) -> Option<Option<u16>> {
+    let (first, last) = (knots.first()?, knots.last()?);
+    if t < first.t || t > last.t {
+        return None;
+    }
+    let lo = knots.partition_point(|k| k.t < t);
+    let hi = knots.partition_point(|k| k.t <= t);
+    if lo < hi {
+        return Some(if left {
+            knots[lo].x10
+        } else {
+            knots[hi - 1].x10
+        });
+    }
+    let (a, b) = (knots[lo - 1], knots[lo]);
+    Some(match (a.x10, b.x10) {
+        (Some(x), Some(y)) => {
+            let span = i128::from(b.t - a.t).max(1);
+            let x = i128::from(x);
+            let v = x + (i128::from(y) - x) * i128::from(t - a.t) / span;
+            u16::try_from(v.clamp(0, 1000)).ok()
+        }
+        _ => None,
+    })
+}
+
+/// A cell index in `0..n` of the future cells of length `s` from `now` holding `t`.
+fn future_index(now: i64, s: i64, n: usize, t: i64) -> Option<usize> {
+    if t < now {
+        return None;
+    }
+    usize::try_from((t - now) / s).ok().filter(|j| *j < n)
+}
+
+impl Chart {
+    /// The chart at `per_day` cells a day (§2.2), into `out` (cleared first): `per_day` past
+    /// cells, the `▕` cell, then `7 · per_day` future cells; none at 0.
+    ///
+    /// A past cell is the last reading at or before its end in the same window (a step, never
+    /// interpolated), blank before the first reading and across an epoch, `↺` where a reset falls
+    /// inside it. A future cell shows one glyph by priority, `╳` > `→` > `↺` > `$` > `┄` > level:
+    /// `╳` where a stop covers at least half of it (a stop that covers no cell that much takes
+    /// the cell that holds its start); `→` where a hand-off falls inside it, moved to the first
+    /// cell after a gap that displaces it, the target's name after it where the run up to the
+    /// next mark holds the name and one cell more; `↺` at a reset; `$` under credits; `┄` past
+    /// [`Chart::unknown_from`]; else the drawn account's fill at the cell's end.
+    pub fn cells(&self, per_day: u8, out: &mut Vec<Cell>) {
+        out.clear();
+        if per_day == 0 {
+            return;
+        }
+        let k = i64::from(per_day);
+        let s = DAY / k;
+        for i in 0..k {
+            let a = self.now - DAY + i * s;
+            let b = if i + 1 == k { self.now } else { a + s };
+            out.push(self.past_cell(a, b));
+        }
+        out.push(Cell::Now);
+        let n = usize::from(per_day) * 7;
+        let first = out.len();
+        let end = |j: usize| self.now + (i64::try_from(j).unwrap_or(0) + 1) * s;
+        out.extend((0..n).map(|j| self.level_cell(end(j))));
+        let mut gap = vec![false; n];
+        let mut paid = vec![false; n];
+        for &(from, to, credits) in &self.stops {
+            self.cover(s, from, to, if credits { &mut paid } else { &mut gap });
+        }
+        let mut arrow: Vec<Option<(String, bool)>> = vec![None; n];
+        let mut reset = vec![false; n];
+        for (t, mark) in &self.marks {
+            let Some(mut j) = future_index(self.now, s, n, *t) else {
+                continue;
+            };
+            match mark {
+                Mark::Reset => reset[j] = true,
+                Mark::Handoff(name) | Mark::Lean(name) => {
+                    // A hand-off a gap displaces moves to the first cell after it.
+                    while j < n && gap[j] {
+                        j += 1;
+                    }
+                    if j < n {
+                        arrow[j] = Some((cut(name), matches!(mark, Mark::Lean(_))));
+                    }
+                }
+            }
+        }
+        let future = &mut out[first..];
+        for j in 0..n {
+            future[j] = if gap[j] {
+                Cell::Gap
+            } else if arrow[j].is_some() {
+                Cell::Handoff
+            } else if reset[j] {
+                Cell::Reset
+            } else if paid[j] {
+                Cell::Credits
+            } else {
+                future[j]
+            };
+        }
+        for j in 0..n {
+            let Some((name, lean)) = &arrow[j] else {
+                continue;
+            };
+            let room = future[j + 1..]
+                .iter()
+                .take_while(|c| matches!(c, Cell::Ahead(_) | Cell::Blank | Cell::Unknown))
+                .count();
+            let len = name.chars().count() + usize::from(*lean);
+            if room > len {
+                let tail = lean.then_some('?');
+                for (cell, c) in future[j + 1..].iter_mut().zip(name.chars().chain(tail)) {
+                    *cell = Cell::Name(c);
+                }
+            }
+        }
+    }
+
+    /// The span `[from, to)` of cell `cell` at `per_day` cells a day; `None` for the now cell
+    /// and past the chart's end.
+    #[must_use]
+    pub fn span_of(&self, per_day: u8, cell: usize) -> Option<(i64, i64)> {
+        if per_day == 0 {
+            return None;
+        }
+        let k = usize::from(per_day);
+        let s = DAY / i64::from(per_day);
+        let i = i64::try_from(cell).ok()?;
+        if cell < k {
+            let a = self.now - DAY + i * s;
+            Some((a, if cell + 1 == k { self.now } else { a + s }))
+        } else if cell == k || cell > 8 * k {
+            None
+        } else {
+            let j = i - i64::try_from(k).ok()? - 1;
+            Some((self.now + j * s, self.now + (j + 1) * s))
+        }
+    }
+
+    /// Marks into `into` each future cell a stop `[from, to)` covers at least half of, or, where
+    /// it covers none that much, the cell that holds its start.
+    fn cover(&self, s: i64, from: i64, to: i64, into: &mut [bool]) {
+        let mut any = false;
+        for (j, slot) in into.iter_mut().enumerate() {
+            let a = self.now + i64::try_from(j).unwrap_or(0) * s;
+            let over = to.min(a + s) - from.max(a);
+            if over > 0 && over * 2 >= s {
+                *slot = true;
+                any = true;
+            }
+        }
+        if !any
+            && to > self.now
+            && let Some(j) = future_index(self.now, s, into.len(), from.max(self.now))
+        {
+            into[j] = true;
+        }
+    }
+
+    fn past_cell(&self, a: i64, b: i64) -> Cell {
+        let starts = |r: &Read| r.epoch.unwrap_or(r.reset - WEEK);
+        if self
+            .past
+            .iter()
+            .any(|r| (a..b).contains(&r.reset) || (a..b).contains(&starts(r)))
+        {
+            return Cell::Reset;
+        }
+        let i = self.past.partition_point(|r| r.t <= b);
+        let Some(r) = i.checked_sub(1).and_then(|i| self.past.get(i)) else {
+            return Cell::Blank;
+        };
+        // Its window ended before the cell, or a later window began between it and the cell's
+        // end (one that begins at the end is the next cell's): nothing is known of the cell.
+        let later = self.past[i..]
+            .iter()
+            .any(|n| (n.reset, n.epoch) != (r.reset, r.epoch) && starts(n) > r.t && starts(n) < b);
+        if r.reset <= a || later {
+            Cell::Blank
+        } else {
+            Cell::Read(level(r.x10))
+        }
+    }
+
+    fn level_cell(&self, b: i64) -> Cell {
+        if self.unknown_from.is_some_and(|u| b > u) {
+            return Cell::Unknown;
+        }
+        let run = self
+            .runs
+            .iter()
+            .rev()
+            .find(|r| r.from < b && b <= r.to)
+            .or_else(|| self.runs.iter().rev().find(|r| r.from < b));
+        match run {
+            None => Cell::Blank,
+            Some(run) => run
+                .at(b.min(run.to))
+                .map_or(Cell::Unknown, |x10| Cell::Ahead(level(x10))),
+        }
+    }
+}
+
+impl Burn {
+    /// The lane at `per_day` cells a day, into `out` (cleared first): its week's past to now as
+    /// read (blank before the first reading), `▕`, then the projected line to its reset (`▔`
+    /// once out, `┄` where nothing is projected) and `↺` at the right edge. Each side holds at
+    /// most a week of cells, the span the lane is defined over: a reset further ahead draws a
+    /// week of line and no `↺`, since its reset lies past the lane's edge.
+    pub fn cells(&self, per_day: u8, now: i64, out: &mut Vec<Cell>) {
+        out.clear();
+        if per_day == 0 {
+            return;
+        }
+        let s = DAY / i64::from(per_day);
+        let week = 7 * i64::from(per_day);
+        let cells = |span: i64| (span.max(0).saturating_add(s - 1) / s).min(week);
+        let p = cells(now.saturating_sub(self.start));
+        for i in 0..p {
+            let b = now - (p - 1 - i) * s;
+            let i = self.read.partition_point(|r| r.t <= b);
+            out.push(
+                i.checked_sub(1)
+                    .and_then(|i| self.read.get(i))
+                    .map_or(Cell::Blank, |r| Cell::Read(level(r.x10))),
+            );
+        }
+        out.push(Cell::Now);
+        if self.renews <= now {
+            return;
+        }
+        let ahead = self.renews.saturating_sub(now);
+        let f = cells(ahead);
+        for j in 0..f {
+            let b = (now + (j + 1) * s).min(self.renews);
+            out.push(if self.out_at.is_some_and(|o| b > o) {
+                Cell::Ahead(8)
+            } else {
+                match fill_at(&self.ahead, b, true) {
+                    Some(Some(x10)) => Cell::Ahead(level(x10)),
+                    _ => Cell::Unknown,
+                }
+            });
+        }
+        if ahead <= f * s {
+            out.push(Cell::Reset);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The view from the outlook
+
+/// The roster's display order (§2.5): `Class::Preferred` first, then file order; stable, so a
+/// rotation never reshuffles it.
+fn roster_order(rows: &[RowOutlook]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..rows.len()).collect();
+    order.sort_by_key(|&i| (rows[i].class != Class::Preferred, i));
+    order
+}
+
+/// The named of `order` (§2.5): its first [`NAMED_MAX`], except that each of `must` outside them
+/// takes the place of the last named one that is none of `must`; kept in `order`'s order.
+fn pick_named<T: Copy + PartialEq>(order: &[T], must: &[T]) -> Vec<T> {
+    let mut named: Vec<T> = order.iter().take(NAMED_MAX).copied().collect();
+    for m in must {
+        if !order.contains(m) || named.contains(m) {
+            continue;
+        }
+        if let Some(p) = named.iter().rposition(|n| !must.contains(n)) {
+            named[p] = *m;
+        }
+        named.sort_by_key(|n| order.iter().position(|o| o == n));
+    }
+    named
+}
+
+/// A row's week reset, where one is ahead of `as_of` on an admitted reading and no further
+/// ahead than a week's can be ([`accounts::believed_reset`], a week and a day): a stored
+/// reading keeps the vendor's `resets_at` as sent, so one in the wrong unit, or `i64::MAX`, is
+/// no reset to say, to draw a lane to, or to add a local offset to.
+fn reset_ahead(row: &RowOutlook, as_of: i64) -> Option<i64> {
+    row.window(Window::Week)
+        .filter(|w| {
+            w.at.is_none_or(|at| super::profile::usage_read_age(at, as_of).is_some())
+        })
+        .and_then(|w| accounts::believed_reset(w.reset, as_of))
+        .filter(|r| *r > as_of)
+}
+
+/// The tenths a figure says, where it says a number.
+const fn figure_x10(figure: Figure) -> Option<u16> {
+    match figure {
+        Figure::Exact(x10) | Figure::AtLeast(x10) => Some(x10),
+        Figure::Out | Figure::Unread => None,
+    }
+}
+
+/// The instants of the week resets of a row whose reset is `reset`, in `[from, to)`.
+fn resets_within(reset: i64, from: i64, to: i64) -> impl Iterator<Item = i64> {
+    let first = (from - reset + WEEK - 1).div_euclid(WEEK);
+    (first..)
+        .map(move |n| reset + n * WEEK)
+        .take_while(move |t| *t < to)
+}
+
+/// Each local midnight in `(from, to)`: the instant each local day begins. Where the clocks
+/// spring forward over midnight (Santiago, Asunción, Havana, Beirut) the day has no 00:00, and
+/// it begins at the change, its first instant on the new offset.
+fn midnights(from: i64, to: i64, offsets: &Offsets) -> Vec<i64> {
+    let mut out = Vec::new();
+    let mut day = (from + offsets.at(from)).div_euclid(DAY) + 1;
+    loop {
+        let local = day * DAY;
+        let mut t = local - offsets.at(local - offsets.at(local));
+        if (t + offsets.at(t)).div_euclid(DAY) < day
+            && let Some(change) = offsets.change_after(t)
+        {
+            t = change;
+        }
+        if t >= to {
+            return out;
+        }
+        if t > from {
+            out.push(t);
+        }
+        day += 1;
+    }
+}
+
+/// A row's knots over `[from, to]`: its fill at `from` from the right, the knots between, its
+/// fill at `to` from the left.
+fn knots_over(knots: &[Knot], from: i64, to: i64) -> Vec<Knot> {
+    let mut out = Vec::new();
+    if let Some(x10) = fill_at(knots, from, false) {
+        out.push(Knot { t: from, x10 });
+    }
+    out.extend(knots.iter().filter(|k| k.t > from && k.t < to).copied());
+    if to > from
+        && let Some(x10) = fill_at(knots, to, true)
+    {
+        out.push(Knot { t: to, x10 });
+    }
+    out
+}
+
+/// What the view's words say a stop with: its pass, from, end and lean.
+struct StopSaid<'a> {
+    pass: PassKind,
+    from: i64,
+    end: StopEnd,
+    lean: Option<&'a str>,
+}
+
+/// The words of one view: the outlook's clock and this tab.
+struct Words<'a> {
+    out: &'a Outlook,
+    tab: &'a str,
+    tab_reset: Option<i64>,
+    single: bool,
+}
+
+impl Words<'_> {
+    fn when(&self, t: i64) -> String {
+        when(t, self.out.as_of, &self.out.offsets)
+    }
+
+    fn spoken_when(&self, t: i64) -> String {
+        spoken_when(t, self.out.as_of, &self.out.offsets)
+    }
+
+    /// `~T` of a forecast start, rounded down by its lead.
+    fn about(&self, t: i64) -> String {
+        format!(
+            "~{}",
+            self.when(round_down(t, self.out.as_of, &self.out.offsets))
+        )
+    }
+
+    fn spoken_about(&self, t: i64) -> String {
+        format!(
+            "about {}",
+            self.spoken_when(round_down(t, self.out.as_of, &self.out.offsets))
+        )
+    }
+
+    /// Whose week reset `r` is: `its reset` in a roster of one, else the account's
+    /// (`main's reset`); `None` where `r` is no row's week reset (a 5-hour window's).
+    fn whose(&self, r: i64) -> Option<String> {
+        let row = self.out.rows.iter().find(|row| {
+            row.window(Window::Week)
+                .and_then(|w| w.reset)
+                .is_some_and(|reset| (r - reset).rem_euclid(WEEK) == 0)
+        })?;
+        Some(if self.single {
+            "its reset".to_owned()
+        } else {
+            format!("{}'s reset", row.label)
+        })
+    }
+
+    /// The instant the work resumes at a wall that waits to `until`: the vendor reset whose
+    /// grace it ends ([`outlook::Walled::reset`], a week's wall or a 5-hour one), said exactly,
+    /// else `until`.
+    fn resumes(&self, until: i64) -> i64 {
+        self.out
+            .rows
+            .iter()
+            .filter_map(|row| row.walled.as_ref()?.reset)
+            .find(|reset| reset.saturating_add(accounts::RESET_GRACE_S) == until)
+            .unwrap_or(until)
+    }
+
+    /// Who is out in a stop from `from`: the one account, its next week, or every account.
+    fn who_out(&self, from: i64) -> &'static str {
+        if !self.single {
+            "every account out"
+        } else if self.tab_reset.is_some_and(|r| from >= r) {
+            "next week out"
+        } else {
+            "out"
+        }
+    }
+
+    /// Phrase 2 of a stop (§2.3).
+    fn stop_phrase(&self, from: i64, end: StopEnd) -> (String, String) {
+        let start = self.about(from);
+        let short = format!("{GAP_MARK} {start}");
+        let full = match end {
+            StopEnd::Reset(r) => format!("{short}\u{2013}{}", self.when(r)),
+            StopEnd::About(t) => format!(
+                "{short}\u{2013}~{}",
+                self.when(round_up(t, self.out.as_of, &self.out.offsets))
+            ),
+            StopEnd::Open => format!("{GAP_MARK} from {start}"),
+        };
+        let short = if end.at().is_none() {
+            full.clone()
+        } else {
+            short
+        };
+        (full, short)
+    }
+
+    /// A stop's end as the title (`spoken` false) or a reader says it: ` until main's reset Sat
+    /// 10:00`, ` until ~Sat 03:00`, ` with no end in reach`.
+    fn stop_end(&self, end: StopEnd, spoken: bool) -> String {
+        let at = |t: i64| {
+            if spoken {
+                self.spoken_when(t)
+            } else {
+                self.when(t)
+            }
+        };
+        match end {
+            StopEnd::Reset(r) => match self.whose(r) {
+                Some(whose) => format!(" until {whose} {}", at(r)),
+                None => format!(" until {}", at(r)),
+            },
+            StopEnd::About(t) => {
+                let t = round_up(t, self.out.as_of, &self.out.offsets);
+                if spoken {
+                    format!(" until about {}", at(t))
+                } else {
+                    format!(" until ~{}", at(t))
+                }
+            }
+            StopEnd::Open => " with no end in reach".to_owned(),
+        }
+    }
+
+    /// A stop as the title (`spoken` false) or a reader says it.
+    fn stop_said(&self, stop: &StopSaid<'_>, spoken: bool) -> String {
+        let mut s = if spoken {
+            format!(
+                "{} from {}",
+                self.who_out(stop.from),
+                self.spoken_about(stop.from)
+            )
+        } else {
+            format!("{} {}", self.who_out(stop.from), self.about(stop.from))
+        };
+        s.push_str(&self.stop_end(stop.end, spoken));
+        if stop.pass == PassKind::Working {
+            s.push_str(if spoken {
+                ", a 5-hour limit"
+            } else {
+                " (a 5-hour limit)"
+            });
+        }
+        if let Some(row) = stop.lean {
+            s.push_str(&format!(", whatever {row} holds"));
+        }
+        s
+    }
+
+    /// The week pass's chain as a reader hears it: its moves, each stop in its place (usage
+    /// credits where they carry it), its lean, and the stop both of the lean's branches meet,
+    /// which the chart draws as `╳` whatever the verdict (§2.6: the spoken row carries the stops
+    /// the row shows).
+    fn chain_spoken(&self, week: &Pass) -> String {
+        let mut clauses: Vec<String> = Vec::new();
+        let mut moves = String::new();
+        let mut prev: Option<&str> = None;
+        let mut stops = week.stops.iter().peekable();
+        let said = |stop: &Stop, lean: Option<&str>| {
+            if stop.credits {
+                let mut s = format!(
+                    "usage credits carry the work from {}{}",
+                    self.spoken_about(stop.from),
+                    self.stop_end(stop.end, true)
+                );
+                if let Some(row) = lean {
+                    s.push_str(&format!(", whatever {row} holds"));
+                }
+                s
+            } else {
+                self.stop_said(
+                    &StopSaid {
+                        pass: PassKind::Week,
+                        from: stop.from,
+                        end: stop.end,
+                        lean,
+                    },
+                    true,
+                )
+            }
+        };
+        let say = |stop: &Stop| said(stop, None);
+        let mut after_stop = false;
+        for link in week.chain.iter().filter(|l| l.to > l.from) {
+            while let Some(stop) = stops.next_if(|stop| stop.from <= link.from) {
+                if !moves.is_empty() {
+                    clauses.push(std::mem::take(&mut moves));
+                }
+                clauses.push(say(stop));
+                after_stop = true;
+            }
+            if prev == Some(link.label.as_str()) && !after_stop {
+                continue;
+            }
+            if moves.is_empty() {
+                moves = if clauses.is_empty() {
+                    link.label.clone()
+                } else {
+                    format!("then {}", link.label)
+                };
+            } else {
+                moves.push_str(&format!(
+                    ", then {} from {}",
+                    link.label,
+                    self.spoken_about(link.from)
+                ));
+            }
+            prev = Some(&link.label);
+            after_stop = false;
+        }
+        if let Some(lean) = &week.lean {
+            let lean = format!(
+                "{}, which aterm cannot read, from {}",
+                lean.row,
+                self.spoken_about(lean.at)
+            );
+            if moves.is_empty() {
+                moves = format!("then {lean}");
+            } else {
+                moves.push_str(&format!(", then {lean}"));
+            }
+        }
+        if !moves.is_empty() {
+            clauses.push(moves);
+        }
+        clauses.extend(stops.map(say));
+        if let (Some(lean), Some(stop)) = (&week.lean, Outlook::lean_stop(week)) {
+            clauses.push(said(stop, Some(&lean.row)));
+        }
+        clauses.join("; ")
+    }
+}
+
+impl Outlook {
+    /// The quota view of the pane whose account is `tab` (its roster label; one the roster
+    /// cannot name reads [`THIS_LOGIN`]), with the footer's own week figure `own` where it holds
+    /// one (it is the lead's, and the projection is shifted to agree with it), for a tab the
+    /// rotation can move (`movable`; else nothing is projected and no verdict is said). A wall
+    /// standing on the tab's account keeps it [`Figure::Out`] whatever `own` says: `out` means
+    /// a standing wall, and a wall never prints a percentage (§2.1, §3.2), while the footer's
+    /// figure ([`Figure::of_weekly`]) is a reading, which is never `Out`.
+    #[must_use]
+    pub fn quota(&self, tab: &str, own: Option<Figure>, movable: bool) -> QuotaView {
+        let as_of = self.as_of;
+        let tab_row = self.rows.iter().position(|r| r.label == tab);
+        let carrier_row = self
+            .carrier
+            .as_deref()
+            .and_then(|c| self.rows.iter().position(|r| r.label == c));
+        // `None` is a login the roster cannot name: always named, first.
+        let order: Vec<Option<usize>> = tab_row
+            .is_none()
+            .then_some(None)
+            .into_iter()
+            .chain(roster_order(&self.rows).into_iter().map(Some))
+            .collect();
+        let must: Vec<Option<usize>> = std::iter::once(tab_row)
+            .chain(carrier_row.filter(|c| Some(*c) != tab_row).map(Some))
+            .collect();
+        let picked = pick_named(&order, &must);
+        let row_figure = tab_row.map_or(Figure::Unread, |i| self.rows[i].figure(as_of));
+        let tab_figure = match own {
+            Some(own) if row_figure != Figure::Out => own,
+            _ => row_figure,
+        };
+        let named: Vec<Named> = picked
+            .iter()
+            .map(|pick| match pick {
+                None => Named {
+                    label: THIS_LOGIN.to_owned(),
+                    this_tab: true,
+                    carrier: false,
+                    figure: tab_figure,
+                    reset: None,
+                    plan: None,
+                },
+                Some(i) => {
+                    let row = &self.rows[*i];
+                    let this_tab = Some(*i) == tab_row;
+                    Named {
+                        label: row.label.clone(),
+                        this_tab,
+                        carrier: Some(*i) == carrier_row,
+                        figure: if this_tab {
+                            tab_figure
+                        } else {
+                            row.figure(as_of)
+                        },
+                        reset: reset_ahead(row, as_of),
+                        plan: row.plan.title(),
+                    }
+                }
+            })
+            .collect();
+        let folded: Vec<String> = order
+            .iter()
+            .filter(|o| !picked.contains(o))
+            .filter_map(|o| o.map(|i| self.rows[i].label.clone()))
+            .collect();
+        let tab_reset = tab_row.and_then(|i| reset_ahead(&self.rows[i], as_of));
+        let drawn = movable.then_some(self.week.as_ref()).flatten();
+        let chart = self.chart_of(tab, tab_row, tab_figure, tab_reset, drawn);
+        let lanes = picked
+            .iter()
+            .flatten()
+            .map(|&i| self.lane_of(&self.rows[i], drawn.is_some()))
+            .collect();
+        let words = Words {
+            out: self,
+            tab,
+            tab_reset,
+            single: self.rows.len() <= 1,
+        };
+        let tail = self.tail_of(&words, tab_row, tab_figure, &chart, movable);
+        let mut view = QuotaView {
+            as_of,
+            named,
+            folded,
+            chart,
+            lanes,
+            tail,
+            title: String::new(),
+            spoken: String::new(),
+        };
+        view.title = self.title_of(&words, &view, drawn, movable);
+        view.spoken = self.spoken_of(&words, &view, drawn, movable);
+        view
+    }
+
+    /// The verdict this tab's pane says: its own wall, else the outlook's.
+    fn verdict_for(&self, tab_row: Option<usize>) -> Verdict {
+        tab_row
+            .and_then(|i| self.rows[i].walled.as_ref())
+            .map_or_else(
+                || self.verdict.clone(),
+                |w| Verdict::Walled {
+                    to: w.to.clone(),
+                    until: w.until,
+                },
+            )
+    }
+
+    /// The stop a lean's both branches meet, where they do: it stands whatever the row holds.
+    fn lean_stop(week: &Pass) -> Option<&Stop> {
+        let lean = week.lean.as_deref()?;
+        outlook::best_stops(lean)
+            .then(|| outlook::worst_stop(lean))
+            .flatten()
+    }
+
+    fn chart_of(
+        &self,
+        tab: &str,
+        tab_row: Option<usize>,
+        tab_figure: Figure,
+        tab_reset: Option<i64>,
+        drawn: Option<&Pass>,
+    ) -> Chart {
+        let as_of = self.as_of;
+        let end = as_of + 7 * DAY;
+        let mut chart = Chart {
+            now: as_of,
+            midnights: midnights(as_of - DAY, end, &self.offsets),
+            ..Chart::default()
+        };
+        if let Some(row) = tab_row.map(|i| &self.rows[i]) {
+            let start = row
+                .read
+                .partition_point(|r| r.t < as_of - DAY)
+                .saturating_sub(1);
+            chart.past = row.read.get(start..).unwrap_or_default().to_vec();
+            // The last past cell holds the lead's figure (§2.2): one figure at now.
+            if let (Some(x10), Some(reset)) = (figure_x10(tab_figure), tab_reset) {
+                let epoch = chart
+                    .past
+                    .last()
+                    .filter(|r| r.reset == reset)
+                    .and_then(|r| r.epoch);
+                chart.past.push(Read {
+                    t: as_of,
+                    x10,
+                    reset,
+                    epoch,
+                });
+            }
+        }
+        let Some(week) = drawn else {
+            // Nothing projected: `┄` across the future, and only this tab's resets.
+            chart.unknown_from = Some(as_of);
+            if let Some(reset) = tab_reset {
+                chart.marks = resets_within(reset, as_of, end)
+                    .map(|t| (t, Mark::Reset))
+                    .collect();
+            }
+            return chart;
+        };
+        let mut prev = tab.to_owned();
+        for link in &week.chain {
+            if link.label != prev {
+                chart
+                    .marks
+                    .push((link.from, Mark::Handoff(link.label.clone())));
+                prev.clone_from(&link.label);
+            }
+            if link.to <= link.from {
+                continue;
+            }
+            let knots = week
+                .fills
+                .get(&link.label)
+                .map(|k| knots_over(k, link.from, link.to))
+                .unwrap_or_default();
+            chart.runs.push(Run {
+                label: link.label.clone(),
+                from: link.from,
+                to: link.to,
+                knots,
+            });
+            if let Some(reset) = self
+                .rows
+                .iter()
+                .find(|r| r.label == link.label)
+                .and_then(|r| r.window(Window::Week))
+                .and_then(|w| w.reset)
+            {
+                chart.marks.extend(
+                    resets_within(reset, link.from, link.to.min(end)).map(|t| (t, Mark::Reset)),
+                );
+            }
+        }
+        // One figure at now: the first run, where it is this tab's, is shifted to the lead's
+        // figure until its first drop, clamped below a fill; a fill stays a fill.
+        if let (Some(first), Some(x10)) = (chart.runs.first_mut(), figure_x10(tab_figure))
+            && first.label == tab
+            && first.from == as_of
+            && let Some(Some(replay)) = first.knots.first().map(|k| k.x10)
+        {
+            let shift = i32::from(x10) - i32::from(replay);
+            let mut prev_t = None;
+            for knot in &mut first.knots {
+                if prev_t == Some(knot.t) {
+                    break;
+                }
+                prev_t = Some(knot.t);
+                knot.x10 = knot.x10.map(|v| {
+                    if v >= 1000 {
+                        1000
+                    } else {
+                        u16::try_from((i32::from(v) + shift).clamp(0, 999)).unwrap_or(999)
+                    }
+                });
+            }
+        }
+        if let Some(lean) = &week.lean {
+            chart.marks.push((lean.at, Mark::Lean(lean.row.clone())));
+        }
+        chart.unknown_from = [week.lean.as_ref().map(|l| l.at), week.cut_at]
+            .into_iter()
+            .flatten()
+            .min();
+        let stop_end = |s: &Stop| s.end.at().unwrap_or(end + DAY);
+        let working = self
+            .working
+            .as_ref()
+            .map_or(&[][..], |p| p.stops.as_slice());
+        let stops: Vec<&Stop> = week
+            .stops
+            .iter()
+            .chain(working)
+            .chain(Outlook::lean_stop(week))
+            .collect();
+        chart.stops = stops
+            .iter()
+            .map(|s| (s.from, stop_end(s), s.credits))
+            .collect();
+        // A stop that ends at a week's vendor reset draws it there: the work resumes on it.
+        chart.marks.extend(stops.iter().filter_map(|s| match s.end {
+            StopEnd::Reset(r)
+                if r < end
+                    && self.rows.iter().any(|row| {
+                        row.window(Window::Week)
+                            .and_then(|w| w.reset)
+                            .is_some_and(|reset| (r - reset).rem_euclid(WEEK) == 0)
+                    }) =>
+            {
+                Some((r, Mark::Reset))
+            }
+            _ => None,
+        }));
+        chart.marks.sort_by_key(|(t, _)| *t);
+        chart
+    }
+
+    fn lane_of(&self, row: &RowOutlook, drawn: bool) -> Burn {
+        let as_of = self.as_of;
+        let Some(renews) = reset_ahead(row, as_of) else {
+            return Burn {
+                label: row.label.clone(),
+                start: as_of - WEEK,
+                renews: as_of,
+                read: Vec::new(),
+                ahead: Vec::new(),
+                out_at: None,
+            };
+        };
+        let ahead = self
+            .week
+            .as_ref()
+            .filter(|_| drawn)
+            .and_then(|p| p.fills.get(&row.label))
+            .map(|k| knots_over(k, as_of, renews))
+            .unwrap_or_default();
+        let week = row.window(Window::Week);
+        let out_at = if row.figure(as_of) == Figure::Out {
+            Some(as_of)
+        } else {
+            week.and_then(|w| w.projection)
+                .filter(|_| drawn)
+                .and_then(|p| p.fills_at)
+        };
+        Burn {
+            label: row.label.clone(),
+            start: renews - WEEK,
+            renews,
+            read: row
+                .read
+                .iter()
+                .filter(|r| r.reset == renews && r.t <= as_of)
+                .copied()
+                .collect(),
+            ahead,
+            out_at,
+        }
+    }
+
+    fn tail_of(
+        &self,
+        words: &Words<'_>,
+        tab_row: Option<usize>,
+        tab_figure: Figure,
+        chart: &Chart,
+        movable: bool,
+    ) -> Tail {
+        if tab_figure == Figure::Unread {
+            return Tail {
+                own: None,
+                verdict: Some(Phrase {
+                    full: NO_FIGURE_FULL.to_owned(),
+                    short: NO_FIGURE.to_owned(),
+                    ink: Role::Quiet,
+                    kept: false,
+                }),
+            };
+        }
+        let verdict = self.verdict_for(tab_row);
+        let phrase = |full: String, short: String, ink: Role, kept: bool| {
+            Some(Phrase {
+                full,
+                short,
+                ink,
+                kept,
+            })
+        };
+        let carrier = tab_row.is_some_and(|i| self.rows[i].carrier);
+        let said = match &verdict {
+            _ if !movable => None,
+            Verdict::Walled { to: None, until } => {
+                let until =
+                    until.map_or_else(|| "its reset".to_owned(), |u| words.when(words.resumes(u)));
+                let words = format!("{WAIT_MARK} until {until}");
+                phrase(words.clone(), words, Role::Warn, true)
+            }
+            Verdict::Stop { from, end, .. } => {
+                let (full, short) = words.stop_phrase(*from, *end);
+                phrase(full, short, Role::Warn, true)
+            }
+            Verdict::Lean { until, row, .. } => phrase(
+                format!("? {} unread from {}", cut(row), words.about(*until)),
+                format!("? {} {}", cut(row), words.about(*until)),
+                Role::Value,
+                true,
+            ),
+            Verdict::Credits { at } => {
+                let words = format!("{CREDITS_MARK} {}", words.about(*at));
+                phrase(words.clone(), words, Role::Warn, true)
+            }
+            Verdict::Refused(why) if carrier => {
+                phrase(why.short(), why.short(), Role::Quiet, false)
+            }
+            Verdict::Walled { to: Some(_), .. } | Verdict::Continuous | Verdict::Refused(_) => None,
+        };
+        // Phrase 1 is left out only where it would repeat phrase 2: a wait that resumes at this
+        // tab's own reset (`⧗ until Sat 10:00` says it). A wait that ends at another account's
+        // reset keeps it, so this tab's reset is said (`↺ Sun 10:00 · ⧗ until Sat 10:00`).
+        let repeats = |reset: &i64| match &verdict {
+            Verdict::Walled {
+                to: None,
+                until: Some(until),
+            } => said.is_some() && words.resumes(*until) == *reset,
+            _ => false,
+        };
+        let own = words.tab_reset.filter(|r| !repeats(r)).map(|reset| {
+            // The curve at the reset, where this tab's account is drawn there and not full.
+            let by_reset = chart
+                .runs
+                .iter()
+                .find(|r| r.label == words.tab && r.from < reset && reset <= r.to)
+                .and_then(|r| r.at(reset))
+                .filter(|x10| *x10 < 1000)
+                .map(whole_under_full);
+            Own {
+                by_reset,
+                reset: words.when(reset),
+            }
+        });
+        Tail { own, verdict: said }
+    }
+
+    /// The pace's words, where it stands: `this Mac's last-24 h pace, 21% a day`.
+    fn pace_title(&self) -> Option<String> {
+        let pace = self.demand.week.ok()?;
+        let pct = self.day_pct()?;
+        Some(match pace.basis {
+            Basis::Day => format!("at this Mac's last-24 h pace, {pct}% a day"),
+            Basis::Hour => format!("at this Mac's last-hour pace, {pct}% a day"),
+            Basis::WeekBegan | Basis::WindowOpened => {
+                format!("at this week's pace so far, {pct}% a day")
+            }
+        })
+    }
+
+    /// The hover title (§2.6). It names the verdict wherever the row says one, and a wall the
+    /// work moves off at the turn's end, which has no phrase on the row (the chart's `→` draws
+    /// it, and at the narrowest rung, with no chart, the title alone says it).
+    fn title_of(
+        &self,
+        words: &Words<'_>,
+        view: &QuotaView,
+        drawn: Option<&Pass>,
+        movable: bool,
+    ) -> String {
+        let Some(tab) = view.named.iter().find(|n| n.this_tab) else {
+            return String::new();
+        };
+        let mut parts = vec![tab.label.clone()];
+        parts.extend(tab.plan.clone());
+        parts.push(match tab.figure {
+            Figure::Exact(_) => format!("{} of its week used, read now", tab.figure.words()),
+            Figure::AtLeast(x10) => format!(
+                "at least {}% of its week used, read earlier",
+                x10.min(1000) / 10
+            ),
+            Figure::Out => "out now".to_owned(),
+            Figure::Unread => format!("{NO_FIGURE}, Claude reports it with its next reply"),
+        });
+        if let Some(own) = &view.tail.own {
+            parts.push(match own.by_reset {
+                Some(pct) => format!("~{pct}% by its reset {}", own.reset),
+                None => format!("resets {}", own.reset),
+            });
+        }
+        let tab_row = self.rows.iter().position(|r| r.label == tab.label);
+        let verdict = self.verdict_for(tab_row);
+        let moves_off = movable && matches!(verdict, Verdict::Walled { to: Some(_), .. });
+        if (view.tail.verdict.is_some() || moves_off) && tab.figure != Figure::Unread {
+            parts.extend(self.verdict_title(words, &verdict));
+        } else if let (Some(week), Verdict::Continuous) = (drawn, &self.verdict) {
+            let moves: Vec<String> = week
+                .chain
+                .windows(2)
+                .filter(|w| w[0].label != w[1].label)
+                .map(|w| format!("{} {}", w[1].label, words.about(w[1].from)))
+                .collect();
+            if !moves.is_empty() {
+                parts.push(format!("the work moves to {}", moves.join(", then ")));
+            }
+        }
+        if drawn.is_some_and(|p| !p.chain.is_empty()) {
+            parts.extend(self.pace_title());
+        }
+        for other in view.named.iter().filter(|n| !n.this_tab) {
+            parts.push(format!("{} {}", other.label, other.figure.words()));
+        }
+        if !view.folded.is_empty() {
+            parts.push(format!("+{} more", view.folded.len()));
+        }
+        parts.push("click: accounts".to_owned());
+        parts.join(SEP)
+    }
+
+    fn verdict_title(&self, words: &Words<'_>, verdict: &Verdict) -> Option<String> {
+        match verdict {
+            Verdict::Walled { to: None, until } => Some(format!(
+                "the work waits until {}",
+                until.map_or_else(|| "its reset".to_owned(), |u| words.when(words.resumes(u)))
+            )),
+            Verdict::Walled { to: Some(to), .. } => {
+                Some(format!("the work moves to {to} at the turn's end"))
+            }
+            Verdict::Stop {
+                pass,
+                from,
+                end,
+                lean,
+            } => Some(words.stop_said(
+                &StopSaid {
+                    pass: *pass,
+                    from: *from,
+                    end: *end,
+                    lean: lean.as_deref(),
+                },
+                false,
+            )),
+            Verdict::Lean {
+                until, row, stop, ..
+            } => {
+                let mut s = format!("{row} unread from {}", words.about(*until));
+                if let Some((from, end)) = stop {
+                    s.push_str(&format!(
+                        "; if it has nothing, {}",
+                        words.stop_said(
+                            &StopSaid {
+                                pass: PassKind::Week,
+                                from: *from,
+                                end: *end,
+                                lean: None,
+                            },
+                            false,
+                        )
+                    ));
+                }
+                Some(s)
+            }
+            Verdict::Credits { at } => Some(format!("on usage credits from {}", words.about(*at))),
+            Verdict::Refused(why) => Some(why.words()),
+            Verdict::Continuous => None,
+        }
+    }
+
+    fn spoken_of(
+        &self,
+        words: &Words<'_>,
+        view: &QuotaView,
+        drawn: Option<&Pass>,
+        movable: bool,
+    ) -> String {
+        let mut s = String::from("Accounts.");
+        for n in &view.named {
+            let pct = |x10: u16| x10.min(1000) / 10;
+            if n.this_tab {
+                s.push_str(&format!(" {}, this tab, ", n.label));
+                s.push_str(&match n.figure {
+                    Figure::Exact(_) => format!(
+                        "{} percent of its week used",
+                        figure_x10(n.figure).map_or(0, whole_spoken)
+                    ),
+                    Figure::AtLeast(x10) => {
+                        format!("at least {} percent of its week used", pct(x10))
+                    }
+                    Figure::Out => "out until its reset".to_owned(),
+                    Figure::Unread => format!("{NO_FIGURE}; Claude reports it with its next reply"),
+                });
+                if let Some(reset) = n.reset.filter(|_| n.figure != Figure::Unread) {
+                    s.push_str(&format!(", resets {}", words.spoken_when(reset)));
+                }
+                s.push('.');
+            } else {
+                s.push_str(&format!(
+                    " {} {}.",
+                    n.label,
+                    match n.figure {
+                        Figure::Exact(x10) => format!("{} percent", whole_spoken(x10)),
+                        Figure::AtLeast(x10) => format!("at least {} percent", pct(x10)),
+                        Figure::Out => "out".to_owned(),
+                        Figure::Unread => "not read".to_owned(),
+                    }
+                ));
+            }
+        }
+        match view.folded.len() {
+            0 => {}
+            1 => s.push_str(" 1 more account."),
+            n => s.push_str(&format!(" {n} more accounts.")),
+        }
+        if view
+            .named
+            .iter()
+            .any(|n| n.this_tab && n.figure == Figure::Unread)
+        {
+            return s;
+        }
+        let tab_row = self.rows.iter().position(|r| r.label == words.tab);
+        let verdict = self.verdict_for(tab_row);
+        match &verdict {
+            Verdict::Walled { to: None, until } if movable => s.push_str(&format!(
+                " Out now: the work waits until {}.",
+                until.map_or_else(
+                    || "its reset".to_owned(),
+                    |u| words.spoken_when(words.resumes(u))
+                )
+            )),
+            Verdict::Walled { to: Some(to), .. } if movable => s.push_str(&format!(
+                " Out now: the work moves to {to} at the turn's end."
+            )),
+            _ => {}
+        }
+        if let Some(week) = drawn.filter(|p| !p.chain.is_empty()) {
+            let pace = self
+                .day_pct()
+                .map_or_else(String::new, |p| format!(" at {p} percent a day"));
+            s.push_str(&format!(
+                " Next 7 days{pace}: {}.",
+                words.chain_spoken(week)
+            ));
+        }
+        match &verdict {
+            _ if !movable => {}
+            Verdict::Stop {
+                pass: PassKind::Working,
+                from,
+                end,
+                lean,
+            } => {
+                let said = words.stop_said(
+                    &StopSaid {
+                        pass: PassKind::Working,
+                        from: *from,
+                        end: *end,
+                        lean: lean.as_deref(),
+                    },
+                    true,
+                );
+                s.push_str(&format!(" Within hours: {said}."));
+            }
+            Verdict::Lean {
+                row,
+                stop: Some((from, end)),
+                ..
+            } => {
+                let said = words.stop_said(
+                    &StopSaid {
+                        pass: PassKind::Week,
+                        from: *from,
+                        end: *end,
+                        lean: None,
+                    },
+                    true,
+                );
+                s.push_str(&format!(" If {row} has nothing: {said}."));
+            }
+            Verdict::Credits { at }
+                if !drawn
+                    .is_some_and(|p| p.stops.iter().any(|st| st.credits && st.from == *at)) =>
+            {
+                s.push_str(&format!(
+                    " Usage credits would carry the work from {}.",
+                    words.spoken_about(*at)
+                ));
+            }
+            Verdict::Refused(why) if tab_row.is_some_and(|i| self.rows[i].carrier) => {
+                s.push(' ');
+                s.push_str(&why.spoken());
+            }
+            _ => {}
+        }
+        s
+    }
+}
+
+/// Whole percent, half up, `100` only for 1000: as [`Figure::words`] says an exact figure.
+fn whole_spoken(x10: u16) -> u16 {
+    if x10 >= 1000 {
+        100
+    } else {
+        ((x10 + 5) / 10).min(99)
+    }
+}
+
+impl QuotaView {
+    /// This tab's named account.
+    #[must_use]
+    pub fn tab(&self) -> Option<&Named> {
+        self.named.iter().find(|n| n.this_tab)
+    }
+
+    /// Case (d): this tab's week has no figure yet, and no chart is drawn until its first reading.
+    #[must_use]
+    pub fn waiting(&self) -> bool {
+        self.tab().is_none_or(|n| n.figure == Figure::Unread)
+    }
+
+    /// Lays the row into `out` at the widest rung of §2.4 that fits `room` cells: `false`, with
+    /// `out` empty, where none does. Case (d) has its own two forms: this tab's name with its
+    /// words full, then short.
+    pub fn lay(&self, room: usize, out: &mut QuotaLine) -> bool {
+        let Some(tab) = self.tab() else {
+            out.clear();
+            return false;
+        };
+        if self.waiting() {
+            for full in [true, false] {
+                out.clear();
+                out.put(&cut(&tab.label), Role::Lit, true);
+                out.lead = 0..out.cells.len();
+                if let Some(words) = &self.tail.verdict {
+                    out.gap();
+                    let from = out.cells.len();
+                    out.put(
+                        if full { &words.full } else { &words.short },
+                        words.ink,
+                        false,
+                    );
+                    out.tail = from..out.cells.len();
+                }
+                if out.cells.len() <= room {
+                    return true;
+                }
+            }
+            out.clear();
+            return false;
+        }
+        let mut chart = Vec::new();
+        for (lead, per_day, tail) in LADDER {
+            out.clear();
+            self.write_lead(lead, out);
+            out.lead = 0..out.cells.len();
+            if per_day > 0 {
+                out.gap();
+                let from = out.cells.len();
+                self.chart.cells(per_day, &mut chart);
+                out.cells.extend(
+                    chart
+                        .iter()
+                        .map(|c| (c.glyph(), c.role(), c.role() == Role::Warn)),
+                );
+                out.chart = from..out.cells.len();
+                out.per_day = per_day;
+            }
+            if self.tail.own.is_some() || self.tail.verdict.is_some() {
+                out.gap();
+                let from = out.cells.len();
+                self.write_tail(tail, out);
+                out.tail = from..out.cells.len();
+            }
+            if out.cells.len() <= room {
+                return true;
+            }
+        }
+        out.clear();
+        false
+    }
+
+    fn write_lead(&self, lead: Lead, out: &mut QuotaLine) {
+        let one = |n: &Named, out: &mut QuotaLine| {
+            let role = if n.this_tab { Role::Lit } else { Role::Value };
+            out.put(&cut(&n.label), role, n.this_tab);
+            out.put(" ", Role::Quiet, false);
+            out.put(&n.figure.words(), role, n.this_tab);
+        };
+        match lead {
+            Lead::Full => {
+                for (i, n) in self.named.iter().enumerate() {
+                    if i > 0 {
+                        out.put(SEP, Role::Quiet, false);
+                    }
+                    one(n, out);
+                }
+                if !self.folded.is_empty() {
+                    out.put(&format!(" +{}", self.folded.len()), Role::Quiet, false);
+                } else if self.named.len() == 1 {
+                    out.put(" used", Role::Quiet, false);
+                }
+            }
+            Lead::Fold | Lead::Tab => {
+                if let Some(tab) = self.tab() {
+                    one(tab, out);
+                }
+                let others = self.named.len().saturating_sub(1) + self.folded.len();
+                if lead == Lead::Fold && others > 0 {
+                    out.put(&format!(" +{others}"), Role::Quiet, false);
+                }
+            }
+        }
+    }
+
+    fn write_own(own: &Own, full: bool, out: &mut QuotaLine) {
+        if let Some(pct) = own.by_reset.filter(|_| full) {
+            out.put(&format!("~{pct}%"), Role::Value, false);
+            out.put(" by ", Role::Quiet, false);
+        }
+        out.put(&RESET_MARK.to_string(), Role::Lit, false);
+        out.put(" ", Role::Quiet, false);
+        out.put(&own.reset, Role::Value, false);
+    }
+
+    fn write_tail(&self, tail: TailForm, out: &mut QuotaLine) {
+        let full = tail == TailForm::T0;
+        let own = match tail {
+            TailForm::T2 if self.tail.verdict.is_some() => None,
+            _ => self.tail.own.as_ref(),
+        };
+        if let Some(own) = own {
+            QuotaView::write_own(own, full, out);
+        }
+        if let Some(verdict) = &self.tail.verdict {
+            if own.is_some() {
+                out.put(SEP, Role::Quiet, false);
+            }
+            out.put(
+                if full { &verdict.full } else { &verdict.short },
+                verdict.ink,
+                false,
+            );
+        }
+    }
+
+    /// Line D's words-only unit (§1.2), for a pane whose line E is not the glass's: its forms,
+    /// widest first: name, figure, `↺`, verdict; name, figure, verdict; name and figure; name.
+    /// The facts drop before the unit shortens; each form is its runs of words with their inks.
+    #[must_use]
+    pub fn fallback(&self) -> Vec<Vec<Piece>> {
+        let Some(tab) = self.tab() else {
+            return Vec::new();
+        };
+        let name = Piece::new(cut(&tab.label), Role::Lit);
+        if self.waiting() {
+            return vec![
+                vec![
+                    name.clone(),
+                    Piece::new(format!(" {NO_FIGURE}"), Role::Quiet),
+                ],
+                vec![name],
+            ];
+        }
+        let figure = [
+            Piece::new(" ", Role::Quiet),
+            Piece::new(tab.figure.words(), Role::Value),
+        ];
+        let reset = self.tail.own.as_ref().map(|own| {
+            [
+                Piece::new(SEP, Role::Quiet),
+                Piece::new(RESET_MARK.to_string(), Role::Lit),
+                Piece::new(format!(" {}", own.reset), Role::Value),
+            ]
+        });
+        let verdict = self.tail.verdict.as_ref().map(|v| {
+            [
+                Piece::new(SEP, Role::Quiet),
+                Piece::new(v.short.clone(), v.ink),
+            ]
+        });
+        let mut forms: Vec<Vec<Piece>> = Vec::new();
+        for (with_reset, with_verdict) in [(true, true), (false, true), (false, false)] {
+            let mut form = vec![name.clone()];
+            form.extend(figure.iter().cloned());
+            if with_reset && let Some(r) = &reset {
+                form.extend(r.iter().cloned());
+            }
+            if with_verdict && let Some(v) = &verdict {
+                form.extend(v.iter().cloned());
+            }
+            if forms.last() != Some(&form) {
+                forms.push(form);
+            }
+        }
+        forms.push(vec![name]);
+        forms
+    }
+}
+
+#[cfg(test)]
+#[path = "quota_view_tests.rs"]
+mod tests;

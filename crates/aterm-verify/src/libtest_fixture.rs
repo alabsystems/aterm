@@ -11,6 +11,8 @@ use std::path::PathBuf;
 
 /// Set (to a directory), the cases act: they fail, refuse, run out of disk, and the napper waits.
 pub(crate) const FIXTURE: &str = "ATERM_VERIFY_LIBTEST_FIXTURE";
+/// Set for the napper to emit libtest's long-running event without waiting a real minute.
+pub(crate) const LONG_RUNNING: &str = "ATERM_VERIFY_LIBTEST_LONG_RUNNING";
 
 /// The words the plain red case's panic carries, so a test can find its block.
 pub(crate) const NONCE: &str = "fixture-nonce-5b1d9c";
@@ -91,6 +93,12 @@ fn z_napper() {
     };
     std::fs::write(dir.join("napper.started"), std::process::id().to_string())
         .expect("said it started");
+    if std::env::var_os(LONG_RUNNING).is_some() {
+        let event = aterm_json::json!({
+            "type": "test", "event": "timeout", "name": "libtest_fixture::z_napper"
+        });
+        writeln!(std::io::stdout(), "{event}").expect("the uncaptured long-running event");
+    }
     aterm_spec::wait::until_within(
         aterm_spec::wait::MUST_HAPPEN,
         "the napper's release",

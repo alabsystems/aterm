@@ -512,6 +512,30 @@ fn actual_owner_timeout_and_caller_cancel_reap_and_settle_original_resources() {
             call_attempt: [91; 16],
         };
         let context = world.owner.context(Peer { pid, birth }, &query).unwrap();
+        // Backdate the start, never sleep or budget successful native reads.
+        let delayed = Instant::now() - Duration::from_secs(3);
+        let delayed_context = world.owner.context_at(Peer { pid, birth }, &query, delayed);
+        let inspection = world
+            .owner
+            .inspect_at(Peer { pid, birth }, &binding.session, delayed);
+        assert!(
+            delayed_context.is_ok() && inspection.is_ok(),
+            "context={delayed_context:?}; inspection={inspection:?}"
+        );
+        assert_eq!(inspection.unwrap().root_pid, pid);
+        let expired = Instant::now() - HANG;
+        assert!(
+            world
+                .owner
+                .context_at(Peer { pid, birth }, &query, expired)
+                .is_err()
+        );
+        assert!(
+            world
+                .owner
+                .inspect_at(Peer { pid, birth }, &binding.session, expired)
+                .is_err()
+        );
         assert_eq!(context.context.original_root.pid, pid);
         assert_eq!(context.context.memory.bytes, MEMORY);
         assert!(

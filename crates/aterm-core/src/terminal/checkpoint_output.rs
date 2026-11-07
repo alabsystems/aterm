@@ -121,8 +121,9 @@ pub struct OutputStateRepr {
         serde(default, skip_serializing_if = "Option::is_none")
     )]
     pub program_state: Option<String>,
-    /// The source episode of `program_state`, which a restore keeps as the report's
-    /// `ProgramStateReport::restored_from`. Restore still assigns its own local report sequence.
+    /// The engine sequence where the report `program_state` carries began
+    /// (`ProgramStateReport::began`), written while a report stands. A restore does not read it:
+    /// it installs `program_state` alone and assigns its own local report sequence.
     #[cfg_attr(
         feature = "serde",
         serde(
@@ -285,7 +286,6 @@ impl Terminal {
             .map(|SavedModeRepr { mode, set }| (mode, set))
             .collect();
         self.transient.update_has_transient_extras();
-        self.program_state
-            .restore(repr.program_state.as_deref(), repr.program_state_began);
+        self.program_state.restore(repr.program_state.as_deref());
     }
 }

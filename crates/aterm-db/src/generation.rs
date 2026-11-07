@@ -105,6 +105,21 @@ fn path_field(value: &Value, name: &str) -> Result<PathBuf> {
 fn fail() -> Error {
     Error::new("Commons writer generation is unavailable or changed")
 }
+/// A check that reached its deadline before it finished. It learned nothing about the
+/// generation, so it must not read as [`fail`]'s finding that the generation changed: on a
+/// loaded Mac a slow, unheld check is out of time, and the next check may pass.
+fn out_of_time() -> Error {
+    Error::new("Commons writer generation check ran out of time before it finished")
+}
+
+/// Every deadline gate of a generation check: refuse with [`out_of_time`] once `deadline` has
+/// passed, never with [`fail`].
+fn within(deadline: Instant) -> Result<()> {
+    if Instant::now() >= deadline {
+        return Err(out_of_time());
+    }
+    Ok(())
+}
 
 // The reservation is published under the old control writer, before candidate
 // custody. Neither it nor the child link is removed by recovery. Empty staging
@@ -219,19 +234,19 @@ impl Selection {
         )
         .map_err(crate::table::failure)?;
         let access = bootstrap
-            .access_in(&journal)
+            .access_observed_in(&journal)
             .map_err(crate::table::failure)?
             .ok_or_else(fail)?;
-        if !access.is_current(&journal)
+        if !access
+            .is_current_observed(&journal)
+            .map_err(crate::table::failure)?
             || access.local().role() != aterm_secrets::commons::roster::Role::Writer
             || aterm_codec::hex::encode_lower(&access.local().binding().actor()) != self.actor
             || trust(&bootstrap) != self.trust
         {
             return Err(fail());
         }
-        if Instant::now() >= deadline {
-            return Err(fail());
-        }
+        within(deadline)?;
         Ok(bootstrap)
     }
 }
@@ -443,6 +458,11 @@ struct Ancestor {
 }
 
 impl Observation {
+    /// The home this observation was taken for: the selected generation's.
+    pub(crate) const fn paths(&self) -> &Paths {
+        &self.paths
+    }
+
     pub(crate) fn local_source_reads(&self) -> Result<Vec<client::CommonsSourceRead>> {
         self.ancestors
             .iter()
@@ -486,9 +506,10 @@ impl Observation {
         let mut child = paths.clone();
         let mut ancestors = Vec::new();
         while let Some(selection) = linked(&child)? {
-            if ancestors.len() == MAX_GENERATIONS || Instant::now() >= read_by {
+            if ancestors.len() == MAX_GENERATIONS {
                 return Err(fail());
             }
+            within(read_by)?;
             let bootstrap = if observe_only {
                 let (bootstrap, _) =
                     Bootstrap::established_with_journal_until(&selection.original, wait())
@@ -508,10 +529,12 @@ impl Observation {
             let journal = Journal::read_existing(bootstrap.journal_dir(), bootstrap.trust())
                 .map_err(crate::table::failure)?;
             let access = bootstrap
-                .access_in(&journal)
+                .access_observed_in(&journal)
                 .map_err(crate::table::failure)?
                 .ok_or_else(fail)?;
-            if !access.is_current(&journal)
+            if !access
+                .is_current_observed(&journal)
+                .map_err(crate::table::failure)?
                 || access.local().role() != aterm_secrets::commons::roster::Role::Writer
                 || aterm_codec::hex::encode_lower(&access.local().binding().actor())
                     != selection.actor
@@ -540,9 +563,7 @@ impl Observation {
     }
 
     pub(crate) fn check(&self, authoring: bool, mutation: bool, deadline: Instant) -> Result<()> {
-        if Instant::now() >= deadline {
-            return Err(fail());
-        }
+        within(deadline)?;
         if (authoring || mutation) && fenced(&self.paths)? {
             return Err(Error::new(
                 "original Commons writer is fenced by succession",
@@ -564,13 +585,26 @@ impl Observation {
                 .bootstrap
                 .revalidate_custody()
                 .map_err(crate::table::failure)?;
+            #[cfg(test)]
+            seams::reached(seams::Point::BeforeDenial);
             let journal = Journal::read_existing(
                 ancestor.bootstrap.journal_dir(),
                 ancestor.bootstrap.trust(),
             )
             .map_err(crate::table::failure)?;
-            if client::local_recipient_denied_in_roster(&selected.original)
-                || !ancestor.access.is_current(&journal)
+            // A vault writer's moment is busy, which a read observes again, not a changed
+            // generation; a denial, or a state that cannot be judged, still refuses.
+            if client::local_recipient_denial_observed(&selected.original)
+                .map_err(crate::table::failure)?
+            {
+                return Err(fail());
+            }
+            #[cfg(test)]
+            seams::reached(seams::Point::BeforeCurrent);
+            if !ancestor
+                .access
+                .is_current_observed(&journal)
+                .map_err(crate::table::failure)?
             {
                 return Err(fail());
             }
@@ -590,9 +624,10 @@ impl Observation {
             }
             child = selected.original;
         }
-        if linked(&child)?.is_some() || Instant::now() >= deadline {
+        if linked(&child)?.is_some() {
             return Err(fail());
         }
+        within(deadline)?;
         Ok(())
     }
 }
@@ -604,9 +639,7 @@ pub(crate) fn guard(paths: &Paths, authoring: bool) -> Result<()> {
 }
 
 pub(crate) fn guard_until(paths: &Paths, authoring: bool, deadline: Instant) -> Result<()> {
-    if Instant::now() >= deadline {
-        return Err(fail());
-    }
+    within(deadline)?;
     if authoring && fenced(paths)? {
         return Err(Error::new(
             "original Commons writer is fenced by succession",
@@ -629,9 +662,7 @@ pub(crate) fn guard_until(paths: &Paths, authoring: bool, deadline: Instant) -> 
     if authoring {
         let mut ancestor = Some(selection);
         for _ in 0..MAX_GENERATIONS {
-            if Instant::now() >= deadline {
-                return Err(fail());
-            }
+            within(deadline)?;
             let Some(selected) = ancestor else {
                 return Ok(());
             };
@@ -689,18 +720,29 @@ pub(crate) fn observed_paths_within(
     Ok(observed_selection_within(paths, read_by, wait)?.paths)
 }
 
-fn observed_selection_within(
+/// The completed generation [`observed_paths_within`] selects, with the observation of its
+/// predecessors that selected it, for a read-only session to keep ([`Session::observe_selected`])
+/// rather than observe every predecessor again: each later use still checks it afresh.
+///
+/// [`Session::observe_selected`]: crate::table::Session::observe_selected
+pub(crate) fn observed_selection_within(
     paths: &Paths,
     read_by: Instant,
     wait: &dyn Fn() -> Instant,
 ) -> Result<Observation> {
+    observe_generation(&observed_generation_until(paths, read_by)?, read_by, wait)
+}
+
+/// The home [`observed_selection_within`] selects, named by its selections alone: no
+/// predecessor is observed yet, so this says which home a read opens, never that it may. A
+/// reader opens that home's established custody and then observes it
+/// ([`observe_generation`]), so the observation it keeps is no older than that custody's wait.
+pub(crate) fn observed_generation_until(paths: &Paths, read_by: Instant) -> Result<Paths> {
     // Ordinary recovery may repair local files; a public observation uses
     // only established custody, including every predecessor in the chain.
     let mut selected = paths.clone();
     for depth in 0..=MAX_GENERATIONS {
-        if Instant::now() >= read_by {
-            return Err(fail());
-        }
+        within(read_by)?;
         if Selection::read(&selected)?.is_none() {
             break;
         }
@@ -709,7 +751,18 @@ fn observed_selection_within(
         }
         selected = candidate(&selected);
     }
-    let observation = Observation::observe_within(&selected, read_by, wait)?;
+    Ok(selected)
+}
+
+/// Observe the generation [`observed_generation_until`] named, under
+/// [`Observation::observe_within`]'s two bounds: each predecessor observed and the chain
+/// complete, as every reader of a successor home must before it reads.
+pub(crate) fn observe_generation(
+    selected: &Paths,
+    read_by: Instant,
+    wait: &dyn Fn() -> Instant,
+) -> Result<Observation> {
+    let observation = Observation::observe_within(selected, read_by, wait)?;
     observation.check(true, false, read_by)?;
     Ok(observation)
 }
@@ -723,12 +776,14 @@ pub(crate) fn lineage_until(
     let (bootstrap, journal) = Bootstrap::established_with_journal_until(&selected, deadline)
         .map_err(crate::table::failure)?;
     let access = bootstrap
-        .access_in(&journal)
+        .access_observed_in(&journal)
         .map_err(crate::table::failure)?
         .ok_or_else(fail)?;
-    if !access.is_current(&journal)
+    if !access
+        .is_current_observed(&journal)
+        .map_err(crate::table::failure)?
         || access.local().role() != aterm_secrets::commons::roster::Role::Writer
-        || client::local_recipient_denied_in_roster(&selected)
+        || client::local_recipient_denial_observed(&selected).map_err(crate::table::failure)?
     {
         return Err(fail());
     }
@@ -752,7 +807,10 @@ pub(crate) fn lineage_until(
         .map_err(crate::table::failure)?;
     let latest = Journal::read_existing(bootstrap.journal_dir(), bootstrap.trust())
         .map_err(crate::table::failure)?;
-    if !access.is_current(&latest) {
+    if !access
+        .is_current_observed(&latest)
+        .map_err(crate::table::failure)?
+    {
         return Err(fail());
     }
     observation.check(true, false, deadline)?;
@@ -834,9 +892,7 @@ fn lineage_prefix_until(paths: &Paths, deadline: Instant) -> Result<Lineage> {
     let mut trust = None;
     let mut ancestors = Vec::new();
     for depth in 0..=MAX_GENERATIONS {
-        if Instant::now() >= deadline {
-            return Err(fail());
-        }
+        within(deadline)?;
         if let Some(selection) = Selection::read(&path)? {
             if depth == MAX_GENERATIONS || selection.complete != Some(seal(&path)?) {
                 return Err(fail());
@@ -1054,8 +1110,11 @@ pub(crate) fn inspect(paths: &Paths) -> Result<Value> {
 }
 
 fn selected_at(paths: &Paths, depth: usize, deadline: Option<Instant>) -> Result<Paths> {
-    if depth > MAX_GENERATIONS || deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+    if depth > MAX_GENERATIONS {
         return Err(fail());
+    }
+    if let Some(deadline) = deadline {
+        within(deadline)?;
     }
     let Some(selection) = Selection::read(paths)? else {
         match deadline {
@@ -1366,6 +1425,47 @@ fn advance_at(paths: &Paths, config: &Path, depth: usize, budget: &Budget<'_>) -
     // serves this same candidate so ordinary authenticated repair can supply them.
     let _ = import_until(&mut selection, &|| budget.check(), budget.until);
     Ok(next)
+}
+
+/// Test seams of the generation checks.
+#[cfg(test)]
+pub(crate) mod seams {
+    use std::cell::RefCell;
+
+    /// Where in [`super::Observation::check`] a hook runs, for each predecessor.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(crate) enum Point {
+        /// Its custody is revalidated; this Mac's standing in its vault is not yet judged.
+        BeforeDenial,
+        /// Its vault does not deny this Mac; the check's access is not yet judged current.
+        BeforeCurrent,
+    }
+
+    /// A hook and the point it waits for.
+    type Hook = (Point, Box<dyn FnMut()>);
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// Run `hook` once this thread's next generation check reaches `point`.
+    pub(crate) fn at(point: Point, hook: impl FnMut() + 'static) {
+        HOOK.with(|slot| *slot.borrow_mut() = Some((point, Box::new(hook))));
+    }
+
+    pub(super) fn reached(point: Point) {
+        let hook = HOOK.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.as_ref().is_some_and(|(at, _)| *at == point) {
+                slot.take()
+            } else {
+                None
+            }
+        });
+        if let Some((_, mut hook)) = hook {
+            hook();
+        }
+    }
 }
 
 #[cfg(test)]

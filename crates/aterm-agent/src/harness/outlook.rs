@@ -15,7 +15,13 @@
 //! - **the replay** drives the executor's own functions (`advise_past_probe`,
 //!   `note_reading_held`, `note_wall`, `begin_rotation`, `prove`) on a clone of the state, over a
 //!   7-day pass at the week's pace and a 12-hour working pass with the 5-hour windows, forking
-//!   once at an account it cannot read ([`Lean`]).
+//!   once at an account it cannot read ([`Lean`]). A stop open at a pass's horizon is followed
+//!   past it, to a week beyond at most, to the instant the policy really resumes the work
+//!   ([`StopEnd`]); each pass keeps every row's fill as it goes ([`Pass::fills`]).
+//!
+//! `docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §3 supersedes the earlier design's stop
+//! ends and time words: a stop never ends at the horizon or at a wall the worst case invented,
+//! and a forecast instant is said to a grain its lead time can bear.
 //!
 //! The renderers ([`Outlook::glance`], [`Outlook::card_rows`], [`Outlook::text`],
 //! [`Outlook::json`]) paint the one model, so the footer, the card and the CLI tell one story.
@@ -51,8 +57,22 @@ pub const WORKING_HORIZON_S: i64 = 12 * 3600;
 pub const MAX_EVENTS: usize = 256;
 /// A stop this short is the grace at a reset and is not reported.
 pub const STOP_GRACE_S: i64 = 5 * 60;
-/// Forecast instants are rounded to this.
-pub const ROUND_S: i64 = 600;
+/// A forecast instant at most this far ahead is said to [`ROUND_NEAR_S`] ([`round_down`]).
+pub const NEAR_LEAD_S: i64 = 6 * 3600;
+/// A forecast instant at most this far ahead (and further than [`NEAR_LEAD_S`]) is said to
+/// [`ROUND_DAY_S`]; one further still to [`ROUND_FAR_S`].
+pub const DAY_LEAD_S: i64 = 24 * 3600;
+/// The grain of a forecast instant within [`NEAR_LEAD_S`].
+pub const ROUND_NEAR_S: i64 = 600;
+/// The grain of a forecast instant within [`DAY_LEAD_S`].
+pub const ROUND_DAY_S: i64 = 1800;
+/// The grain of a forecast instant beyond [`DAY_LEAD_S`]: a constant pace cannot place an
+/// instant days ahead to the minute.
+pub const ROUND_FAR_S: i64 = 3600;
+/// How far back a row's own readings are kept for the glass ([`RowOutlook::read`]).
+pub const READ_SPAN_S: i64 = 8 * 24 * 3600;
+/// The most readings kept of one row ([`RowOutlook::read`]): one an hour over [`READ_SPAN_S`].
+pub const READ_MAX: usize = 192;
 /// A lookback rise of at least this many tenths (one point) on the carrier's scale is the
 /// working pass's week rate; less, and the week's pace is.
 pub const WORKING_WEEK_MIN_X10: i64 = 10;
@@ -373,6 +393,16 @@ impl Refusal {
         }
     }
 
+    /// Its short words, the quota row's (`no pace yet`): [`Self::words`] without their detail.
+    #[must_use]
+    pub fn short(self) -> String {
+        match self {
+            Refusal::TooEarly { .. } => "no pace yet".into(),
+            Refusal::Stale { .. } => "not projected".into(),
+            other => other.words(),
+        }
+    }
+
     /// The spoken words.
     #[must_use]
     pub fn spoken(self) -> String {
@@ -455,6 +485,10 @@ pub struct WindowOutlook {
     pub window: Window,
     /// Its tenths used as read, where a figure is (never shown for an unread class).
     pub used_x10: Option<u32>,
+    /// Its tenths used as last read, whatever its class ([`Self::used_x10`] keeps only a class
+    /// the card shows as a number): the glass's figure, a bound until its reset
+    /// ([`Figure::of_week`]).
+    pub seen_x10: Option<u32>,
     /// Its reset as read (past for a reset class).
     pub reset: Option<i64>,
     /// When it was read.
@@ -497,6 +531,9 @@ pub struct RowOutlook {
     pub windows: Vec<WindowOutlook>,
     /// Where a wall stands on it now: the policy's answer at its wall.
     pub walled: Option<Walled>,
+    /// Its week as this Mac read it over the last [`READ_SPAN_S`], oldest first: the last
+    /// reading of each hour of each window, at most [`READ_MAX`] ([`Read`]).
+    pub read: Vec<Read>,
 }
 
 impl RowOutlook {
@@ -505,6 +542,125 @@ impl RowOutlook {
     pub fn window(&self, w: Window) -> Option<&WindowOutlook> {
         self.windows.iter().find(|x| x.window == w)
     }
+
+    /// Its week's figure as the glass says it ([`Figure::of_week`]).
+    #[must_use]
+    pub fn figure(&self, as_of: i64) -> Figure {
+        self.window(Window::Week)
+            .map_or(Figure::Unread, |week| Figure::of_week(week, as_of))
+    }
+}
+
+/// One reading of a row's week on this Mac ([`RowOutlook::read`]): a step the glass draws as
+/// read, never interpolated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Read {
+    /// When it was read.
+    pub t: i64,
+    /// Its tenths used (0..=1000).
+    pub x10: u16,
+    /// Its window's vendor reset: a new reset is a new window.
+    pub reset: i64,
+    /// The used limit reset its window restarted at, where one did: a new epoch is a new window
+    /// too, empty from that instant.
+    pub epoch: Option<i64>,
+}
+
+/// A week figure as the glass says it (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §2.1):
+/// never an inferred 100%.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Figure {
+    /// Read within the last 15 minutes, its reset ahead: `63%`.
+    Exact(u16),
+    /// A lower bound, true until its window's reset since use only rises within a window: an
+    /// older reading (a stale carrier's too), a row idle here, used since, or a pool row's:
+    /// `≥70%`, rounded down so it stays true.
+    AtLeast(u16),
+    /// A standing wall: `out`, never a percentage.
+    Out,
+    /// Unread, or read before a reset that has passed: `?`.
+    Unread,
+}
+
+impl Figure {
+    /// A reading's figure at `now`: exact while current, a lower bound after, unread once its
+    /// window reset or where its clock cannot be admitted.
+    #[must_use]
+    pub fn of_reading(used_x10: u32, resets_at: i64, at: i64, now: i64) -> Figure {
+        let Some(age) = super::profile::usage_read_age(at, now) else {
+            return Figure::Unread;
+        };
+        if resets_at <= now {
+            return Figure::Unread;
+        }
+        let x10 = u16::try_from(used_x10.min(1000)).unwrap_or(1000);
+        if age <= super::profile::USAGE_CURRENT_S {
+            Figure::Exact(x10)
+        } else {
+            Figure::AtLeast(x10)
+        }
+    }
+
+    /// A footer's own weekly figure at `now` ([`Self::of_reading`]).
+    #[must_use]
+    pub fn of_weekly(figure: &super::profile::WeeklyFigure, now: i64) -> Figure {
+        Figure::of_reading(figure.used_x10, figure.resets_at, figure.at, now)
+    }
+
+    /// An outlook row's week at `as_of`: a wall is [`Figure::Out`]; a reading of now exact; the
+    /// last reading of any other class ([`WindowOutlook::seen_x10`]) a lower bound while its
+    /// reset is ahead and its clock admitted (a stale carrier's too, whose pace is refused but
+    /// whose figure stays true); else unread.
+    #[must_use]
+    pub fn of_week(week: &WindowOutlook, as_of: i64) -> Figure {
+        if week.fresh == Fresh::Walled {
+            return Figure::Out;
+        }
+        let (Some(x10), Some(reset), Some(at)) = (week.seen_x10, week.reset, week.at) else {
+            return Figure::Unread;
+        };
+        match Figure::of_reading(x10, reset, at, as_of) {
+            Figure::Exact(x10) if week.fresh != Fresh::Now => Figure::AtLeast(x10),
+            figure => figure,
+        }
+    }
+
+    /// Its words: `63%`, `≥70%`, `out`, `?`. A figure under 100 is never said as `100%`, and a
+    /// bound is never rounded up past what was read.
+    #[must_use]
+    pub fn words(self) -> String {
+        match self {
+            Figure::Exact(x10) => format!("{}%", whole_used(x10)),
+            Figure::AtLeast(x10) => format!("\u{2265}{}%", floor_used(x10)),
+            Figure::Out => "out".into(),
+            Figure::Unread => "?".into(),
+        }
+    }
+
+    /// What a reader hears.
+    #[must_use]
+    pub fn spoken(self) -> String {
+        match self {
+            Figure::Exact(x10) => format!("{} percent used", whole_used(x10)),
+            Figure::AtLeast(x10) => format!("at least {} percent used", floor_used(x10)),
+            Figure::Out => "out until its reset".into(),
+            Figure::Unread => "not read".into(),
+        }
+    }
+}
+
+/// Whole percent used, half up, but `100` only for a reading of 100.
+fn whole_used(x10: u16) -> u16 {
+    if x10 >= 1000 {
+        100
+    } else {
+        ((x10 + 5) / 10).min(99)
+    }
+}
+
+/// Whole percent used, rounded down: a lower bound stays true (62.5% is `≥62%`, never `≥63%`).
+fn floor_used(x10: u16) -> u16 {
+    x10.min(1000) / 10
 }
 
 /// The policy's answer at a standing wall.
@@ -514,6 +670,25 @@ pub struct Walled {
     pub to: Option<String>,
     /// Else when the work resumes.
     pub until: Option<i64>,
+    /// The vendor reset `until` is the grace after, where a standing wall (on any row) names
+    /// one and stands exactly to it: `until` is that reset plus [`accounts::RESET_GRACE_S`], and
+    /// the glass says the reset, exactly (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md`
+    /// §2.1), whichever window's wall it is.
+    pub reset: Option<i64>,
+}
+
+/// The vendor reset whose grace a standing wall ends at `until`, on any row of `state`: the
+/// lookup `begin_stop` makes for a planned stop, here for a wait standing now.
+fn wall_reset(state: &State, until: i64) -> Option<i64> {
+    state
+        .accounts
+        .values()
+        .flat_map(|a| a.walls.values())
+        .filter(|wall| wall.stands_until() == Some(until))
+        .find_map(|wall| {
+            wall.until
+                .filter(|reset| reset.saturating_add(accounts::RESET_GRACE_S) == until)
+        })
 }
 
 /// Which pass.
@@ -575,21 +750,62 @@ pub struct Link {
     pub left_at_x10: Option<u32>,
 }
 
+/// Where a stop ends: the first event past its start on which the policy resumes the work or
+/// moves it, followed past the pass's horizon to [`Pass::horizon`] plus a week at most.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum StopEnd {
+    /// At this vendor reset of the account the work resumes on (the work resumes at its grace's
+    /// end): said exactly.
+    Reset(i64),
+    /// At this forecast instant: said `~`, rounded up by its lead.
+    About(i64),
+    /// Nothing ends it within a week past the horizon.
+    Open,
+}
+
+impl StopEnd {
+    /// The instant it names, where it names one.
+    #[must_use]
+    pub const fn at(self) -> Option<i64> {
+        match self {
+            StopEnd::Reset(t) | StopEnd::About(t) => Some(t),
+            StopEnd::Open => None,
+        }
+    }
+
+    /// The JSON word.
+    #[must_use]
+    pub const fn kind(self) -> &'static str {
+        match self {
+            StopEnd::Reset(_) => "reset",
+            StopEnd::About(_) => "about",
+            StopEnd::Open => "open",
+        }
+    }
+}
+
 /// A stop: every account out.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Stop {
     /// From.
     pub from: i64,
-    /// To (the end of the wall's grace where it ends at a reset).
-    pub to: i64,
+    /// Where it ends.
+    pub end: StopEnd,
     /// The window that walled.
     pub window: Window,
-    /// It ends at a vendor reset ([`Self::shown_to`]).
-    pub at_reset: bool,
-    /// The end a person reads: the vendor's reset, or [`Self::to`].
-    pub shown_to: i64,
     /// The work would go on on usage credits (R-9's switch on).
     pub credits: bool,
+}
+
+/// One knot of a row's fill in a pass ([`Pass::fills`]): its tenths used of the pass's window
+/// (the week in the week pass, the 5-hour window in the working pass) at `t`, `None` where the
+/// replay does not know it. The fill is linear between knots; a drop is two knots at one `t`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Knot {
+    /// When.
+    pub t: i64,
+    /// Its tenths used (0..=1000), where known.
+    pub x10: Option<u16>,
 }
 
 /// A fork at an account aterm cannot read.
@@ -624,8 +840,13 @@ pub struct Pass {
     pub cut_at: Option<i64>,
     /// The events it took.
     pub events: usize,
-    /// Each used row window's projection.
+    /// Each used row window's projection: its first window's, at its reset.
     pub proj: BTreeMap<(String, Window), Proj>,
+    /// Each row's fill through the pass, up to its horizon (or its fork), oldest first: a knot
+    /// wherever it changes course (the carrier's after each step, a reset's drop, a move, the
+    /// worst case's assumption, the end), so a later window's run-out has its curve too. All rows
+    /// together hold at most [`MAX_EVENTS`] knots for each row.
+    pub fills: BTreeMap<String, Vec<Knot>>,
 }
 
 impl Pass {
@@ -673,10 +894,8 @@ pub enum Verdict {
         pass: PassKind,
         /// From.
         from: i64,
-        /// The end a person reads.
-        to: i64,
-        /// It ends at a vendor reset (exact).
-        at_reset: bool,
+        /// Where it ends.
+        end: StopEnd,
         /// Both branches of a lean stop: the row it leans on.
         lean: Option<String>,
     },
@@ -688,9 +907,9 @@ pub enum Verdict {
         row: String,
         /// Its class.
         why: Fresh,
-        /// The worst case's stop: from, the end a person reads, and whether that end is a
-        /// vendor reset (exact) or projected (`~`, rounded up).
-        stop: Option<(i64, i64, bool)>,
+        /// The worst case's stop: from, and where it ends (never at the wall the worst case
+        /// invented).
+        stop: Option<(i64, StopEnd)>,
     },
     /// Usage credits carry a stop ahead (R-9's switch on).
     Credits {
@@ -721,7 +940,8 @@ impl Verdict {
         }
     }
 
-    /// Whether it says the work stops (said in warn ink, with its `⧗` mark and words).
+    /// Whether it says the work stops (said in warn ink, with its mark and words: `╳` for a
+    /// projected stop, `⧗` for a wall that waits now).
     #[must_use]
     pub const fn warns(&self) -> bool {
         matches!(
@@ -834,22 +1054,38 @@ impl Offsets {
         }
     }
 
-    /// `offset_at`'s offsets from nine days before `now` to nine days after: sampled hourly,
-    /// each change found to the second. Outside that span the nearest end's offset holds.
+    /// `offset_at`'s offsets from nine days before `now` to nine days after: sampled every
+    /// [`OFFSETS_STEP_S`], each change found to the second. Outside that span the nearest end's
+    /// offset holds.
     #[must_use]
     pub fn around(now: i64, offset_at: impl Fn(i64) -> i64) -> Offsets {
+        let Ok(offsets) =
+            Offsets::sampled(now, |t| Ok::<_, std::convert::Infallible>(offset_at(t)));
+        offsets
+    }
+
+    /// [`Offsets::around`] for a zone that may not answer (`aterm_uds::zone::local_offset_at` on
+    /// a platform it cannot read): `None` where `offset_at` says nothing at any instant it is
+    /// asked, so the caller says no local time rather than another zone's.
+    #[must_use]
+    pub fn read_around(now: i64, offset_at: impl Fn(i64) -> Option<i64>) -> Option<Offsets> {
+        Offsets::sampled(now, |t| offset_at(t).ok_or(())).ok()
+    }
+
+    /// [`Offsets::around`]'s sampling, stopped at the first instant `offset_at` fails on.
+    fn sampled<E>(now: i64, offset_at: impl Fn(i64) -> Result<i64, E>) -> Result<Offsets, E> {
         let mut t = now - OFFSETS_SPAN_S;
-        let mut was = offset_at(t);
+        let mut was = offset_at(t)?;
         let mut steps = vec![(i64::MIN, was)];
         while t < now + OFFSETS_SPAN_S {
             let next = t + OFFSETS_STEP_S;
-            let then = offset_at(next);
+            let then = offset_at(next)?;
             if then != was {
                 // The first second after t, up to and including next, on the new offset.
                 let (mut lo, mut hi) = (t, next);
                 while hi - lo > 1 {
                     let mid = lo + (hi - lo) / 2;
-                    if offset_at(mid) == was {
+                    if offset_at(mid)? == was {
                         lo = mid;
                     } else {
                         hi = mid;
@@ -860,7 +1096,7 @@ impl Offsets {
             }
             t = next;
         }
-        Offsets { steps }
+        Ok(Offsets { steps })
     }
 
     /// The offset at `t`.
@@ -870,6 +1106,13 @@ impl Offsets {
         self.steps
             .get(i.saturating_sub(1))
             .map_or(0, |(_, offset)| *offset)
+    }
+
+    /// The first instant after `t` at which the offset changes, where one does.
+    #[must_use]
+    pub fn change_after(&self, t: i64) -> Option<i64> {
+        let i = self.steps.partition_point(|(from, _)| *from <= t);
+        self.steps.get(i).map(|(from, _)| *from)
     }
 }
 
@@ -1218,6 +1461,19 @@ struct Win {
     fills_at: Option<i64>,
 }
 
+impl Win {
+    /// An empty window with no reset, known as `known`.
+    const fn empty(known: Known) -> Win {
+        Win {
+            acc: 0,
+            reset: None,
+            known,
+            low_fired: false,
+            fills_at: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct SimRow {
     label: String,
@@ -1269,6 +1525,8 @@ struct Ctx<'a> {
     credits: bool,
     kind: PassKind,
     horizon: i64,
+    /// A stop open at the horizon is followed to here at most: [`Self::horizon`] plus a week.
+    resume_bound: i64,
     /// `x10 · M` per day, per modeled window.
     week_rate: i64,
     five_rate: Option<i64>,
@@ -1282,6 +1540,14 @@ impl Ctx<'_> {
         }
     }
 
+    /// The window a pass's fills and links say: the week, or the working pass's 5 hours.
+    const fn filled(&self) -> Window {
+        match self.kind {
+            PassKind::Week => Window::Week,
+            PassKind::Working => Window::Five,
+        }
+    }
+
     fn rate(&self, w: Window) -> i64 {
         match w {
             Window::Week => self.week_rate,
@@ -1289,6 +1555,19 @@ impl Ctx<'_> {
         }
         .max(0)
     }
+}
+
+/// A stop in progress ([`Sim::begin_stop`]).
+#[derive(Clone, Debug)]
+struct Planned {
+    from: i64,
+    /// When the policy said the work may go on, unclamped: it may lie past the horizon.
+    until: i64,
+    /// The window that walled.
+    window: Window,
+    /// Each row whose real wall stands exactly to [`Self::until`], with the vendor reset that
+    /// instant is the grace of.
+    resets: Vec<(usize, i64)>,
 }
 
 #[derive(Clone)]
@@ -1299,14 +1578,18 @@ struct Sim<'a> {
     carrier: usize,
     t: i64,
     link_from: i64,
-    /// A stop in progress: from, its planned end, the window that walled, and the vendor reset
-    /// its planned end is the grace of.
-    stop: Option<(i64, i64, Window, Option<i64>)>,
+    /// A stop in progress.
+    stop: Option<Planned>,
     /// Every decision taken, where a test asked for them ([`Decision`]).
     trace: Option<std::rc::Rc<std::cell::RefCell<Vec<Decision>>>>,
     chain: Vec<Link>,
     stops: Vec<Stop>,
     proj: BTreeMap<(String, Window), Proj>,
+    /// [`Pass::fills`], and the knots in it.
+    fills: BTreeMap<String, Vec<Knot>>,
+    knots: usize,
+    /// The fills reached the horizon (or the fork): no knot follows.
+    fills_closed: bool,
     events: usize,
     cut_at: Option<i64>,
     branch: Branch,
@@ -1386,6 +1669,7 @@ impl<'a> Sim<'a> {
                 carrier: label,
                 point: point.clone(),
                 t: self.t,
+                horizon: self.ctx.horizon,
                 advice: advice.clone(),
                 modeled,
             });
@@ -1400,12 +1684,75 @@ impl<'a> Sim<'a> {
             from: self.link_from,
             to: self.t,
             ends,
-            left_at_x10: Some(row.used_x10(match self.ctx.kind {
-                PassKind::Week => &row.week,
-                PassKind::Working => &row.five,
-            })),
+            left_at_x10: Some(row.used_x10(row.win(self.ctx.filled()))),
         });
         self.link_from = self.t;
+    }
+
+    /// Row `i`'s fill of the pass's window now, where the replay knows it.
+    fn fill_of(&self, i: usize) -> Option<u16> {
+        let row = &self.rows[i];
+        let win = row.win(self.ctx.filled());
+        (win.known != Known::Unknown).then(|| u16::try_from(row.used_x10(win)).unwrap_or(1000))
+    }
+
+    /// A knot of row `i`'s fill at `t` ([`Pass::fills`]): none past the horizon or the fills'
+    /// close, nor past [`MAX_EVENTS`] for each row, all rows counted; a repeat is dropped, and
+    /// a flat run keeps only its ends.
+    fn push_knot(&mut self, i: usize, t: i64, x10: Option<u16>) {
+        if self.fills_closed
+            || t > self.ctx.horizon
+            || self.knots >= MAX_EVENTS.saturating_mul(self.rows.len())
+        {
+            return;
+        }
+        let knot = Knot { t, x10 };
+        let knots = self.fills.entry(self.rows[i].label.clone()).or_default();
+        let n = knots.len();
+        if n >= 1 && knots[n - 1] == knot {
+            return;
+        }
+        if n >= 2
+            && knots[n - 2].x10 == x10
+            && knots[n - 1].x10 == x10
+            && knots[n - 2].t < knots[n - 1].t
+            && knots[n - 1].t <= t
+        {
+            knots[n - 1].t = t;
+            return;
+        }
+        knots.push(knot);
+        self.knots += 1;
+    }
+
+    /// A knot of row `i`'s fill now.
+    fn note_fill(&mut self, i: usize) {
+        let x10 = self.fill_of(i);
+        self.push_knot(i, self.t, x10);
+    }
+
+    /// A knot of every row's fill now, at most at the horizon, and no knot after
+    /// ([`Pass::fills`] ends here).
+    fn close_fills(&mut self) {
+        if self.fills_closed {
+            return;
+        }
+        let t = self.t.min(self.ctx.horizon);
+        for i in 0..self.rows.len() {
+            let x10 = self.fill_of(i);
+            self.push_knot(i, t, x10);
+        }
+        self.fills_closed = true;
+    }
+
+    /// A pass's (or a branch's) fills begin: every row's knot now.
+    fn seed_fills(&mut self) {
+        self.fills.clear();
+        self.knots = 0;
+        self.fills_closed = false;
+        for i in 0..self.rows.len() {
+            self.note_fill(i);
+        }
     }
 
     fn capture(&mut self, i: usize, w: Window) {
@@ -1424,17 +1771,23 @@ impl<'a> Sim<'a> {
         }
     }
 
-    /// The earliest event after `t` (R4), at most the horizon.
+    /// The earliest event after `t` (R4): at most the horizon, or while a stop is open, the
+    /// resume bound. The worst case's invented wall and reset lie at or past the bound
+    /// ([`Self::assume_worst`]), so neither is ever an event.
     fn next_event(&self) -> i64 {
         let t = self.t;
-        let mut next = self.ctx.horizon;
+        let mut next = if self.stop.is_some() {
+            self.ctx.resume_bound
+        } else {
+            self.ctx.horizon
+        };
         let mut at = |e: i64| {
             if e > t && e < next {
                 next = e;
             }
         };
-        if let Some((_, until, _, _)) = self.stop {
-            at(until);
+        if let Some(stop) = &self.stop {
+            at(stop.until);
         } else {
             let row = &self.rows[self.carrier];
             for &w in self.ctx.modeled() {
@@ -1458,7 +1811,8 @@ impl<'a> Sim<'a> {
         }
         for row in &self.rows {
             for &w in self.ctx.modeled() {
-                if let Some(reset) = row.win(w).reset {
+                let win = row.win(w);
+                if let Some(reset) = win.reset {
                     at(reset);
                 }
             }
@@ -1478,6 +1832,15 @@ impl<'a> Sim<'a> {
         if self.stop.is_some() || dt <= 0 {
             return;
         }
+        let c = self.carrier;
+        self.note_fill(c);
+        self.spend(to, dt);
+        let x10 = self.fill_of(c);
+        self.push_knot(c, to, x10);
+    }
+
+    /// The carrier spends the `dt` seconds to `to` at the work's pace, at most to full.
+    fn spend(&mut self, to: i64, dt: i128) {
         let modeled = self.ctx.modeled();
         let rates: Vec<(Window, i128)> = modeled
             .iter()
@@ -1497,10 +1860,14 @@ impl<'a> Sim<'a> {
         }
     }
 
-    /// R8: each modeled window whose reset is now.
+    /// R8: each modeled window whose reset is now; a row whose filled window resets drops in
+    /// [`Pass::fills`]: two knots at one instant.
     fn on_resets(&mut self) {
         let t = self.t;
         for i in 0..self.rows.len() {
+            let before = self.fill_of(i);
+            let filled = self.ctx.filled();
+            let drops = self.rows[i].win(filled).reset.is_some_and(|r| r <= t);
             let mut reseen = false;
             for &w in self.ctx.modeled() {
                 if self.rows[i].win(w).reset.is_none_or(|r| r > t) {
@@ -1527,6 +1894,11 @@ impl<'a> Sim<'a> {
                     Window::Five => carrier.then(|| t + w.len_s()),
                 };
                 reseen |= row.seen;
+            }
+            if drops {
+                self.push_knot(i, t, before);
+                let after = self.fill_of(i);
+                self.push_knot(i, t, after);
             }
             if reseen {
                 self.read_into_state(i);
@@ -1558,10 +1930,6 @@ impl<'a> Sim<'a> {
             .unwrap_or(false)
     }
 
-    fn stands_until(&self, label: &str) -> Option<i64> {
-        self.state.accounts.get(label)?.limited_until(self.t)
-    }
-
     /// Opens the carrier's 5-hour window at first use, in the working pass.
     fn open_five(&mut self) {
         if self.ctx.kind != PassKind::Working {
@@ -1571,11 +1939,8 @@ impl<'a> Sim<'a> {
         let row = &mut self.rows[self.carrier];
         if row.five.reset.is_none_or(|r| r <= t) && row.five.known != Known::Unknown {
             row.five = Win {
-                acc: 0,
                 reset: Some(t + Window::Five.len_s()),
-                known: Known::Exact,
-                low_fired: false,
-                fills_at: None,
+                ..Win::empty(Known::Exact)
             };
         }
     }
@@ -1591,26 +1956,41 @@ impl<'a> Sim<'a> {
         self.at_wall(w)
     }
 
+    /// The end of the carrier's own standing wall: `None` where none stands, and a stop is
+    /// planned to the resume bound. The worst case's invented wall stands past the bound
+    /// ([`Self::assume_worst`]), so a stop planned to it is still open there, as one planned to
+    /// the bound is.
+    fn own_wall(&self) -> Option<i64> {
+        self.state
+            .accounts
+            .get(&self.carrier_label())?
+            .walls
+            .values()
+            .filter_map(accounts::Wall::stands_until)
+            .filter(|end| self.t < *end)
+            .max()
+    }
+
     /// R6's decision at the carrier's standing wall on `w`.
     fn at_wall(&mut self, w: Window) -> Option<()> {
         let point = Point::Wall {
             window: w.id().to_owned(),
             at: Some(self.t),
         };
-        let own_wall = |sim: &Self| {
-            sim.stands_until(&sim.carrier_label())
-                .unwrap_or(sim.ctx.horizon)
-                .max(sim.t + 1)
-        };
         match self.advise(&point) {
             Advice::Move { to, rotates, .. } => {
                 if !self.rotate(&to, rotates) {
                     // The rotation was refused (spent, raced, pinned): the work stays walled.
-                    let until = own_wall(self);
+                    let until = self.own_wall().unwrap_or(self.ctx.resume_bound);
                     self.begin_stop(until, w);
                     return Some(());
                 }
-                self.end_stop();
+                let on = self.index(&to);
+                self.end_stop(on);
+                if self.t >= self.ctx.horizon {
+                    // Past the horizon a move only ends the stop: no link follows.
+                    return Some(());
+                }
                 self.take(&to, Ends::Walls)
             }
             Advice::Wait { until } | Advice::Stay(StayWhy::Breaker { until }) => {
@@ -1618,45 +1998,74 @@ impl<'a> Sim<'a> {
                 Some(())
             }
             Advice::Resume { .. } => {
-                self.end_stop();
+                let on = Some(self.carrier);
+                self.end_stop(on);
                 Some(())
             }
             Advice::Stay(_) | Advice::Probe => {
-                let until = own_wall(self);
+                let until = self.own_wall().unwrap_or(self.ctx.resume_bound);
                 self.begin_stop(until, w);
                 Some(())
             }
         }
     }
 
+    /// Plans the stop (or re-plans the open one) to `until`, unclamped: it may lie past the
+    /// horizon. Each row whose real wall stands exactly to that instant is noted with the vendor
+    /// reset it is the grace of ([`Planned::resets`]).
     fn begin_stop(&mut self, until: i64, w: Window) {
-        let until = until.max(self.t + 1).min(self.ctx.horizon);
-        let reset = self
-            .state
-            .accounts
-            .values()
-            .flat_map(|a| a.walls.values())
-            .filter(|wall| wall.stands_until() == Some(until))
-            .find_map(|wall| wall.until);
+        let until = until.max(self.t + 1);
+        let resets = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, row)| {
+                let walls = &self.state.accounts.get(&row.label)?.walls;
+                walls
+                    .values()
+                    .filter(|wall| wall.stands_until() == Some(until))
+                    .find_map(|wall| {
+                        wall.until
+                            .filter(|reset| reset.saturating_add(accounts::RESET_GRACE_S) == until)
+                    })
+                    .map(|reset| (i, reset))
+            })
+            .collect();
         match &mut self.stop {
-            Some((_, end, _, shown)) => {
-                *end = until;
-                *shown = reset;
+            Some(stop) => {
+                stop.until = until;
+                stop.resets = resets;
             }
-            None => self.stop = Some((self.t, until, w, reset)),
+            None => {
+                self.stop = Some(Planned {
+                    from: self.t,
+                    until,
+                    window: w,
+                    resets,
+                });
+            }
         }
     }
 
-    fn end_stop(&mut self) {
-        let Some((from, planned, window, shown)) = self.stop.take() else {
+    /// Ends the open stop now, the work going on on row `on`: [`StopEnd::Reset`] where that is
+    /// the planned instant and `on`'s real wall ends there by its vendor reset, else
+    /// [`StopEnd::About`] now. `None` is a stop nothing ended by the resume bound
+    /// ([`StopEnd::Open`]). One that ends within [`STOP_GRACE_S`] of its start is no stop.
+    fn end_stop(&mut self, on: Option<usize>) {
+        let Some(stop) = self.stop.take() else {
             return;
         };
-        let to = planned.min(self.t);
-        if to.saturating_sub(from) <= STOP_GRACE_S {
-            self.link_from = self.t;
-            return;
-        }
-        let reset = shown.filter(|_| to == planned);
+        self.link_from = self.t;
+        let end = match on {
+            None => StopEnd::Open,
+            Some(_) if self.t.saturating_sub(stop.from) <= STOP_GRACE_S => return,
+            Some(i) => stop
+                .resets
+                .iter()
+                .find(|(row, _)| *row == i)
+                .filter(|_| self.t == stop.until)
+                .map_or(StopEnd::About(self.t), |&(_, reset)| StopEnd::Reset(reset)),
+        };
         let credits = self.ctx.credits
             && self
                 .state
@@ -1664,14 +2073,11 @@ impl<'a> Sim<'a> {
                 .get(&self.carrier_label())
                 .is_none_or(|a| !matches!(a.credits, Some(accounts::Credits::Off(_))));
         self.stops.push(Stop {
-            from,
-            to,
-            window,
-            at_reset: reset.is_some(),
-            shown_to: reset.unwrap_or(to),
+            from: stop.from,
+            end,
+            window: stop.window,
             credits,
         });
-        self.link_from = self.t;
     }
 
     /// R7's rotation onto `to`, where the advice `rotates`: the executor's compare-and-set, then
@@ -1720,6 +2126,7 @@ impl<'a> Sim<'a> {
         if known == Known::Exact || self.rows[b].seen {
             self.rows[b].seen = true;
             self.open_five();
+            self.note_fill(b);
             // A row the policy took on a figure it holds of it, though its truth is spent (a
             // wall the clone no longer stands, its window not yet reset): it walls at once.
             if let Some(w) = self.full_window().filter(|_| self.stop.is_none()) {
@@ -1744,29 +2151,47 @@ impl<'a> Sim<'a> {
         }
     }
 
+    /// The worst case of an unread row: it walls at once, out to the resume bound. Its reset and
+    /// its wall's end (the bound plus the reset grace) lie at or past the bound, which no event
+    /// reaches ([`Self::next_event`]): the invention is never an event and never ends a stop,
+    /// by construction. Its fill is an assumption, not a figure: the week is
+    /// [`Known::Unknown`], so [`Pass::fills`] never draws it full (never an inferred 100%).
     fn assume_worst(&mut self, b: usize) {
         let label = self.rows[b].label.clone();
-        let horizon = self.ctx.horizon;
+        let bound = self.ctx.resume_bound;
         // It walls at its first turn: a link of no length, so the chain names it.
         self.close_link(Ends::Walls);
+        self.note_fill(b);
         let row = &mut self.rows[b];
         row.seen = true;
         let full = i128::from(FULL_X10) * row.scale();
         row.week = Win {
             acc: full,
-            reset: Some(horizon),
-            known: Known::Exact,
+            reset: Some(bound),
             low_fired: true,
             fills_at: Some(self.t),
+            ..Win::empty(Known::Unknown)
         };
+        self.note_fill(b);
         let _ = accounts::note_wall(
             &mut self.state,
             &label,
             accounts::WEEK_LIMIT,
-            Some(horizon),
+            Some(bound),
             self.t,
             self.t,
         );
+        // The policy believes a vendor reset only within `RESET_BELIEVED_S` of its wall
+        // (`accounts::believed_reset`), so the wall was noted with none; the worst case's
+        // invention stands to the resume bound.
+        if let Some(wall) = self
+            .state
+            .accounts
+            .get_mut(&label)
+            .and_then(|a| a.walls.get_mut(accounts::WEEK_LIMIT))
+        {
+            wall.until = Some(bound);
+        }
         let _ = self.at_wall(Window::Week);
     }
 
@@ -1782,25 +2207,17 @@ impl<'a> Sim<'a> {
             }
             _ => {
                 row.week = Win {
-                    acc: 0,
                     reset: Some(t + Window::Week.len_s()),
-                    known: Known::Exact,
-                    low_fired: false,
-                    fills_at: None,
+                    ..Win::empty(Known::Exact)
                 };
             }
         }
         if row.five.known != Known::Exact {
-            row.five = Win {
-                acc: 0,
-                reset: None,
-                known: Known::Exact,
-                low_fired: false,
-                fills_at: None,
-            };
+            row.five = Win::empty(Known::Exact);
         }
         self.open_five();
         self.read_into_state(b);
+        self.note_fill(b);
     }
 
     fn fork(&mut self, b: usize) {
@@ -1811,12 +2228,14 @@ impl<'a> Sim<'a> {
         worst.chain.clear();
         worst.stops.clear();
         worst.link_from = self.t;
+        worst.seed_fills();
         worst.assume_worst(b);
         let mut best = self.clone();
         best.branch = Branch::Best;
         best.chain.clear();
         best.stops.clear();
         best.link_from = self.t;
+        best.seed_fills();
         best.assume_best(b);
         let at = self.t;
         self.lean = Some(Box::new(Lean {
@@ -1828,8 +2247,12 @@ impl<'a> Sim<'a> {
         }));
     }
 
-    /// Runs the pass to its horizon.
+    /// Runs the pass to its horizon, and a stop open there on to its end (at most the resume
+    /// bound).
     fn run(mut self) -> Pass {
+        if self.fills.is_empty() {
+            self.seed_fills();
+        }
         self.open_five();
         if let Some(w) = self.full_window().filter(|_| self.stop.is_none()) {
             if self.wall(w).is_none() {
@@ -1863,23 +2286,31 @@ impl<'a> Sim<'a> {
             self.advance(next);
             self.t = next;
             if self.t >= self.ctx.horizon {
-                break;
+                self.close_fills();
+                // Past the horizon the replay only ends an open stop.
+                if self.stop.is_none() || self.t >= self.ctx.resume_bound {
+                    break;
+                }
             }
             self.on_resets();
-            let carrier = self.carrier_label();
-            if let Some((_, until, w, _)) = self.stop {
+            if let Some(Planned { until, window, .. }) = self.stop {
                 if self.t < until {
                     continue;
                 }
-                if self.limited(&carrier) {
-                    if self.at_wall(w).is_none() {
+                if self.limited(&self.carrier_label()) {
+                    if self.at_wall(window).is_none() {
                         return self.finish(true);
                     }
-                    if self.stop.is_some_and(|(_, end, _, _)| end > self.t) {
+                    if self.stop.is_some() {
                         continue;
                     }
+                } else {
+                    let on = Some(self.carrier);
+                    self.end_stop(on);
                 }
-                self.end_stop();
+                if self.t >= self.ctx.horizon {
+                    break;
+                }
                 if self.limited(&self.carrier_label()) {
                     continue;
                 }
@@ -1915,10 +2346,12 @@ impl<'a> Sim<'a> {
 
     fn finish(mut self, forked: bool) -> Pass {
         if !forked {
-            self.t = self.t.min(self.ctx.horizon);
             if self.stop.is_some() {
-                self.end_stop();
-            } else {
+                // Nothing ended it by the resume bound (or the event bound cut it).
+                self.close_fills();
+                self.end_stop(None);
+            } else if self.link_from < self.ctx.horizon {
+                self.t = self.t.min(self.ctx.horizon);
                 self.close_link(Ends::Horizon);
             }
             for i in 0..self.rows.len() {
@@ -1927,6 +2360,7 @@ impl<'a> Sim<'a> {
                 }
             }
         }
+        self.close_fills();
         Pass {
             kind: self.ctx.kind,
             horizon: self.ctx.horizon,
@@ -1936,6 +2370,7 @@ impl<'a> Sim<'a> {
             cut_at: self.cut_at,
             events: self.events,
             proj: self.proj,
+            fills: self.fills,
         }
     }
 }
@@ -2074,31 +2509,17 @@ fn win_of(seen: Option<Seen>, fresh: Fresh, m: u32, now: i64, w: Window) -> Win 
         (Fresh::Walled, s) => Win {
             acc: i128::from(FULL_X10) * scale,
             reset: s.map(|s| s.reset),
-            known: Known::Exact,
             low_fired: true,
             fills_at: Some(now),
+            ..Win::empty(Known::Exact)
         },
         (_, Some(s)) => Win {
             acc: i128::from(s.pct_x10) * scale,
             reset: Some(s.reset),
-            known,
-            low_fired: false,
-            fills_at: None,
+            ..Win::empty(known)
         },
-        (_, None) if w == Window::Five && admitted.is_some() => Win {
-            acc: 0,
-            reset: None,
-            known: Known::Exact,
-            low_fired: false,
-            fills_at: None,
-        },
-        (_, None) => Win {
-            acc: 0,
-            reset: None,
-            known: Known::Unknown,
-            low_fired: false,
-            fills_at: None,
-        },
+        (_, None) if w == Window::Five && admitted.is_some() => Win::empty(Known::Exact),
+        (_, None) => Win::empty(Known::Unknown),
     }
 }
 
@@ -2160,6 +2581,8 @@ pub struct Decision {
     pub point: Point,
     /// The instant.
     pub t: i64,
+    /// The pass's horizon: a decision at or past it only ends a stop.
+    pub horizon: i64,
     /// The answer.
     pub advice: Advice,
     /// The carrier's modeled figures then (each window, its tenths used, its reset), which the
@@ -2319,6 +2742,7 @@ fn build(
                     fresh.shows_figure() && super::profile::usage_read_age(s.at, now).is_some()
                 })
                 .map(|s| s.pct_x10),
+            seen_x10: seen.map(|s| s.pct_x10),
             reset: seen.map(|s| s.reset),
             at: seen.map(|s| s.at),
             fresh,
@@ -2339,7 +2763,7 @@ fn build(
                         .next()
                 })
                 .unwrap_or_else(|| accounts::WEEK_LIMIT.to_owned());
-            match accounts::advise_past_probe(
+            let (to, until) = match accounts::advise_past_probe(
                 roster,
                 &clone,
                 inputs.enrolled,
@@ -2351,21 +2775,20 @@ fn build(
                 inputs.mode,
                 now,
             ) {
-                Advice::Move { to, .. } => Walled {
-                    to: Some(to),
-                    until: None,
-                },
-                Advice::Wait { until } => Walled {
-                    to: None,
-                    until: Some(until),
-                },
-                _ => Walled {
-                    to: None,
-                    until: state
+                Advice::Move { to, .. } => (Some(to), None),
+                Advice::Wait { until } => (None, Some(until)),
+                _ => (
+                    None,
+                    state
                         .accounts
                         .get(&row.label)
                         .and_then(|a| a.limited_until(now)),
-                },
+                ),
+            };
+            Walled {
+                to,
+                until,
+                reset: until.and_then(|u| wall_reset(state, u)),
             }
         });
         rows.push(RowOutlook {
@@ -2381,6 +2804,11 @@ fn build(
                 window(Window::Five, fresh_five, seen_five),
             ],
             walled,
+            read: inputs
+                .series
+                .get(&row.label)
+                .map(|rows| reads_of(rows, now))
+                .unwrap_or_default(),
         });
         // The carrier is followed from its reading whatever its order here (the replay holds the
         // work on it, as R7 follows a row once taken); every other row read before now is a
@@ -2498,6 +2926,7 @@ fn build(
             credits: inputs.credits,
             kind,
             horizon,
+            resume_bound: horizon.saturating_add(accounts::WEEK_WINDOW_S),
             week_rate,
             five_rate,
         },
@@ -2510,6 +2939,9 @@ fn build(
         chain: Vec::new(),
         stops: Vec::new(),
         proj: BTreeMap::new(),
+        fills: BTreeMap::new(),
+        knots: 0,
+        fills_closed: false,
         events: 0,
         cut_at: None,
         branch: Branch::Main,
@@ -2567,6 +2999,56 @@ fn build(
     }
     out.week = Some(week);
     out.working = working;
+    out
+}
+
+/// A row's week as this Mac read it ([`RowOutlook::read`]): each admitted reading of the last
+/// [`READ_SPAN_S`] (a beat repeats the reading before it), the last of each hour of each window
+/// kept, oldest first, at most the newest [`READ_MAX`].
+fn reads_of(rows: &[SeriesRow], now: i64) -> Vec<Read> {
+    let mut figs: Vec<Read> = Vec::new();
+    let mut last: Option<Read> = None;
+    for row in rows {
+        let read = match &row.said {
+            // A beat repeats the last `fig` row's figures, both windows: `last` is that row's
+            // week, `None` included, so a beat after a row that read no week repeats none.
+            account_series::Said::Fig { seven_day, .. } => {
+                last = seven_day.as_ref().map(|fig| Read {
+                    t: fig.at,
+                    x10: u16::try_from(fig.pct_x10.min(1000)).unwrap_or(1000),
+                    reset: fig.reset,
+                    epoch: fig.epoch,
+                });
+                last
+            }
+            account_series::Said::Beat => last.map(|prev| Read { t: row.t, ..prev }),
+            account_series::Said::Plan(_) => None,
+        };
+        let Some(read) = read else {
+            continue;
+        };
+        if super::profile::usage_read_age(read.t, now).is_some() && read.t >= now - READ_SPAN_S {
+            figs.push(Read {
+                t: read.t.min(now),
+                ..read
+            });
+        }
+    }
+    figs.sort_by_key(|r| r.t);
+    let mut out: Vec<Read> = Vec::with_capacity(figs.len().min(READ_MAX));
+    for read in figs {
+        match out.last_mut() {
+            Some(prev)
+                if prev.t.div_euclid(3600) == read.t.div_euclid(3600)
+                    && (prev.reset, prev.epoch) == (read.reset, read.epoch) =>
+            {
+                *prev = read;
+            }
+            _ => out.push(read),
+        }
+    }
+    let cut = out.len().saturating_sub(READ_MAX);
+    out.drain(..cut);
     out
 }
 
@@ -2670,13 +3152,15 @@ fn demand_of(
     }
 }
 
-fn worst_stop(lean: &Lean) -> Option<&Stop> {
+/// A lean's worst case's first stop, its own lean's followed: [`Verdict::Lean`]'s `stop`.
+pub(crate) fn worst_stop(lean: &Lean) -> Option<&Stop> {
     lean.worst
         .first_stop()
         .or_else(|| lean.worst.lean.as_ref().and_then(|l| worst_stop(l)))
 }
 
-fn best_stops(lean: &Lean) -> bool {
+/// Whether a lean's best case stops too, so the stop stands whatever the row holds.
+pub(crate) fn best_stops(lean: &Lean) -> bool {
     lean.best.first_stop().is_some()
 }
 
@@ -2690,8 +3174,7 @@ fn verdict_of(walled: Option<Walled>, week: &Pass, working: Option<&Pass>) -> Ve
     let stop = |pass: &Pass, lean: Option<String>, s: &Stop| Verdict::Stop {
         pass: pass.kind,
         from: s.from,
-        to: s.shown_to,
-        at_reset: s.at_reset,
+        end: s.end,
         lean,
     };
     let mut leaning: Option<Verdict> = None;
@@ -2710,7 +3193,7 @@ fn verdict_of(walled: Option<Walled>, week: &Pass, working: Option<&Pass>) -> Ve
                     until: lean.at,
                     row: lean.row.clone(),
                     why: lean.why,
-                    stop: Some((s.from, s.shown_to, s.at_reset)),
+                    stop: Some((s.from, s.end)),
                 });
             }
         }
@@ -2759,52 +3242,75 @@ fn clock_of(minutes: i64) -> String {
     format!("{:02}:{:02}", minutes / 60, minutes % 60)
 }
 
-/// The menu's time words for `t` seen at `now`: `20:10` on the same local day, `Wed 22:30`
-/// within the next six days, `1 Nov 18:10` beyond (`autopilot_menu::when`'s form).
+/// The glass's time words for `t` seen at `now`: `20:10` on the same local day, `Wed 22:30`
+/// one to six days on, `Thu 12 Nov 05:00` from seven days (a day-7 instant shares today's
+/// weekday, so it carries its date) and for any earlier day.
 #[must_use]
 pub fn when(t: i64, now: i64, offsets: &Offsets) -> String {
-    let (day, min) = local(t, offsets.at(t));
-    let (today, _) = local(now, offsets.at(now));
-    let diff = day - today;
-    if diff == 0 {
-        clock_of(min)
-    } else if (1..=6).contains(&diff) {
-        format!(
-            "{} {}",
-            WEEKDAYS[usize::try_from(day.rem_euclid(7)).unwrap_or(0)],
-            clock_of(min)
-        )
-    } else {
-        let (_, m, d) = aterm_types::rfc3339::civil_from_days(day);
-        format!(
-            "{d} {} {}",
-            MONTHS[usize::try_from(m - 1).unwrap_or(0).min(11)],
-            clock_of(min)
-        )
-    }
+    when_in(t, now, offsets, &WEEKDAYS, &MONTHS)
 }
 
-/// [`when`] for a screen reader: `Wednesday 22:30`, `1 November 18:10`.
+/// The length of the [`when`] words at the head of `text`, in bytes (each an ASCII cell): `HH:MM`,
+/// `Ddd HH:MM` or `Ddd D Mon HH:MM`, with an hour under 24, a minute under 60, a day of the month
+/// from 1 to 31 with no leading zero, and [`when`]'s own weekday and month names; `None` where
+/// `text` does not start with one. What follows is the caller's to judge.
+#[must_use]
+pub fn when_len(text: &str) -> Option<usize> {
+    let clock = |s: &[u8]| {
+        let two = |hi: u8, lo: u8, most: u8| {
+            hi.is_ascii_digit() && lo.is_ascii_digit() && (hi - b'0') * 10 + (lo - b'0') <= most
+        };
+        matches!(s, [h1, h2, b':', m1, m2, ..] if two(*h1, *h2, 23) && two(*m1, *m2, 59))
+    };
+    let bytes = text.as_bytes();
+    if clock(bytes) {
+        return Some(5);
+    }
+    WEEKDAYS.iter().find(|day| text.starts_with(*day))?;
+    let rest = bytes.get(3..)?.strip_prefix(b" ")?;
+    if clock(rest) {
+        return Some(4 + 5);
+    }
+    let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+    let date = std::str::from_utf8(rest.get(..digits)?).ok()?;
+    if !(1..=2).contains(&digits) || date.starts_with('0') || date.parse::<u8>().ok()? > 31 {
+        return None;
+    }
+    let rest = rest.get(digits..)?.strip_prefix(b" ")?;
+    MONTHS
+        .iter()
+        .find(|month| rest.starts_with(month.as_bytes()))?;
+    let rest = rest.get(3..)?.strip_prefix(b" ")?;
+    clock(rest).then_some(4 + digits + 1 + 4 + 5)
+}
+
+/// [`when`] for a screen reader: `Wednesday 22:30`, `Thursday 12 November 05:00`.
 #[must_use]
 pub fn spoken_when(t: i64, now: i64, offsets: &Offsets) -> String {
+    when_in(t, now, offsets, &WEEKDAYS_LONG, &MONTHS_LONG)
+}
+
+fn when_in(
+    t: i64,
+    now: i64,
+    offsets: &Offsets,
+    weekdays: &[&str; 7],
+    months: &[&str; 12],
+) -> String {
     let (day, min) = local(t, offsets.at(t));
     let (today, _) = local(now, offsets.at(now));
-    let diff = day - today;
-    if diff == 0 {
-        clock_of(min)
-    } else if (1..=6).contains(&diff) {
-        format!(
-            "{} {}",
-            WEEKDAYS_LONG[usize::try_from(day.rem_euclid(7)).unwrap_or(0)],
-            clock_of(min)
-        )
-    } else {
-        let (_, m, d) = aterm_types::rfc3339::civil_from_days(day);
-        format!(
-            "{d} {} {}",
-            MONTHS_LONG[usize::try_from(m - 1).unwrap_or(0).min(11)],
-            clock_of(min)
-        )
+    let weekday = weekdays[usize::try_from(day.rem_euclid(7)).unwrap_or(0)];
+    match day - today {
+        0 => clock_of(min),
+        1..=6 => format!("{weekday} {}", clock_of(min)),
+        _ => {
+            let (_, m, d) = aterm_types::rfc3339::civil_from_days(day);
+            format!(
+                "{weekday} {d} {} {}",
+                months[usize::try_from(m - 1).unwrap_or(0).min(11)],
+                clock_of(min)
+            )
+        }
     }
 }
 
@@ -2832,17 +3338,32 @@ pub fn day_words(t: i64, offsets: &Offsets) -> String {
     )
 }
 
-/// A forecast instant rounded down to [`ROUND_S`] in local time.
+/// The grain of a forecast instant `lead` seconds after the outlook's instant: 10 minutes up
+/// to six hours ahead, 30 minutes up to a day, an hour beyond. The `~` and the grain together
+/// say how near a forecast is.
 #[must_use]
-pub fn round_down(t: i64, offsets: &Offsets) -> i64 {
-    t - (t + offsets.at(t)).rem_euclid(ROUND_S)
+pub const fn grain(lead: i64) -> i64 {
+    if lead <= NEAR_LEAD_S {
+        ROUND_NEAR_S
+    } else if lead <= DAY_LEAD_S {
+        ROUND_DAY_S
+    } else {
+        ROUND_FAR_S
+    }
 }
 
-/// A forecast end rounded up to [`ROUND_S`] in local time.
+/// A forecast start seen at `as_of`, rounded down to its lead's [`grain`] in local time.
 #[must_use]
-pub fn round_up(t: i64, offsets: &Offsets) -> i64 {
-    let r = (t + offsets.at(t)).rem_euclid(ROUND_S);
-    if r == 0 { t } else { t + ROUND_S - r }
+pub fn round_down(t: i64, as_of: i64, offsets: &Offsets) -> i64 {
+    t - (t + offsets.at(t)).rem_euclid(grain(t - as_of))
+}
+
+/// A forecast end seen at `as_of`, rounded up to its lead's [`grain`] in local time.
+#[must_use]
+pub fn round_up(t: i64, as_of: i64, offsets: &Offsets) -> i64 {
+    let g = grain(t - as_of);
+    let r = (t + offsets.at(t)).rem_euclid(g);
+    if r == 0 { t } else { t + g - r }
 }
 
 /// A span as the card says it: `3d13h`, `10h30m`, `16m`.
@@ -3002,7 +3523,7 @@ pub struct VerdictWords {
     pub short: String,
     /// The shortest form, where it stays at the narrow rungs.
     pub shortest: Option<String>,
-    /// Said in warn ink (a stop or a wall that waits), its `⧗` mark leading.
+    /// Said in warn ink, its mark leading: `╳` a projected stop, `⧗` a wall that waits now.
     pub warn: bool,
     /// It stays when the rule is narrow (a stop or a wall verdict).
     pub kept_narrow: bool,
@@ -3021,9 +3542,11 @@ pub struct Glance {
     pub five: Option<String>,
     /// The verdict, where this pane's tab can be moved and the pace stands.
     pub verdict: Option<VerdictWords>,
-    /// The hover title's words on the week (`58% used, ~98% by its reset at today's pace`).
+    /// The hover title's words on the week (`58% used, ~98% by its reset at today's pace`);
+    /// none of a wall's, which the footer's `weekly out` says.
     pub title: Option<String>,
-    /// The hover title's verdict clause (`continuous 7d: me → alt1 ~Wed 06:40`).
+    /// The hover title's verdict clause (`continuous 7d: me → alt1 ~Wed 06:40`; a 5-hour stop's
+    /// `stop ~20:10–21:10 (a 5-hour limit)`).
     pub title_verdict: Option<String>,
     /// The spoken sentences after the week's own (`At today's pace about 98% used by then. …`).
     pub spoken: Option<String>,
@@ -3094,42 +3617,51 @@ impl Outlook {
         spoken_when(t, self.as_of, &self.offsets)
     }
 
-    /// `~T` of a forecast instant rounded down.
+    /// `~T` of a forecast start, rounded down by its lead ([`grain`]).
     fn about(&self, t: i64) -> String {
-        format!("~{}", self.when(round_down(t, &self.offsets)))
+        format!("~{}", self.when(round_down(t, self.as_of, &self.offsets)))
     }
 
-    /// The spoken `about T` of a forecast instant rounded down.
+    /// The spoken `about T` of a forecast start, rounded down by its lead.
     fn spoken_about(&self, t: i64) -> String {
-        format!("about {}", self.spoken_when(round_down(t, &self.offsets)))
+        format!(
+            "about {}",
+            self.spoken_when(round_down(t, self.as_of, &self.offsets))
+        )
     }
 
-    /// The end of a stop: the vendor's reset exact, else `~T` rounded up.
-    fn end_words(&self, to: i64, at_reset: bool) -> String {
-        if at_reset {
-            self.when(to)
-        } else {
-            format!("~{}", self.when(round_up(to, &self.offsets)))
+    /// A forecast end, rounded up by its lead.
+    fn end_at(&self, t: i64) -> i64 {
+        round_up(t, self.as_of, &self.offsets)
+    }
+
+    /// The end of a stop: the vendor's reset exact, else `~T` rounded up by its lead; `None`
+    /// for one nothing ends in reach.
+    fn end_words(&self, end: StopEnd) -> Option<String> {
+        match end {
+            StopEnd::Reset(r) => Some(self.when(r)),
+            StopEnd::About(t) => Some(format!("~{}", self.when(self.end_at(t)))),
+            StopEnd::Open => None,
         }
     }
 
     /// [`Self::end_words`] for a screen reader.
-    fn spoken_end(&self, to: i64, at_reset: bool) -> String {
-        if at_reset {
-            self.spoken_when(to)
-        } else {
-            self.spoken_when(round_up(to, &self.offsets))
+    fn spoken_end(&self, end: StopEnd) -> Option<String> {
+        match end {
+            StopEnd::Reset(r) => Some(self.spoken_when(r)),
+            StopEnd::About(t) => Some(self.spoken_when(self.end_at(t))),
+            StopEnd::Open => None,
         }
     }
 
-    /// The span a stop is said to last, from its words' own instants.
-    fn stop_span(&self, from: i64, to: i64, at_reset: bool) -> i64 {
-        let end = if at_reset {
-            to
-        } else {
-            round_up(to, &self.offsets)
+    /// The span a stop is said to last, from its words' own instants; `None` for an open one.
+    fn stop_span(&self, from: i64, end: StopEnd) -> Option<i64> {
+        let end = match end {
+            StopEnd::Reset(r) => r,
+            StopEnd::About(t) => self.end_at(t),
+            StopEnd::Open => return None,
         };
-        end - round_down(from, &self.offsets)
+        Some(end - round_down(from, self.as_of, &self.offsets))
     }
 
     fn carrier_plan(&self) -> (i64, Option<String>) {
@@ -3141,7 +3673,7 @@ impl Outlook {
     }
 
     /// The week pace a day, in whole percent of the carrier's week.
-    fn day_pct(&self) -> Option<u32> {
+    pub(crate) fn day_pct(&self) -> Option<u32> {
         let pace = self.demand.week.ok()?;
         let (m, _) = self.carrier_plan();
         u32::try_from((pace.x10_m_per_day / m).clamp(0, 1000))
@@ -3188,19 +3720,19 @@ impl Outlook {
         }
         let after = stop.and_then(|s| {
             let next = pass.chain.iter().find(|l| l.from >= s.from)?;
-            Some(if s.at_reset {
-                format!(
+            match s.end {
+                StopEnd::Reset(r) => Some(format!(
                     "then {} from its reset {}",
                     next.label,
-                    self.when(s.shown_to)
-                )
-            } else {
-                format!(
+                    self.when(r)
+                )),
+                StopEnd::About(t) => Some(format!(
                     "then {} from ~{}",
                     next.label,
-                    self.when(round_up(s.to, &self.offsets))
-                )
-            })
+                    self.when(self.end_at(t))
+                )),
+                StopEnd::Open => None,
+            }
         });
         (out, after)
     }
@@ -3236,8 +3768,7 @@ impl Outlook {
             Verdict::Stop {
                 pass,
                 from,
-                to,
-                at_reset,
+                end,
                 lean,
             } => {
                 let what = if *pass == PassKind::Working {
@@ -3245,24 +3776,28 @@ impl Outlook {
                 } else {
                     "A stop"
                 };
-                let end = self.spoken_end(*to, *at_reset);
+                let end = self
+                    .spoken_end(*end)
+                    .map_or_else(|| " with no end in reach".into(), |e| format!(" to {e}"));
                 let tail = match lean {
                     Some(row) => format!(", whatever {row}, {}, holds", cannot(row)),
                     None => ", when every account is out".into(),
                 };
                 format!(
-                    "{what} is expected from {} to {end}{tail}.",
+                    "{what} is expected from {}{end}{tail}.",
                     self.spoken_about(*from)
                 )
             }
             Verdict::Lean {
                 until, row, stop, ..
             } => {
-                let worst = stop.map_or_else(String::new, |(from, to, at_reset)| {
+                let worst = stop.map_or_else(String::new, |(from, end)| {
+                    let end = self
+                        .spoken_end(end)
+                        .map_or_else(|| " with no end in reach".into(), |e| format!(" to {e}"));
                     format!(
-                        " If {row} has nothing, a stop from {} to {}.",
+                        " If {row} has nothing, a stop from {}{end}.",
                         self.spoken_about(from),
-                        self.spoken_end(to, at_reset)
                     )
                 });
                 format!(
@@ -3312,11 +3847,12 @@ impl Outlook {
         let projection = week
             .projection
             .filter(|_| clock_admitted && self.demand.week.is_ok() && (movable || row.carrier));
-        let used = if week.fresh == Fresh::Walled {
-            Some(1000)
-        } else {
-            clock_admitted.then(|| used_x10.or(week.used_x10)).flatten()
-        };
+        // A wall is `out`, never an inferred 100%: no bar, no percentage.
+        let walled = week.fresh == Fresh::Walled;
+        let used = clock_admitted
+            .then(|| used_x10.or(week.used_x10))
+            .flatten()
+            .filter(|_| !walled);
         let bar = used.map(|used| {
             let ten = bar_cells(used, projection, 10);
             let five = bar_cells(used, projection, 5);
@@ -3345,6 +3881,21 @@ impl Outlook {
         let verdict_of = own.as_ref().unwrap_or(&self.verdict);
         let verdict = movable.then(|| words_of(self, verdict_of)).flatten();
         let title_verdict = verdict.as_ref().map(|w| {
+            // A title carries no drawing glyph: a projected stop's `╳` is said as the word. The
+            // glass never names the 5-hour window; the title says where its stop comes from.
+            let mut full = w
+                .full
+                .strip_prefix("\u{2573} ")
+                .map_or_else(|| w.full.clone(), |rest| format!("stop {rest}"));
+            if matches!(
+                verdict_of,
+                Verdict::Stop {
+                    pass: PassKind::Working,
+                    ..
+                }
+            ) {
+                full.push_str(" (a 5-hour limit)");
+            }
             let chain = self
                 .week
                 .as_ref()
@@ -3352,10 +3903,12 @@ impl Outlook {
                 .map(|p| self.chain_words(p, true).0)
                 .filter(|c| c.contains('\u{2192}'));
             match chain {
-                Some(chain) => format!("{}: {chain}", w.full),
-                None => w.full.clone(),
+                Some(chain) => format!("{full}: {chain}"),
+                None => full,
             }
         });
+        // A wall's week has no title words: the footer's own words say `weekly out`, and the
+        // verdict's clause says how long, so the title never repeats `out` or states a figure.
         let mut title = String::new();
         if let Some(used) = used {
             title.push_str(&format!("{} used", pct(used)));
@@ -3450,27 +4003,24 @@ fn words_of(out: &Outlook, verdict: &Verdict) -> Option<VerdictWords> {
                 true,
             )
         }
+        // A projected stop is `╳` whichever pass found it (`⧗` is a wall standing now), and
+        // the 5-hour window is never named here (§2.3).
         Verdict::Stop {
-            pass,
-            from,
-            to,
-            at_reset,
-            lean,
+            from, end, lean, ..
         } => {
             let start = out.about(*from);
-            let end = out.end_words(*to, *at_reset);
             let q = if lean.is_some() { " ?" } else { "" };
-            let five = if *pass == PassKind::Working {
-                "5h "
+            let short = format!("\u{2573} {start}{q}");
+            let full = out.end_words(*end).map_or_else(
+                || format!("\u{2573} from {start}{q}"),
+                |end| format!("\u{2573} {start}\u{2013}{end}{q}"),
+            );
+            let short = if end.at().is_none() {
+                full.clone()
             } else {
-                ""
+                short
             };
-            words(
-                format!("\u{29d7} {five}stop {start}\u{2013}{end}{q}"),
-                format!("\u{29d7} {five}stop {start}{q}"),
-                Some(format!("\u{29d7} {five}{start}{q}")),
-                true,
-            )
+            words(full, short.clone(), Some(short), true)
         }
         Verdict::Lean { until, row, .. } => words(
             format!("continuous to {}, then {row} ?", out.about(*until)),
@@ -3516,7 +4066,7 @@ pub enum CardRow {
         text: String,
         /// What a reader hears, where it differs.
         spoken: Option<String>,
-        /// Said in warn ink, its `⧗` leading.
+        /// Said in warn ink, its `╳` (a projected stop) or `⧗` (a wall now) leading.
         warn: bool,
         /// Said in value ink (else the label's).
         value: bool,
@@ -3763,7 +4313,11 @@ impl Outlook {
                     .is_some_and(|l| cell_at(c) + per / 2 >= l.at)
                 {
                     Holds::Lean
-                } else if pass.stops.iter().any(|s| covers(s.from, s.to, c)) {
+                } else if pass
+                    .stops
+                    .iter()
+                    .any(|s| covers(s.from, s.end.at().unwrap_or(i64::MAX), c))
+                {
                     Holds::Stop
                 } else if let Some(link) = pass.chain.iter().find(|l| covers(l.from, l.to, c)) {
                     Holds::Row(link.label.clone())
@@ -3883,13 +4437,9 @@ impl Outlook {
                 }
                 Part::Stop(stop) => {
                     last = None;
-                    said.push(format!(
-                        "a stop until {}",
-                        if stop.at_reset {
-                            self.spoken_end(stop.shown_to, true)
-                        } else {
-                            self.spoken_end(stop.to, false)
-                        }
+                    said.push(self.spoken_end(stop.end).map_or_else(
+                        || "a stop with no end in reach".into(),
+                        |end| format!("a stop until {end}"),
                     ));
                 }
             }
@@ -3935,31 +4485,31 @@ impl Outlook {
         }
         match &self.verdict {
             Verdict::Stop {
-                pass,
-                from,
-                to,
-                at_reset,
-                ..
+                pass, from, end, ..
             } => {
-                let stop = format!(
-                    "\u{29d7}  {} {} \u{2013} {}",
-                    if *pass == PassKind::Working {
-                        "5h stop"
-                    } else {
-                        "Stop"
-                    },
-                    self.about(*from),
-                    self.end_words(*to, *at_reset),
-                );
-                let span = span_words(self.stop_span(*from, *to, *at_reset));
-                note(
-                    vec![
-                        format!("{stop} ({span}): every account out"),
-                        format!("{stop} ({span})"),
-                        stop,
-                    ],
-                    true,
-                )
+                let what = if *pass == PassKind::Working {
+                    "5h stop"
+                } else {
+                    "Stop"
+                };
+                let span = self.stop_span(*from, *end);
+                let from = self.about(*from);
+                let forms = match (self.end_words(*end), span) {
+                    (Some(to), Some(span)) => {
+                        let stop = format!("\u{2573}  {what} {from} \u{2013} {to}");
+                        let span = span_words(span);
+                        vec![
+                            format!("{stop} ({span}): every account out"),
+                            format!("{stop} ({span})"),
+                            stop,
+                        ]
+                    }
+                    _ => {
+                        let stop = format!("\u{2573}  {what} from {from}");
+                        vec![format!("{stop}: every account out"), stop]
+                    }
+                };
+                note(forms, true)
             }
             Verdict::Walled { to: None, .. } => note(
                 vec![format!(
@@ -4029,18 +4579,34 @@ impl Outlook {
         let bar_n = if wide { 30 } else { 16 };
         let strip_n = if wide { 56 } else { 42 };
         let note = |cands: Vec<String>| CardRow::note(first_fit(cands, room));
+        // A projected stop's `╳` is drawn, never heard: a reader hears `a stop`.
+        let stop_note = |cands: Vec<String>| {
+            let text = first_fit(cands, room);
+            CardRow::Note {
+                spoken: Some(text.trim_start().replace('\u{2573}', "a stop")),
+                text,
+                warn: false,
+                value: false,
+            }
+        };
         let mut head: Vec<CardRow> = vec![self.verdict_row(room, narrow)];
         // Notes that give way to height first (§15: the design's mockups leave them out).
         let mut extra: Vec<CardRow> = Vec::new();
         if !narrow {
             if let Verdict::Lean { stop, row, why, .. } = &self.verdict {
-                if let Some((from, to, at_reset)) = stop {
-                    let (from, to) = (self.about(*from), self.end_words(*to, *at_reset));
-                    head.push(note(vec![
-                        format!("   if {row} has nothing: \u{29d7} stop {from} \u{2013} {to}"),
-                        format!("   if nothing: \u{29d7} stop {from} \u{2013} {to}"),
-                        format!("   if nothing: \u{29d7} stop {from}"),
-                    ]));
+                if let Some((from, end)) = stop {
+                    let from = self.about(*from);
+                    head.push(stop_note(match self.end_words(*end) {
+                        Some(to) => vec![
+                            format!("   if {row} has nothing: \u{2573} {from} \u{2013} {to}"),
+                            format!("   if nothing: \u{2573} {from} \u{2013} {to}"),
+                            format!("   if nothing: \u{2573} {from}"),
+                        ],
+                        None => vec![
+                            format!("   if {row} has nothing: \u{2573} from {from}"),
+                            format!("   if nothing: \u{2573} from {from}"),
+                        ],
+                    }));
                 }
                 head.push(note(match why {
                     f if f.bounded() => vec![
@@ -4084,27 +4650,27 @@ impl Outlook {
                 }
             );
             let five = match (&self.working, self.demand.five) {
-                (_, Err(Refusal::Idle)) => Some(vec!["   5h: idle".to_string()]),
-                (Some(w), _) if w.stops.is_empty() => Some(vec![
+                (_, Err(Refusal::Idle)) => Some(note(vec!["   5h: idle".to_string()])),
+                (Some(w), _) if w.stops.is_empty() => Some(note(vec![
                     "   5h: no stop in the next 12h at this hour's pace".into(),
                     "   5h: no stop in the next 12h".into(),
-                ]),
+                ])),
                 // The verdict says the stop; the 5-hour line says what carries the work after it.
                 (Some(w), _) if five_stop => self
                     .chain_words(w, false)
                     .1
-                    .map(|after| vec![format!("   5h: {after}")]),
+                    .map(|after| note(vec![format!("   5h: {after}")])),
                 (Some(w), _) => w.stops.first().map(|s| {
-                    vec![format!(
-                        "   5h: \u{29d7} stop {} \u{2013} {}",
-                        self.about(s.from),
-                        self.end_words(s.shown_to, s.at_reset)
-                    )]
+                    let from = self.about(s.from);
+                    stop_note(vec![self.end_words(s.end).map_or_else(
+                        || format!("   5h: \u{2573} from {from}"),
+                        |to| format!("   5h: \u{2573} {from} \u{2013} {to}"),
+                    )])
                 }),
-                (None, Err(why)) => Some(vec![format!("   5h: {}", why.words())]),
+                (None, Err(why)) => Some(note(vec![format!("   5h: {}", why.words())])),
                 (None, Ok(_)) => None,
             };
-            head.extend(five.map(note));
+            head.extend(five);
             if wide {
                 if !self.not_needed.is_empty() {
                     extra.push(CardRow::note(format!(
@@ -4496,8 +5062,9 @@ impl Outlook {
             (None, Some(p)) if p.fills_at.is_some() || p.at_reset_x10 >= 1000 => {
                 out.push_str(&format!(
                     " \u{b7} out ~{} before reset",
-                    p.fills_at
-                        .map_or_else(String::new, |t| self.cli_when(round_down(t, &self.offsets)))
+                    p.fills_at.map_or_else(String::new, |t| {
+                        self.cli_when(round_down(t, self.as_of, &self.offsets))
+                    })
                 ));
             }
             (None, Some(p)) => {
@@ -4691,7 +5258,7 @@ impl Outlook {
         let at = |t: i64| {
             format!(
                 "~{}",
-                long_when(round_down(t, &self.offsets), &self.offsets)
+                long_when(round_down(t, self.as_of, &self.offsets), &self.offsets)
             )
         };
         let mut lines: Vec<(i64, String)> = Vec::new();
@@ -4749,13 +5316,11 @@ impl Outlook {
                     "{indent}{:<width$}  {:<17} \u{2192} {}{}",
                     "stop",
                     at(stop.from),
-                    if stop.at_reset {
-                        long_when(stop.shown_to, &self.offsets)
-                    } else {
-                        format!(
-                            "~{}",
-                            long_when(round_up(stop.to, &self.offsets), &self.offsets)
-                        )
+                    match stop.end {
+                        StopEnd::Reset(r) => long_when(r, &self.offsets),
+                        StopEnd::About(t) =>
+                            format!("~{}", long_when(self.end_at(t), &self.offsets)),
+                        StopEnd::Open => "no end in reach".into(),
                     },
                     if stop.credits {
                         "  (usage credits would carry it)"
@@ -4881,7 +5446,7 @@ impl Outlook {
         let mut v = Map::new();
         v.insert("kind".into(), Value::from(self.verdict.kind()));
         let (from, to, row, why) = match &self.verdict {
-            Verdict::Stop { from, to, lean, .. } => (Some(*from), Some(*to), lean.clone(), None),
+            Verdict::Stop { from, lean, .. } => (Some(*from), None, lean.clone(), None),
             Verdict::Lean {
                 until, row, why, ..
             } => (None, Some(*until), Some(row.clone()), Some(why.word())),
@@ -4892,6 +5457,13 @@ impl Outlook {
         };
         v.insert("from".into(), from.map_or(Value::Null, Value::from));
         v.insert("to".into(), to.map_or(Value::Null, Value::from));
+        v.insert(
+            "end".into(),
+            match &self.verdict {
+                Verdict::Stop { end, .. } => end_json(*end),
+                _ => Value::Null,
+            },
+        );
         v.insert("row".into(), row.map_or(Value::Null, Value::from));
         v.insert("why".into(), why.map_or(Value::Null, Value::from));
         o.insert("verdict".into(), Value::Object(v));
@@ -4960,6 +5532,14 @@ fn proj_json(p: Proj) -> Value {
     Value::Object(o)
 }
 
+/// A stop's end as the CLI writes it: `{"kind": "reset"|"about"|"open", "at": t|null}`.
+fn end_json(end: StopEnd) -> Value {
+    let mut o = Map::new();
+    o.insert("kind".into(), Value::from(end.kind()));
+    o.insert("at".into(), end.at().map_or(Value::Null, Value::from));
+    Value::Object(o)
+}
+
 fn pass_json(p: &Pass) -> Value {
     let mut o = Map::new();
     o.insert("pass".into(), Value::from(p.kind.word()));
@@ -4984,9 +5564,8 @@ fn pass_json(p: &Pass) -> Value {
         .map(|s| {
             let mut o = Map::new();
             o.insert("from".into(), Value::from(s.from));
-            o.insert("to".into(), Value::from(s.shown_to));
+            o.insert("end".into(), end_json(s.end));
             o.insert("window".into(), Value::from(s.window.id()));
-            o.insert("at_reset".into(), Value::from(s.at_reset));
             o.insert("credits".into(), Value::from(s.credits));
             Value::Object(o)
         })
@@ -5009,4 +5588,4 @@ fn pass_json(p: &Pass) -> Value {
 
 #[cfg(test)]
 #[path = "outlook_tests.rs"]
-mod tests;
+pub(crate) mod tests;

@@ -36,7 +36,7 @@ pub const ACCOUNT_MARK: char = '\u{2386}';
 pub const WEEKLY_MARK: char = '\u{25f7}';
 /// Names the account unit's 5-hour part (`· 5h 62% left`, [`Segment::joined`]).
 pub const FIVE_MARK: char = '\u{25f6}';
-/// Names the account unit's outlook (`· continuous 7d`, `· ⧗ stop ~Wed 22:30–Thu 09:00`,
+/// Names the account unit's outlook (`· continuous 7d`, `· ╳ ~Wed 22:00–Thu 09:00`,
 /// [`Segment::joined`]): the rotation's own policy replayed at today's pace
 /// ([`super::outlook`]).
 pub const OUTLOOK_MARK: char = '\u{21bb}';
@@ -338,7 +338,7 @@ pub enum Tone {
     /// The value ink.
     #[default]
     Value,
-    /// The warn ink: a projected stop, its `⧗` leading its words.
+    /// The warn ink: a projected stop (its `╳` leading its words) or a wall waiting now (`⧗`).
     Warn,
 }
 
@@ -3876,7 +3876,8 @@ fn fact_segments(facts: &FooterFacts, stubs: bool) -> Vec<Segment> {
 /// The words that say the week: `weekly `, the bar where the outlook drew one, the figure, and
 /// its reset (`weekly ━━━━━━╍╍╍┽ 42% left ♻ Thu 09:00`); a standing wall says the reset itself.
 /// A week aterm has not read is not shown, as a figure-less week never is on the rule; a 7-day
-/// wall's is `weekly 0% left`. Joined to the unit where an email leads it (`headed`).
+/// wall's is [`super::profile::WEEKLY_OUT`], never a percentage. Joined to the unit where an
+/// email leads it (`headed`).
 fn weekly_segment(
     facts: &FooterFacts,
     headed: bool,
@@ -3886,7 +3887,7 @@ fn weekly_segment(
     let wall = facts.usage.as_ref().and_then(|u| u.wall.as_ref());
     let words = s.weekly.clone().or_else(|| {
         wall.is_some_and(|w| w.label == "7d")
-            .then(|| "weekly 0% left".into())
+            .then(|| super::profile::WEEKLY_OUT.into())
     })?;
     let mut segment = if headed {
         Segment::joined(WEEKLY_MARK, words)

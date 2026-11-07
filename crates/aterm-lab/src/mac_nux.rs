@@ -60,6 +60,8 @@ pub const USAGE: &str = "\
                 setup's one Mac password shows as a prompt nobody answers (the image's own rule needs none).
                 --no-clt: a base with the Command Line Tools removed (xcode-select -p fails); --vanilla:
                 REF's cirruslabs -vanilla image (NOT RUN when it must be pulled with under 71 GB free).
+                --record also retains a built-here app's exact zip and private provenance receipt beside
+                FILE before a guest starts; an unavailable archive is recorded without stopping the run.
                 --repeat N: each row N times, each in its own clone. Every row also reads the dialog census
                 (each window owner that appears, the guest helper polling the window list every 250 ms with
                 no Screen Recording grant; where it saw a Gatekeeper window, syspolicyd's and
@@ -169,7 +171,10 @@ pub const USAGE: &str = "\
                                    --password-stdin with its join password piped: to the vault's
                                    entry on disk; FAILED unless it lands, the admin's bytes, within
                                    60 s
-                  vault-phrase     a new Mac let in by a member's Allow and the phrase it shows (F10),
+                  vault-phrase     private member admission and synthetic credential materialization:
+                                   first a broker-only baseline runs once as root through the guest
+                                   app and password driver; its prompts are preparation, measured
+                                   separately from the phrase, with no first-user password claim;
                                    found by its own browse: a seed identity founds a vault on
                                    127.0.0.1 (never advertised) with a synthetic GitHub token, publish
                                    token and AI accounts list in [everyone] and runs its approver; a
@@ -179,10 +184,11 @@ pub const USAGE: &str = "\
                                    the guest's own address, registered under a lab members service
                                    made for the run, _alab-lab-<nonce>._tcp, which no ALab Mac
                                    browses; it presses Allow for the first Mac that asks; the phrase
-                                   read off its record, never a window); a third, with
-                                   ATERM_LAB_MEMBER_SERVICE naming that service and no --at, runs
-                                   aterm members join --no-wait (install.sh's ask), aterm members join
-                                   <phrase>, then its subscriber: the ask
+                                   read off its record, never a window); a third first pins that
+                                   private URL and signer, Pending with all three files absent;
+                                   with ATERM_LAB_MEMBER_SERVICE naming that service and no --at,
+                                   it runs aterm members join --no-wait, aterm members join
+                                   <phrase>, then explicitly runs secrets watch: the ask
                                    to the member's row, to the phrase shown and typed, to each file on
                                    disk, to members status reading In; FAILED unless the phrase came
                                    from that member, every file is the seed's value, the joiner reads
@@ -192,7 +198,9 @@ pub const USAGE: &str = "\
                                    on loopback, and every _alab-vault._tcp and _alab._tcp browse, in
                                    the guest and on this Mac, ran and heard no guest advert (NOT RUN,
                                    nothing of the joiner's run, on an app that does not name the
-                                   variable); and the lab's table: once the member is in, the seed
+                                   variable). This measures no default ALab enrollment, automatic
+                                   subscriber installation, real account authentication or clones;
+                                   and the lab's table: once the member is in, the seed
                                    signs Genesis v2 (the lab's first [everyone] epoch), imports a
                                    one-row emails sheet (aterm db alab import --apply) and seals a
                                    random password into it (aterm db emails set … --stdin); once
@@ -1859,6 +1867,122 @@ struct App {
     id: String,
 }
 
+const APP_BUILD_ARGS: &[&str] = &[
+    "--unverified",
+    "ship",
+    "dev-app",
+    "--no-install",
+    "--no-link",
+    "--no-pin",
+    "--sign-id",
+    "-",
+    "--out",
+];
+
+fn app_source() -> Result<aterm_json::Value, String> {
+    let git = |dir: &Path, args: &[&str]| -> Result<String, String> {
+        let out = aterm_uds::deadline::output_until(
+            aterm_uds::spawnfd::command("git")
+                .current_dir(dir)
+                .args(args)
+                .stdin(Stdio::null()),
+            Instant::now() + STEP,
+        )
+        .map_err(|error| format!("git {}: {error}", args[0]))?;
+        if !out.status.success() {
+            return Err(format!("git {}: {}", args[0], out.status));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    };
+    let repo = &paths().repo;
+    Ok(aterm_json::json!({
+        "commit":git(repo, &["rev-parse", "HEAD"])?,
+        "tree":git(repo, &["rev-parse", "HEAD^{tree}"])?,
+        "astream_commit":git(&repo.join("vendor/astream"), &["rev-parse", "HEAD"])?,
+        "dirty":!git(repo, &["status", "--porcelain"])?.is_empty(),
+    }))
+}
+
+/// Retain only completed bytes under final names. An interrupted or failed copy stays private
+/// with a `.partial` suffix, and the caller records its unavailability without refusing a row.
+fn retain_app(
+    record: &Path,
+    zip: &Path,
+    bundle: &Path,
+    before: &Result<aterm_json::Value, String>,
+    after: &Result<aterm_json::Value, String>,
+    app: &App,
+) -> Result<PathBuf, String> {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    let private = |path: &Path| -> std::io::Result<std::fs::File> {
+        let file = crate::util::create_new_regular_file(path, 0o600)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        Ok(file)
+    };
+    let mut name = record
+        .file_name()
+        .ok_or("app record has no file name")?
+        .to_os_string();
+    name.push(".app.noindex");
+    let root = record.with_file_name(name);
+    crate::util::create_private_dir_all(&root).map_err(|error| error.to_string())?;
+    aterm_uds::private_file::check_private_dir(&root).map_err(|error| error.to_string())?;
+    let directory = aterm_tempfile::Builder::new()
+        .prefix("app-")
+        .tempdir_in(&root)
+        .map_err(|error| error.to_string())?
+        .keep();
+    let result = (|| -> Result<PathBuf, String> {
+        let io = |error: std::io::Error| error.to_string();
+        let partial = directory.join("aterm.zip.partial");
+        let (mut reader, metadata) = aterm_uds::regular_file::open(zip).map_err(io)?;
+        let mut writer = private(&partial).map_err(io)?;
+        let bytes = std::io::copy(&mut reader, &mut writer).map_err(io)?;
+        // Order diagnostic contents before publication. A power loss may lose these
+        // copies; they are not authoritative state and need no full-device flush.
+        aterm_durable::ordered(&writer).map_err(io)?;
+        drop(writer);
+        let archive_sha = crate::windows::sha256_file(&partial)?;
+        if bytes != metadata.len() || archive_sha != crate::windows::sha256_file(zip)? {
+            return Err("the retained archive differs from the staged app zip".into());
+        }
+        let unchanged = before
+            .as_ref()
+            .ok()
+            .zip(after.as_ref().ok())
+            .map(|(a, b)| a == b);
+        let value = aterm_json::json!({
+            "schema":"aterm-mac-nux-app-v1", "created_at_ms":crate::util::now_ms(),
+            "origin":"built-here", "cargo_profile":"release", "build_argv":APP_BUILD_ARGS,
+            "build_out":bundle.parent().map(|path|path.display().to_string()),
+            "source_before":{"value":before.as_ref().ok(),"error":before.as_ref().err()},
+            "source_after":{"value":after.as_ref().ok(),"error":after.as_ref().err()},
+            "source_observation_unchanged":unchanged,
+            "bundle":{"name":"aterm.app", "id":app.id, "version":app.version,
+                "build":plist_value(bundle, "CFBundleVersion"), "commit":plist_value(bundle, "ATermGitCommit"),
+                "executable_sha256":crate::windows::sha256_file(&bundle.join("Contents/MacOS/aterm"))?,
+                "signing":"ad-hoc; hardened runtime and release entitlements; codesign --verify --strict succeeded"},
+            "archive":{"file":"aterm.zip", "bytes":bytes, "sha256":archive_sha},
+        });
+        let receipt_partial = directory.join("receipt.json.partial");
+        let mut receipt = private(&receipt_partial).map_err(io)?;
+        receipt
+            .write_all(&aterm_json::to_vec(&value).map_err(|error| error.to_string())?)
+            .map_err(io)?;
+        aterm_durable::ordered(&receipt).map_err(io)?;
+        drop(receipt);
+        // Hard links publish complete files without replacing an existing name.
+        std::fs::hard_link(&partial, directory.join("aterm.zip")).map_err(io)?;
+        let path = directory.join("receipt.json");
+        std::fs::hard_link(&receipt_partial, &path).map_err(io)?;
+        std::fs::remove_file(partial).map_err(io)?;
+        std::fs::remove_file(receipt_partial).map_err(io)?;
+        Ok(path)
+    })();
+    result.map_err(|error| format!("{error}; partial evidence at {}", directory.display()))
+}
+
 fn plist_value(app: &Path, key: &str) -> String {
     let out = crate::windows::run(
         Path::new("/usr/libexec/PlistBuddy"),
@@ -1899,26 +2023,16 @@ fn host_run(bin: &str, args: &[&str]) -> Result<(), Fail> {
 fn build_app(run: &Path) -> Result<PathBuf, Fail> {
     let out = run.join("app");
     println!("mac nux: building the app here (ship dev-app, made release-shaped)");
-    let args = [
-        "--unverified",
-        "ship",
-        "dev-app",
-        "--no-install",
-        "--no-link",
-        "--no-pin",
-        "--sign-id",
-        "-",
-        "--out",
-    ];
+    let args = APP_BUILD_ARGS;
     // An alias, past the shim: claimed as the build it runs.
     let claim = crate::util::claim_build(
-        &args,
+        args,
         Some(&["--unverified", "build", "--release", "-p", "aterm"]),
         &crate::paths::paths().repo,
     )
     .map_err(|e| Fail::die(format!("ship dev-app: {e}")))?;
     let status = crate::util::status_claimed(
-        crate::util::targo(&args).arg(&out).stdin(Stdio::null()),
+        crate::util::targo(args).arg(&out).stdin(Stdio::null()),
         claim,
     )
     .map_err(|e| Fail::die(format!("targo: {e}")))?;
@@ -1961,7 +2075,13 @@ fn build_app(run: &Path) -> Result<PathBuf, Fail> {
 
 /// Put the app into the share as `aterm.zip` (the share does not carry a bundle's links): `--app`
 /// read where it is, else built here.
-fn stage_app(app: Option<&Path>, run: &Path, share: &Path) -> Result<App, Fail> {
+fn stage_app(
+    app: Option<&Path>,
+    run: &Path,
+    share: &Path,
+    record: Option<&Path>,
+) -> Result<App, Fail> {
+    let before = (app.is_none() && record.is_some()).then(app_source);
     let (bundle, how) = match app {
         Some(p) => {
             if !p.join("Contents/Info.plist").is_file() {
@@ -1984,11 +2104,29 @@ fn stage_app(app: Option<&Path>, run: &Path, share: &Path) -> Result<App, Fail> 
             &share.join("aterm.zip").to_string_lossy(),
         ],
     )?;
-    Ok(App {
+    let mut app = App {
         how,
         version: plist_value(&bundle, "CFBundleShortVersionString"),
         id: plist_value(&bundle, "CFBundleIdentifier"),
-    })
+    };
+    if let (Some(record), Some(before)) = (record, before) {
+        let after = app_source();
+        let retained = match retain_app(
+            record,
+            &share.join("aterm.zip"),
+            &bundle,
+            &before,
+            &after,
+            &app,
+        ) {
+            Ok(receipt) => format!("retained [app receipt](<{}>)", receipt.display()),
+            Err(why) => format!("app retention unavailable: {why}"),
+        };
+        println!("mac nux: {retained}");
+        app.how.push_str("; ");
+        app.how.push_str(&retained);
+    }
+    Ok(app)
 }
 
 /// One row's guest: the clone, and where the app and its command are for the account it runs as.
@@ -6256,6 +6394,15 @@ exec /usr/bin/tar -c -f - "$@""#,
             r#"collector_uid=$(/usr/bin/id -u)
 [ "$collector_uid" = {collector_uid} ] || exit 5
 collector_status=0
+printf '%s\n' '--- processes (no argv) ---'
+/bin/ps -ax -o pid=,ppid=,uid=,stat=,comm= || collector_status=1
+printf '%s\n' '--- root broker launchd ---'
+{broker_print} || collector_status=1
+printf '%s\n' '--- root broker log ---'
+{broker_log} || collector_status=1
+printf '%s\n' '--- broker protocol ---'
+{aterm} lan status || collector_status=1
+printf '%s\n' '--- GUI control ---'
 {aterm} ctl ls || collector_status=1
 for f in "$HOME/Library/Application Support/aterm/command-line-tools-tab.children/"*; do
   [ -f "$f" ] && [ ! -L "$f" ] && [ "$(/usr/bin/stat -f %u "$f")" = "$collector_uid" ] || continue
@@ -6266,6 +6413,14 @@ for f in "$HOME/Library/Application Support/aterm/command-line-tools-tab.childre
 done
 exit "$collector_status""#,
             aterm = crate::util::shell_quote(&g.aterm),
+            broker_print = g.as_root(&format!(
+                "/bin/launchctl print system/{}",
+                aterm_uds::lan::LABEL
+            )),
+            broker_log = g.as_root(&format!(
+                "/usr/bin/tail -n 12 '{}'",
+                aterm_uds::lan::LOG_PATH
+            )),
         ),
         STEP,
     );
@@ -6577,7 +6732,12 @@ pub fn cmd_nux(args: &[String]) -> Res {
         reveal::stage(&share)?;
     }
     let app = if ask.scenarios.iter().any(|s| s.needs_app()) {
-        Some(stage_app(ask.app.as_deref(), run, &share)?)
+        Some(stage_app(
+            ask.app.as_deref(),
+            run,
+            &share,
+            ask.record.as_deref(),
+        )?)
     } else {
         None
     };

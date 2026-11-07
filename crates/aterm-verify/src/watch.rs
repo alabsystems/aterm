@@ -520,19 +520,69 @@ fn stage_should_yield(root: &Path, rows: &[aterm_capacity::Record]) -> bool {
     })
 }
 
+/// One non-tree stage's atomic resource envelope. Memory and cores must be admitted together:
+/// a Background memory wait may never retain cores a foreground build needs.
+fn stage_need(id: &str, cores: u32) -> aterm_capacity::Need {
+    aterm_capacity::Need::new(format!("verify watch {id}"))
+        .mem_gib(26)
+        .cores(cores)
+        .covers()
+}
+
+/// The already-built candidate verifier for the tree row. It starts directly, so it, not a
+/// `targo run` wrapper, leads the cancellable process group and owns its Background claims.
+fn tree_command(
+    root: &Path,
+    args: &[&str],
+    stage2: &Path,
+    path: &std::ffi::OsStr,
+) -> crate::exec::Cmd {
+    let binary = root
+        .join(".ubd/target.noindex/debug")
+        .join(format!("aterm-verify{}", std::env::consts::EXE_SUFFIX));
+    crate::exec::Cmd::new(binary)
+        .args(args.iter().copied())
+        .env("TRUST_STAGE2_BIN", stage2)
+        .env("PATH", path)
+        .env("CARGO_TARGET_DIR", root.join(".ubd/target.noindex"))
+}
+
+fn sample_removed_env() -> Vec<String> {
+    let mut removed: Vec<String> = std::env::vars_os()
+        .filter_map(|(name, _)| name.into_string().ok())
+        .filter(|name| {
+            aterm_toolchain::release_env::clears(name)
+                || aterm_toolchain::release_env::launcher_env(name)
+        })
+        .collect();
+    for name in [
+        "BUILD_SLOT_HELD",
+        "CARGO_BUILD_JOBS",
+        aterm_capacity::COVER_ENV,
+        aterm_capacity::DISK_COVER_ENV,
+        "ATERM_RELEASE_*",
+    ] {
+        if !removed.iter().any(|present| present == name) {
+            removed.push(name.to_owned());
+        }
+    }
+    removed
+}
+
 fn sample(root: &Path, result: &Path) -> Result<bool, String> {
     use aterm_capacity::Machine as _;
     crate::exec::group::kill_on_interrupt();
-    let admitted_at = Instant::now();
+    // The zero-resource claim gives a release authority to end the whole sample group even
+    // between stages. Resource ownership belongs to each stage, where memory and CPU are one
+    // ordered admission.
     let claim = match aterm_capacity::admit(
-        aterm_capacity::Need::new("verify watch sample").cores(aterm_capacity::cores()),
+        aterm_capacity::Need::new("verify watch sample lifecycle"),
         aterm_capacity::Admit::Preemptible,
     ) {
         Ok(claim) => claim,
         Err(aterm_capacity::Error::Stopped { .. }) => return Ok(false),
         Err(why) => return Err(why.to_string()),
     };
-    let admission_waiting_s = admitted_at.elapsed().as_secs_f64();
     let env = crate::EnvSnapshot::capture();
     let tools = crate::preflight(&env, root)?;
     let prefix = aterm_toolchain::atpkg_prefix(&env.home, env.xdg_config_home.as_deref());
@@ -549,13 +599,7 @@ fn sample(root: &Path, result: &Path) -> Result<bool, String> {
     let mut rows = Vec::new();
     let scratch = root.join(".git/watch-exec");
     fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
-    let removed: Vec<String> = std::env::vars_os()
-        .filter_map(|(name, _)| name.into_string().ok())
-        .filter(|name| {
-            aterm_toolchain::release_env::clears(name)
-                || aterm_toolchain::release_env::launcher_env(name)
-        })
-        .collect();
+    let removed = sample_removed_env();
     let removed_refs: Vec<&str> = removed.iter().map(String::as_str).collect();
     // Compat first: this is the same snapshot, compiler and invocation as the stage step.
     let stages: [(&str, &[&str]); 6] = [
@@ -570,54 +614,65 @@ fn sample(root: &Path, result: &Path) -> Result<bool, String> {
         if claim.should_yield().map_err(|e| e.to_string())? {
             return Ok(false);
         }
-        // The tree verifier admits each of its own stages. Tool compilation and the compat
-        // check need their own bound: the measured tree-compile peak is 26 GiB (§3).
-        let memory = if id == "tree" {
-            None
-        } else {
-            Some(
-                match aterm_capacity::admit(
-                    aterm_capacity::Need::new(format!("verify watch {id}"))
-                        .mem_gib(26)
-                        .covers(),
-                    aterm_capacity::Admit::Preemptible,
-                ) {
-                    Ok(claim) => claim,
-                    Err(aterm_capacity::Error::Stopped { .. }) => return Ok(false),
-                    Err(why) => return Err(why.to_string()),
-                },
-            )
-        };
+        let admitted_at = Instant::now();
+        let mut stage_claim = Some(
+            match aterm_capacity::admit(
+                stage_need(id, aterm_capacity::cores()),
+                aterm_capacity::Admit::Preemptible,
+            ) {
+                Ok(claim) => claim,
+                Err(aterm_capacity::Error::Stopped { .. }) => return Ok(false),
+                Err(why) => return Err(why.to_string()),
+            },
+        );
+        let admission_waiting_s = admitted_at.elapsed().as_secs_f64();
+        let granted_cores = stage_claim.as_ref().map_or(0, aterm_capacity::Claim::cores);
         let mut cmd = crate::exec::Cmd::new(&tools.targo);
         let package = if args[0] == "ship" {
             "aterm-release"
         } else {
             "aterm-verify"
         };
-        cmd = cmd
-            .args([
+        if id == "tree" {
+            cmd = cmd.args([
                 "--unverified",
-                "run",
+                "build",
                 "--locked",
                 "--profile",
                 "test",
                 "-p",
                 package,
-                "--",
-            ])
-            .args(args[1..].iter().copied());
+                "--bin",
+                package,
+            ]);
+        } else {
+            cmd = cmd
+                .args([
+                    "--unverified",
+                    "run",
+                    "--locked",
+                    "--profile",
+                    "test",
+                    "-p",
+                    package,
+                    "--",
+                ])
+                .args(args[1..].iter().copied());
+        }
+        let stage_marker = stage_claim
+            .as_ref()
+            .map(|held| held.record().cover_marker())
+            .ok_or("watch stage has no resource claim")?;
         cmd = cmd
             .env("TRUST_STAGE2_BIN", &tools.stage2_dir)
             .env("PATH", tools.path_with_stage2_first(&env.path))
             .env("CARGO_TARGET_DIR", root.join(".ubd/target.noindex"))
-            .env("CARGO_BUILD_JOBS", claim.cores().to_string())
-            .env("BUILD_SLOT_HELD", "1");
-        if let Some(memory) = &memory {
-            cmd = cmd.env(aterm_capacity::COVER_ENV, memory.record().cover_marker());
-        }
+            .env("CARGO_BUILD_JOBS", granted_cores.to_string())
+            .env("BUILD_SLOT_HELD", "1")
+            .env(aterm_capacity::COVER_ENV, stage_marker);
         let log = root.join(format!(".git/watch-{id}.log"));
         let began = Instant::now();
-        let ran = crate::exec::run(
+        let mut ran = crate::exec::run(
             &cmd,
             crate::exec::ExecEnv {
                 cwd: root,
@@ -630,6 +685,29 @@ fn sample(root: &Path, result: &Path) -> Result<bool, String> {
                 host: &crate::exec::LiveHost,
             },
         );
+        if id == "tree" && ran.ok {
+            let build_output = std::mem::take(&mut ran.output);
+            // The candidate verifier owns each tree stage's combined memory/CPU claim. Drop the
+            // tool-build envelope before entering it, so no parent retains cores around those
+            // admissions.
+            drop(stage_claim.take());
+            let direct_path = tools.path_with_stage2_first(&env.path);
+            let direct = tree_command(root, &args[1..], &tools.stage2_dir, &direct_path);
+            ran = crate::exec::run(
+                &direct,
+                crate::exec::ExecEnv {
+                    cwd: root,
+                    path: &env.path,
+                    scratch: &scratch,
+                    child_ceiling: None,
+                    remove_env: &removed_refs,
+                    add_env: &[],
+                    stage_groups: None,
+                    host: &crate::exec::LiveHost,
+                },
+            );
+            ran.output.insert_str(0, &build_output);
+        }
         fs::write(&log, &ran.output).map_err(|e| e.to_string())?;
         if ran.code == Some(75) || crate::exec::group::stopping() {
             return Ok(false);
@@ -652,7 +730,7 @@ fn sample(root: &Path, result: &Path) -> Result<bool, String> {
         }
         row.log = format!(
             "granted_cores={} admission_waiting_s={admission_waiting_s} load1={:?} elapsed_s={}\n{}",
-            claim.cores(),
+            granted_cores,
             aterm_capacity::Live.read(None).load1,
             began.elapsed().as_secs_f64(),
             row.log
@@ -1435,6 +1513,113 @@ mod tests {
         ));
         row.need.rank = aterm_capacity::Rank::Release;
         assert!(stage_should_yield(Path::new("/sample"), &[row]));
+    }
+    #[test]
+    fn the_tree_stage_runs_the_candidate_verifier_without_an_outer_slot() {
+        let command = tree_command(
+            Path::new("/repo"),
+            &["release", "--tree", "--background"],
+            Path::new("/trust/bin"),
+            std::ffi::OsStr::new("/trust/bin:/usr/bin"),
+        );
+        assert_eq!(
+            command.argv(),
+            [
+                format!(
+                    "/repo/.ubd/target.noindex/debug/aterm-verify{}",
+                    std::env::consts::EXE_SUFFIX
+                ),
+                "release".to_owned(),
+                "--tree".to_owned(),
+                "--background".to_owned(),
+            ]
+        );
+        for forbidden in [
+            "BUILD_SLOT_HELD",
+            "CARGO_BUILD_JOBS",
+            aterm_capacity::COVER_ENV,
+            aterm_capacity::DISK_COVER_ENV,
+            "ATERM_RELEASE_*",
+        ] {
+            assert!(
+                command.envs.iter().all(|(name, _)| name != forbidden),
+                "the direct verifier must own {forbidden}, not inherit an outer claim"
+            );
+            assert!(
+                sample_removed_env().iter().any(|name| name == forbidden),
+                "the sample must remove inherited {forbidden}"
+            );
+        }
+    }
+    #[test]
+    fn a_stage_waits_for_memory_without_holding_foreground_cores() {
+        use aterm_capacity::{Admit, Fixed, Ledger, Need, Pace, Reading};
+        use aterm_spec::wait::{MUST_HAPPEN, until_within};
+
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let ledger = Ledger::at(dir.path().join("ledger"));
+        let machine = std::sync::Arc::new(Fixed::new(Reading::of_gib(48, 40, 14)));
+        let memory = aterm_capacity::admit_with(
+            &ledger,
+            &*machine,
+            Need::new("ordinary memory holder").mem_gib(30),
+            Admit::Wait,
+            Pace::default(),
+            &mut |_| {},
+        )
+        .expect("the foreground memory claim");
+
+        std::thread::scope(|scope| {
+            let (admitted_tx, admitted_rx) = std::sync::mpsc::sync_channel(1);
+            let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+            let waiting_ledger = ledger.clone();
+            let waiting_machine = std::sync::Arc::clone(&machine);
+            let waiter = scope.spawn(move || {
+                let claim = aterm_capacity::admit_with(
+                    &waiting_ledger,
+                    &*waiting_machine,
+                    stage_need("inputs", 14),
+                    // The production caller is a dedicated process-group leader and requests
+                    // Preemptible. This scratch ledger exercises the same atomic Need under Wait
+                    // so the unit-test harness never authorizes cancellation of its shared group.
+                    Admit::Wait,
+                    Pace {
+                        poll: Duration::from_millis(5),
+                        ..Pace::default()
+                    },
+                    &mut |_| {},
+                )
+                .expect("the background stage claim");
+                admitted_tx.send(claim.cores()).expect("reported admission");
+                release_rx.recv().expect("released by the test");
+            });
+
+            let waiting = until_within(MUST_HAPPEN, "the stage's one atomic wait", || {
+                ledger
+                    .list()
+                    .ok()?
+                    .into_iter()
+                    .find(|record| record.need.what == "verify watch inputs")
+            });
+            assert_eq!(waiting.need.mem, 26 << 30);
+            assert_eq!(waiting.need.cores, 14);
+            assert!(waiting.need.covers);
+            assert_eq!(waiting.need.rank, aterm_capacity::Rank::Ordinary);
+            assert!(
+                waiting.held.is_none(),
+                "a memory wait must retain no Background cores: {waiting:?}"
+            );
+
+            drop(memory);
+            assert_eq!(
+                until_within(MUST_HAPPEN, "the unblocked stage admission", || {
+                    admitted_rx.try_recv().ok()
+                }),
+                14
+            );
+            release_tx.send(()).expect("release the stage claim");
+            waiter.join().expect("the stage waiter");
+        });
     }
     #[test]
     fn partial_or_unavailable_samples_never_become_green() {

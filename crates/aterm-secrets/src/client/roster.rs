@@ -169,19 +169,65 @@ pub(crate) fn with_roster_observation<T>(
     paths: &Paths,
     read: impl FnOnce(RosterObservation<'_>) -> crate::Result<T>,
 ) -> crate::Result<Option<T>> {
+    Ok(match observe_roster(paths, read)? {
+        Observed::Read(value) => Some(value),
+        Observed::Busy | Observed::Unseen => None,
+    })
+}
+
+/// [`with_roster_observation`] for a caller that may observe again: a vault writer that holds
+/// the state lock at this moment is [`crate::ErrorKind::VaultBusy`], not `Ok(None)`, which
+/// still says the vault was seen and gave no observation.
+pub(crate) fn with_roster_observation_or_busy<T>(
+    paths: &Paths,
+    read: impl FnOnce(RosterObservation<'_>) -> crate::Result<T>,
+) -> crate::Result<Option<T>> {
+    match observe_roster(paths, read)? {
+        Observed::Read(value) => Ok(Some(value)),
+        Observed::Busy => Err(vault_busy()),
+        Observed::Unseen => Ok(None),
+    }
+}
+
+/// A vault writer holds this Mac's state lock: nothing was observed.
+pub(crate) fn vault_busy() -> Error {
+    Error::of_kind(
+        crate::ErrorKind::VaultBusy,
+        "this Mac's vault is busy: a vault writer holds its state lock",
+    )
+}
+
+enum Observed<T> {
+    Read(T),
+    /// A vault writer held the state lock.
+    Busy,
+    /// A configured vault with no lock, or a vault that appeared while it was read.
+    Unseen,
+}
+
+fn observe_roster<T>(
+    paths: &Paths,
+    read: impl FnOnce(RosterObservation<'_>) -> crate::Result<T>,
+) -> crate::Result<Observed<T>> {
     match StateLock::observe_narrowed(paths)? {
-        StateObservation::Held(lock) => read(RosterObservation::Held(&lock)).map(Some),
-        StateObservation::Busy => Ok(None),
+        StateObservation::Held(lock) => read(RosterObservation::Held(&lock)).map(Observed::Read),
+        StateObservation::Busy => Ok(Observed::Busy),
         StateObservation::Absent => {
             if config(paths)?.is_some() {
-                return Ok(None);
+                return Ok(Observed::Unseen);
             }
             let value = read(RosterObservation::Standalone)?;
-            Ok((matches!(
-                StateLock::observe_classified(paths)?,
-                StateObservation::Absent
-            ) && config(paths)?.is_none())
-            .then_some(value))
+            Ok(
+                if matches!(
+                    StateLock::observe_classified(paths)?,
+                    StateObservation::Absent
+                ) && config(paths)?.is_none()
+                {
+                    Observed::Read(value)
+                } else {
+                    Observed::Unseen
+                },
+            )
         }
     }
 }

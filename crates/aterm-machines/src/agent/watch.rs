@@ -29,8 +29,8 @@ pub const START_HANG: Duration = Duration::from_secs(60);
 /// The pause between two looks for `<id>.watching`.
 const START_POLL: Duration = Duration::from_millis(100);
 
-/// Timeout for the watcher's `lock-screen` command.
-const LOCK_BUDGET: Duration = Duration::from_secs(30);
+/// The inner readback's whole hang detector, plus a minute for the command to start and exit.
+const LOCK_BUDGET: Duration = Duration::from_secs(super::lock::LOCK_HANG.as_secs() + 60);
 
 /// Time as `arm` and the watcher see it, so a test watches for hours without sleeping.
 pub trait Clock {
@@ -895,6 +895,11 @@ mod tests {
             "admin@gui$ /A/bin/aterm machines agent lock-screen"
         );
         assert!(lock_cmd(&layout(), &admin()).session);
+        assert!(
+            lock_cmd(&layout(), &admin()).budget
+                >= super::super::lock::LOCK_HANG + Duration::from_secs(60),
+            "the enclosing command must cover startup and the complete console readback"
+        );
     }
 
     #[test]

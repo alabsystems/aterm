@@ -391,7 +391,10 @@ const HELP_TAP: &str = "\
 `tap` is the statusLine command aterm adds to Claude Code while `[harness] usage_tap = true`
 (the default). Claude Code pipes its usage JSON to `<aterm> harness tap` after each reply and
 every 10 s; `tap` writes `<aterm state>/harness/claude-harness/rl/<tab>-<pid>.json` (0600;
-`--state` and `$ATERM_HARNESS_STATE` do not move it), prints `5h <p>% \u{b7} 7d <p>%`, and exits 0.
+`--state` and `$ATERM_HARNESS_STATE` do not move it), prints the week's use on one line
+(`week 63% used \u{b7} resets Sat 10:00`, the reset on the local clock and left out where the
+local zone does not read, or `week \u{b7} no figure yet`; never the 5-hour figure, which it
+still records), and exits 0.
 It is added only on the machine's own login (the default one, the roster's lone one, or,
 where `accounts.toml` lists two or more accounts, any login it lists or one a renewal moved
 one of its rows away from; one row's tap follows only its current login) in the default
@@ -19693,6 +19696,7 @@ fn run_tap(out: &mut dyn Write) -> ExitCode {
         &super::tap::TapVars::from_process(),
         super::tap::rl_dir().as_deref(),
         limit::unix_now(),
+        limit::local_offset_at,
         out,
     )
 }
@@ -19715,6 +19719,7 @@ fn run_tap_carrying() -> ExitCode {
         &super::tap::TapVars::from_process(),
         super::tap::rl_dir().as_deref(),
         limit::unix_now(),
+        limit::local_offset_at,
         || {
             if nested || !cfg!(unix) {
                 return None;

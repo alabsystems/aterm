@@ -370,6 +370,11 @@ pub(crate) fn belongs_to_fleet(dir: &Path, fleet_secret: &[u8]) -> Result<bool> 
 /// sync round reads its credentials: a neighbour's write changes neither the namespace nor this
 /// answer, and a verb's own open answers busy.
 pub(crate) fn holds_fleet_tables(dir: &Path) -> Result<bool> {
+    // The folder first: one no verb can open says why, and not what its file looks like.
+    match private_file::check_private_dir(dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        checked => checked?,
+    }
     if missing(dir, CONFIG)? {
         return Ok(false);
     }

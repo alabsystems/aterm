@@ -540,79 +540,82 @@ fn serve_inner(
                 .as_ref()
                 .map(PathBuf::from)
                 .unwrap_or_else(|| copy.home.join("auth.json"));
-            let result = renewal::with_successor(&env, &old, &intent.identity, |next| {
-                let index = index_path(&env, next, &proof, &intent).ok_or("index")?;
-                if let Some(id) = renewal::read_index(&index)? {
-                    let mut receipt = renewal::read_receipt(&env, &id).ok_or("indexed-receipt")?;
-                    let same_source = receipt.sid == ctx.self_id.as_str()
-                        && receipt.old_pid == proof.pid
-                        && receipt.old_birth == process.birth
-                        && receipt.intent == intent
-                        && receipt.matches_successor(next);
-                    let stale_ready = same_native_host(&receipt)
-                        && same_source
-                        && ready_native_no_go(ctx, &receipt.id)
-                        && receipt.retire_stale_ready(
-                            authority.revision(),
-                            ctx.human_input.seq(),
-                            now_ms(),
-                        );
-                    if stale_ready {
-                        renewal::write_receipt(&env, &receipt)?;
-                        return Ok(receipt);
+            let result =
+                renewal::with_successor_writer(&env, &old, &intent.identity, |next, writer| {
+                    let index = index_path(&env, next, &proof, &intent).ok_or("index")?;
+                    if let Some(id) = renewal::read_index(&index)? {
+                        let mut receipt =
+                            renewal::read_receipt(&env, &id).ok_or("indexed-receipt")?;
+                        let same_source = receipt.sid == ctx.self_id.as_str()
+                            && receipt.old_pid == proof.pid
+                            && receipt.old_birth == process.birth
+                            && receipt.intent == intent
+                            && receipt.matches_successor(next);
+                        let stale_ready = same_native_host(&receipt)
+                            && same_source
+                            && ready_native_no_go(ctx, &receipt.id)
+                            && receipt.retire_stale_ready(
+                                authority.revision(),
+                                ctx.human_input.seq(),
+                                now_ms(),
+                            );
+                        if stale_ready {
+                            renewal::write_receipt(&env, &receipt)?;
+                            return Ok(receipt);
+                        }
+                        // A wall-clock deadline never closes an already claimed
+                        // native operation. Its coordinator reconciles the exact
+                        // request and retires it only against a positive outcome.
+                        if !receipt.may_replace() {
+                            return Ok(receipt);
+                        }
                     }
-                    // A wall-clock deadline never closes an already claimed
-                    // native operation. Its coordinator reconciles the exact
-                    // request and retires it only against a positive outcome.
-                    if !receipt.may_replace() {
-                        return Ok(receipt);
-                    }
-                }
-                let id = aterm_agent::harness::native_act::operation_id().map_err(|_| "entropy")?;
-                let prepare = make_prepare(
-                    ctx,
-                    resume,
-                    process.clone(),
-                    next,
-                    &id,
-                    authority.revision(),
-                )
-                .ok_or("plan")?;
-                let receipt = Receipt {
-                    destination: None,
-                    id,
-                    intent: intent.clone(),
-                    sid: ctx.self_id.as_str().into(),
-                    old_pid: proof.pid,
-                    old_birth: process.birth,
-                    claim_revision: authority.revision(),
-                    human_seq: ctx.human_input.seq(),
-                    old_auth: next.old_auth.clone(),
-                    new_auth: next.new_auth.clone(),
-                    generation: next.generation,
-                    row_stamp: renewal::row_stamp(&next.row),
-                    native_prepare: aterm_agent::harness::native_act::Request::prepare(prepare)
-                        .encode()
-                        .ok_or("plan")?,
-                    expires_ms: now_ms().saturating_add(120_000),
-                    phase: Phase::Ready,
-                    successor_pid: None,
-                    successor_birth: None,
-                    accepted_turn: None,
-                    launch_attempted: false,
-                    candidate: None,
-                    current_attempt: None,
-                    revoked: false,
-                };
-                renewal::write_receipt(&env, &receipt)?;
-                aterm_agent::harness::upgrade_models::write_atomic_mode(
-                    &index,
-                    &receipt.id,
-                    Some(0o600),
-                )
-                .map_err(|_| "index")?;
-                Ok(receipt)
-            });
+                    let id =
+                        aterm_agent::harness::native_act::operation_id().map_err(|_| "entropy")?;
+                    let prepare = make_prepare(
+                        ctx,
+                        resume,
+                        process.clone(),
+                        next,
+                        &id,
+                        authority.revision(),
+                    )
+                    .ok_or("plan")?;
+                    let receipt = Receipt {
+                        destination: None,
+                        id,
+                        intent: intent.clone(),
+                        sid: ctx.self_id.as_str().into(),
+                        old_pid: proof.pid,
+                        old_birth: process.birth,
+                        claim_revision: authority.revision(),
+                        human_seq: ctx.human_input.seq(),
+                        old_auth: next.old_auth.clone(),
+                        new_auth: next.new_auth.clone(),
+                        generation: next.generation,
+                        row_stamp: renewal::row_stamp(&next.row),
+                        native_prepare: aterm_agent::harness::native_act::Request::prepare(prepare)
+                            .encode()
+                            .ok_or("plan")?,
+                        expires_ms: now_ms().saturating_add(120_000),
+                        phase: Phase::Ready,
+                        successor_pid: None,
+                        successor_birth: None,
+                        accepted_turn: None,
+                        launch_attempted: false,
+                        candidate: None,
+                        current_attempt: None,
+                        revoked: false,
+                    };
+                    writer.create(&receipt)?;
+                    aterm_agent::harness::upgrade_models::write_atomic_mode(
+                        &index,
+                        &receipt.id,
+                        Some(0o600),
+                    )
+                    .map_err(|_| "index")?;
+                    Ok(receipt)
+                });
             match result {
                 Ok(Some(receipt)) => acknowledged_receipt_reply(&env, &receipt),
                 _ => "OK codex-renewal state=waiting\n".into(),
@@ -830,9 +833,11 @@ fn commit(
     let sid = ctx.self_id.as_str().to_owned();
     let id = id.to_owned();
     let worker_env = env.clone();
+    let worker_receipt = receipt.clone();
     let spawned = std::thread::Builder::new()
         .name("codex-renewal".into())
         .spawn(move || {
+            let driver = WorkerRootDriver(worker_ctx.clone());
             loop {
                 let Some(ctx) = worker_ctx.upgrade() else {
                     break;
@@ -851,75 +856,22 @@ fn commit(
                 // response retries only its exact retained native operation and
                 // original deadline; it never invents another plan or signal.
                 let _attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    // All nested control/network waits run on this private worker, never
-                    // the dispatch lane handling the original Codex request.
-                    if renewal::prepare_restart(&opts, &sid, &prepare).is_err() {
-                        // A failed or lost preparation reply can follow a durable
-                        // native claim. Keep this exact root and its seal for
-                        // retry; only positive native completion can retire it.
-                        return;
-                    }
-                    let Some(store) = worker_env.accounts_store_for(accounts::Cli::Codex) else {
+                    let Some(current) = renewal::read_receipt(&worker_env, &id) else {
                         return;
                     };
-                    {
-                        let Ok(Some(_guard)) = store.acquire_bounded() else {
-                            return;
-                        };
-                        let Some(mut receipt) = renewal::read_receipt(&worker_env, &id) else {
-                            return;
-                        };
-                        if receipt.phase != Phase::Committing {
-                            return;
-                        }
-                        receipt.launch_attempted = true;
-                        if renewal::write_receipt(&worker_env, &receipt).is_err() {
-                            return;
-                        }
-                    }
-                    if let Some(ctx) = worker_ctx.upgrade() {
-                        ctx.native_policy.renewal_before_signal();
-                    }
-                    let observed = renewal::drive_restart(&opts, &sid, &prepare);
-                    if observed.is_some() {
-                        remove_seal(&worker_ctx, &id);
-                    }
-                    let Ok(Some(_guard)) = store.acquire_bounded() else {
-                        return;
-                    };
-                    let Some(mut receipt) = renewal::read_receipt(&worker_env, &id) else {
-                        return;
-                    };
-                    if receipt.phase != Phase::Committing {
+                    if current.sid != sid || !current.same_intent(&worker_receipt) {
                         return;
                     }
-                    match observed {
-                        Some(renewal::RestartCompletion::NotStarted) => {
-                            receipt.phase = Phase::Retired;
-                            receipt.launch_attempted = false;
-                            let _saved = renewal::write_receipt(&worker_env, &receipt);
-                        }
-                        Some(renewal::RestartCompletion::Forward(observed)) => {
-                            receipt.phase = Phase::Committed;
-                            receipt.successor_pid = Some(observed.registration.vendor.pid);
-                            receipt.successor_birth = Some(observed.registration.vendor.birth);
-                            let _saved = renewal::write_receipt(&worker_env, &receipt);
-                        }
-                        Some(renewal::RestartCompletion::Rollback(observed)) => {
-                            receipt.phase = Phase::Retired;
-                            receipt.successor_pid = Some(observed.registration.vendor.pid);
-                            receipt.successor_birth = Some(observed.registration.vendor.birth);
-                            let _saved = renewal::write_receipt(&worker_env, &receipt);
-                        }
-                        None => {}
-                    }
-                    // Unknown outcome retains the original operation and its persisted
-                    // native record. It never authorizes a second launch.
+                    // Host calls run outside the account writer. Publication consumes
+                    // the exact durable journal; only terminal settlement releases seals.
+                    let _progress =
+                        renewal::advance_root(&worker_env, &current, &prepare, &opts, &driver);
                 }));
                 let Some(current) = renewal::read_receipt(&worker_env, &id) else {
                     break;
                 };
                 if current.phase != Phase::Committing
+                    || current.current_attempt.is_some()
                     || !aterm_agent::harness::native_act::monotonic_us()
                         .is_some_and(|now| now < prepare.deadline_us)
                 {
@@ -946,8 +898,10 @@ fn commit(
             service::continue_closed(&worker_ctx, &opts, &id);
             if let Some(ctx) = worker_ctx.upgrade() {
                 service::observe_terminal(&ctx, &id);
-                ctx.native_policy
-                    .renewal_coordinator_stopped(&id, prepare.deadline_us);
+                let deadline = renewal::read_receipt(&worker_env, &id)
+                    .and_then(|current| renewal::active_prepare(&worker_env, &current))
+                    .map_or(prepare.deadline_us, |active| active.deadline_us);
+                ctx.native_policy.renewal_coordinator_stopped(&id, deadline);
             }
         });
     if spawned.is_err() {
@@ -957,6 +911,18 @@ fn commit(
         return "ERR codex-renewal worker unavailable\n".into();
     }
     acknowledged_receipt_reply(env, &receipt)
+}
+
+struct WorkerRootDriver(std::sync::Weak<crate::SessionCtx>);
+
+impl renewal::RootDriver for WorkerRootDriver {
+    fn before_signal(&self) -> bool {
+        let Some(ctx) = self.0.upgrade() else {
+            return false;
+        };
+        ctx.native_policy.renewal_before_signal();
+        true
+    }
 }
 
 fn remove_seal(ctx: &std::sync::Weak<crate::SessionCtx>, id: &str) {
@@ -1531,6 +1497,99 @@ mod tests {
             continuation: None,
             fresh_snapshot: None,
         }
+    }
+
+    #[test]
+    fn codex_renewal_service_recovers_a_late_root_before_host_work() {
+        let handle = crate::session_store::test_handle_on(19101, -1);
+        let ctx = Arc::clone(&handle.ctx);
+        install(&ctx, 71, &[Scope::Relaunch]);
+        let directory = aterm_tempfile::tempdir().unwrap();
+        let mut seed = seal(&ctx);
+        seed.env.home = Some(directory.path().join("home"));
+        seed.env.state = directory.path().join("state");
+        seed.prepare.deadline_us = 1;
+        seed.receipt.native_prepare =
+            aterm_agent::harness::native_act::Request::prepare(seed.prepare.clone())
+                .encode()
+                .unwrap();
+        seed.receipt.phase = Phase::Committing;
+        seed.receipt.launch_attempted = true;
+        let env = &seed.env;
+        let root = &seed.receipt;
+        let options = opts(env, &root.sid).unwrap();
+        renewal::with_receipt_writer(env, |_| renewal::write_receipt(env, root))
+            .unwrap()
+            .unwrap();
+        assert!(service::root_allows_native_work(
+            env,
+            root,
+            &seed.prepare,
+            &options
+        ));
+
+        let native_dir = env.state.join("upgrade");
+        aterm_types::fs_restricted::ensure_private_dir(&native_dir).unwrap();
+        let file = format!("renewal-{}.json", seed.prepare.id);
+        // A completed header without the positive NoExec fact is pending,
+        // never permission to ask the host for another operation.
+        let mut retained = aterm_json::json!({
+            "phase": "done", "agent": "codex", "tab": root.sid,
+            "native_coordination": true,
+            "native_completed_prepare": root.native_prepare,
+        });
+        aterm_agent::harness::upgrade_models::write_atomic_mode(
+            &native_dir.join(&file),
+            &retained.to_string(),
+            Some(0o600),
+        )
+        .unwrap();
+        assert!(!service::root_allows_native_work(
+            env,
+            root,
+            &seed.prepare,
+            &options
+        ));
+        assert_eq!(renewal::read_receipt(env, &root.id).as_ref(), Some(root));
+
+        let fields = retained.as_object_mut().unwrap();
+        let _completed = fields.remove("native_completed_prepare");
+        let _noexec = fields.insert(
+            "native_noexec_prepare".into(),
+            aterm_json::Value::from(root.native_prepare.clone()),
+        );
+        aterm_agent::harness::upgrade_models::write_atomic_mode(
+            &native_dir.join(&file),
+            &retained.to_string(),
+            Some(0o600),
+        )
+        .unwrap();
+        let failure = aterm_durable::seam::FailingDirs::after(0, aterm_durable::seam::EIO);
+        assert!(!service::root_allows_native_work(
+            env,
+            root,
+            &seed.prepare,
+            &options
+        ));
+        assert_eq!(renewal::read_receipt(env, &root.id).as_ref(), Some(root));
+        drop(failure);
+
+        assert!(!service::root_allows_native_work(
+            env,
+            root,
+            &seed.prepare,
+            &options
+        ));
+        let retired = renewal::read_receipt(env, &root.id).unwrap();
+        assert_eq!(retired.phase, Phase::Retired);
+        assert!(!retired.launch_attempted);
+        assert!(!service::root_allows_native_work(
+            env,
+            root,
+            &seed.prepare,
+            &options
+        ));
+        assert_eq!(renewal::read_receipt(env, &root.id), Some(retired));
     }
 
     #[test]

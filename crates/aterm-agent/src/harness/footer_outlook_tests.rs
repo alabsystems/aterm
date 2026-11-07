@@ -17,6 +17,12 @@ fn cells(used: usize, more: usize, tick: bool) -> [BarCell; 10] {
     })
 }
 
+/// A PAUSED RECOVERY KEEPS OBSERVATIONS WITHOUT FORECAST SEGMENTS on today's footer: a paused or
+/// busy recovery keeps the glance's observations and drops `OUTLOOK_MARK` and every forecast
+/// meter cell from the live segments. It stays beside the quota view's
+/// `a_paused_recovery_shows_no_forecast` until S5 deletes this file with the glance footer, since
+/// the footer it guards is live until then. Negative control: `fact_segments` reading
+/// `facts.glance` in place of `facts.glance_view()` keeps `OUTLOOK_MARK` under a pause.
 #[test]
 fn paused_recovery_keeps_observations_without_forecast_segments() {
     use crate::harness::account_progress::{AccountProgress, ProgressPhase};
@@ -171,9 +177,9 @@ fn scene_for(name: char, email: &str) -> FooterFacts {
                 cells(6, 4, false),
                 "5h 62% left",
                 Some(words(
-                    "\u{29d7} stop ~Wed 22:30\u{2013}Thu 09:00",
-                    "\u{29d7} stop ~Wed 22:30",
-                    Some("\u{29d7} ~Wed 22:30"),
+                    "\u{2573} ~Wed 22:00\u{2013}Thu 09:00",
+                    "\u{2573} ~Wed 22:00",
+                    Some("\u{2573} ~Wed 22:00"),
                     true,
                 )),
             ),
@@ -201,9 +207,9 @@ fn scene_for(name: char, email: &str) -> FooterFacts {
                 cells(6, 3, true),
                 "5h 19% left",
                 Some(words(
-                    "\u{29d7} 5h stop ~20:10\u{2013}21:10",
-                    "\u{29d7} 5h stop ~20:10",
-                    Some("\u{29d7} 5h ~20:10"),
+                    "\u{2573} ~20:10\u{2013}21:10",
+                    "\u{2573} ~20:10",
+                    Some("\u{2573} ~20:10"),
                     true,
                 )),
             ),
@@ -213,7 +219,7 @@ fn scene_for(name: char, email: &str) -> FooterFacts {
             None,
             false,
             Glance {
-                reset: Some("1 Nov 18:10".into()),
+                reset: Some("Sun 1 Nov 18:10".into()),
                 verdict: None,
                 ..glance(cells(1, 0, false), "5h 62% left", None)
             },
@@ -446,10 +452,11 @@ fn the_outlook_never_costs_the_account() {
                     "{name} {email} observed={observed} at {room}: the outlook pushed the account out: {with:?} (no \
                  outlook: {without:?})"
                 );
+                // A projected stop's words lead with `╳` (`⧗` is a wall standing now).
                 let stop = with
                     .segments
                     .iter()
-                    .any(|s| s.mark == OUTLOOK_MARK && s.text.starts_with(WALL_MARK));
+                    .any(|s| s.mark == OUTLOOK_MARK && s.text.starts_with('\u{2573}'));
                 if stop && !shows(&with.segments, WEEKLY_MARK) {
                     narrow_stops += 1;
                 }

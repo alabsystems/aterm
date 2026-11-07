@@ -15,6 +15,7 @@
 //! or refuses this process is a broker, and its own words stand. It serves LAN uses, never a
 //! question about the broker itself (`super::Arrivals`, which hears a broker arrive).
 
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use crate::CtlStream;
@@ -30,6 +31,12 @@ pub trait Direct: Send + Sync {
     /// # Errors
     /// No allowance, in words.
     fn allowed(&self) -> Result<String, String>;
+
+    /// The file macOS keeps [`Self::allowed`]'s answer in, whose change can move it: what the
+    /// window's watch of the LAN's arrival hears (`aterm_machines::lan_reach::watch_arrivals`), so
+    /// an Allow given while this process runs (to a program in one of its tabs, which macOS holds
+    /// this app responsible for) is heard. `None` where no file holds it.
+    fn record(&self) -> Option<PathBuf>;
 
     /// Serve one connection of the broker's protocol on `stream` until either end closes. Called
     /// on a thread of its own.
@@ -78,6 +85,13 @@ fn current() -> Option<&'static dyn Direct> {
         return None;
     }
     PROVIDED.get().copied()
+}
+
+/// The file this thread's direct path reads macOS's answer from ([`Direct::record`]), where it has
+/// a direct path and the path names one.
+#[must_use]
+pub fn record() -> Option<PathBuf> {
+    current().and_then(|direct| direct.record())
 }
 
 /// The near end of an in-process session and macOS's allowance in words, when this process has a

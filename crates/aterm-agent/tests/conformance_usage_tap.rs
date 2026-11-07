@@ -79,6 +79,7 @@ fn reading(pid: i64, api: i64, figs: i64) -> Reading {
         model: None,
         ctx_left: None,
         dur_us: 0,
+        row: None,
     }
 }
 

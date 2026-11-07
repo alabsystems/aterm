@@ -732,7 +732,7 @@ pub(crate) enum Fact {
     Context,
     /// `Σ 6m33s ↑20M ↓82k`.
     Usage,
-    /// `⎆ sol-m27@example.test · max 20x · weekly 0% left`, one unit.
+    /// `⎆ sol-m27@example.test · max 20x · weekly 61% left`, one unit.
     Account,
 }
 
@@ -4529,7 +4529,13 @@ impl App {
                 .is_some_and(|ws| ws.mods.control_key());
         match glass {
             GlassAt::Chip(chip) => {
-                if secondary && self.open_autopilot_menu_at(wid, x, y) {
+                if secondary {
+                    if !self.open_autopilot_menu_at(wid, x, y)
+                        && self.inline_rename_edit(wid).is_some()
+                    {
+                        self.clear_strip_press(wid);
+                        self.settle_rename_edit(wid);
+                    }
                     return true;
                 }
                 self.press_visible_claude_chip(wid, session, chip, at)
@@ -8442,6 +8448,20 @@ mod gesture_tests {
             press(&mut app, cell, MouseButton::Right);
             assert!(pty(&mut reader, 0).is_empty(), "{cell:?}: no paste");
         }
+        #[cfg(target_os = "macos")]
+        {
+            app.windows.get_mut(&wid).unwrap().mods =
+                aterm_window::keyboard::ModifiersState::CONTROL;
+            for cell in [(light.0, light.1 - 1), light] {
+                press(&mut app, cell, MouseButton::Left);
+                assert!(
+                    pty(&mut reader, 0).is_empty(),
+                    "control-click {cell:?}: no toggle or paste"
+                );
+            }
+            app.windows.get_mut(&wid).unwrap().mods =
+                aterm_window::keyboard::ModifiersState::empty();
+        }
         press(&mut app, pane, MouseButton::Right);
         let got = String::from_utf8_lossy(&pty(&mut reader, "PROBE-CLIP".len())).into_owned();
         crate::control::PBPASTE_STUB.with(|board| *board.borrow_mut() = None);
@@ -8587,6 +8607,25 @@ mod gesture_tests {
             "the vacated mode row: closed"
         );
         assert_eq!(pinned(&app).as_deref(), Some("swallowed"));
+        rename(&mut app, "right-swallowed");
+        app.on_cursor_moved(wid, x, y);
+        app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Right);
+        app.on_mouse_input(wid, ElementState::Released, MouseButton::Right);
+        assert!(
+            app.inline_rename_edit(wid).is_none(),
+            "right-click on vacated mode row: closed"
+        );
+        assert_eq!(pinned(&app).as_deref(), Some("right-swallowed"));
+        rename(&mut app, "right-light");
+        let (x, y) = px_of(&app, wid, hit(&app, wid, MODE));
+        app.on_cursor_moved(wid, x, y);
+        app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Right);
+        app.on_mouse_input(wid, ElementState::Released, MouseButton::Right);
+        assert!(
+            app.inline_rename_edit(wid).is_none(),
+            "right-click on mode light: closed"
+        );
+        assert_eq!(pinned(&app).as_deref(), Some("right-light"));
         assert!(
             pty(&mut reader, 0).is_empty(),
             "nothing reached the program"

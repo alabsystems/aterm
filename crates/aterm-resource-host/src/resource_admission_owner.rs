@@ -46,6 +46,8 @@ mod member_recipe;
 pub(super) mod members;
 #[path = "resource_admission_metadata.rs"]
 pub(super) mod metadata;
+#[path = "resource_admission_inputs.rs"]
+mod native_inputs;
 #[path = "resource_admission_parent_loan.rs"]
 mod parent_loan;
 
@@ -315,12 +317,21 @@ impl Owner {
         self.tick_queue();
     }
     pub(super) fn inspect(&mut self, peer: Peer, session: &str) -> io::Result<Inspection> {
+        self.inspect_at(peer, session, Instant::now())
+    }
+    fn inspect_at(
+        &mut self,
+        peer: Peer,
+        session: &str,
+        started: Instant,
+    ) -> io::Result<Inspection> {
         self.fence.check_current()?;
         if self.faulted {
             return Err(refused("host custody is faulted"));
         }
         for job in self.jobs.values_mut() {
             let root = job.child.child_mut().id();
+            let deadline = started + Duration::from_secs(60);
             if job.binding.session == session
                 && !job.reaped
                 && !job.settled
@@ -330,7 +341,7 @@ impl Owner {
                     aterm_uds::process::Birth(peer.birth),
                     root,
                     aterm_uds::process::Birth(job.root_birth),
-                    Instant::now() + Duration::from_secs(2),
+                    deadline,
                 )
             {
                 return job::inspection(&self.fence, &self.debt, job);

@@ -41,68 +41,7 @@ fn push_row_cell_text(grid: &Grid, row: u16, cells: &Row, col: u16, out: &mut St
     }
     if cell.has_extras() {
         if let Some(extra) = grid.cell_extra(row, col) {
-            let marks = extra.combining();
-            // A single push grows once. A sequence no larger than the whole
-            // buffer fits after its amortized growth; count bytes only when
-            // several marks can require more than that growth step.
-            if marks.len() > 1 && out.capacity() < marks.len().saturating_mul(4) {
-                reserve_combining_bytes(out, marks);
-            }
-            for &combining in marks {
-                out.push(combining);
-            }
-        }
-    }
-}
-
-// Keep the rare capacity-edge scan out of the per-cell emission frame.
-#[inline(never)]
-fn reserve_combining_bytes(out: &mut String, marks: &[char]) {
-    let bytes: usize = marks.iter().map(|mark| mark.len_utf8()).sum();
-    let needed = out.len().saturating_add(bytes);
-    if needed <= out.capacity() {
-        return;
-    }
-    // Skip intermediate growth without shrinking the geometric capacity that
-    // scalar pushes would leave for the next cell. A tiny byte buffer's first
-    // growth has a minimum capacity of eight in the pinned standard library.
-    let mut capacity = out.capacity().max(4);
-    while capacity < needed {
-        capacity = capacity.saturating_mul(2);
-    }
-    out.reserve(capacity.saturating_sub(out.len()));
-}
-
-#[cfg(test)]
-mod combining_capacity_tests {
-    use super::reserve_combining_bytes;
-
-    #[test]
-    fn batching_preserves_scalar_growth_capacity_for_following_text() {
-        for capacity in [0, 1, 2, 3, 4, 5, 7, 8, 15, 17, 31, 33, 63] {
-            for prefix in ["", "abc", "prefix  "] {
-                for mark in ['\u{301}', '\u{20dd}', '\u{1d185}'] {
-                    for count in 2..=16 {
-                        let marks = vec![mark; count];
-                        let mut actual = String::with_capacity(capacity);
-                        actual.push_str(prefix);
-                        actual.push('x');
-                        let mut scalar = String::with_capacity(capacity);
-                        scalar.push_str(prefix);
-                        scalar.push('x');
-                        reserve_combining_bytes(&mut actual, &marks);
-                        for &ch in &marks {
-                            actual.push(ch);
-                            scalar.push(ch);
-                        }
-                        assert_eq!(actual, scalar);
-                        assert_eq!(actual.capacity(), scalar.capacity());
-                        actual.push('y');
-                        scalar.push('y');
-                        assert_eq!(actual.capacity(), scalar.capacity());
-                    }
-                }
-            }
+            extra.push_combining_text(out);
         }
     }
 }

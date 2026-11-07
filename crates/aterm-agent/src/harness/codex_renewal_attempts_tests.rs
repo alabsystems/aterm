@@ -7,6 +7,9 @@ use crate::harness::native_act::{
     Image, NativePlan, Prepare, Process, Request as NativeRequest, RestartCommand,
 };
 
+#[path = "codex_renewal_creation_tests.rs"]
+mod creation;
+
 pub(super) fn fixture() -> (aterm_tempfile::TempDir, Env, Receipt, Prepare) {
     let tmp = aterm_tempfile::tempdir().unwrap();
     let mut env = Env::from_process().unwrap();

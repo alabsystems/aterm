@@ -4,6 +4,7 @@
 //! Cell extras: rare attributes kept in a side table (`CellExtras`) keyed by cell position.
 
 use aterm_alloc::SmallVec;
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 pub use crate::extra_collection::CellExtras;
@@ -352,6 +353,31 @@ impl CellExtra {
         &self.combining
     }
 
+    /// Append this cell's combining marks while preserving geometric string growth.
+    #[expect(
+        clippy::inline_always,
+        reason = "measured viewport extraction: ordinary cross-crate inlining regressed full one-mark rows by nine percent; keep scalar emission in the caller"
+    )]
+    #[inline(always)]
+    pub fn push_combining_text(&self, out: &mut String) {
+        let marks = self.combining();
+        // One scalar grows once; a sequence no larger than the whole buffer
+        // fits after its amortized growth. At a small-buffer edge, count only
+        // when even that next growth could leave too little spare capacity.
+        if marks.len() > 1 {
+            let bound = marks.len().saturating_mul(4);
+            if out.capacity() < bound {
+                let grown_spare = out.capacity().saturating_mul(2).saturating_sub(out.len());
+                if grown_spare < bound {
+                    reserve_combining_bytes(out, marks);
+                }
+            }
+        }
+        for &mark in marks {
+            out.push(mark);
+        }
+    }
+
     /// Add a combining character up to [`Self::MAX_COMBINING`].
     #[inline]
     pub fn add_combining(&mut self, c: char) {
@@ -573,16 +599,17 @@ pub struct UniformExtras<'a> {
     pub hyperlink: Option<&'a Arc<HyperlinkData>>,
 }
 
-/// Encode a packed `0xTT_XXXXXX` underline colour as an SGR 58/59 parameter.
-#[must_use]
-pub fn underline_color_sgr(packed: u32) -> String {
+/// Append a packed `0xTT_XXXXXX` underline colour as an SGR 58/59 parameter.
+pub fn push_underline_color_sgr(out: &mut String, packed: u32) {
     match (packed >> 24) & 0xFF {
-        0x00 | 0x02 => format!("58:5:{}", packed & 0xFF),
+        0x00 | 0x02 => {
+            let _ = write!(out, "58:5:{}", packed & 0xFF);
+        }
         0x01 => {
             let (r, g, b) = ((packed >> 16) & 0xFF, (packed >> 8) & 0xFF, packed & 0xFF);
-            format!("58:2::{r}:{g}:{b}")
+            let _ = write!(out, "58:2::{r}:{g}:{b}");
         }
-        _ => "59".to_string(),
+        _ => out.push_str("59"),
     }
 }
 
@@ -603,3 +630,58 @@ pub const fn is_combining_mark(c: char) -> bool {
 #[cfg(test)]
 #[path = "extra_tests.rs"]
 mod tests;
+
+// Keep the rare capacity-edge scan out of the per-cell emission frame.
+#[inline(never)]
+fn reserve_combining_bytes(out: &mut String, marks: &[char]) {
+    let bytes: usize = marks.iter().map(|mark| mark.len_utf8()).sum();
+    let needed = out.len().saturating_add(bytes);
+    if needed <= out.capacity() {
+        return;
+    }
+    // Skip intermediate growth without shrinking the geometric capacity that
+    // scalar pushes would leave for the next cell. A tiny byte buffer's first
+    // growth has a minimum capacity of eight in the pinned standard library.
+    let mut capacity = out.capacity().max(4);
+    while capacity < needed {
+        capacity = capacity.saturating_mul(2);
+    }
+    out.reserve(capacity.saturating_sub(out.len()));
+}
+
+#[cfg(test)]
+mod combining_capacity_tests {
+    use super::CellExtra;
+
+    #[test]
+    fn batching_preserves_scalar_growth_capacity_for_following_text() {
+        for capacity in [0, 1, 2, 3, 4, 5, 7, 8, 15, 17, 31, 33, 63] {
+            for prefix in ["", "abc", "prefix  "] {
+                for mark in ['\u{301}', '\u{20dd}', '\u{1d185}'] {
+                    for count in 0..=16 {
+                        let marks = vec![mark; count];
+                        let mut extra = CellExtra::default();
+                        for &ch in &marks {
+                            extra.add_combining(ch);
+                        }
+                        let mut actual = String::with_capacity(capacity);
+                        actual.push_str(prefix);
+                        actual.push('x');
+                        let mut scalar = String::with_capacity(capacity);
+                        scalar.push_str(prefix);
+                        scalar.push('x');
+                        extra.push_combining_text(&mut actual);
+                        for &ch in &marks {
+                            scalar.push(ch);
+                        }
+                        assert_eq!(actual, scalar);
+                        assert_eq!(actual.capacity(), scalar.capacity());
+                        actual.push('y');
+                        scalar.push('y');
+                        assert_eq!(actual.capacity(), scalar.capacity());
+                    }
+                }
+            }
+        }
+    }
+}

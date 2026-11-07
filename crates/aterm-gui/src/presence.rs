@@ -740,132 +740,11 @@ pub(crate) fn local_offset_s() -> Option<i64> {
     local_offset_at(limit::unix_now())
 }
 
-/// `struct tm` (`<time.h>`), laid out alike on Darwin and glibc: nine `int`s,
-/// then the BSD/GNU `tm_gmtoff` and `tm_zone`.
-#[cfg(unix)]
-#[repr(C)]
-struct Tm {
-    _date_and_time: [libc::c_int; 9],
-    tm_gmtoff: libc::c_long,
-    _tm_zone: *const libc::c_char,
-}
-
-#[cfg(all(unix, target_pointer_width = "64"))]
-const _: () = assert!(size_of::<Tm>() == 56);
-
-#[cfg(unix)]
-unsafe extern "C" {
-    fn localtime_r(clock: *const libc::time_t, result: *mut Tm) -> *mut Tm;
-    fn tzset();
-}
-
-/// The local zone's offset from UTC at the instant `unix`.
-#[cfg(unix)]
+/// The local zone's offset from UTC at the instant `unix`: aterm's one local-clock reader
+/// (`aterm_uds::zone::local_offset_at`, Unix and Windows), the one the usage tap says its reset
+/// on, so the glass and the tap's row name the same local instant.
 pub(crate) fn local_offset_at(unix: i64) -> Option<i64> {
-    refreshed_local_offset_at(
-        unix,
-        || {
-            // SAFETY: `tzset` takes no pointers, serializes its C-library zone
-            // state, and reads the environment without changing it, as does
-            // `localtime_r`. No thread may mutate `TZ` beside these readers.
-            unsafe { tzset() }
-        },
-        native_local_offset_at,
-    )
-}
-
-/// [`local_offset_at`]'s order: `refresh`, then `read`, on every call.
-#[cfg(unix)]
-fn refreshed_local_offset_at(
-    unix: i64,
-    refresh: impl FnOnce(),
-    read: impl FnOnce(i64) -> Option<i64>,
-) -> Option<i64> {
-    refresh();
-    read(unix)
-}
-
-#[cfg(unix)]
-fn native_local_offset_at(unix: i64) -> Option<i64> {
-    let clock: libc::time_t = unix;
-    let mut tm = std::mem::MaybeUninit::<Tm>::zeroed();
-    // SAFETY: `clock` is a live `time_t` and `tm` a writable, correctly laid
-    // out `struct tm` (its size pinned above); `localtime_r` writes only it.
-    let filled = unsafe { localtime_r(&clock, tm.as_mut_ptr()) };
-    if filled.is_null() {
-        return None;
-    }
-    // SAFETY: a non-null answer filled every field; all are plain integers or
-    // a pointer this never reads.
-    Some(unsafe { tm.assume_init() }.tm_gmtoff)
-}
-
-/// `FILETIME` and `SYSTEMTIME` ([`local_offset_at`]).
-#[cfg(windows)]
-mod win_time {
-    #[repr(C)]
-    #[derive(Default)]
-    pub(super) struct FileTime {
-        pub(super) low: u32,
-        pub(super) high: u32,
-    }
-
-    /// Year, month, weekday, day, hour, minute, second, millisecond: only ever handed from one conversion to the next, never read here.
-    #[repr(C)]
-    #[derive(Default)]
-    pub(super) struct SystemTime {
-        _fields: [u16; 8],
-    }
-
-    unsafe extern "system" {
-        pub(super) fn FileTimeToSystemTime(file: *const FileTime, system: *mut SystemTime) -> i32;
-        pub(super) fn SystemTimeToTzSpecificLocalTime(
-            zone: *const std::ffi::c_void,
-            utc: *const SystemTime,
-            local: *mut SystemTime,
-        ) -> i32;
-        pub(super) fn SystemTimeToFileTime(system: *const SystemTime, file: *mut FileTime) -> i32;
-    }
-}
-
-/// Windows: the offset the system zone's rules give the instant `unix`, in seconds.
-#[cfg(windows)]
-pub(crate) fn local_offset_at(unix: i64) -> Option<i64> {
-    use win_time::{
-        FileTime, FileTimeToSystemTime, SystemTime, SystemTimeToFileTime,
-        SystemTimeToTzSpecificLocalTime,
-    };
-    const UNIX_EPOCH_TICKS: i64 = 116_444_736_000_000_000;
-    const TICKS_PER_SECOND: i64 = 10_000_000;
-    let ticks = unix
-        .checked_mul(TICKS_PER_SECOND)?
-        .checked_add(UNIX_EPOCH_TICKS)?;
-    let raw = u64::try_from(ticks).ok()?;
-    let utc_file = FileTime {
-        low: raw as u32,
-        high: (raw >> 32) as u32,
-    };
-    let (mut utc, mut local) = (SystemTime::default(), SystemTime::default());
-    let mut local_file = FileTime::default();
-    // SAFETY: every pointer addresses a live, correctly laid out `repr(C)`
-    // value of the type the call documents; a null zone names the active one.
-    // Each call writes only its out parameter.
-    let converted = unsafe {
-        FileTimeToSystemTime(&utc_file, &mut utc) != 0
-            && SystemTimeToTzSpecificLocalTime(std::ptr::null(), &utc, &mut local) != 0
-            && SystemTimeToFileTime(&local, &mut local_file) != 0
-    };
-    if !converted {
-        return None;
-    }
-    let local_ticks =
-        i64::try_from((u64::from(local_file.high) << 32) | u64::from(local_file.low)).ok()?;
-    Some((local_ticks - ticks).div_euclid(TICKS_PER_SECOND))
-}
-
-#[cfg(not(any(unix, windows)))]
-pub(crate) fn local_offset_at(_unix: i64) -> Option<i64> {
-    None
+    aterm_uds::zone::local_offset_at(unix)
 }
 
 #[cfg(test)]
@@ -2050,67 +1929,6 @@ mod tests {
         assert_eq!(countdown_to_reset("soon"), None);
     }
 
-    /// The in-process offset equals `date`'s (`limit::offset_at`) at instants
-    /// across a year and on each side of the 2026 US and EU daylight-saving
-    /// switches, so a switch this machine's zone has is crossed.
-    #[cfg(unix)]
-    #[test]
-    fn the_in_process_offset_is_the_one_date_reads() {
-        const JAN_1_2026: i64 = 1_767_225_600;
-        let switches = [1_772_964_000, 1_774_746_000, 1_792_890_000, 1_793_523_600];
-        let instants = (0..12)
-            .map(|month| JAN_1_2026 + month * 30 * 86_400)
-            .chain(switches.iter().flat_map(|&at| [at - 1, at]));
-        let mut compared = 0;
-        for at in instants {
-            let Some(reference) = limit::offset_at(None, at) else {
-                continue;
-            };
-            assert_eq!(local_offset_at(at), Some(reference), "at {at}");
-            compared += 1;
-        }
-        assert!(compared > 0, "`date` answered for no instant");
-    }
-
-    /// Windows: the offset now is the one the zone record says is in force
-    /// now (`GetTimeZoneInformation`: its bias, plus the daylight or standard
-    /// bias it reports active), a second reading by another API.
-    #[cfg(windows)]
-    #[test]
-    fn the_windows_offset_now_is_the_zone_records() {
-        #[repr(C)]
-        struct TimeZoneInformation {
-            bias: i32,
-            _standard_name: [u16; 32],
-            _standard_date: [u16; 8],
-            standard_bias: i32,
-            _daylight_name: [u16; 32],
-            _daylight_date: [u16; 8],
-            daylight_bias: i32,
-        }
-        unsafe extern "system" {
-            fn GetTimeZoneInformation(info: *mut TimeZoneInformation) -> u32;
-        }
-        const TIME_ZONE_ID_DAYLIGHT: u32 = 2;
-        let mut info = std::mem::MaybeUninit::<TimeZoneInformation>::zeroed();
-        // SAFETY: `info` is writable storage for one TIME_ZONE_INFORMATION.
-        let id = unsafe { GetTimeZoneInformation(info.as_mut_ptr()) };
-        assert_ne!(id, u32::MAX, "the zone record reads");
-        // SAFETY: the call above filled the structure.
-        let info = unsafe { info.assume_init() };
-        let active = if id == TIME_ZONE_ID_DAYLIGHT {
-            info.daylight_bias
-        } else {
-            info.standard_bias
-        };
-        let now = limit::unix_now();
-        let offset = local_offset_at(now).expect("the zone reads");
-        assert_eq!(offset, -i64::from(info.bias + active) * 60);
-        assert_eq!(offset % (15 * 60), 0, "{offset}");
-        assert!((-12 * 3600..=14 * 3600).contains(&offset), "{offset}");
-        assert_eq!(local_offset_at(-11_644_473_601), None, "before 1601");
-    }
-
     /// Replacing the system zone changes its name as well as its offsets: a
     /// notice naming the former zone is no figure under the new one, and one
     /// naming the new zone is placed with its offsets.
@@ -2123,12 +1941,11 @@ mod tests {
         let now = 1_789_812_000_i64;
         let source_offset = std::cell::Cell::new(-7 * 3600);
         let cached_offset = std::cell::Cell::new(-7 * 3600);
-        let offset_at = |unix| {
-            refreshed_local_offset_at(
-                unix,
-                || cached_offset.set(source_offset.get()),
-                |_| Some(cached_offset.get()),
-            )
+        // A reader that reads the zone again before every answer, as
+        // `aterm_uds::zone::local_offset_at` does (`tzset`, then `localtime_r`).
+        let offset_at = |_| {
+            cached_offset.set(source_offset.get());
+            Some(cached_offset.get())
         };
         let old = local_zone_at(&path);
         assert_eq!(old.as_deref(), Some("America/Los_Angeles"));

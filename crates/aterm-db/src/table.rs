@@ -852,6 +852,47 @@ impl<'a> Session<'a> {
         Self::from_journal(bootstrap, journal, deadline)
     }
 
+    /// Observe the generation `selection` selected ([`crate::generation::observed_selection_within`]),
+    /// whose established custody is `bootstrap` with its read-only control view `journal`, as
+    /// [`Self::from_observed_journal`] takes them. A successor home keeps `selection`'s
+    /// observation of its predecessors rather than observing each of them again: the session's
+    /// generation checks, which every store open and read batch runs before it reads, reobserve
+    /// policy, custody and the current control and log view under `read_by`, as a fresh
+    /// observation's would.
+    ///
+    /// # Errors
+    /// As [`Self::from_observed_journal`], and `selection` observed another home.
+    pub(crate) fn observe_selected(
+        bootstrap: &'a Bootstrap,
+        journal: Journal,
+        selection: crate::generation::Observation,
+        read_by: std::time::Instant,
+    ) -> Result<Self> {
+        if journal.directory() != bootstrap.journal_dir() {
+            return Err(Error::new(
+                "Commons session journal belongs to another custody directory",
+            ));
+        }
+        if journal.is_writer() {
+            return Err(Error::new(
+                "Commons observed session requires a read-only journal",
+            ));
+        }
+        if selection.paths() != bootstrap.paths() {
+            return Err(Error::new(
+                "Commons generation observation belongs to another home",
+            ));
+        }
+        bootstrap.revalidate_custody().map_err(failure)?;
+        let generation = if crate::generation::is_candidate(bootstrap.paths()) {
+            Some(selection)
+        } else {
+            crate::generation::guard_until(bootstrap.paths(), false, read_by)?;
+            None
+        };
+        Self::with_generation(bootstrap, journal, generation, Some(read_by))
+    }
+
     fn from_journal(
         bootstrap: &'a Bootstrap,
         journal: Journal,

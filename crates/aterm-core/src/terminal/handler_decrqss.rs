@@ -5,6 +5,7 @@
 //! DECRQSS (Request Selection or Setting) query handler and DECRPSS response builders.
 
 use crate::grid::{CellFlags, PackedColor};
+use std::fmt::Write as _;
 
 use super::CursorStyle;
 use super::handler::TerminalHandler;
@@ -21,36 +22,38 @@ enum DecrqssPayload {
 }
 
 /// Push the SGR parameters for `color` (`base` is 30 for fg or 40 for bg).
-fn push_color_sgr(params: &mut Vec<String>, color: PackedColor, base: u8) {
+fn push_color_sgr(params: &mut String, color: PackedColor, base: u8) {
     if color.is_indexed() {
         let idx = color.index();
         if idx < 8 {
-            params.push(format!("{}", base + idx));
+            let _ = write!(params, ";{}", base + idx);
         } else if idx < 16 {
-            params.push(format!("{}", base + 60 + idx - 8));
+            let _ = write!(params, ";{}", base + 60 + idx - 8);
         } else {
-            params.push(format!("{}:5:{idx}", base + 8));
+            let _ = write!(params, ";{}:5:{idx}", base + 8);
         }
     } else if color.is_rgb() {
         let (r, g, b) = color.rgb_components();
-        params.push(format!("{}:2::{r}:{g}:{b}", base + 8));
+        let _ = write!(params, ";{}:2::{r}:{g}:{b}", base + 8);
     }
 }
 
 /// The SGR parameters that set `style` and `underline` from a reset, with ISO 8613-3 colon subparameters (`0` alone for the default pen).
 pub(super) fn sgr_of(style: &super::types::CurrentStyle, underline: Option<u32>) -> String {
-    let mut params: Vec<String> = Vec::new();
+    let mut params = String::from("0");
     for (flag, sgr) in [
         (CellFlags::BOLD, "1"),
         (CellFlags::DIM, "2"),
         (CellFlags::ITALIC, "3"),
     ] {
         if style.flags.contains(flag) {
-            params.push(sgr.to_string());
+            params.push(';');
+            params.push_str(sgr);
         }
     }
     if let Some(underline) = style.flags.underline_sgr() {
-        params.push(underline.to_string());
+        params.push(';');
+        params.push_str(underline);
     }
     for (flag, sgr) in [
         (CellFlags::BLINK, "5"),
@@ -59,21 +62,21 @@ pub(super) fn sgr_of(style: &super::types::CurrentStyle, underline: Option<u32>)
         (CellFlags::STRIKETHROUGH, "9"),
     ] {
         if style.flags.contains(flag) {
-            params.push(sgr.to_string());
+            params.push(';');
+            params.push_str(sgr);
         }
     }
     if let Some(line) = style.flags.overline_or_script_sgr() {
-        params.push(line.to_string());
+        params.push(';');
+        params.push_str(line);
     }
     if let Some(color) = underline {
-        params.push(aterm_grid::underline_color_sgr(color));
+        params.push(';');
+        aterm_grid::push_underline_color_sgr(&mut params, color);
     }
     push_color_sgr(&mut params, style.fg, 30);
     push_color_sgr(&mut params, style.bg, 40);
-    if params.is_empty() {
-        return "0".to_string();
-    }
-    format!("0;{}", params.join(";"))
+    params
 }
 
 impl TerminalHandler<'_> {

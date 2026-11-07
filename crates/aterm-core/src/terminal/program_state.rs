@@ -177,9 +177,6 @@ pub struct ProgramStateReport {
     /// The `seq` of the report that began the one standing now: a report equal to the one
     /// before it (a writer's re-send) keeps it, so one box re-sent is still one box.
     pub began: u64,
-    /// The source episode a checkpoint restored into this local report. A changed
-    /// report or reset clears this lineage; a re-send of the same report keeps it.
-    pub restored_from: Option<u64>,
     /// The report standing now; `None` after a `clear`, a reset, or before any.
     pub state: Option<ProgramState>,
     /// How many turns the accepted reports began: a `working` or `blocked` report begins one unless
@@ -229,7 +226,6 @@ impl ProgramStateReport {
                 };
                 if state != self.state {
                     self.began = self.seq;
-                    self.restored_from = None;
                 }
                 self.state = state;
                 true
@@ -293,20 +289,18 @@ impl ProgramStateReport {
     /// against it (a re-send of it keeps where it began). `None`, or a body this reader does not
     /// take, leaves none standing. The sequence only moves forward. Installing a different report
     /// clears the turn edges ([`Self::turn_edges`]); restoring the report standing keeps them.
-    pub(super) fn restore(&mut self, body: Option<&str>, source_began: Option<u64>) {
+    pub(super) fn restore(&mut self, body: Option<&str>) {
         let state = match body.and_then(parse) {
             Some(Body::Report(state)) => Some(state),
             Some(Body::Clear) | None => None,
         };
         if state == self.state {
-            self.restored_from = source_began.filter(|began| *began > 0 && state.is_some());
             return;
         }
         self.seq = self.seq.wrapping_add(1);
         self.began = self.seq;
         self.state = state;
         self.edges = [None; TURN_EDGES_KEPT];
-        self.restored_from = source_began.filter(|began| *began > 0 && state.is_some());
         if let Some(state) = state {
             self.last = Some(state.state);
         }
@@ -319,7 +313,6 @@ impl ProgramStateReport {
             self.seq = self.seq.wrapping_add(1);
             self.began = self.seq;
             self.state = None;
-            self.restored_from = None;
         }
     }
 }
@@ -521,7 +514,7 @@ mod tests {
             Some("state=blocked:app=codex:kind=permission")
         );
         let mut restored = ProgramStateReport::default();
-        restored.restore(body.as_deref(), Some(live.began));
+        restored.restore(body.as_deref());
         assert_eq!(restored.state, live.state);
         assert_eq!((restored.seq, restored.began, restored.turns), (1, 1, 0));
         assert!(restored.accept("state=blocked:app=codex:kind=permission"));
@@ -531,30 +524,21 @@ mod tests {
             "a re-send of the carried box is the same box"
         );
         let numbering = (restored.seq, restored.began, restored.turns);
-        restored.restore(body.as_deref(), Some(42));
-        assert_eq!(
-            restored.restored_from,
-            Some(42),
-            "an in-place restore replaces source lineage too"
-        );
+        restored.restore(body.as_deref());
         assert_eq!((restored.seq, restored.began, restored.turns), numbering);
-        restored.restore(body.as_deref(), None);
-        assert_eq!(
-            restored.restored_from, None,
-            "an old checkpoint leaves no inherited identity"
-        );
+        restored.restore(body.as_deref());
         assert_eq!((restored.seq, restored.began, restored.turns), numbering);
         assert!(restored.accept("state=working:app=codex"));
         assert_eq!(restored.turns, 0, "the carried turn goes on");
         for body in [None, Some("state=clear"), Some("state=sleeping:app=codex")] {
             let mut none = ProgramStateReport::default();
-            none.restore(body, None);
+            none.restore(body);
             assert_eq!(none, ProgramStateReport::default(), "{body:?}");
         }
         let mut idle = ProgramStateReport::default();
         assert!(idle.accept("state=idle:app=codex"));
         assert_eq!(idle.carried().as_deref(), Some("state=idle:app=codex"));
-        idle.restore(None, None);
+        idle.restore(None);
         assert_eq!((idle.seq, idle.began, idle.state), (2, 2, None));
     }
 
@@ -822,13 +806,13 @@ mod tests {
         );
         let kept: Vec<_> = report.turn_edges().collect();
         let body = report.carried();
-        report.restore(body.as_deref(), Some(report.began));
+        report.restore(body.as_deref());
         assert_eq!(
             report.turn_edges().collect::<Vec<_>>(),
             kept,
             "CONTROL: the report standing restored keeps them"
         );
-        report.restore(Some("state=working:app=codex"), Some(9));
+        report.restore(Some("state=working:app=codex"));
         assert_eq!(
             report.turn_edges().count(),
             0,
@@ -1069,7 +1053,7 @@ mod tests {
             Some("state=blocked:app=grok-build:kind=permission")
         );
         let mut restored = ProgramStateReport::default();
-        restored.restore(body.as_deref(), Some(live.began));
+        restored.restore(body.as_deref());
         assert_eq!(restored.state, live.state);
         assert!(restored.accept("state=blocked:kind=permission:app=grok-build"));
         assert_eq!((restored.began, restored.turns), (1, 0), "the same box");

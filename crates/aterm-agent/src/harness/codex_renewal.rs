@@ -497,8 +497,8 @@ impl Candidate {
 mod attempts;
 pub use attempts::{
     Attempt, AttemptRef, Cancellation, CancellationKind, CompletionProgress,
-    NativeCancellationProof, ReceiptWriter, read_active_attempt, read_attempt, read_cancellation,
-    with_receipt_writer,
+    NativeCancellationProof, ReceiptWriter, RootDriver, advance_root, read_active_attempt,
+    read_attempt, read_cancellation, with_receipt_writer,
 };
 
 /// Durable metadata only. Native command and operation persistence are retained

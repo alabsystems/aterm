@@ -3130,3 +3130,76 @@ fn a_link_chain_names_each_hop_a_lookup_takes() {
         "made absolute where it names now"
     );
 }
+
+/// A file key named through a link its reader cannot read (a link made under a strict umask,
+/// which a lookup still goes through) is left to the rounds: no listener can be put on what it
+/// names, in another folder here, and a round's look, which follows the link, tells a write
+/// made there in place.
+/// NEGATIVE CONTROL: arming it as a file (dropping `Took::of`'s unread-link arm) listens only on
+/// the link's own folder, and the write is never told.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_file_key_through_a_link_it_cannot_read_is_looked_at_each_round() {
+    let dir = scratch("watch-unread-link");
+    let real = std::fs::canonicalize(dir.path()).unwrap();
+    let other = real.join("other");
+    std::fs::create_dir(&other).unwrap();
+    let target = other.join("fleet.md");
+    std::fs::write(&target, "one\n").unwrap();
+    let link = real.join("fleet.md");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let named = std::ffi::CString::new(link.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a NUL-terminated path; the call changes the link's own mode, not its target's.
+    let changed =
+        unsafe { libc::fchmodat(libc::AT_FDCWD, named.as_ptr(), 0, libc::AT_SYMLINK_NOFOLLOW) };
+    assert_eq!(changed, 0, "{}", io::Error::last_os_error());
+    assert_eq!(
+        std::fs::read_link(&link).unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied,
+        "the link refuses its reader",
+    );
+    assert_eq!(
+        std::fs::read_to_string(&link).unwrap(),
+        "one\n",
+        "a lookup goes through"
+    );
+    let (told, heard) = mpsc::channel();
+    let watch = FileWatch::platform(
+        "aterm-document-watch",
+        Box::new(move |key| {
+            let _ = told.send(key);
+        }),
+    )
+    .unwrap();
+    watch.watch(3, link.clone());
+    assert_eq!(
+        heard.recv_timeout(aterm_spec::wait::MUST_HAPPEN),
+        Ok(3),
+        "the first look"
+    );
+    std::fs::write(&target, "two, written in place\n").unwrap();
+    assert_eq!(
+        heard.recv_timeout(aterm_spec::wait::MUST_HAPPEN),
+        Ok(3),
+        "a round's look through the link told the write"
+    );
+    drop(watch);
+}
+
+/// A volume mounted or unmounted is a change of every key's path; a low disk or a server that
+/// stopped answering moves none.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_mount_or_unmount_is_heard_and_no_other_volume_event() {
+    for (fflags, moves) in [
+        (0x0008, true),
+        (0x0010, true),
+        (0x0018, true),
+        (0x0004, false),
+        (0x0001, false),
+        (0x0100, false),
+        (0, false),
+    ] {
+        assert_eq!(kqueue::remounted(fflags), moves, "{fflags:#x}");
+    }
+}

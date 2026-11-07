@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A RELEASE'S TRUST BUILD IS ITS CANDIDATE'S `trust.lock` (docs/DESIGN-fast-build-release-
-//! 2026-11-05.md §4.7, A14's release part): the seam `release_steps.rs::prover()` calls, so an index
-//! that flips the store's `current` mid-cut changes no step's compiler.
+//! Candidate `trust.lock` resolution helpers for A14's release integration
+//! (docs/DESIGN-fast-build-release-2026-11-05.md §4.7).
+//!
+//! These helpers resolve and check a candidate's compiler independently of the store's
+//! `current`. The production release path does not call them yet. Its remaining integration
+//! must choose the candidate before resolving its compiler, lease it before probing its identity,
+//! seal inputs under it, retain the locked build and tree root in the journal, and use the lock's
+//! stock toolchain throughout the cut.
 //!
 //! - [`lock_at`]: the lock a commit carries (`git show <rev>:trust.lock`).
 //! - [`locked_prover`]: the store build that lock names, by number and tree root, reinstalled by

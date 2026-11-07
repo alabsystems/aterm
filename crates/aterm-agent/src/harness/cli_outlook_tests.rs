@@ -83,6 +83,36 @@ fn seeded(tmp: &Tmp, env: &Env) {
     }
 }
 
+/// Every stop's end in an outlook's JSON, its lean branches' too, as `(kind, at)`: the report
+/// writes `"end": {"kind": "reset"|"about"|"open", "at": t|null}`, `at` null only for an open
+/// stop, and no `to` or `at_reset`.
+fn stop_ends(outlook: &Value) -> Vec<(String, Option<i64>)> {
+    let mut out = Vec::new();
+    let mut passes: Vec<&Value> = outlook["passes"].as_array().into_iter().flatten().collect();
+    while let Some(pass) = passes.pop() {
+        for stop in pass["stops"].as_array().into_iter().flatten() {
+            assert!(
+                stop.get("to").is_none() && stop.get("at_reset").is_none(),
+                "{stop:?}"
+            );
+            let end = &stop["end"];
+            let kind = end["kind"].as_str().expect("an end's kind").to_owned();
+            assert!(
+                ["reset", "about", "open"].contains(&kind.as_str()),
+                "{kind}"
+            );
+            let at = end["at"].as_i64();
+            assert_eq!(at.is_none(), kind == "open", "{end:?}");
+            out.push((kind, at));
+        }
+        if let Some(lean) = pass.get("lean").filter(|l| !l.is_null()) {
+            passes.push(&lean["worst"]);
+            passes.push(&lean["best"]);
+        }
+    }
+    out
+}
+
 /// The card's outlook for `env`'s store, as the window's memo builds it
 /// (`aterm-gui/src/accounts_outlook.rs`): the bound roster, the store's state, the series and
 /// the renewals, the policy's switches.
@@ -110,7 +140,8 @@ fn card_outlook(env: &Env) -> outlook::Outlook {
 }
 
 /// ACCEPTANCE 3 (and T14's report half): THE REPORT SAYS THE CARD'S NUMBERS. For one seed, the
-/// `--json` report's `outlook` is the card's model rendered, its text carries the card's
+/// `--json` report's `outlook` is the card's model rendered (each stop's `end` a kind and an
+/// instant, the lean's worst case stopping to `me`'s reset), its text carries the card's
 /// outlook block and, under each row, the card's figure for that row; neither report writes a
 /// file. Negative control: a report whose outlook is built without the series refuses the pace
 /// the card projects, and its JSON is not the card's.
@@ -134,6 +165,12 @@ fn the_report_says_the_cards_numbers_and_writes_nothing() {
         Some(&card.json()),
         "the report's outlook is the card's model"
     );
+    assert!(
+        stop_ends(&json["outlook"]).contains(&("reset".into(), Some(env.now + 3 * D + 13 * H))),
+        "a stop to me's reset: {:?}",
+        json["outlook"]
+    );
+    assert!(json["outlook"]["verdict"].get("end").is_some());
 
     let (_, text, _) = acc_quiet(AccountsCmd::Report { json: false }, &env);
     assert!(
@@ -212,6 +249,10 @@ fn the_report_does_not_forecast_service_after_a_signed_out_accounts_reset() {
         json["outlook"]["verdict"]["why"].as_str(),
         Some("account-unavailable")
     );
+    assert!(
+        json["outlook"]["verdict"]["end"].is_null(),
+        "a refusal has no end"
+    );
     assert!(json["outlook"]["passes"].as_array().unwrap().is_empty());
     let model = card_outlook(&env);
     assert_eq!(json.get("outlook"), Some(&model.json()));
@@ -225,9 +266,9 @@ fn the_report_does_not_forecast_service_after_a_signed_out_accounts_reset() {
 /// THE REPORT REPLAYS UNDER THE MODE THE WINDOW DOES: with the harness off (`[harness] enabled =
 /// false`), or off for Claude Code (`[harness.claude] enabled = false`), nothing rotates Claude
 /// Code's accounts, so the report's outlook says `rotation off` whatever `[harness] accounts`
-/// says, as the window's card does. Control: the harness on, the same seed says `rotation
-/// early`. Negative control: the report reading `[harness] accounts` alone says `early` with the
-/// harness off.
+/// says, as the window's card does, and its JSON's stop (`me` alone walls) ends at `me`'s reset.
+/// Control: the harness on, the same seed says `rotation early`. Negative control: the report
+/// reading `[harness] accounts` alone says `early` with the harness off.
 #[test]
 fn the_report_replays_under_the_windows_mode() {
     for (toml, mode) in [
@@ -252,6 +293,16 @@ fn the_report_replays_under_the_windows_mode() {
             text.contains(&format!("\u{b7} rotation {mode} \u{b7}")),
             "{toml}: rotation {mode}:\n{text}"
         );
+        if mode == "off" {
+            let (_, json, _) = acc_quiet(AccountsCmd::Report { json: true }, &env);
+            let json: Value = aterm_json::from_str(json.trim()).expect("the report is JSON");
+            assert!(
+                stop_ends(&json["outlook"])
+                    .contains(&("reset".into(), Some(env.now + 3 * D + 13 * H))),
+                "{toml}: me waits to its reset: {:?}",
+                json["outlook"]
+            );
+        }
         assert_eq!(card_outlook(&env).mode.as_str(), mode, "{toml}: the card's");
     }
 }

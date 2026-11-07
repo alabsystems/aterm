@@ -32,6 +32,7 @@ fn arm(name: &str) -> (&'static [&'static str], bool) {
         "disk" => (&["d_enospc"], true),
         "mixed" => (&["c_refused", "d_enospc"], true),
         "bare" => (&["c_plain"], false),
+        "long" => (&[], true),
         other => panic!("no arm {other}"),
     }
 }
@@ -79,7 +80,12 @@ fn standin_live_run() {
             .map(|c| OsString::from(format!("libtest_fixture::{c}"))),
     );
     argv_a.extend(["libtest_fixture::z_napper".into(), "--exact".into()]);
-    let a = binary("-p aterm-verify --lib a", argv_a, (FIXTURE, &dir));
+    let mut a = binary("-p aterm-verify --lib a", argv_a, (FIXTURE, &dir));
+    if std::env::var(ARM).as_deref() == Ok("long") {
+        a.record
+            .env
+            .push((crate::libtest_fixture::LONG_RUNNING.into(), "1".into()));
+    }
     let argv_b = vec![
         exe,
         "live_halt_tests::standin_marker".into(),
@@ -290,4 +296,35 @@ fn a_bare_run_says_its_red_and_ends_nothing() {
     assert_eq!(words(&ran.rows), ["FAIL"], "{all}");
     assert!(ran.block.contains("z_napper ... ok"), "{all}");
     assert!(ran.b_ran, "{all}");
+}
+
+#[test]
+fn a_long_running_case_is_journaled_before_completion_and_halts_nothing() {
+    let dir = scratch();
+    let ran = run_arm(dir.path(), "long", |read| {
+        let event = until_within(MUST_HAPPEN, "the live long-running case event", || {
+            read().lines().find_map(|line| {
+                let event: aterm_json::Value =
+                    aterm_json::from_str(line.strip_prefix("verify-event: ")?).ok()?;
+                (event["event"].as_str() == Some("test-case-running-long")).then_some(event)
+            })
+        });
+        assert_eq!(event["case"].as_str(), Some("libtest_fixture::z_napper"));
+        assert_eq!(event["test"].as_str(), Some("-p aterm-verify --lib a"));
+        assert_eq!(event["outcome"].as_str(), Some("RUNNING"));
+        assert_eq!(event["halts"].as_bool(), Some(false));
+        assert_eq!(event["binary_completed"].as_bool(), Some(false));
+        assert!(dir.path().join("napper.started").is_file());
+        assert!(
+            !dir.path().join("b").exists(),
+            "the first binary still owns its turn"
+        );
+        std::fs::write(dir.path().join("napper.release"), "").expect("release the case");
+    });
+    let all = format!("{}\n{}\n{}", ran.rows, ran.block, ran.events);
+    assert!(ran.b_ran, "{all}");
+    assert_eq!(words(&ran.rows), ["ok"], "{all}");
+    assert!(ran.findings.is_empty(), "{all}");
+    assert!(ran.block.contains("z_napper ... ok"), "{all}");
+    assert!(!ran.events.contains("\"test-case-failed\""), "{all}");
 }

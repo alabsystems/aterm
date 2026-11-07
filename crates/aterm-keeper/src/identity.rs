@@ -14,7 +14,7 @@ use aterm_uds::CtlStream;
 pub const CODE_CHECK_HANG: Duration = Duration::from_secs(60);
 
 /// How long a peer's code check ([`Identity::check`]) may take, at least.
-pub const PEER_CHECK_HANG: Duration = Duration::from_secs(10);
+pub const PEER_CHECK_HANG: Duration = Duration::from_secs(60);
 
 /// The floor a test set on this process's peer waits, in milliseconds (0: none set).
 #[cfg(any(test, debug_assertions))]

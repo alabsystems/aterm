@@ -57,10 +57,18 @@ fn mode(path: &Path) -> u32 {
     std::fs::metadata(path).expect("stat").permissions().mode() & 0o777
 }
 
+/// The tests' now: Thu 15 Oct 2026 08:07:40 UTC.
+const NOW: i64 = 1_792_051_660;
+
+/// The tests' local clock: UTC ([`run`]'s `offset`).
+fn utc(_: i64) -> Option<i64> {
+    Some(0)
+}
+
 /// Run the verb on `stdin`, into `dir`: its exit and the one line it printed.
 fn tap(stdin: &[u8], vars: &TapVars, dir: Option<&Path>) -> (std::process::ExitCode, String) {
     let mut out = Vec::new();
-    let code = run(&mut &stdin[..], false, vars, dir, 1_792_051_660, &mut out);
+    let code = run(&mut &stdin[..], false, vars, dir, NOW, utc, &mut out);
     (code, String::from_utf8(out).expect("utf-8"))
 }
 
@@ -176,9 +184,16 @@ fn the_tap_names_the_console_image_beside_a_windowed_one() {
     assert_eq!(tap_image(&console, |_| false), Some(console.clone()));
 }
 
-/// A payload with figures writes a v1 file (0600 in a 0700 directory) and prints the figures; no
-/// figures, non-JSON, empty or oversized stdin prints the dash line; no tab, no process or no
-/// directory writes nothing; every run prints one line and exits 0.
+/// The row the tap prints at [`NOW`] for a week 61% used that resets Mon 19 Oct 08:06:36 UTC.
+const WEEK_61: &str = "week 61% used \u{b7} resets Mon 08:06\n";
+
+/// A payload with figures writes a v1 file (0600 in a 0700 directory) and prints the week; no
+/// figures, a five-hour window alone, non-JSON, empty or oversized stdin prints [`NO_WEEK`] and
+/// still writes the reading, with no figures and its row `own`, over the one held (the row Claude
+/// shows is the tap's no-figure words, which the glass's claim reads the file for); no tab, no
+/// process or no directory writes nothing; every run prints one line and exits 0. Negative
+/// control: a `record` that writes only a reading with figures (`has_figures`) leaves the held
+/// week in the file and fails the figure-less pin.
 #[test]
 fn the_verb_writes_its_reading_and_always_prints_one_line_and_exits_zero() {
     let root = scratch("verb");
@@ -188,7 +203,7 @@ fn the_verb_writes_its_reading_and_always_prints_one_line_and_exits_zero() {
     let seven = Some((61, 1_792_397_196));
     let (code, line) = tap(payload(18, five, seven).as_bytes(), &vars(), Some(&rl));
     assert_eq!(code, std::process::ExitCode::SUCCESS);
-    assert_eq!(line, "5h 42% \u{b7} 7d 61%\n");
+    assert_eq!(line, WEEK_61);
     let file = rl.join(format!("{SID}-68537.json"));
     #[cfg(unix)]
     {
@@ -225,7 +240,7 @@ fn the_verb_writes_its_reading_and_always_prints_one_line_and_exits_zero() {
     let candidate = rl.join(format!(".{SID}-68537.json.tmp{}", std::process::id()));
     std::fs::write(&candidate, "borrowed sentinel").expect("candidate");
     let (_, collision_line) = tap(payload(19, five, seven).as_bytes(), &vars(), Some(&rl));
-    assert_eq!(collision_line, "5h 42% \u{b7} 7d 61%\n");
+    assert_eq!(collision_line, WEEK_61);
     assert_eq!(
         std::fs::read_to_string(&candidate).expect("preserved"),
         "borrowed sentinel"
@@ -240,7 +255,7 @@ fn the_verb_writes_its_reading_and_always_prints_one_line_and_exits_zero() {
         // SAFETY: name is a live terminated path in the owned directory.
         assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
         let (_, collision_line) = tap(payload(19, five, seven).as_bytes(), &vars(), Some(&rl));
-        assert_eq!(collision_line, "5h 42% \u{b7} 7d 61%\n");
+        assert_eq!(collision_line, WEEK_61);
         assert!(
             std::fs::symlink_metadata(&candidate)
                 .expect("preserved FIFO")
@@ -266,13 +281,20 @@ fn the_verb_writes_its_reading_and_always_prints_one_line_and_exits_zero() {
         Vec::new(),
         over,
     ] {
+        let _ = tap(payload(20, five, seven).as_bytes(), &vars(), Some(&rl));
         let (code, line) = tap(&stdin, &vars(), Some(&rl));
         assert_eq!(code, std::process::ExitCode::SUCCESS);
-        assert_eq!(line, format!("{NO_FIGURES}\n"));
-        assert!(!line.trim().is_empty());
+        assert_eq!(line, format!("{NO_WEEK}\n"));
+        let (held, _) = Reading::read(&rl, SID, 68537, 0).expect("the figure-less reading");
+        assert_eq!(
+            (held.five_hour, held.seven_day, held.row),
+            (None, None, Some(Row::Own)),
+            "{:?}",
+            String::from_utf8_lossy(&stdin[..stdin.len().min(40)])
+        );
     }
     let (_, line) = tap(payload(0, five, None).as_bytes(), &vars(), Some(&rl));
-    assert_eq!(line, "5h 42% \u{b7} 7d \u{2013}\n");
+    assert_eq!(line, format!("{NO_WEEK}\n"), "a five-hour window alone");
     let nowhere = dir.join("nowhere");
     for vars in [
         TapVars {
@@ -294,7 +316,7 @@ fn the_verb_writes_its_reading_and_always_prints_one_line_and_exits_zero() {
     ] {
         let (code, line) = tap(payload(1, five, seven).as_bytes(), &vars, Some(&nowhere));
         assert_eq!(code, std::process::ExitCode::SUCCESS);
-        assert_eq!(line, format!("{NO_FIGURES}\n"));
+        assert_eq!(line, format!("{NO_WEEK}\n"));
         assert!(!nowhere.exists(), "{vars:?}");
     }
     let blocked = dir.join("blocked");
@@ -305,10 +327,10 @@ fn the_verb_writes_its_reading_and_always_prints_one_line_and_exits_zero() {
         Some(&blocked.join("rl")),
     );
     assert_eq!(code, std::process::ExitCode::SUCCESS);
-    assert_eq!(line, "5h 42% \u{b7} 7d 61%\n");
+    assert_eq!(line, WEEK_61);
     let (code, line) = tap(payload(1, five, seven).as_bytes(), &vars(), None);
     assert_eq!(code, std::process::ExitCode::SUCCESS);
-    assert_eq!(line, "5h 42% \u{b7} 7d 61%\n");
+    assert_eq!(line, WEEK_61);
 }
 
 /// NOTHING OF STDIN IS WRITTEN AS IT CAME, and no variable but the four is
@@ -363,7 +385,10 @@ fn the_verb_never_writes_a_secret_it_was_handed() {
     let out = child.wait_with_output().expect("wait");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{stdout}");
-    assert!(stdout.contains("5h 7% \u{b7} 7d 9%"), "{stdout}");
+    assert!(
+        stdout.contains("week 9% used\n") && !stdout.contains("5h") && !stdout.contains("7%"),
+        "{stdout}"
+    );
     let file = state
         .join("harness")
         .join(super::super::cli::HARNESS)
@@ -397,6 +422,7 @@ fn a_re_report_keeps_the_first_reports_stamp() {
             &vars(),
             Some(&dir),
             now,
+            utc,
             &mut out,
         );
         Reading::read(&dir, SID, 68537, 0).expect("its own file").0
@@ -495,6 +521,7 @@ fn a_window_that_only_reset_away_keeps_the_first_reports_stamp() {
             &vars(),
             Some(&dir),
             now,
+            utc,
             &mut out,
         );
         Reading::read(&dir, SID, 68537, 0).expect("its own file").0
@@ -535,6 +562,7 @@ fn a_reading_is_read_only_from_its_own_processes_file() {
         &vars,
         Some(&dir),
         100,
+        utc,
         &mut out,
     );
     let name = format!("{SID}-68537.json");
@@ -586,13 +614,15 @@ fn reading(pid: u32, api_ms: u64, five: Option<u32>, seven: Option<u32>) -> Read
         model: None,
         ctx_left: None,
         dur_us: 0,
+        row: None,
     }
 }
 
 /// THE TENTHS AND THE MODEL (the account-stats design §4.2, F1): Claude Code
 /// hands `used_percentage` with one decimal (`42.6` in the lab, 2.1.301):
-/// the row prints the whole percent it rounds to, the file keeps the tenths
-/// and the process's `model.id` beside it, and both read back.
+/// the reading holds the whole percent it rounds to, the file keeps the tenths
+/// and the process's `model.id` beside it, and both read back; the row says
+/// the week's whole percent alone.
 #[test]
 fn a_reading_keeps_the_vendors_tenths_and_its_model() {
     let text = r#"{"model":{"id":"claude-opus-5-5"},"cost":{"total_api_duration_ms":9},
@@ -601,7 +631,13 @@ fn a_reading_keeps_the_vendors_tenths_and_its_model() {
     let r = Reading::of_stdin(text, &vars(), 1_792_050_000).expect("a reading");
     let five = r.five_hour.expect("the five-hour window");
     assert_eq!((five.pct, five.pct_x10, five.x10()), (43, Some(426), 426));
-    assert_eq!(r.line(), "5h 43% \u{b7} 7d 61%");
+    assert_eq!(
+        r.week_words(
+            1_792_050_000,
+            Some(&super::super::outlook::Offsets::fixed(0))
+        ),
+        "week 61% used \u{b7} resets Mon 08:06"
+    );
     assert_eq!(
         r.seven_day.and_then(|w| w.pct_x10),
         Some(610),
@@ -1279,62 +1315,63 @@ fn with_tap_row(rows: &[String], row: &str) -> Vec<String> {
     out
 }
 
+/// One day, seconds.
+const DAY: i64 = 86_400;
+
+/// A reading of the week `x10` used, resetting at `resets_at`, beside a five-hour window 42% used.
+fn week(x10: u32, resets_at: i64) -> Reading {
+    Reading {
+        seven_day: Some(Window {
+            pct: (x10 + 5) / 10,
+            resets_at,
+            pct_x10: Some(x10),
+        }),
+        ..reading(68537, 0, Some(42), None)
+    }
+}
+
 /// THE TAP'S ROW IS SAFE FOR EVERY READER (the real Claude Code 2.1.300's
 /// screens, inline at 110 columns and at 80 beside `Now using usage
-/// credits`): with every line the tap prints in its row, the phase reads
-/// idle with no wall, the footer's mode row and the live REPL's row are
-/// found under it, and the line holds no guarded string of the vendor's.
+/// credits`): with every form of line the tap prints in its row (the widest
+/// among them), the phase reads idle with no wall, the footer's mode row and
+/// the live REPL's row are found under it, the line holds no guarded string of
+/// the vendor's, and it ends two cells or more before Claude Code's notice,
+/// where [`parse_line`] reads it back. The rows the fixtures measured are the
+/// five-hour-and-week words of builds before this one, which it refuses.
 #[test]
 fn the_taps_row_reads_idle_and_keeps_the_mode_row_for_every_reader() {
     use super::super::footer;
+    let utc = super::super::outlook::Offsets::fixed(0);
     let lines = [
-        line_of(
-            Some(Window {
-                pct: 42,
-                resets_at: 1,
-                pct_x10: None,
-            }),
-            Some(Window {
-                pct: 61,
-                resets_at: 2,
-                pct_x10: None,
-            }),
-        ),
-        line_of(
-            Some(Window {
-                pct: 100,
-                resets_at: 1,
-                pct_x10: None,
-            }),
-            Some(Window {
-                pct: 100,
-                resets_at: 2,
-                pct_x10: None,
-            }),
-        ),
-        line_of(
-            Some(Window {
-                pct: 0,
-                resets_at: 1,
-                pct_x10: None,
-            }),
-            None,
-        ),
-        NO_FIGURES.to_string(),
+        week(610, NOW + 3600).week_words(NOW, Some(&utc)),
+        week(1000, NOW + 2 * DAY).week_words(NOW, Some(&utc)),
+        week(1000, NOW + 7 * DAY).week_words(NOW, Some(&utc)),
+        week(0, NOW - 1).week_words(NOW, Some(&utc)),
+        NO_WEEK.to_string(),
     ];
+    assert_eq!(lines[2], "week 100% used \u{b7} resets Thu 22 Oct 08:07");
     for rows in tap_screens() {
         let bottom = aterm_phase::phase::composer_bottom(&rows).expect("the composer");
-        assert!(
-            rows[bottom + 1].starts_with("  5h "),
-            "{:?}",
-            rows[bottom + 1]
-        );
+        let measured = &rows[bottom + 1];
+        assert!(measured.starts_with("  5h "), "{measured:?}");
+        assert_eq!(parse_line(&measured[2..]), None, "{measured:?}");
+        let words_end = measured[2..].find("  ").map_or(measured.len(), |e| 2 + e);
+        let notice = measured[words_end..].find(|c: char| c != ' ').map(|at| {
+            (
+                measured[..words_end + at].chars().count(),
+                &measured[words_end + at..],
+            )
+        });
         for line in &lines {
-            assert!(line.chars().count() <= 17, "{line}");
-            let at = rows[bottom + 1].find("5h ").expect("the tap");
-            let mut row = rows[bottom + 1].clone();
-            let end = row[at..].find("  ").map_or(row.len(), |e| at + e);
-            row.replace_range(at..end, line);
+            let width = line.chars().count();
+            let mut row = format!("  {line}");
+            if let Some((col, text)) = notice {
+                assert!(2 + width + 2 <= col, "{line} reaches the notice at {col}");
+                row.extend(std::iter::repeat_n(' ', col - 2 - width));
+                row.push_str(text);
+                assert_eq!(row.chars().count(), measured.chars().count());
+            }
+            assert_eq!(parse_line(&row[2..]), Some(width), "{row}");
             let screen = with_tap_row(&rows, &row);
             let read = aterm_phase::read(Some("claude"), &screen, None);
             assert_eq!(read.phase, aterm_phase::Phase::Idle, "{row}");
@@ -1735,19 +1772,31 @@ const PAYLOAD_2_1_310: &str = include_str!("testdata/tap/claude-2.1.310-statusli
 const PAYLOAD_2_1_316_WEEK_ONLY: &str =
     include_str!("testdata/tap/claude-2.1.316-statusline-week-only.json");
 
+/// The instant the 2.1.316 week-only payload was captured: five minutes before its prompt cache's
+/// `expires_at` (Sat 31 Oct 2026 20:03:13 UTC), an hour into a week that resets Sat 7 Nov 19:00.
+const CAPTURED_2_1_316: i64 = 1_793_477_293 - 300;
+
 /// THE TAP READS 2.1.316'S WEEK-ONLY PAYLOAD AS IT IS: the week (1%, its reset) and no five-hour
-/// window, never a guessed one; the row says `5h –`, and the reading has figures, which is what
+/// window, never a guessed one; the row says the week, and the reading has figures, which is what
 /// tells `harness usage` the vendor reports no five-hour window rather than that nothing was read.
+/// It runs at the payload's own instant ([`CAPTURED_2_1_316`]): at the tests' [`NOW`] its reset
+/// lies 23 days ahead, further than a week's can, and the row would rightly say none.
 #[test]
 fn a_week_only_payload_reads_the_week_and_no_five_hour_window() {
     let dir = scratch("week-only");
-    let (code, line) = tap(
-        PAYLOAD_2_1_316_WEEK_ONLY.as_bytes(),
+    let mut out = Vec::new();
+    let code = run(
+        &mut PAYLOAD_2_1_316_WEEK_ONLY.as_bytes(),
+        false,
         &vars(),
         Some(dir.path()),
+        CAPTURED_2_1_316,
+        utc,
+        &mut out,
     );
+    let line = String::from_utf8(out).expect("utf-8");
     assert_eq!(code, std::process::ExitCode::SUCCESS);
-    assert_eq!(line, "5h \u{2013} \u{b7} 7d 1%\n");
+    assert_eq!(line, "week 1% used \u{b7} resets Sat 7 Nov 19:00\n");
     let (reading, _) = Reading::read(dir.path(), SID, 68537, 0).expect("the reading");
     assert_eq!(reading.five_hour, None);
     assert_eq!(
@@ -1781,6 +1830,7 @@ fn the_carrying_tap_records_the_week_and_hands_on_the_payload() {
         &vars(),
         Some(dir.path()),
         now,
+        utc,
         || Some("echo mine".to_string()),
         &mut out,
     );
@@ -1811,11 +1861,15 @@ fn the_carrying_tap_records_the_week_and_hands_on_the_payload() {
         &vars(),
         Some(dir.path()),
         now,
+        utc,
         || None,
         &mut out,
     );
     assert_eq!(own, Carried::Own);
-    assert_eq!(String::from_utf8_lossy(&out), "5h 38% \u{b7} 7d 12%\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out),
+        "week 12% used \u{b7} resets Sat 31 Oct 19:00\n"
+    );
     let over = vec![b' '; STDIN_MAX + 1];
     let mut out = Vec::new();
     let asked = std::cell::Cell::new(false);
@@ -1826,6 +1880,7 @@ fn the_carrying_tap_records_the_week_and_hands_on_the_payload() {
             &vars(),
             Some(dir.path()),
             now,
+            utc,
             || {
                 asked.set(true);
                 Some("echo mine".to_string())
@@ -1834,11 +1889,349 @@ fn the_carrying_tap_records_the_week_and_hands_on_the_payload() {
         ),
         Carried::Own
     );
-    assert_eq!(String::from_utf8_lossy(&out), format!("{NO_FIGURES}\n"));
+    assert_eq!(String::from_utf8_lossy(&out), format!("{NO_WEEK}\n"));
     assert!(
         !asked.get(),
         "the owner's file is not read for a payload the tap cannot hand on"
     );
+}
+
+/// THE TAP NEVER PRINTS A FIVE-HOUR FIGURE (the design's §5.2): with the five-hour window at 42%
+/// beside a week of 61%, alone, or full beside a week of 3%, the plain tap and the carrying one
+/// print the week's words or [`NO_WEEK`], with no `5h` and no five-hour figure, while the file
+/// still records the five-hour window (for walls, the tap clock and the journal). Negative
+/// controls: printing the five-hour-and-week row (`5h 42% · 7d 61%`, before this slice) fails the
+/// first assertion; recording only what is printed (the five-hour window dropped) fails the last.
+#[test]
+fn the_tap_never_prints_a_five_hour_figure() {
+    let root = scratch("no-five");
+    let cases = [
+        (Some((42, 1_792_062_396)), Some((61, 1_792_397_196)), "42%"),
+        (Some((42, 1_792_062_396)), None, "42%"),
+        (Some((100, 1_792_062_396)), Some((3, 1_792_397_196)), "100%"),
+    ];
+    for (five, seven, figure) in cases {
+        let stdin = payload(7, five, seven);
+        let (_, line) = tap(stdin.as_bytes(), &vars(), Some(root.path()));
+        let mut carried = Vec::new();
+        let _ = run_carrying(
+            &mut stdin.as_bytes(),
+            false,
+            &vars(),
+            Some(root.path()),
+            NOW,
+            utc,
+            || None,
+            &mut carried,
+        );
+        for printed in [line, String::from_utf8(carried).expect("utf-8")] {
+            assert!(
+                printed.starts_with("week ")
+                    && !printed.contains("5h")
+                    && !printed.contains(figure),
+                "{printed}"
+            );
+        }
+        let (read, _) = Reading::read(root.path(), SID, 68537, 0).expect("the reading");
+        assert_eq!(read.five_hour.map(|w| w.pct), five.map(|(pct, _)| pct));
+    }
+}
+
+/// Run the plain tap and the carrying one whose owner names no command on `stdin`, into `dir`, on
+/// the local clock `offset`: what each printed.
+fn both_taps(
+    stdin: &[u8],
+    tty: bool,
+    vars: &TapVars,
+    dir: &Path,
+    offset: fn(i64) -> Option<i64>,
+) -> [String; 2] {
+    let mut plain = Vec::new();
+    let _ = run(
+        &mut &stdin[..],
+        tty,
+        vars,
+        Some(dir),
+        NOW,
+        offset,
+        &mut plain,
+    );
+    let mut carried = Vec::new();
+    let _ = run_carrying(
+        &mut &stdin[..],
+        tty,
+        vars,
+        Some(dir),
+        NOW,
+        offset,
+        || None,
+        &mut carried,
+    );
+    [plain, carried].map(|out| String::from_utf8(out).expect("utf-8"))
+}
+
+/// THE TAP ALWAYS PRINTS EXACTLY ONE LINE, NEVER AN EMPTY ONE (a command that prints nothing loses
+/// the row: aterm-phase's `claude-2.1.300-tap-row-silent-command.txt`): a tty for stdin, an empty
+/// payload, `{}`, non-JSON, bytes that are not UTF-8, an oversized payload, a week's payload with
+/// no tab named, a week's, and weeks whose reset no week can have (`i64::MAX`, a month on) on a
+/// clock east of UTC, each through the plain tap and the carrying one whose owner names no
+/// command, print one non-empty line that [`parse_line`] reads whole; the impossible resets say
+/// the week with no reset. Negative controls: a print kept for a reading only (an `if let
+/// Some(reading)` around the write) fails it on the payload with no tab named; a reset said
+/// whenever it is ahead of now (the believability bound dropped, as the slice before this fix
+/// had it) overflows the local clock's sum at `i64::MAX` (a panic, so no line) and says a month on.
+#[test]
+fn the_tap_always_prints_one_line() {
+    let root = scratch("one-line");
+    let week = payload(9, None, Some((61, 1_792_397_196)));
+    let over = vec![b' '; STDIN_MAX + 1];
+    let own = vars();
+    let no_tab = TapVars {
+        sid: None,
+        ..vars()
+    };
+    let inputs: [(&[u8], bool, &TapVars); 8] = [
+        (week.as_bytes(), true, &own),
+        (b"", false, &own),
+        (b"{}", false, &own),
+        (b"not json", false, &own),
+        (b"\xff\xfe{}", false, &own),
+        (&over, false, &own),
+        (week.as_bytes(), false, &no_tab),
+        (week.as_bytes(), false, &own),
+    ];
+    for (stdin, tty, vars) in inputs {
+        for out in both_taps(stdin, tty, vars, root.path(), utc) {
+            let line = out.strip_suffix('\n').expect("a line");
+            assert!(!line.is_empty() && !line.contains('\n'), "{out:?}");
+            assert_eq!(parse_line(line), Some(line.chars().count()), "{out:?}");
+        }
+    }
+    let tokyo: fn(i64) -> Option<i64> = |_| Some(9 * 3600);
+    for resets_at in [i64::MAX, NOW + 30 * DAY] {
+        let stdin = payload(9, None, Some((5, resets_at)));
+        for out in both_taps(stdin.as_bytes(), false, &own, root.path(), tokyo) {
+            assert_eq!(out, "week 5% used\n", "a reset at {resets_at}");
+            assert_eq!(parse_line(out.trim_end()), Some(12));
+        }
+    }
+}
+
+/// THE TAP SAYS NO RESET WHERE THE LOCAL ZONE DOES NOT READ (`aterm_uds::zone::local_offset_at`
+/// answers `None` on a platform it cannot read): a week resetting Mon 19 Oct 08:06:36 UTC prints
+/// `week 61% used`, through the plain tap and the carrying one, and so does a zone that fails at
+/// one instant of the span it is asked over ([`super::super::outlook::Offsets::read_around`]),
+/// rather than an instant said on UTC that the glass, on the local clock, says otherwise. The
+/// control: a zone that reads (UTC, and UTC−8) says the reset on its own clock. Negative control:
+/// a zone that falls back to UTC (`unwrap_or(0)`, the CLI's before this fix) prints `· resets Mon
+/// 08:06` and fails the first assertion.
+#[test]
+fn the_tap_says_no_reset_where_the_local_zone_does_not_read() {
+    let root = scratch("no-zone");
+    let stdin = payload(4, None, Some((61, 1_792_397_196)));
+    let unread: fn(i64) -> Option<i64> = |_| None;
+    let gap: fn(i64) -> Option<i64> = |t| (t != NOW + 6 * 3600).then_some(0);
+    for zone in [unread, gap] {
+        for out in both_taps(stdin.as_bytes(), false, &vars(), root.path(), zone) {
+            assert_eq!(out, "week 61% used\n");
+            assert_eq!(parse_line(out.trim_end()), Some(13));
+        }
+    }
+    let pacific: fn(i64) -> Option<i64> = |_| Some(-8 * 3600);
+    for (zone, said) in [
+        (utc as fn(i64) -> Option<i64>, WEEK_61),
+        (pacific, "week 61% used \u{b7} resets Mon 00:06\n"),
+    ] {
+        for out in both_taps(stdin.as_bytes(), false, &vars(), root.path(), zone) {
+            assert_eq!(out, said);
+        }
+    }
+}
+
+/// A CARRIED ROW IS RECORDED AS THE OWNER'S (the design's §5.2): the carrying tap asks for the
+/// owner's command before it writes, so a run that hands the payload on writes `"row":"owner"`,
+/// which is not claimable, and prints nothing. The control: a run whose owner names no command,
+/// and the plain tap, write `"row":"own"`, which is. Negative controls: asking after the write
+/// (every run `own`, as before this slice) fails the first half; a carrying tap that always writes
+/// `owner` fails the control.
+#[test]
+fn a_carried_row_is_recorded_as_the_owners() {
+    let root = scratch("carried-row");
+    let dir = root.path();
+    let stdin = payload(5, None, Some((61, 1_792_397_196)));
+    let file = dir.join(file_name(SID, 68537).expect("a name"));
+    let carry = |owner: Option<&str>| {
+        let mut out = Vec::new();
+        let carried = run_carrying(
+            &mut stdin.as_bytes(),
+            false,
+            &vars(),
+            Some(dir),
+            NOW,
+            utc,
+            || owner.map(str::to_owned),
+            &mut out,
+        );
+        let text = std::fs::read_to_string(&file).expect("the file");
+        let (reading, _) = Reading::read(dir, SID, 68537, 0).expect("the reading");
+        (
+            carried,
+            String::from_utf8(out).expect("utf-8"),
+            text,
+            reading,
+        )
+    };
+    let (carried, out, text, reading) = carry(Some("echo mine"));
+    assert!(matches!(carried, Carried::Owner { .. }), "{carried:?}");
+    assert_eq!(out, "");
+    assert!(text.contains(r#""row":"owner""#), "{text}");
+    assert_eq!(reading.row, Some(Row::Owner));
+    assert!(!reading.claimable());
+    let (carried, out, text, reading) = carry(None);
+    assert_eq!(carried, Carried::Own);
+    assert_eq!(out, WEEK_61);
+    assert!(text.contains(r#""row":"own""#), "{text}");
+    assert_eq!(reading.row, Some(Row::Own));
+    assert!(reading.claimable());
+    let _ = carry(Some("echo mine"));
+    let _ = tap(stdin.as_bytes(), &vars(), Some(dir));
+    let (reading, _) = Reading::read(dir, SID, 68537, 0).expect("the reading");
+    assert_eq!(
+        reading.row,
+        Some(Row::Own),
+        "the plain tap's row is its own"
+    );
+}
+
+/// A NEW READING KEEPS FORMAT ONE (the design's §5.2 and §8.3): the file a run writes says `"v":1`
+/// beside the new `row` key, so a GUI or a tap of another build reads it; a file without the key
+/// (every build before this one) still reads, its figures intact, and is not claimable; a row word
+/// this build does not know, beside a key it does not know, reads as no row. The control: the
+/// same file at `"v":2` is refused, as [`Reading::of_json`] refuses every other version. Negative
+/// controls: bumping [`FORMAT_V`] fails the first assertion; an `of_json` that takes any version
+/// fails the control.
+#[test]
+fn a_new_reading_keeps_format_one() {
+    let root = scratch("format-one");
+    let _ = tap(
+        payload(3, None, Some((61, 1_792_397_196))).as_bytes(),
+        &vars(),
+        Some(root.path()),
+    );
+    let path = root.path().join(file_name(SID, 68537).expect("a name"));
+    let text = std::fs::read_to_string(&path).expect("the file");
+    assert!(
+        text.contains("\"v\":1,") && text.contains(r#""row":"own","#),
+        "{text}"
+    );
+    let read = Reading::of_json(&text).expect("it reads");
+    assert_eq!(read.row, Some(Row::Own));
+    assert!(read.claimable());
+    let older = Reading::of_json(&text.replace(r#""row":"own","#, "")).expect("an older file");
+    assert_eq!(older.row, None);
+    assert!(!older.claimable());
+    assert_eq!(
+        (older.seven_day, older.at, older.api_ms),
+        (read.seven_day, read.at, read.api_ms)
+    );
+    let later = Reading::of_json(&text.replace(r#""row":"own","#, r#""row":"glass","later":1,"#))
+        .expect("a later word and key");
+    assert_eq!(later.row, None);
+    assert!(!later.claimable());
+    assert_eq!(
+        Reading::of_json(&text.replace("\"v\":1,", "\"v\":2,")),
+        None,
+        "another version is refused"
+    );
+}
+
+/// PARSE_LINE READS EVERY LINE THE TAP PRINTS, AND ONLY THOSE (the design's §5.2): every week
+/// figure from 0 to 100% in tenths, its reset later today, one to six days on and seven days on
+/// (each form of [`super::super::outlook::when`]) on three local clocks, or not ahead, or a month
+/// on (no week's reset, so none said), and [`NO_WEEK`], each read back at its width in cells,
+/// alone, padded with blanks and beside a
+/// notice two blanks away, and never with a word one blank after it. It refuses the
+/// five-hour-and-week rows of builds before this one (as aterm-phase's 2.1.300 and 2.1.312
+/// fixtures measured them) and an owner's own text. Negative controls: a parser that takes any
+/// `week ` head fails the refusals; a printer that says tenths (`63.4%`) fails the round trip.
+#[test]
+fn parse_line_reads_every_line_the_tap_prints() {
+    use super::super::outlook::Offsets;
+    let clocks = [
+        Offsets::fixed(0),
+        Offsets::fixed(-7 * 3600),
+        Offsets::fixed(5 * 3600 + 1800),
+    ];
+    let resets = [
+        NOW - 1,
+        NOW,
+        NOW + 600,
+        NOW + 3600,
+        NOW + DAY,
+        NOW + 3 * DAY,
+        NOW + 6 * DAY,
+        NOW + 7 * DAY,
+        NOW + 7 * DAY + 13 * 3600,
+        NOW + 30 * DAY,
+    ];
+    let mut forms = std::collections::BTreeSet::new();
+    for clock in &clocks {
+        for reset in resets {
+            for x10 in 0..=1000 {
+                let line = week(x10, reset).week_words(NOW, Some(clock));
+                let width = line.chars().count();
+                forms.insert(
+                    line.split_once(" resets ")
+                        .map_or(0, |(_, when)| when.split(' ').count()),
+                );
+                for text in [
+                    line.clone(),
+                    format!("{line}   "),
+                    format!("{line}  Now using usage credits"),
+                ] {
+                    assert_eq!(parse_line(&text), Some(width), "{text}");
+                }
+                assert_eq!(parse_line(&format!("{line} credits")), None, "{line}");
+            }
+        }
+    }
+    assert_eq!(
+        forms,
+        std::collections::BTreeSet::from([0, 1, 2, 4]),
+        "no reset, and each form of when"
+    );
+    assert_eq!(parse_line(NO_WEEK), Some(NO_WEEK.chars().count()));
+    assert_eq!(
+        parse_line(&format!("{NO_WEEK}     Now using usage credits")),
+        Some(20)
+    );
+    for refused in [
+        "5h 42% \u{b7} 7d 61%",
+        "5h 100% \u{b7} 7d 61%",
+        "5h \u{2013} \u{b7} 7d 42%",
+        "5h \u{2013} \u{b7} 7d \u{2013}",
+        "",
+        " week 61% used",
+        "week 101% used",
+        "week 07% used",
+        "week 63.5% used",
+        "week 63% left",
+        "week \u{2265}63% used",
+        "week 63% used \u{b7} resets soon",
+        "week 63% used \u{b7} resets 24:00",
+        "week 63% used \u{b7} resets 23:60",
+        "week 63% used \u{b7} resets Thx 05:00",
+        "week 63% used \u{b7} resets Thu 32 Nov 05:00",
+        "week 63% used \u{b7} resets Thu 05 Nov 05:00",
+        "week 63% used \u{b7} resets Thu 5 Now 05:00",
+        "week 63% used \u{b7} resets Sat 10:000",
+        "week 63% used \u{b7} resets Sat 10:00 \u{b7} mine",
+        "week \u{b7} no figure",
+        "main \u{b7} Opus 5.5 \u{b7} 42%",
+        "~/aterm main* opus",
+    ] {
+        assert_eq!(parse_line(refused), None, "{refused}");
+    }
 }
 
 /// THE OWNER'S COMMAND RUNS AS CLAUDE CODE RUNS IT: `/bin/sh -c`, the payload on its stdin

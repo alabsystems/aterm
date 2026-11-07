@@ -114,6 +114,7 @@ pub use foundation::{
     CommonsInit, Foundable, NotFounded, admin_commons_found_by_default, admin_commons_init,
     commons_foundable,
 };
+pub(crate) use genesis::configured_genesis;
 pub use genesis::{SignedGenesis, admin_sign_genesis, seed_vault_genesis};
 #[cfg(any(test, debug_assertions))]
 pub use genesis::{test_found, test_sign_genesis};
@@ -189,8 +190,8 @@ pub use retirement::{
 pub use roster::admin_seed_swarm_roster;
 #[cfg(any(test, debug_assertions))]
 pub use roster::test_unwaited_roster;
-pub(crate) use roster::with_roster_observation;
 pub use roster::{historical_swarm_roster, resolve_local_swarm_label, swarm_lease_holder};
+pub(crate) use roster::{vault_busy, with_roster_observation, with_roster_observation_or_busy};
 #[cfg(any(test, debug_assertions))]
 pub use seat_ask::test_read_dropped;
 pub use seat_ask::{
@@ -200,9 +201,9 @@ pub(crate) use steward::local_recipient_denial_held;
 pub(crate) use steward::{AlabRoleContext, AlabRoleObservation, observe_alab_role};
 pub use steward::{
     StewardLease, StewardRevoke, StewardStandbyServer, Stewardship,
-    local_recipient_denied_in_roster, steward_alab_policy_role, steward_ensure_lease,
-    steward_ensure_standby_server, steward_finish_revokes, steward_lease_check,
-    steward_revoke_check, steward_standby_server_check, stewardship,
+    local_recipient_denial_observed, local_recipient_denied_in_roster, steward_alab_policy_role,
+    steward_ensure_lease, steward_ensure_standby_server, steward_finish_revokes,
+    steward_lease_check, steward_revoke_check, steward_standby_server_check, stewardship,
 };
 pub use subscriber::mend_subscriber;
 pub(crate) use vault_memo::observe_commons_now;
@@ -8310,12 +8311,27 @@ pub(super) fn admin_removed_in_log(
     identity: &Identity,
     doc: &Document,
 ) -> bool {
+    admin_removed_in_log_with_lock(paths, config, envelope, identity, doc, None)
+}
+
+fn admin_removed_in_log_with_lock(
+    paths: &Paths,
+    config: &Config,
+    envelope: &Envelope,
+    identity: &Identity,
+    doc: &Document,
+    lock: Option<&StateLock>,
+) -> bool {
     let log = match log_entries::trusted_seeded_log(paths, config, envelope) {
         Ok(Some((log, _))) => log,
         Ok(None) => return false,
         Err(_) => return true,
     };
-    let Ok(mut roster) = log_entries::local_swarm_roster_for_log(paths, &log) else {
+    let current = match lock {
+        Some(lock) => log_entries::local_swarm_roster_for_log_held(paths, &log, lock),
+        None => log_entries::local_swarm_roster_for_log(paths, &log),
+    };
+    let Ok(mut roster) = current else {
         return true;
     };
     if let Ok(Some(doc_roster)) = crate::swarm_roster::SwarmRoster::from_document(doc) {

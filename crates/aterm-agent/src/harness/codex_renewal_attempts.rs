@@ -15,7 +15,7 @@ mod tests;
 
 #[path = "codex_renewal_completion.rs"]
 mod completion;
-pub use completion::CompletionProgress;
+pub use completion::{CompletionProgress, RootDriver, advance_root};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -72,6 +72,69 @@ pub trait NativeCancellationProof {
 impl<'a> ReceiptWriter<'a> {
     pub(super) fn held(env: &'a Env, guard: &'a accounts::Lock) -> Self {
         Self { env, _guard: guard }
+    }
+
+    /// Create one uncommitted root without replacing any retained artifact.
+    /// An exact retry repairs its durability barriers; conflicting, unsafe or
+    /// unreadable roots and cancellation records remain in place.
+    ///
+    /// # Errors
+    /// The initial receipt is invalid, cancellation exists or is unreadable,
+    /// an existing root differs, or the creation cannot be acknowledged.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "ReceiptCreation",
+            action = "Existing",
+            reason = "The filesystem supplies the retained root artifact"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "ReceiptCreation",
+            action = "Cancellation",
+            reason = "The filesystem supplies the retained cancellation artifact"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "ReceiptCreation",
+            action = "Failed",
+            reason = "The filesystem refuses the final directory acknowledgement"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "ReceiptCreation",
+            action = "Create",
+            project = "aterm_agent::harness::codex_renewal::attempts::tests::creation::transition"
+        )
+    )]
+    pub fn create(&self, initial: &Receipt) -> Result<(), &'static str> {
+        if initial.phase != Phase::Ready
+            || initial.revoked
+            || initial.launch_attempted
+            || initial.current_attempt.is_some()
+            || initial.candidate.is_some()
+            || initial.successor_pid.is_some()
+            || initial.successor_birth.is_some()
+            || initial.accepted_turn.is_some()
+            || initial.target_identity().is_none()
+            || !hex(&initial.intent.identity.account, 64)
+            || !hex(&initial.intent.identity.user, 64)
+        {
+            return Err("receipt-not-initial");
+        }
+        if read_cancellation(self.env, initial)?.is_some() {
+            return Err("receipt-revoked");
+        }
+        write_immutable(
+            &receipt_path(self.env, &initial.id).ok_or("receipt-id")?,
+            initial,
+        )
     }
 
     /// Acknowledge the exact visible receipt, including any cancellation

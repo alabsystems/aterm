@@ -83,6 +83,14 @@ impl Owner {
         peer: Peer,
         query: &wire::ContextQuery,
     ) -> io::Result<wire::ContextReply> {
+        self.context_at(peer, query, Instant::now())
+    }
+    pub(super) fn context_at(
+        &mut self,
+        peer: Peer,
+        query: &wire::ContextQuery,
+        started: Instant,
+    ) -> io::Result<wire::ContextReply> {
         query.encode()?;
         let key = (query.binding.session.clone(), query.binding.root_attempt);
         let job = self
@@ -110,14 +118,16 @@ impl Owner {
             return Err(refused("native context scope is closing"));
         }
         let mut value = job::inspection(&self.fence, &self.debt, job)?;
+        // Local native reads establish coverage; scheduler delay is no evidence
+        // that the authenticated caller left its original scope.
+        let deadline = started + Duration::from_secs(60);
         if !aterm_uds::process::stable_descendant(
             peer.pid,
             aterm_uds::process::Birth(peer.birth),
             job.child.child_mut().id(),
             aterm_uds::process::Birth(job.root_birth),
-            Instant::now() + Duration::from_millis(100),
+            deadline,
         ) {
-            let deadline = Instant::now() + Duration::from_millis(100);
             value.subject = job
                 .members
                 .values_mut()

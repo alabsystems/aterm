@@ -349,6 +349,17 @@ impl Registry {
         crate::att::Handle::at(self.paths.clone(), &crate::att::REGISTRY).view()
     }
 
+    /// [`Self::view`] for a read a person waits on, which may read until `read_by` while each wait
+    /// for a holder stays the ordinary admission's: the registry's generation
+    /// ([`crate::att::Handle::at_until`]) and then its rows ([`crate::att::Handle::view_until`]).
+    ///
+    /// # Errors
+    /// As [`Self::view`], or the read ran out of time at `read_by`.
+    pub fn view_until(&self, read_by: std::time::Instant) -> Result<View> {
+        crate::att::Handle::at_until(self.paths.clone(), &crate::att::REGISTRY, read_by)?
+            .view_until(read_by)
+    }
+
     /// Write the compiled provider, CLI and plan rows ([`seeds`]) into every cell a complete
     /// scan of the registry finds absent, under this Mac's quota of automatic records: each
     /// row in one record, each record with a content-derived request id, so a re-run writes

@@ -148,7 +148,7 @@ version = "0.2.0"
 
 [[package]]
 name = "aterm"
-version = "0.168.0"
+version = "0.169.0"
 dependencies = [
  "agh",
  "astream-broker",

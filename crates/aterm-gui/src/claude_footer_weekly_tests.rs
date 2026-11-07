@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use aterm_agent::harness::accounts;
 use aterm_agent::harness::footer;
-use aterm_agent::harness::profile::{SubscriptionDisplay, WeeklyFigure, WeeklyGap};
+use aterm_agent::harness::profile::{SubscriptionDisplay, WEEKLY_OUT, WeeklyFigure, WeeklyGap};
 use aterm_agent::harness::tap::{self, Refusal};
 
 use super::{
@@ -297,6 +297,7 @@ fn reading(
         model: None,
         ctx_left: None,
         dur_us: 0,
+        row: None,
     };
     std::fs::create_dir_all(rl()).unwrap();
     std::fs::write(file(pid), reading.to_json()).unwrap();
@@ -808,6 +809,7 @@ fn a_week_the_tap_re_reports_after_a_reset_is_as_old_as_its_first_report() {
             &vars,
             Some(&rl()),
             now,
+            |_| Some(0),
             &mut Vec::<u8>::new(),
         );
     };
@@ -962,8 +964,8 @@ fn a_footer_with_no_weekly_figure_says_why() {
 }
 
 /// The accounts store's week reaches the footer through the resolver: a weekly wall it
-/// holds says `weekly 0% left`, a figure newer than the footer's own aged one wins, and a
-/// refused profile read reads none of it.
+/// holds says `weekly out` (never an inferred `0% left`), a figure newer than the footer's own
+/// aged one wins, and a refused profile read reads none of it.
 #[test]
 fn the_resolver_reads_the_stores_week_under_the_same_rule() {
     let save = save_main;
@@ -972,7 +974,7 @@ fn the_resolver_reads_the_stores_week_under_the_same_rule() {
     save(None, true);
     assert_eq!(
         weekly(asks(untapped, stored)),
-        words("weekly 0% left"),
+        words(WEEKLY_OUT),
         "the store's weekly wall"
     );
     assert_eq!(
@@ -1243,7 +1245,7 @@ fn a_process_outside_the_default_home_reads_none_of_the_stores_week() {
     std::fs::rename(&dir, records()).unwrap();
     assert_eq!(
         weekly(asks(untapped, stored)),
-        words("weekly 0% left"),
+        words(WEEKLY_OUT),
         "the control: the wall is the default home's own"
     );
     save_main(Some(NOW - 60), false);
@@ -1382,8 +1384,8 @@ fn a_pane_whose_gate_refused_shows_no_glance() {
 }
 
 /// A 7D WALL IN THE TRANSCRIPT BEATS THE FOOTER'S OWN AGED FIGURE: at the weekly limit, a tap
-/// reading twenty minutes old says `weekly 0% left`, never the week it read before the wall;
-/// a current reading still says its own.
+/// reading twenty minutes old says `weekly out`, never the week it read before the wall nor a
+/// percentage; a current reading still says its own.
 #[test]
 fn a_weekly_wall_beats_the_footers_own_aged_figure() {
     fresh("footer-weekly-wall");
@@ -1397,7 +1399,7 @@ fn a_weekly_wall_beats_the_footers_own_aged_figure() {
     weekly_wall();
     assert_eq!(
         weekly(asks(tapped, armed)),
-        words("weekly 0% left"),
+        words(WEEKLY_OUT),
         "the wall over an aged reading"
     );
     reading(PID as u32, NOW - 60, (970, RESET), None, None);

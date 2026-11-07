@@ -4,14 +4,16 @@
 //! What this Mac's own import of its fleet_db replica recorded beside that replica
 //! (docs/DESIGN-alab-one-mesh-2026-11-05.md §4.7, §11 A7): whether every cell the replica holds
 //! is covered by the registry, how many are not, the replica's keyed digest and the `[everyone]`
-//! epoch it was keyed under. Value-free: a count, hex digests and the coordinates of uncovered
-//! cells by collection, row key and column, never a cell's text.
+//! epoch it was keyed under, and the source keys its imports here made. Value-free: a count, hex
+//! digests and the coordinates of uncovered cells by collection, row key and column, never a cell's
+//! text.
 //!
 //! The record is a local fact of this Mac. fleet_db's write verbs read it
 //! ([`refuse_writes`]): once it says `covered`, the replica's rows live in the registry and a
 //! write to the replica would edit a copy no one reads, so they point to `aterm db emails`.
 //! Before that, fleet_db works as it did. A replica edited after its import is imported again
-//! before it is deleted: the deletion compares the digest recorded here with one taken then.
+//! before it is deleted: the deletion compares the digest recorded here with one taken then, and
+//! that import reports what the edit withdrew, by the source keys recorded here, and keeps it.
 //!
 //! **Coverage is judged per cell** against the registry as the import left it: the replica's
 //! sheets are planned once more, alone, against the written registry ([`judge`]). A cell is
@@ -29,13 +31,13 @@
 use super::{Kind, Plan};
 use crate::{Error, Result};
 use aterm_json::{Value, json};
-use std::path::Path;
+use std::{collections::BTreeSet, path::Path};
 
 /// The record's file name inside the replica's folder.
 pub const FILE: &str = "registry-import.json";
 
 /// The largest record read back.
-const MAX_RECORD: usize = 64 * 1024;
+const MAX_RECORD: usize = 1024 * 1024;
 
 /// The most uncovered cells a record lists by coordinate; the count is always whole.
 const MAX_LISTED: usize = 256;
@@ -44,7 +46,7 @@ const MAX_LISTED: usize = 256;
 /// (`att::secret_digest`), so a replica digest never compares equal to a table digest. Its version
 /// is the judgement's: a record an earlier judge wrote cannot pass a deletion's digest check, so
 /// its replica is imported again first.
-const REPLICA_DIGEST: &[u8] = b"aterm/fleet-db/replica-digest/2\0";
+const REPLICA_DIGEST: &[u8] = b"aterm/fleet-db/replica-digest/3\0";
 
 /// One replica cell the registry does not cover: where, and the finding's word, never a value.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -87,7 +89,8 @@ const fn benign(kind: Kind) -> bool {
 /// [`Kind::SecretFlagLike`] finding's replica values are flag words that agree with whether the
 /// registry holds a value in its cell. Empty means every cell is covered.
 pub fn judge(plan: &Plan, flag_agrees: &dyn Fn(&super::Finding) -> bool) -> Vec<Uncovered> {
-    let mut out = std::collections::BTreeSet::new();
+    let mut out = BTreeSet::new();
+    let mut keyless = Vec::new();
     for planned in &plan.planned {
         if planned.step == super::Step::Write {
             let (column, _) = planned
@@ -102,7 +105,14 @@ pub fn judge(plan: &Plan, flag_agrees: &dyn Fn(&super::Finding) -> bool) -> Vec<
             });
         }
     }
-    if !plan.rows.is_empty() && out.is_empty() {
+    // A source row is no cell of the replica: a run whose other sheets state every value leaves
+    // the dump's table unused, with no source row of its own and every cell in the registry.
+    let owed = plan
+        .rows
+        .iter()
+        .flatten()
+        .any(|change| change.collection != super::SOURCE.name);
+    if owed && out.is_empty() {
         out.insert(Uncovered {
             kind: "unwritten",
             collection: None,
@@ -117,14 +127,20 @@ pub fn judge(plan: &Plan, flag_agrees: &dyn Fn(&super::Finding) -> bool) -> Vec<
         if finding.kind == Kind::SecretFlagLike && flag_agrees(finding) {
             continue;
         }
-        out.insert(Uncovered {
+        let cell = Uncovered {
             kind: finding.kind.word(),
             collection: finding.collection.map(str::to_owned),
             pk: finding.pk.clone(),
             column: finding.column.clone(),
-        });
+        };
+        // A row with no key yet is its own cell, so the count stays whole.
+        if cell.pk.is_none() {
+            keyless.push(cell);
+        } else {
+            out.insert(cell);
+        }
     }
-    out.into_iter().collect()
+    out.into_iter().chain(keyless).collect()
 }
 
 /// A replica's keyed digest: HMAC-SHA-256 over its whole dump (`fleet_db::dump_all` with its
@@ -161,6 +177,10 @@ pub struct Record {
     pub epoch: Option<String>,
     /// This Mac's clock when it judged (a claim, never an ordering input).
     pub at_ms: u64,
+    /// The source keys this replica's imports on this Mac made: what they wrote and an edit no
+    /// longer says is this replica's to report, while another Mac's replica, named alike, is
+    /// another source. A record older than this list names none, until the replica's next import.
+    pub sources: BTreeSet<String>,
 }
 
 impl Record {
@@ -194,10 +214,34 @@ pub fn report(uncovered: &[Uncovered]) -> Value {
 /// # Errors
 /// The folder is not private, or the file cannot be written.
 pub fn write(dir: &Path, record: &Record, listed: &[Uncovered]) -> Result<()> {
-    let bytes = aterm_json::to_vec(&record.json(listed))
+    let mut stored = record.json(listed);
+    if let Some(fields) = stored.as_object_mut() {
+        let sources = record.sources.iter().cloned().map(Value::String).collect();
+        fields.insert("sources".to_owned(), Value::Array(sources));
+    }
+    let bytes = aterm_json::to_vec(&stored)
         .map_err(|_| Error::new("the import's record could not be encoded"))?;
     aterm_uds::private_file::write_private(dir, FILE, &bytes)
         .map_err(|_| Error::new("the import's record could not be written beside the replica"))
+}
+
+/// Move the record from the replica folder `from` into `to`, where a rekey put the same rows: the
+/// source keys it names stay this replica's. A record already at `to` stays.
+///
+/// # Errors
+/// The record at `from` cannot be read, or cannot be written at `to`.
+pub fn carry(from: &Path, to: &Path) -> Result<()> {
+    use aterm_uds::private_file::{PrivateFileError, read_private, write_private};
+    let carried = || Error::new("the import's record could not be carried beside the replica");
+    match read_private(to, FILE, MAX_RECORD) {
+        Err(PrivateFileError::Missing) => {}
+        _ => return Ok(()),
+    }
+    match read_private(from, FILE, MAX_RECORD) {
+        Ok(bytes) => write_private(to, FILE, &bytes).map_err(|_| carried()),
+        Err(PrivateFileError::Missing) => Ok(()),
+        Err(_) => Err(carried()),
+    }
 }
 
 /// The record beside the replica at `dir`: `None` where no import of it recorded one.
@@ -212,11 +256,17 @@ pub fn read(dir: &Path) -> Result<Option<Record>> {
         Err(PrivateFileError::Missing) => return Ok(None),
         Err(_) => {
             return Err(Error::new(
-                "the import's record beside this replica cannot be read",
+                "the import's record beside this replica (registry-import.json) cannot be read: \
+                 remove it and import again, which reports nothing earlier imports wrote",
             ));
         }
     };
-    let malformed = || Error::new("the import's record beside this replica is malformed");
+    let malformed = || {
+        Error::new(
+            "the import's record beside this replica (registry-import.json) is malformed: remove \
+             it and import again, which reports nothing earlier imports wrote",
+        )
+    };
     let value: Value = aterm_json::from_slice(&bytes).map_err(|_| malformed())?;
     let text = |name: &str| -> Result<Option<String>> {
         match value.get(name) {
@@ -238,6 +288,22 @@ pub fn read(dir: &Path) -> Result<Option<Record>> {
         digest: text("digest")?,
         epoch: text("epoch")?,
         at_ms: value.get("at_ms").and_then(Value::as_u64).unwrap_or(0),
+        sources: match value.get("sources") {
+            None | Some(Value::Null) => BTreeSet::new(),
+            Some(Value::Array(keys)) => keys
+                .iter()
+                .map(|key| {
+                    key.as_str()
+                        .filter(|key| {
+                            key.strip_prefix("sr-")
+                                .is_some_and(|tag| aterm_codec::hex::is_lower(tag, tag.len()))
+                        })
+                        .map(str::to_owned)
+                        .ok_or_else(malformed)
+                })
+                .collect::<Result<_>>()?,
+            Some(_) => return Err(malformed()),
+        },
     }))
 }
 

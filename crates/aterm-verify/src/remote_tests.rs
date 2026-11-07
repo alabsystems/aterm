@@ -74,6 +74,71 @@ fn github_spellings_share_a_route_and_unsupported_urls_never_become_git_fallback
 }
 
 #[test]
+fn main_refresh_requires_a_successful_incremental_snapshot_and_one_commit() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    for (symbolic, fetched, tip, object, expected, calls_expected) in [
+        (1, 0, AFTER, "commit\n", true, 4),
+        (1, 4, BEFORE, "commit\n", false, 2),
+        (0, 0, AFTER, "commit\n", false, 1),
+        (128, 0, AFTER, "commit\n", false, 1),
+        (1, 0, "bad", "commit\n", false, 3),
+        (1, 0, AFTER, "tag\n", false, 4),
+    ] {
+        let calls = Cell::new(0);
+        let current = Cell::new(BEFORE);
+        let run = |tool, args: &[OsString]| {
+            if tool == Tool::Git && args.first().is_some_and(|arg| arg == "remote") {
+                return Ok(url(tool, args).unwrap());
+            }
+            let call = calls.get();
+            calls.set(call + 1);
+            match call {
+                0 => {
+                    assert_eq!(tool, Tool::Git);
+                    assert_eq!(
+                        args,
+                        words(&["symbolic-ref", "--quiet", "refs/agh/fetched-main"])
+                    );
+                    Ok(out(symbolic, ""))
+                }
+                1 => {
+                    assert_eq!(tool, Tool::Agh);
+                    let mut command = words(&["repo", "fetch-main", "fixture/repo"]);
+                    command.push(root.path().as_os_str().to_owned());
+                    assert_eq!(args, command);
+                    if fetched == 0 {
+                        current.set(tip);
+                    }
+                    Ok(out(fetched, ""))
+                }
+                2 => {
+                    assert_eq!(tool, Tool::Git);
+                    assert_eq!(
+                        args,
+                        words(&["rev-parse", "--verify", "refs/agh/fetched-main"])
+                    );
+                    Ok(out(0, &format!("{}\n", current.get())))
+                }
+                3 => {
+                    assert_eq!(tool, Tool::Git);
+                    assert_eq!(args, words(&["cat-file", "-t", tip]));
+                    Ok(out(0, object))
+                }
+                _ => panic!("no retry or raw GitHub transport: {tool:?} {args:?}"),
+            }
+        };
+        let value = Remote::open(root.path(), "origin", &run)
+            .unwrap()
+            .refresh_main();
+        assert_eq!(value.is_ok(), expected);
+        if expected {
+            assert_eq!(value.unwrap(), AFTER);
+        }
+        assert_eq!(calls.get(), calls_expected);
+    }
+}
+
+#[test]
 fn github_fetch_keeps_the_observed_commit_when_main_or_the_journal_advances() {
     let root = aterm_tempfile::tempdir().expect("root");
     for reference in ["refs/heads/main", "refs/aterm/judged"] {

@@ -175,7 +175,6 @@ pub(crate) struct Config {
     pub(crate) spare_shell_needs_person: Option<bool>,
     pub(crate) tab_status_badge: Option<bool>,
     pub(crate) tab_connection_badge: Option<bool>,
-    pub(crate) desktop_alerts: Option<bool>,
     pub(crate) agents_auto_prime: Option<bool>,
     pub(crate) bidi: Option<String>,
     pub(crate) ambiguous_width: Option<String>,
@@ -8542,6 +8541,47 @@ mod config_policy_tests {
             super::unaccepted_value_notices(source, &[]).is_empty(),
             "a retired key's value is never a value its reader rejects"
         );
+    }
+
+    /// A `desktop_alerts` line left in a person's file, whatever its value (a word no `bool`
+    /// reads included), loads with every other setting, is told once that the key does nothing,
+    /// and `--validate-config` passes with that one warning; `settings set` and `unset` answer
+    /// the same sentence.
+    #[test]
+    fn a_config_that_still_sets_desktop_alerts_loads_and_is_told_once() {
+        use crate::native_config_language::compatibility_only_message;
+        let others = "font_px = 17.0\n";
+        let told = format!("line 1: {}", compatibility_only_message("desktop_alerts"));
+        for value in ["true", "false", "\"on\""] {
+            let source = format!("desktop_alerts = {value}\n{others}");
+            let loaded = Config::parse(&source).expect("a retired key never fails the file");
+            let baseline = Config::parse(others).expect("the other settings parse alone");
+            assert!(
+                loaded == baseline,
+                "{source:?}: every other setting loads as without it"
+            );
+            let warnings = crate::native_config_language::key_warnings(&source);
+            assert!(
+                warnings.ignored.is_empty(),
+                "{source:?}: {:?}",
+                warnings.ignored
+            );
+            assert_eq!(warnings.retired, std::slice::from_ref(&told), "{source:?}");
+            assert_eq!(
+                crate::diagnostics::validate_config_text(&source),
+                Ok(vec![told.clone()]),
+                "{source:?}: the file validates, with the one warning"
+            );
+            assert!(
+                super::unaccepted_value_notices(&source, &[]).is_empty(),
+                "{source:?}: a retired key's value is never a value its reader rejects"
+            );
+        }
+        assert_eq!(
+            crate::native_config_language::control_settings_refusal("desktop_alerts"),
+            compatibility_only_message("desktop_alerts"),
+        );
+        assert!(told.contains("was removed"), "{told}");
     }
 
     #[test]

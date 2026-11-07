@@ -396,11 +396,19 @@ pub fn admin_cached_until(paths: &Paths, deadline: Instant) -> crate::Result<Adm
 }
 
 fn admin_cached_with_lock(paths: &Paths, lock: Option<StateLock>) -> crate::Result<Admin> {
-    let _lock = lock.ok_or_else(|| Error::new("vault state is changing; retry enrollment"))?;
-    admin_cached_unlocked(paths)
+    let lock = lock.ok_or_else(|| Error::new("vault state is changing; retry enrollment"))?;
+    admin_cached_held(paths, &lock)
 }
 
 pub(super) fn admin_cached_unlocked(paths: &Paths) -> crate::Result<Admin> {
+    admin_cached_observed(paths, None)
+}
+
+pub(super) fn admin_cached_held(paths: &Paths, lock: &StateLock) -> crate::Result<Admin> {
+    admin_cached_observed(paths, Some(lock))
+}
+
+fn admin_cached_observed(paths: &Paths, lock: Option<&StateLock>) -> crate::Result<Admin> {
     let config = config(paths)?.ok_or_else(|| Error::new("no cached vault configured"))?;
     let pin = config
         .signer
@@ -451,7 +459,14 @@ pub(super) fn admin_cached_unlocked(paths: &Paths) -> crate::Result<Admin> {
     if envelope::signer_public(&opened.seed)? != envelope.signer {
         return Err(Error::new("cached admin custody differs from its signer"));
     }
-    if super::admin_removed_in_log(paths, &config, &envelope, &identity, &opened.doc) {
+    if super::admin_removed_in_log_with_lock(
+        paths,
+        &config,
+        &envelope,
+        &identity,
+        &opened.doc,
+        lock,
+    ) {
         return Err(Error::new("this device cannot open cached admin custody"));
     }
     let served_machines = opened

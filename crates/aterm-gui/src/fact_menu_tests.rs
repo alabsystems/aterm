@@ -9,8 +9,9 @@ use aterm_agent::harness::footer::{FactKind, FactMask};
 use aterm_agent::harness::session_usage::TrafficView;
 
 use super::{
-    AccountLabel, AccountMenuRow, FactAct, FactMenuFacts, SessionWeek, account_menu_rows_from,
-    band_glyphs, band_level, rows, traffic_rows, weekly_facts, weekly_gap_why, weekly_meter_bar,
+    AccountLabel, AccountMenuRow, FactAct, FactMenuFacts, RowWeek, SessionWeek,
+    account_menu_rows_from, band_glyphs, band_level, rows, traffic_rows, weekly_facts,
+    weekly_gap_why, weekly_meter_bar,
 };
 use crate::autopilot_menu::{MenuAct, MenuRow, PlotInk};
 use crate::claude_lights::Fact;
@@ -812,8 +813,8 @@ fn the_account_menu_says_why_the_week_is_missing() {
 
 /// THE ACCOUNT MENU TAKES THE FOOTER'S WEEK as the footer says it: a figure's words (tenths
 /// too) give the meter and the session's row its whole percent, an aged figure its age as a
-/// store row's, a 7d wall gives `weekly 0% left`, and with neither the footer's reason goes
-/// to the menu's why.
+/// store row's, a 7d wall gives `weekly out` (no meter, never a percentage) and the session's
+/// row a limited one, and with neither the footer's reason goes to the menu's why.
 #[test]
 fn the_account_menu_takes_the_footers_week_or_its_reason() {
     use aterm_agent::harness::profile::{SubscriptionDisplay, WeeklyFigure, WeeklyGap};
@@ -823,7 +824,7 @@ fn the_account_menu_takes_the_footers_week_or_its_reason() {
         weekly_gap: gap,
         ..SubscriptionDisplay::default()
     };
-    let left = |pct: u32, age: &str| Some((pct, age.to_owned()));
+    let left = |pct: u32, age: &str| Some(RowWeek::Left(pct, age.to_owned()));
     assert_eq!(
         weekly_facts(&sub(Some("weekly 61.5% left"), None), false, NOW),
         (
@@ -874,10 +875,10 @@ fn the_account_menu_takes_the_footers_week_or_its_reason() {
         ..aged.clone()
     };
     assert_eq!(weekly_facts(&future, false, NOW), (None, None, None));
-    assert_eq!(weekly_facts(&future, true, NOW).0, left(0, ""));
+    assert_eq!(weekly_facts(&future, true, NOW).0, Some(RowWeek::Out));
     assert_eq!(
         weekly_facts(&aged, true, NOW + 86_400).0,
-        left(0, ""),
+        Some(RowWeek::Out),
         "a 7d wall still says its own"
     );
     assert_eq!(
@@ -886,8 +887,8 @@ fn the_account_menu_takes_the_footers_week_or_its_reason() {
         "the footer's reason"
     );
     assert_eq!(
-        weekly_facts(&sub(None, Some(WeeklyGap::NoReply)), true, NOW).0,
-        left(0, ""),
+        weekly_facts(&sub(None, Some(WeeklyGap::NoReply)), true, NOW),
+        (Some(RowWeek::Out), Some("weekly out".into()), None),
         "a 7d wall over every reason"
     );
     assert_eq!(
@@ -1015,7 +1016,7 @@ fn an_account_rows_store_figure_carries_its_age() {
         SessionWeek {
             label: None,
             figure: None,
-            left: Some((62, " \u{b7} 40m ago".into())),
+            left: Some(RowWeek::Left(62, " \u{b7} 40m ago".into())),
         },
         NOW,
     );
@@ -1053,7 +1054,7 @@ fn an_account_rows_store_figure_carries_its_age() {
             SessionWeek {
                 label: None,
                 figure: Some(figure),
-                left: Some((40, String::new())),
+                left: Some(RowWeek::Left(40, String::new())),
             },
             NOW,
         );
@@ -1163,7 +1164,7 @@ fn an_account_rows_store_figure_carries_its_age() {
                     resets_at: NOW + 86_400,
                     at: NOW - 60,
                 }),
-                left: Some((40, String::new())),
+                left: Some(RowWeek::Left(40, String::new())),
             },
             NOW,
         )
@@ -1269,7 +1270,7 @@ fn quota_rows_keep_only_time_admitted_post_refill_fallbacks() {
         let session = SessionWeek {
             label: Some("main".into()),
             figure: Some(figure),
-            left: Some((20, String::new())),
+            left: Some(RowWeek::Left(20, String::new())),
         };
         let got = row(&state, session.clone(), NOW);
         if own_after {
@@ -1355,7 +1356,7 @@ fn the_sessions_week_reaches_the_row_its_login_is_judged_to() {
                     resets_at: NOW + 86_400,
                     at: NOW - 60,
                 }),
-                left: Some((10, String::new())),
+                left: Some(RowWeek::Left(10, String::new())),
             },
             NOW,
         );
@@ -1547,6 +1548,10 @@ fn account_menu_shows_weekly_meter_and_rotation_accounts() {
     assert_eq!(state, before);
 }
 
+/// The Account menu's rows tell an auto-login row from a disabled one, and a walled row says
+/// `out (limited)`, never a percentage (glass design §2.1: never an inferred 100%). Negative
+/// control: a limited row or a footer's wall said `0% left (limited)` (the S1 slice before its
+/// review) fails the walled row.
 #[test]
 fn account_menu_rows_from_distinguishes_auto_login_and_disabled_rows() {
     use aterm_agent::harness::accounts;
@@ -1616,7 +1621,7 @@ fn account_menu_rows_from_distinguishes_auto_login_and_disabled_rows() {
         SessionWeek {
             label: None,
             figure: None,
-            left: Some((0, String::new())),
+            left: Some(RowWeek::Out),
         },
         NOW,
     );
@@ -1641,8 +1646,12 @@ fn account_menu_rows_from_distinguishes_auto_login_and_disabled_rows() {
             (false, false)
         ]
     );
-    assert!(menu_rows[0].label.contains("0%"));
-    assert!(menu_rows[1..].iter().all(|row| !row.label.contains('%')));
+    // A wall says `out`, never a percentage (never an inferred 100% used).
+    assert!(
+        menu_rows[0].label.ends_with("\u{b7} out (limited)"),
+        "{menu_rows:?}"
+    );
+    assert!(menu_rows.iter().all(|row| !row.label.contains('%')));
     assert!(
         menu_rows[3].label.ends_with("signed out (auto-login)"),
         "{menu_rows:?}"

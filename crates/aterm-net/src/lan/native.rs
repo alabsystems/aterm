@@ -27,7 +27,17 @@ pub(super) fn route(
     bound: Option<u32>,
     until: Instant,
 ) -> io::Result<Route> {
-    let until = until.min(deadline());
+    route_at(local, peer, bound, until, Instant::now())
+}
+
+fn route_at(
+    local: Option<SocketAddr>,
+    peer: SocketAddr,
+    bound: Option<u32>,
+    until: Instant,
+    started: Instant,
+) -> io::Result<Route> {
+    let until = until.min(deadline_at(started));
     within(until)?;
     #[cfg(target_os = "macos")]
     {
@@ -307,20 +317,14 @@ fn sequence() -> io::Result<u32> {
 
 const MAX_REPLY: usize = 64 * 1024;
 const MAX_MESSAGES: usize = 64;
-const WITHIN: Duration = Duration::from_secs(2);
+const WITHIN: Duration = Duration::from_secs(60);
 
-/// When a LAN observation begun now must end (an admission, a recheck, a listener's bind and
-/// listen, and the cap on every route query's own deadline): [`WITHIN`] from now, or in a test
-/// binary (a crate's unit tests, or a `tests/*.rs` binary, which links this library without
-/// `cfg(test)`) the hang detector from now, since its routes, sockets and listeners are this
-/// machine's kernel's, which always answer however loaded the machine is.
+/// Hang detector for local kernel observations: admission, recheck, bind/listen and route queries.
 pub(super) fn deadline() -> Instant {
-    #[cfg(debug_assertions)]
-    if aterm_uds::test_binary::scratch_root().is_some() {
-        // The hang detector (`aterm_spec::wait::MUST_HAPPEN`), which this library cannot name.
-        return Instant::now() + Duration::from_secs(60);
-    }
-    Instant::now() + WITHIN
+    deadline_at(Instant::now())
+}
+fn deadline_at(started: Instant) -> Instant {
+    started + WITHIN
 }
 pub(super) fn within(until: Instant) -> io::Result<()> {
     if Instant::now() >= until {
@@ -442,6 +446,28 @@ mod tests {
             route(None, "127.0.0.1:9".parse().unwrap(), None, Instant::now())
                 .unwrap_err()
                 .kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
+
+    #[test]
+    fn native_route_observation_survives_scheduling_delay() {
+        let (_, index) = loopback();
+        let peer = "127.0.0.1:9".parse().unwrap();
+        let started = Instant::now() - Duration::from_secs(3);
+        let observed =
+            route_at(None, peer, None, started + Duration::from_secs(60), started).unwrap();
+        assert_eq!(observed.index, index);
+        assert_eq!(
+            route_at(
+                None,
+                peer,
+                None,
+                Instant::now() + Duration::from_secs(60),
+                Instant::now() - Duration::from_secs(60)
+            )
+            .unwrap_err()
+            .kind(),
             io::ErrorKind::TimedOut
         );
     }

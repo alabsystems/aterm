@@ -5,6 +5,9 @@ use super::*;
 use crate::harness::native_act::{NativePlan, Request};
 use crate::harness::native_observe::{ObservationBinding, Registration, SavedObservation};
 
+#[path = "codex_renewal_root_tests.rs"]
+mod root;
+
 struct Fixture {
     _tmp: aterm_tempfile::TempDir,
     env: crate::harness::cli::Env,

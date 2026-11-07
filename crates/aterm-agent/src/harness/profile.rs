@@ -1152,6 +1152,10 @@ pub fn usage_read_age(at: i64, now: i64) -> Option<i64> {
     now.checked_sub(at).filter(|age| *age >= -USAGE_SKEW_S)
 }
 
+/// The weekly words of a standing 7-day wall: `out`, never an inferred percentage
+/// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §3.2, `Figure::Out`).
+pub const WEEKLY_OUT: &str = "weekly out";
+
 /// Facts for the requested on-screen account/subscription display.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct SubscriptionDisplay {
@@ -1160,7 +1164,7 @@ pub struct SubscriptionDisplay {
     /// The selected account's subscription plan.
     pub plan: Option<String>,
     /// Its weekly quota's words: a figure's under the one age rule ([`WeeklyFigure::words`]),
-    /// a wall's `weekly 0% left`, or a screen's.
+    /// a wall's [`WEEKLY_OUT`], or a screen's.
     pub weekly: Option<String>,
     /// The figure [`Self::weekly`] says, where a read gave one (`None`: a wall's or a screen's
     /// words, or no figure).
@@ -1306,7 +1310,7 @@ impl WeeklyGap {
 /// narrow for them beside the account: an aged figure without its ` left` and ` ago` but with
 /// its `weekly` (`weekly 61.5% \u{b7} 59m`), since the rule draws the week behind the account
 /// unit's `\u{b7}` and no mark of its own names it; `None` for words that are already their
-/// narrowest (a current figure, a wall's `weekly 0% left`).
+/// narrowest (a current figure, a wall's [`WEEKLY_OUT`]).
 #[must_use]
 pub fn narrow_weekly(words: &str) -> Option<String> {
     let (share, age) = words

@@ -23,6 +23,44 @@ pub enum CompletionProgress {
 }
 
 impl ReceiptWriter<'_> {
+    /// Acknowledge the root's write-ahead marker before native driving. An
+    /// attached candidate on an already-marked root is retained on retry.
+    /// This metadata grants no native execution authority.
+    ///
+    /// # Errors
+    /// The exact root or preparation changed, is cancelled or terminal, or
+    /// its receipt cannot be durably acknowledged.
+    pub fn record_launch_attempted(
+        &self,
+        expected: &Receipt,
+        prepare: &Prepare,
+    ) -> Result<Receipt, &'static str> {
+        if expected.revoked
+            || renewal::read_cancellation(self.env, expected)?.is_some()
+            || renewal::read_receipt(self.env, &expected.id).as_ref() != Some(expected)
+            || expected.phase != Phase::Committing
+            || expected.current_attempt.is_some()
+            || expected.successor_pid.is_some()
+            || expected.successor_birth.is_some()
+            || expected.accepted_turn.is_some()
+            || renewal::restart_wire(prepare).is_none()
+            || renewal::active_prepare(self.env, expected).as_ref() != Some(prepare)
+        {
+            return Err("launch-root-changed");
+        }
+        if expected.launch_attempted {
+            self.acknowledge(expected)?;
+            return Ok(expected.clone());
+        }
+        if expected.candidate.is_some() {
+            return Err("launch-unmarked-candidate");
+        }
+        let mut marked = expected.clone();
+        marked.launch_attempted = true;
+        renewal::write_receipt(self.env, &marked)?;
+        Ok(marked)
+    }
+
     /// Recover only the supplied current attempt, then durably publish its
     /// observed result. The native file lock is attempted without waiting; no
     /// host connection, signal, resume, child admission or seal release occurs.
@@ -137,6 +175,114 @@ impl ReceiptWriter<'_> {
         }
         Ok(CompletionProgress::Published(Box::new(target)))
     }
+}
+
+/// The native effects of one root coordinator attempt. Calls happen outside
+/// the account writer. The driver still needs the native host's own admission.
+pub trait RootDriver {
+    fn now_us(&self) -> Option<u64> {
+        crate::harness::native_act::monotonic_us()
+    }
+
+    fn prepare(
+        &self,
+        opts: &upgrade_drive::Opts,
+        sid: &str,
+        prepare: &Prepare,
+    ) -> Result<(), &'static str> {
+        renewal::prepare_restart(opts, sid, prepare)
+    }
+
+    /// False means the owning session can no longer authorize driving.
+    fn before_signal(&self) -> bool;
+
+    fn drive(&self, opts: &upgrade_drive::Opts, sid: &str, prepare: &Prepare) {
+        let _observed = renewal::drive_restart(opts, sid, prepare);
+    }
+}
+
+fn recover_current(
+    env: &crate::harness::cli::Env,
+    expected: &Receipt,
+    prepare: &Prepare,
+    opts: &upgrade_drive::Opts,
+) -> Result<CompletionProgress, &'static str> {
+    let current = renewal::read_receipt(env, &expected.id).ok_or("root-receipt-unavailable")?;
+    if !current.same_intent(expected) || current.current_attempt.is_some() {
+        return Err("root-intent-changed");
+    }
+    renewal::with_receipt_writer(env, |writer| {
+        writer.recover_completion(&current, prepare, opts)
+    })?
+    .ok_or("root-writer-busy")
+}
+
+/// Advance one root attempt, consuming retained completion before considering
+/// its deadline. Raw transport returns never publish a receipt or release a seal.
+///
+/// # Errors
+/// The root changed or local durability cannot be acknowledged. Native failure
+/// leaves its exact retained journal for the next attempt.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "RenewalRootRecovery",
+        action = "NextCase",
+        reason = "The caller, native journal and driver provide each bounded scenario"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "RenewalRootRecovery",
+        action = "Step",
+        project = "aterm_agent::harness::codex_renewal::attempts::completion::tests::root::transition"
+    )
+)]
+pub fn advance_root(
+    env: &crate::harness::cli::Env,
+    expected: &Receipt,
+    prepare: &Prepare,
+    opts: &upgrade_drive::Opts,
+    driver: &impl RootDriver,
+) -> Result<CompletionProgress, &'static str> {
+    if expected.current_attempt.is_some() {
+        return Err("root-is-child");
+    }
+    let progress = renewal::with_receipt_writer(env, |writer| {
+        writer.recover_completion(expected, prepare, opts)
+    })?
+    .ok_or("root-writer-busy")?;
+    if !matches!(
+        progress,
+        CompletionProgress::Absent | CompletionProgress::Active
+    ) || !driver.now_us().is_some_and(|now| now < prepare.deadline_us)
+    {
+        return Ok(progress);
+    }
+    if driver.prepare(opts, &expected.sid, prepare).is_err() {
+        return recover_current(env, expected, prepare, opts);
+    }
+    let progress = recover_current(env, expected, prepare, opts)?;
+    if !matches!(
+        progress,
+        CompletionProgress::Absent | CompletionProgress::Active
+    ) || !driver.now_us().is_some_and(|now| now < prepare.deadline_us)
+    {
+        return Ok(progress);
+    }
+    let latest = renewal::read_receipt(env, &expected.id).ok_or("root-receipt-unavailable")?;
+    if !latest.same_intent(expected) {
+        return Err("root-intent-changed");
+    }
+    renewal::with_receipt_writer(env, |writer| {
+        writer.record_launch_attempted(&latest, prepare)
+    })?
+    .ok_or("root-writer-busy")?;
+    if driver.now_us().is_some_and(|now| now < prepare.deadline_us) && driver.before_signal() {
+        driver.drive(opts, &expected.sid, prepare);
+    }
+    recover_current(env, expected, prepare, opts)
 }
 
 /// `Some(None)` closes a child without retiring its still-pending root.

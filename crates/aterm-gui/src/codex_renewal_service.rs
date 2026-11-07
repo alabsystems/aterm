@@ -530,6 +530,11 @@ fn run_closed(
             pause();
             continue;
         };
+        if !root_allows_native_work(&env, &root, &prepare, opts) {
+            drop(ctx);
+            pause();
+            continue;
+        }
         let Some(now) = aterm_agent::harness::native_act::monotonic_us() else {
             drop(ctx);
             pause();
@@ -584,6 +589,28 @@ fn run_closed(
         drop(ctx);
         pause();
     }
+}
+
+/// A root can finish after its original worker hands off to this service.
+/// Consume that completion before considering any deadline or host operation.
+/// An unreadable, contended or pending journal holds the service in place.
+pub(super) fn root_allows_native_work(
+    env: &Env,
+    root: &Receipt,
+    prepare: &Prepare,
+    opts: &aterm_agent::harness::upgrade_drive::Opts,
+) -> bool {
+    if root.current_attempt.is_some() {
+        return true;
+    }
+    matches!(
+        renewal::with_receipt_writer(env, |writer| {
+            writer.recover_completion(root, prepare, opts)
+        }),
+        Ok(Some(
+            renewal::CompletionProgress::Absent | renewal::CompletionProgress::Active
+        ))
+    )
 }
 
 fn pause() {

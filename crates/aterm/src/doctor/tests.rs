@@ -1772,6 +1772,50 @@ fn base_clt_waits_out_a_first_compile_slower_than_a_status_read() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn base_clt_checks_the_system_selection_despite_a_builds_developer_override() {
+    use atpkg::prereq::{CcHost, CcVerdict};
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = aterm_tempfile::tempdir().unwrap();
+    let shim = root.path().join("shim");
+    let developer = root.path().join("system developer");
+    let clang = developer.join("usr/bin/clang");
+    std::fs::create_dir_all(clang.parent().unwrap()).unwrap();
+    std::fs::write(&clang, "installed compiler").unwrap();
+    std::fs::set_permissions(&clang, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::create_dir_all(&shim).unwrap();
+    for (name, body) in [
+        ("cc", "printf x > \"$2\"\n/bin/chmod +x \"$2\"\n".to_owned()),
+        ("xcrun", format!("printf '%s\\n' '{}'\n", clang.display())),
+    ] {
+        let file = shim.join(name);
+        std::fs::write(&file, format!("#!/bin/sh\n{body}")).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let host = CcHost {
+        shim_dir: Some(shim.clone()),
+        xcode_select_link: root.path().join("no-selection"),
+        default_developer_dir: developer,
+        xcode_developer_dir: None,
+        developer_dir_override: Some(root.path().join("missing build developer")),
+        sdkroot_override: None,
+        deployment_target_override: None,
+        inherit_environment: true,
+        bound: std::time::Duration::from_secs(60),
+        tmp_root: root.path().to_owned(),
+    };
+    let path = Some(shim.as_os_str());
+    assert_eq!(
+        atpkg::prereq::probe_with(path, &host),
+        CcVerdict::NoDeveloperDir
+    );
+    assert_eq!(
+        super::base_clt_probe_on(path, host),
+        CcVerdict::Ready { driver: clang }
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn base_clt_checks_the_installed_sdk_without_a_builds_sdkroot_override() {
     use atpkg::prereq::{CcHost, CcVerdict};
     use std::os::unix::fs::PermissionsExt as _;
@@ -1779,7 +1823,7 @@ fn base_clt_checks_the_installed_sdk_without_a_builds_sdkroot_override() {
     let cc = root.path().join("cc");
     std::fs::write(
         &cc,
-        "#!/bin/sh\n[ \"$1\" = --version ] && { echo cc; exit 0; }\nif [ -n \"$SDKROOT\" ]; then echo 'build SDK unavailable' >&2; exit 1; fi\nprintf x > \"$2\"\n/bin/chmod +x \"$2\"\n",
+        "#!/bin/sh\n[ \"$1\" = --version ] && { echo cc; exit 0; }\nif [ -n \"$SDKROOT\" ]; then echo 'build SDK unavailable' >&2; exit 1; fi\nif [ -n \"$MACOSX_DEPLOYMENT_TARGET\" ]; then echo 'build target unavailable' >&2; exit 1; fi\nprintf x > \"$2\"\n/bin/chmod +x \"$2\"\n",
     ).unwrap();
     std::fs::set_permissions(&cc, std::fs::Permissions::from_mode(0o755)).unwrap();
     let host = CcHost {
@@ -1789,6 +1833,8 @@ fn base_clt_checks_the_installed_sdk_without_a_builds_sdkroot_override() {
         xcode_developer_dir: None,
         developer_dir_override: None,
         sdkroot_override: Some(root.path().join("unavailable-build-sdk")),
+        deployment_target_override: Some("unavailable-build-target".into()),
+        inherit_environment: true,
         bound: std::time::Duration::from_secs(60),
         tmp_root: root.path().to_owned(),
     };
@@ -1796,6 +1842,14 @@ fn base_clt_checks_the_installed_sdk_without_a_builds_sdkroot_override() {
     assert!(matches!(
         atpkg::prereq::probe_with(path, &host),
         CcVerdict::Broken { why, .. } if why == "build SDK unavailable"
+    ));
+    let target_only = CcHost {
+        sdkroot_override: None,
+        ..host.clone()
+    };
+    assert!(matches!(
+        atpkg::prereq::probe_with(path, &target_only),
+        CcVerdict::Broken { why, .. } if why == "build target unavailable"
     ));
     assert_eq!(
         super::base_clt_probe_on(path, host),

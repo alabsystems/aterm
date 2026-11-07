@@ -229,6 +229,14 @@ const RETIRED_CONFIG_KEYS: &[RetiredConfigKeyMetadata] = &[
         feature: "Merged top deck",
         effect_label: "No effect",
     },
+    // aterm's own desktop notices went (2026-11-07): `notify::delivers` had dropped every one
+    // since 2026-11-01, so `desktop_alerts` decided nothing a person saw. A file that still sets
+    // it loads and is told the key does nothing.
+    RetiredConfigKeyMetadata {
+        key: "desktop_alerts",
+        feature: "Desktop alerts",
+        effect_label: "No effect",
+    },
 ];
 
 pub(crate) fn retired_config_key(key: &str) -> Option<&'static RetiredConfigKeyMetadata> {

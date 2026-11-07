@@ -93,7 +93,7 @@ fn custody(paths: &Paths) -> crate::Result<Vec<(PathBuf, [u8; 32])>> {
 
 fn context(paths: &Paths, lock: &StateLock) -> crate::Result<Context> {
     let before = custody(paths)?;
-    let admin = super::enrollment::admin_cached_unlocked(paths)?;
+    let admin = super::enrollment::admin_cached_held(paths, lock)?;
     if !admin.commons_bound {
         return Err(Error::new(
             "Commons recovery requires an already bound authority",

@@ -563,7 +563,27 @@ fn authenticated_probe_is_bounded_and_rejects_loader_identity_and_exit_failures(
         "test \"$1 $2\" = 'update identity' || exit 9\nprintf '%s\\n' '{}'",
         aterm_json::to_string(&good).unwrap()
     ));
-    probe(&script, aterm_spec::wait::MUST_HAPPEN).unwrap();
+    probe(&script, PROBE_HANG).unwrap();
+    probe_candidate_at(
+        &script,
+        &manifest,
+        native().unwrap(),
+        &f.context.dir,
+        PROBE_HANG,
+        Instant::now() - Duration::from_secs(11),
+    )
+    .unwrap();
+    assert!(
+        probe_candidate_at(
+            &script,
+            &manifest,
+            native().unwrap(),
+            &f.context.dir,
+            PROBE_HANG,
+            Instant::now() - Duration::from_secs(61),
+        )
+        .is_err()
+    );
     let mut bad = good;
     bad.build_number += 1;
     let other_identity = format!("printf '%s\\n' '{}'", aterm_json::to_string(&bad).unwrap());
@@ -595,8 +615,11 @@ fn authenticated_probe_is_bounded_and_rejects_loader_identity_and_exit_failures(
     }
     write_script("while :; do :; done");
     probe(&script, Duration::from_millis(50)).expect_err("a probe that never answers");
-    probe(&f.context.dir.join("candidate"), Duration::from_secs(1))
-        .expect_err("synthetic signed-header ELF cannot satisfy the real loader probe");
+    probe(
+        &f.context.dir.join("candidate"),
+        aterm_spec::wait::MUST_HAPPEN,
+    )
+    .expect_err("synthetic signed-header ELF cannot satisfy the real loader probe");
     assert!(fs::read_dir(&f.context.dir).unwrap().all(|entry| {
         !entry
             .unwrap()

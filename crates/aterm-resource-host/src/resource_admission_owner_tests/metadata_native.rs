@@ -435,6 +435,7 @@ fn host() {
     let mut last_progress = (capture_progress(&world.scratch.path), Instant::now());
     let mut member_seen = false;
     let mut sdk_seen = false;
+    let mut sdk_loaded_checked = false;
     let mut root_pid = None;
     let mut released = false;
     let mut controls = Vec::new();
@@ -478,8 +479,20 @@ fn host() {
                 assert_eq!(world.owner.debt.reserved().unwrap(), 1);
                 assert!(job.metadata_sdk.is_some());
             }
-            if job.metadata_sdk.is_some() {
+            if let Some(sdk) = &job.metadata_sdk {
                 sdk_seen = true;
+                if job.metadata_ready && !sdk_loaded_checked {
+                    let checked = sdk.validate_loaded_at(
+                        root_pid.unwrap(),
+                        Instant::now() - Duration::from_secs(3),
+                    );
+                    assert!(checked.is_ok(), "original loaded SDK: {checked:?}");
+                    assert!(
+                        sdk.validate_loaded_at(root_pid.unwrap(), Instant::now() - HANG)
+                            .is_err()
+                    );
+                    sdk_loaded_checked = true;
+                }
                 assert!(matches!(
                     atpkg::lease::holders(
                         &layout.prefix,
@@ -673,6 +686,9 @@ fn host() {
     );
     assert_eq!(root_pid, Some(pid));
     assert!(member_seen && sdk_seen && (released || genuine));
+    if mode == "normal" {
+        assert!(sdk_loaded_checked);
+    }
     assert!(
         !world
             .scratch

@@ -60,9 +60,9 @@ fn unit(stop: bool) -> FooterFacts {
     let ten = bar();
     let verdict = if stop {
         VerdictWords {
-            full: "\u{29d7} stop ~Wed 22:30\u{2013}Thu 09:00".into(),
-            short: "\u{29d7} stop ~Wed 22:30".into(),
-            shortest: Some("\u{29d7} ~Wed 22:30".into()),
+            full: "\u{2573} ~Wed 22:00\u{2013}Thu 09:00".into(),
+            short: "\u{2573} ~Wed 22:00".into(),
+            shortest: Some("\u{2573} ~Wed 22:00".into()),
             warn: true,
             kept_narrow: true,
         }
@@ -115,8 +115,8 @@ fn card_rows() -> Vec<MenuRow> {
     vec![
         MenuRow::plot(plot, "me: 58% used, about 78% by its reset"),
         MenuRow::Note {
-            text: "\u{29d7} stop ~Wed 22:30\u{2013}Thu 09:00".into(),
-            spoken: "Stop from about Wednesday 22:30 to Thursday 09:00.".into(),
+            text: "\u{2573}  Stop ~Wed 22:00 \u{2013} Thu 09:00 (11h): every account out".into(),
+            spoken: "A stop is expected from about Wednesday 22:00 to Thursday 09:00, when every account is out.".into(),
             tone: NoteTone::Warn,
         },
     ]
@@ -138,9 +138,10 @@ fn rule_greys(blank: RenderCell) -> [RenderCell; 3] {
 /// under Cruise and Land the meter keeps the glass's vivid law
 /// ([`aterm_effects::glass_inks::day_vivid`]: OKLCh C 0.12, or nearly the most sRGB holds at its
 /// hue and lightness where that is less); the bar never takes the warn ink, and wherever
-/// the warn ink is used its words lead with `⧗` (a stop is said, not coloured). The system
-/// accent reads nowhere on the rule (`lines_b_d_and_e_ignore_the_system_accent`). Negative
-/// control: the dashes mixed toward the ground (`mix(meter, bg, 0.4)`) wash out on Day.
+/// the warn ink is used its words lead with `╳`, a projected stop's mark (a stop is said, not
+/// coloured). The system accent reads nowhere on the rule
+/// (`lines_b_d_and_e_ignore_the_system_accent`). Negative control: the dashes mixed toward the
+/// ground (`mix(meter, bg, 0.4)`) wash out on Day.
 #[test]
 fn the_outlooks_inks_read_on_every_ground_and_day_stays_vivid() {
     use aterm_effects::harness_card::CardPalette;
@@ -220,8 +221,9 @@ fn the_outlooks_inks_read_on_every_ground_and_day_stays_vivid() {
                     }
                     assert_eq!(bar_cells, 10, "{what}: the bar is drawn");
                     if stop {
+                        // `said` holds the warn ink's glyphs, its blanks not among them.
                         assert!(
-                            said.starts_with('\u{29d7}') && said.contains("stop"),
+                            said.starts_with('\u{2573}') && said.contains("~Wed22:00"),
                             "{what}: the warn ink says the stop in words: {said:?}"
                         );
                     } else {
@@ -302,7 +304,7 @@ fn the_cards_outlook_inks_read_on_every_ground_and_day_stays_vivid() {
                 checked += 1;
             }
             let note: String = painted[2].iter().map(|c| c.ch).collect();
-            assert!(note.contains("\u{29d7} stop"), "{what}: {note:?}");
+            assert!(note.contains("\u{2573}  Stop ~Wed"), "{what}: {note:?}");
             for cell in painted[2]
                 .iter()
                 .filter(|c| c.ch != ' ' && c.ch != '\u{2502}')

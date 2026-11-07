@@ -1347,13 +1347,13 @@ fn a_glance_at_rest_costs_nothing_and_a_moved_bar_composes_once() {
     let mut stop = outlook_unit(6);
     if let Some(glance) = stop.glance.as_mut() {
         glance.verdict = Some(aterm_agent::harness::outlook::VerdictWords {
-            full: "\u{29d7} stop ~Wed 22:30\u{2013}Thu 09:00".into(),
-            short: "\u{29d7} stop ~Wed 22:30".into(),
-            shortest: Some("\u{29d7} ~Wed 22:30".into()),
+            full: "\u{2573} ~Wed 22:00\u{2013}Thu 09:00".into(),
+            short: "\u{2573} ~Wed 22:00".into(),
+            shortest: Some("\u{2573} ~Wed 22:00".into()),
             warn: true,
             kept_narrow: true,
         });
-        glance.title_verdict = Some("stop ~Wed 22:30".into());
+        glance.title_verdict = Some("stop ~Wed 22:00\u{2013}Thu 09:00".into());
     }
     publish(&app, session, stop);
     let told = cost(&mut app, wid);
@@ -1364,7 +1364,7 @@ fn a_glance_at_rest_costs_nothing_and_a_moved_bar_composes_once() {
     );
     let stopped = glass_row(&app, wid, rule);
     assert!(
-        stopped.contains('\u{29d7}') && stopped.contains("40% left"),
+        stopped.contains("\u{2573} ~Wed 22:00") && stopped.contains("40% left"),
         "the stop is on the glass beside the same figure: {stopped:?}"
     );
     for i in 0..30 {

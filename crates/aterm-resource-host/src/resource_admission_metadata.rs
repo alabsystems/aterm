@@ -273,9 +273,10 @@ impl member::MemberResources for Resources {
         if let Some(inputs) = &mut self.inputs {
             let held = &inputs.held;
             inputs.prelude.poll(child, |pid| {
-                held.validate_loaded(
+                native_inputs::validate_loaded(
+                    held,
                     trust_resource_provenance::process::read_identity(pid)?,
-                    Instant::now() + Duration::from_secs(2),
+                    Instant::now(),
                 )
             })
         } else {
@@ -286,18 +287,13 @@ impl member::MemberResources for Resources {
         self.scheduling.bind_child(pid)?;
         if let Some(inputs) = &self.inputs {
             let child = trust_resource_provenance::process::read_identity(pid)?;
-            inputs
-                .held
-                .validate_loaded(child, Instant::now() + Duration::from_secs(2))?;
+            native_inputs::validate_loaded(&inputs.held, child, Instant::now())?;
         }
         Ok(())
     }
     fn finish_inputs(&mut self) -> Option<Result<(), String>> {
         self.inputs.as_ref().map(|inputs| {
-            inputs
-                .held
-                .validate(Instant::now() + Duration::from_secs(2))
-                .map_err(|error| error.to_string())
+            native_inputs::validate(&inputs.held, Instant::now()).map_err(|error| error.to_string())
         })
     }
 }

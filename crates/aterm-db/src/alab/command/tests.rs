@@ -1922,6 +1922,83 @@ pub(super) fn replica_fixture(paths: &Paths, n: usize, status: &str) -> PathBuf 
     dir
 }
 
+/// A cell a guard refuses keeps a real replica uncovered, listed by its column and never its text,
+/// until a write to the replica settles it.
+/// NEGATIVE CONTROL: with `Planner::refused` keeping only the coordinate, the replica is recorded
+/// covered: `` left: Bool(true) right: Bool(false) ``.
+#[test]
+fn a_refused_cell_keeps_a_replica_uncovered_until_it_is_settled() {
+    let lab = Lab::new(&[Role::Writer]);
+    let paths = &lab.paths[0];
+    let dir = replica_fixture(paths, 1, "active");
+    let put = |chip: &str| {
+        let row = json!({"label": "m3", "chip": chip, "status": "active"});
+        let mut db = crate::fleet_db::open_at(&dir).unwrap();
+        crate::fleet_db::put_row(&mut db, "computers", "m3", row).unwrap();
+    };
+    let chip = "Apple M4 Max 16-core CPU 40-core GPU";
+    put(chip);
+    let mut never = |_: &Path| -> Result<()> { panic!("no review") };
+    let mut go = |list: &[&str]| run(paths, &words(list), Some(&Stand), &mut never, NOW);
+    let import = ["import", "--fleet-db", "--authoritative", "--apply"];
+    let first = go(&import).unwrap();
+    assert_eq!(first["replica"]["covered"], json!(false), "{first}");
+    assert_eq!(first["replica"]["uncovered"], json!(1), "{first}");
+    let cell = &first["replica"]["cells"][0];
+    assert_eq!(
+        (&cell["why"], &cell["column"]),
+        (&json!("unmapped"), &json!("chip")),
+        "{first}"
+    );
+    assert!(
+        !aterm_json::to_string(&first).unwrap().contains(chip),
+        "{first}"
+    );
+    put("M4 Max");
+    let settled = go(&import).unwrap();
+    assert_eq!(settled["replica"]["covered"], json!(true), "{settled}");
+}
+
+/// A replica read fill-only beside sheets that state the same values is covered from the first run
+/// and stays so: the dump's table goes unused and is owed only a source row, which is no cell of the
+/// replica. What the replica says differently still leaves it uncovered.
+/// NEGATIVE CONTROL: with `covered::judge` calling any row owed: `` left: Bool(false) right:
+/// Bool(true) ``.
+#[test]
+fn a_replica_beside_its_sheets_reads_as_covered() {
+    let lab = Lab::new(&[Role::Writer]);
+    let paths = &lab.paths[0];
+    let dir = replica_fixture(paths, 0, "active");
+    let number = "415-555-0101";
+    let put = |carrier: &str| {
+        let row = json!({
+            "phone": number, "label": "phone-1", "owner_carrier": carrier, "status": "active",
+        });
+        let mut db = crate::fleet_db::open_at(&dir).unwrap();
+        crate::fleet_db::put_row(&mut db, "phones", number, row).unwrap();
+    };
+    put("Acme");
+    let secrets = paths.home.join(".secrets");
+    std::fs::create_dir_all(&secrets).unwrap();
+    std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let sheet = format!("phone,carrier\n{number},Acme\n");
+    aterm_uds::private_file::write_private(&secrets, "alab-phones.csv", sheet.as_bytes()).unwrap();
+    let mut never = |_: &Path| -> Result<()> { panic!("no review") };
+    let mut go = |list: &[&str]| run(paths, &words(list), Some(&Stand), &mut never, NOW);
+    let import = ["import", "--fleet-db", "--fill-only", "--apply"];
+    for round in 1..=3 {
+        let report = go(&import).unwrap();
+        assert_eq!(
+            report["replica"]["covered"],
+            json!(true),
+            "{round}: {report}"
+        );
+    }
+    put("Other");
+    let report = go(&import).unwrap();
+    assert_eq!(report["replica"]["covered"], json!(false), "{report}");
+}
+
 /// `import --fleet-db` on a real lab reads this Mac's replica in place: its mode must be named, a
 /// Mac with no replica is refused and none is made, and an authoritative import of 39 passwords
 /// lands as 39 `Secret` cells sealed by this Mac's registry key, which open there to each row's
@@ -2492,6 +2569,7 @@ fn fleet_db_writes_refuse_once_the_replica_is_covered_and_work_before() {
         digest: None,
         epoch: None,
         at_ms: NOW,
+        sources: std::collections::BTreeSet::new(),
     };
     covered::write(&dir, &uncovered, &[]).unwrap();
     assert!(fleet(&["delete", "emails", &email]).unwrap().is_some());
@@ -2783,4 +2861,156 @@ fn a_sheet_path_names_a_workbook_tab() {
         workbook(Path::new("/x/book.xlsx#"), SheetKind::Emails),
         None
     );
+}
+
+/// A replica edited since its import reports what it no longer says, through the real import, by
+/// the source keys its record names, and keeps it: a link, a phone, a note, a service, a machine's
+/// alias and a preference the edit removed stay, and the replica stays uncovered, so the import
+/// licenses no deletion of it until the owner settles each one.
+/// NEGATIVE CONTROL: with `record_coverage` recording no sources, the second import reads covered
+/// over the old link: `` left: Bool(true) right: Bool(false) ``.
+#[test]
+fn an_edited_replica_reports_what_it_no_longer_says() {
+    let lab = Lab::new(&[Role::Writer]);
+    let paths = &lab.paths[0];
+    let dir = replica_fixture(paths, 0, "active");
+    let put = |table: &str, key: &str, row: Value| {
+        let mut db = crate::fleet_db::open_at(&dir).unwrap();
+        crate::fleet_db::put_row(&mut db, table, key, row).unwrap();
+    };
+    let aliased = "box01@proton.example";
+    let root = "box02@proton.example";
+    let gone = "box04@proton.example";
+    let seat = "codex:box03@proton.example";
+    put(
+        "computers",
+        "m3",
+        json!({"label": "m3", "status": "active", "aliases": "m4"}),
+    );
+    put(
+        "computers",
+        "m5",
+        json!({"label": "m5", "status": "active", "notes": "first words"}),
+    );
+    let (_, root_row) = email_row(2, "active");
+    put("emails", root, root_row);
+    put(
+        "emails",
+        aliased,
+        json!({
+            "email": aliased, "provider": "proton", "account_type": "alias", "root_account": root,
+            "password": null, "status": "active", "phone": "415-555-0101", "protected": false,
+            "assigned_computers": [], "services": [], "notes": "old note words",
+        }),
+    );
+    let (_, gone_row) = email_row(4, "active");
+    put("emails", gone, gone_row);
+    let account = |service: &str, machines: Value, notes: Value| {
+        json!({
+            "id": seat, "provider": "openai", "service": service,
+            "email": "box03@proton.example", "receiving_mailbox": "box03@proton.example",
+            "assigned_computers": machines, "tier": "1", "status": "active", "notes": notes,
+        })
+    };
+    let (_, seat_row) = email_row(3, "active");
+    put("emails", "box03@proton.example", seat_row);
+    put(
+        "ai_accounts",
+        seat,
+        account("codex", json!(["m3", "m5"]), json!("seat note")),
+    );
+
+    let mut never = |_: &Path| -> Result<()> { panic!("no review") };
+    let mut go = |list: &[&str]| run(paths, &words(list), Some(&Stand), &mut never, NOW);
+    let import = [
+        "import",
+        "--fleet-db",
+        "--authoritative",
+        "--apply",
+        "--findings",
+    ];
+    let first = go(&import).unwrap();
+    let handle = Handle::at(paths.clone(), &att::REGISTRY);
+    let login = keys::address_pk(aliased).unwrap();
+    let cell = |collection: &crate::typed::Collection, pk: &str, column: &str| {
+        handle
+            .view_sealed(|view, _| {
+                Ok(view
+                    .project(collection)
+                    .rows
+                    .get(pk)
+                    .and_then(|row| row.get(column))
+                    .cloned()
+                    .unwrap_or(Value::Null))
+            })
+            .unwrap()
+    };
+    assert_ne!(
+        cell(&registry::ADDRESS, &login, "alias_of"),
+        Value::Null,
+        "{first}"
+    );
+    assert_ne!(
+        cell(&registry::ADDRESS, &login, "phone"),
+        Value::Null,
+        "{first}"
+    );
+
+    put(
+        "computers",
+        "m3",
+        json!({"label": "m3", "status": "active"}),
+    );
+    put(
+        "emails",
+        aliased,
+        json!({
+            "email": aliased, "provider": "proton", "account_type": "root", "root_account": aliased,
+            "password": null, "status": "active", "phone": null, "protected": false,
+            "assigned_computers": [], "services": [], "notes": null,
+        }),
+    );
+    put(
+        "ai_accounts",
+        seat,
+        account("chatgpt", json!(["m5"]), Value::Null),
+    );
+    {
+        let mut db = crate::fleet_db::open_at(&dir).unwrap();
+        crate::fleet_db::delete_row(&mut db, "emails", gone).unwrap();
+    }
+    let second = go(&import).unwrap();
+    assert_eq!(second["replica"]["covered"], json!(false), "{second}");
+    assert_eq!(second["findings"]["no-longer-listed"], json!(1), "{second}");
+    for column in ["alias_of", "mailbox", "phone", "note"] {
+        assert_ne!(
+            cell(&registry::ADDRESS, &login, column),
+            Value::Null,
+            "{column}"
+        );
+    }
+    let account_pk = keys::account_pk("codex", "box03@proton.example").unwrap();
+    assert_eq!(cell(&ACCOUNT, &account_pk, "note"), json!("seat note"));
+    let member = |collection: &crate::typed::Collection, pk: &str, column: &str, element: &str| {
+        handle
+            .view_sealed(|view, _| {
+                Ok(view
+                    .project(collection)
+                    .rows
+                    .get(pk)
+                    .and_then(|row| row.fields.get(column))
+                    .is_some_and(|field| field.has_member(element)))
+            })
+            .unwrap()
+    };
+    assert!(member(&ACCOUNT, &account_pk, "services", "chatgpt"));
+    assert!(member(&ACCOUNT, &account_pk, "services", "codex"));
+    let m3 = keys::planned_machine_pk("m3", |_| false).unwrap();
+    assert!(member(&MACHINE, &m3, "aliases", "m4"));
+    let preference = keys::preference_pk(&m3, &account_pk).unwrap();
+    assert_eq!(cell(&PREFERENCE, &preference, "row"), json!("live"));
+
+    let third = go(&import).unwrap();
+    assert_eq!(third["written"], json!(0), "{third}");
+    assert_eq!(third["replica"]["covered"], json!(false), "{third}");
 }

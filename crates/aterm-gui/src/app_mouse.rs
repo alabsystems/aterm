@@ -5243,6 +5243,10 @@ impl App {
                 .get(&wid)
                 .map_or((0.0, 0.0), |ws| ws.last_cursor_px);
             if self.glass_swallows_at(wid, px, py) {
+                if self.inline_rename_edit(wid).is_some() {
+                    self.clear_strip_press(wid);
+                    self.settle_rename_edit(wid);
+                }
                 return None;
             }
             // Every button on the glass is the glass's (the harness label's included, which
@@ -5251,6 +5255,10 @@ impl App {
                 .claude_glass_at(wid, px, py)
                 .is_some_and(|(_, at)| !matches!(at, crate::claude_lights::GlassAt::Mark))
             {
+                if self.inline_rename_edit(wid).is_some() {
+                    self.clear_strip_press(wid);
+                    self.settle_rename_edit(wid);
+                }
                 #[cfg(windows)]
                 if button == WinitMouseButton::Right
                     && let Some(ws) = self.windows.get_mut(&wid)

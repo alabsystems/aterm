@@ -575,6 +575,27 @@ fn lines_of<'a>(rows: Option<&'a str>, lines: Option<&'a str>) -> Option<&'a str
         .or(rows)
 }
 
+/// THE WORDS OF A TURN THE NEEDS FOLD AND THE GO-AHEAD'S PARK BOTH READ, `(before, tail)`: its
+/// earlier messages and its last as drawn (`said`, `(tail, before)`), each read as its measured
+/// lines (`lines`, the same pair with each line the program wrapped read as one) where they hold
+/// the same words ([`lines_of`]), the earlier messages told apart by `breaks` in the text read. A
+/// point reads its turn so ([`TurnEndReading::needs_said`]) and a break of the agent's background
+/// work alike, so every line the go-ahead answers is a line the fold stands, never a row of one:
+/// the menu bar matches lines exactly ([`Needs::less`]), and a line the go-ahead answers never
+/// goes up (DESIGN-harness-autopilot §15.6).
+#[must_use]
+pub(crate) fn needs_words<'a>(
+    (tail, before): (Option<&'a str>, Option<&'a str>),
+    (tail_lines, before_lines): (Option<&'a str>, Option<&'a str>),
+    breaks: &'a needs::Breaks,
+) -> (Option<needs::Before<'a>>, Option<&'a str>) {
+    let before = match before_lines.filter(|l| said_letters(Some(l)) == said_letters(before)) {
+        Some(lines) => Some(needs::Before::new(lines, &breaks.lines)),
+        None => before.map(|t| needs::Before::new(t, &breaks.said)),
+    };
+    (before, lines_of(tail, tail_lines))
+}
+
 /// THE MARK OF A SCREEN'S LETTERS ([`TurnEndReading::screen_mark`]).
 #[must_use]
 pub fn screen_mark(rows: &[String]) -> u64 {
@@ -11860,15 +11881,20 @@ impl TurnEndReading {
             .map(|t| needs::Before::new(t, &self.turn_breaks.said))
     }
 
-    /// The turn's earlier messages as the needs fold reads them: [`Self::turn_lines`] where it
-    /// holds the same words as [`Self::turn_said`] ([`lines_of`]), else [`Self::before`].
-    fn lines_before(&self) -> Option<needs::Before<'_>> {
-        match (self.turn_said.as_deref(), self.turn_lines.as_deref()) {
-            (said, Some(lines)) if lines_of(said, Some(lines)) == Some(lines) => {
-                Some(needs::Before::new(lines, &self.turn_breaks.lines))
-            }
-            _ => self.before(),
-        }
+    /// THE WORDS OF THE TURN THE NEEDS FOLD READS ([`TurnEndState::observe`]), `(before, tail)`:
+    /// its earlier messages ([`Self::turn_lines`] where they hold the same words as
+    /// [`Self::turn_said`], else [`Self::before`]) and its last ([`Self::said_lines`] where they
+    /// hold the same words as [`Self::said_tail`], else the tail), each line the program wrapped
+    /// read as one ([`needs_words`]). The go-ahead's park reads these words too
+    /// ([`Self::go_ahead_past`]), so every line it answers is a line the fold stands, never a row
+    /// of one (DESIGN-harness-autopilot §15.6).
+    #[must_use]
+    pub fn needs_said(&self) -> (Option<needs::Before<'_>>, Option<&str>) {
+        needs_words(
+            (self.said_tail.as_deref(), self.turn_said.as_deref()),
+            (self.said_lines.as_deref(), self.turn_lines.as_deref()),
+            &self.turn_breaks,
+        )
     }
 
     /// WHETHER A NEED THE TURN NAMED STANDS: the reply's own, or one its earlier messages named
@@ -11883,8 +11909,8 @@ impl TurnEndReading {
     }
 
     /// THE GO-AHEAD THE REPLY PARKS ON ([`go_ahead::parked`]): the turn's earlier messages and its
-    /// last, a need the turn's last word retracted cut ([`needs::retracted_cut`]); `None` where the
-    /// turn was interrupted.
+    /// last, as the needs fold reads them ([`Self::needs_said`]), a need the turn's last word
+    /// retracted cut ([`needs::retracted_cut`]); `None` where the turn was interrupted.
     #[must_use]
     pub fn go_ahead(&self) -> Option<go_ahead::Park> {
         self.go_ahead_past(None)
@@ -11896,11 +11922,8 @@ impl TurnEndReading {
         if self.interrupted {
             return None;
         }
-        turn_go_ahead(
-            self.before(),
-            self.said_tail.as_deref().unwrap_or_default(),
-            act,
-        )
+        let (before, tail) = self.needs_said();
+        turn_go_ahead(before, tail.unwrap_or_default(), act)
     }
 
     /// Reads one screen.
@@ -16463,7 +16486,8 @@ impl TurnEndState {
     /// it ([`Self::key_hour_ends`]: a key a point observed, or the reading's own, which the
     /// decision's `status` read can find first; the replies may agree to or restate their hold),
     /// nor where the ask names an irreversible act ([`REVERSIBLE_ANSWER`] answers that) other
-    /// than the agent's own cleanup on a need's wrapped rows ([`go_ahead_answers`]).
+    /// than the agent's own cleanup on a need's wrapped rows ([`go_ahead_answers`]), read in the
+    /// rows as drawn and in the words the park read ([`go_ahead_answers_on`]).
     #[must_use]
     pub fn go_ahead_owed(&self, reading: &TurnEndReading, now: Instant) -> Option<go_ahead::Park> {
         self.owed_unless(reading, self.key_hour_ends(reading, now).is_some())
@@ -16499,12 +16523,15 @@ impl TurnEndState {
         let park = reading.go_ahead_past(act)?;
         let unlanded =
             reading.autopilot == Autopilot::Cruise || reading.repo.found().is_some() || park.lands;
-        (unlanded && go_ahead_answers(reading.said_tail.as_deref())).then_some(park)
+        // The guard reads the report as drawn and as the park read it ([`go_ahead_answers_on`]).
+        let guarded = go_ahead_answers_on(reading.said_tail.as_deref(), reading.needs_said().1);
+        (unlanded && guarded).then_some(park)
     }
 
     /// THE GO-AHEAD A BREAK OF THE AGENT'S BACKGROUND WORK PARKS ON: the break's turn read as a
     /// turn end reads it ([`TurnEndReading::go_ahead_past`]), `turn_said` its earlier messages
-    /// and `tail` its last, past the act the turn opens with where `opens_cut`. So a plan in an
+    /// and `tail` its last, in the words the break's needs fold read ([`Self::fold_break_needs`],
+    /// [`needs_words`]), past the act the turn opens with where `opens_cut`. So a plan in an
     /// earlier message (`delete the release tags, then push`) parks nothing at a break either.
     #[must_use]
     pub fn go_ahead_at_break(
@@ -18834,12 +18861,10 @@ impl TurnEndState {
                 // A TURN A WALL CUT ONLY ADDS ([`Needs::join`]): the resume the wall gets opens
                 // a turn of its own, whose point reads none of these words again, so its needs go
                 // up here, and its report, which would have named every need again, never came.
-                self.fold_turn_needs(
-                    reading.lines_before(),
-                    lines_of(tail, reading.said_lines.as_deref()),
-                    act.as_deref(),
-                    walled,
-                );
+                // A screen's rows are read as the lines they wrap: the words the go-ahead's park
+                // reads too ([`TurnEndReading::needs_said`]).
+                let (before, said) = reading.needs_said();
+                self.fold_turn_needs(before, said, act.as_deref(), walled);
                 // THE GO-AHEAD'S COUNT ([`GoAheads`]) stands while the replies park, on any word,
                 // and no new key of the person's came.
                 if !walled {
@@ -20670,6 +20695,16 @@ pub(crate) fn go_ahead_answers(tail: Option<&str>) -> bool {
         }
     }
     tidied && !irreversible_ask(Some(&rows.join("\n")))
+}
+
+/// THE IRREVERSIBLE GUARD OVER A PARK READ OFF THE NEEDS FOLD'S WORDS: [`go_ahead_answers`] on the
+/// report as the screen draws it, `rows`, as the guard always read it, and on the report as the
+/// park reads it, `said` (the screen's measured lines where they hold its words:
+/// [`needs_words`]), where the two differ. The go-ahead goes only where both let it, so reading
+/// the park off whole lines never lets through an ask the guard reads in the rows.
+#[must_use]
+pub(crate) fn go_ahead_answers_on(rows: Option<&str>, said: Option<&str>) -> bool {
+    go_ahead_answers(rows) && (said == rows || go_ahead_answers(said))
 }
 
 /// Judges the worker's last words ([`Said`]).

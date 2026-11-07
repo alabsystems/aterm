@@ -14921,6 +14921,8 @@ fn the_seed_reads_the_command_line_tools_without_running_anything() {
         xcode_developer_dir: None,
         developer_dir_override: None,
         sdkroot_override: None,
+        deployment_target_override: None,
+        inherit_environment: true,
         bound: std::time::Duration::from_secs(60),
         tmp_root: root.to_path_buf(),
     };
@@ -14996,6 +14998,8 @@ fn clt_install_aliases_are_recognized_by_atpkg_install() {
             xcode_developer_dir: None,
             developer_dir_override: None,
             sdkroot_override: None,
+            deployment_target_override: None,
+            inherit_environment: true,
             bound: std::time::Duration::from_secs(60),
             tmp_root: root.to_path_buf(),
         };

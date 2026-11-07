@@ -27,6 +27,24 @@ pub(crate) fn elf_fixture() -> Vec<u8> {
     bytes
 }
 
+/// Runs the executable fixture just written at `path` once, its output discarded, until Linux
+/// stops refusing its exec as busy (`ETXTBSY`): a child another test thread forked while the file
+/// was open for writing holds that descriptor until its own `exec`, and a script that later execs
+/// `path` (a twin, a shim) has no retry of its own. Once one exec has passed, nothing holds the
+/// unchanged file open for writing, so every later exec of it passes too. Only for a fixture
+/// whose run does nothing but print.
+#[cfg(unix)]
+pub(crate) fn settled(path: &Path) {
+    aterm_spec::wait::past_text_busy(|| {
+        aterm_uds::spawnfd::command(path)
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null())
+            .status()
+    })
+    .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+}
+
 /// A scratch directory: dereferences to its path, removed on drop.
 #[derive(Debug)]
 pub(crate) struct Dir {

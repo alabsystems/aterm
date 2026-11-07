@@ -2737,6 +2737,7 @@ mod sh_shim_tests {
             )
             .unwrap();
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::testdir::settled(path);
         };
         let target = root.join("store-build");
         script(&target, "V");
@@ -2820,6 +2821,7 @@ mod sh_shim_tests {
             std::fs::write(&alab_bin, sh_shim_content(to)).unwrap();
             std::fs::set_permissions(&alab_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
             assert_eq!(resolve_shim(&alab_bin).as_deref(), Some(to));
+            crate::testdir::settled(&alab_bin);
         };
         lay_shim(&build_exe);
         let handed = run(&argv, false);
@@ -2844,6 +2846,7 @@ mod sh_shim_tests {
             "atpkg: grok-alab was yanked/revoked — run `aterm pkg update`",
         )
         .unwrap();
+        crate::testdir::settled(&alab_bin);
         assert!(
             resolve_shim(&alab_bin).is_none(),
             "a tombstone execs nothing"

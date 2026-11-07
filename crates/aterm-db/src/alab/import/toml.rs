@@ -396,6 +396,7 @@ pub fn mailbox_sheet(name: &str, bytes: &[u8]) -> Result<Sheet> {
         mode: Mode::FillOnly,
         secrets,
         conflicted: BTreeSet::new(),
+        earlier: BTreeSet::new(),
     })
 }
 
@@ -515,6 +516,28 @@ impl Planner<'_> {
                 }
                 continue;
             };
+            // A protected login holds no mailbox: each field it gives is refused by name, its login
+            // too, which alone says a mailbox signs in as it.
+            if let Some(login_pk) = self.address(&login, kind, &login_at)
+                && self.guarded(&login_pk)
+            {
+                for spellings in given.values() {
+                    for given in spellings {
+                        let column = sheet.headers[given.col].clone();
+                        self.toml_finding(
+                            Kind::ProtectedSecret,
+                            ADDRESS.name,
+                            Some(&login_pk),
+                            &column,
+                            vec![given.at.clone()],
+                        );
+                    }
+                }
+                for (header, at) in unknown {
+                    self.toml_finding(Kind::Unmapped, MAILBOX.name, None, &header, vec![at]);
+                }
+                continue;
+            }
             // The row the login names, and its mailbox: none where several rows say the login.
             let (Some(mb), Some(login_pk)) = (
                 self.mailbox(&login, kind, &login_at)?,

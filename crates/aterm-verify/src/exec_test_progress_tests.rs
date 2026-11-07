@@ -28,6 +28,43 @@ fn passed(name: &str, stdout: &str) -> String {
 
 const PLAIN: &str = "\nthread 'x' panicked at src/a.rs:1:1:\nassertion failed\n";
 
+#[test]
+fn a_long_running_case_is_reported_once_without_deciding_or_ending_it() {
+    let timeout = |name| {
+        format!(
+            "{}\n",
+            aterm_json::json!({"type": "test", "event": "timeout", "name": name})
+        )
+    };
+    assert_eq!(
+        table(
+            true,
+            &[
+                timeout("orphan"),
+                started("slow"),
+                timeout("slow"),
+                timeout("slow"),
+                passed("slow", ""),
+                timeout("slow"),
+                started("red"),
+                failed("red", PLAIN),
+            ]
+        ),
+        [
+            vec![],
+            vec![],
+            vec![Seen::RunningLong {
+                case: "slow".into()
+            }],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![red("red")],
+        ]
+    );
+}
+
 fn refused() -> String {
     format!("\nthread 'x' panicked at src/a.rs:1:1:\n{COULD_NOT_RUN_SENTINEL} — no fish\n")
 }

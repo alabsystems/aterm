@@ -146,10 +146,12 @@ admin (a machine in [admins]):
   aterm secrets commons restore          inspect a recovery plan for the existing published root;
         [--expect <plan-digest>]          with its exact digest, restore control access for eligible
                                          existing members, preserving history and explicit denials
-  aterm secrets genesis <file>           ALab's admin, once, with a released aterm: sign
-                                         Genesis v2 (every [machines] key, with its Commons
-                                         binding where Commons holds one) into a new <file>;
-                                         prints only its digest and member count
+  aterm secrets genesis <file>           an admin signs Genesis v2 into a new <file>, seeds its
+                                         membership records and encrypted entries, and attempts sync;
+                                         every [machines] key, with its current Commons binding.
+                                         An explicit private URL uses its pinned signer; ALab,
+                                         its default URLs and lineage need a released aterm.
+                                         Prints only its digest and member count
 server and services:
   aterm secrets serve [--listen <addr:port>] [--advertise <name> | --no-advertise]
         [--pin <vault>=<key>] [--store <dir>] [--hold <1-60 secs>] [--no-keep-awake]
@@ -1802,7 +1804,7 @@ mod unix {
                 Ok(ExitCode::SUCCESS)
             }
             Command::Genesis(file) => {
-                let done = client::admin_sign_genesis(&paths, Path::new(&file))?;
+                let done = client::configured_genesis(&paths, Path::new(&file))?;
                 println!(
                     "Genesis v2 digest {}, {} members",
                     aterm_codec::hex::encode_lower(&done.digest),

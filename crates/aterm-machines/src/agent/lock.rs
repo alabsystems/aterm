@@ -10,7 +10,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 /// How long the session may take to read locked once loginwindow took the request.
-pub const LOCK_HANG: Duration = Duration::from_secs(10);
+pub const LOCK_HANG: Duration = Duration::from_secs(60);
 
 /// The pause between two readings.
 const READ_PAUSE: Duration = Duration::from_millis(250);
@@ -46,6 +46,15 @@ pub fn session_locked(xml: &[u8], uid: u32) -> Result<bool, String> {
 
 /// `aterm machines agent lock-screen` ([`System::lock_screen`], [`ioreg_root_cmd`]).
 pub fn lock_screen(sys: &dyn System, out: &mut dyn Write, hang: Duration) -> ExitCode {
+    lock_screen_with_start(sys, out, hang, Instant::now)
+}
+
+fn lock_screen_with_start(
+    sys: &dyn System,
+    out: &mut dyn Write,
+    hang: Duration,
+    started: impl FnOnce() -> Instant,
+) -> ExitCode {
     let mut done = |line: String, code: ExitCode| {
         let _ = writeln!(out, "{line}");
         let _ = out.flush();
@@ -55,7 +64,7 @@ pub fn lock_screen(sys: &dyn System, out: &mut dyn Write, hang: Duration) -> Exi
         return done(format!("not locked: {why}"), ExitCode::FAILURE);
     }
     let uid = sys.euid();
-    let start = Instant::now();
+    let start = started();
     loop {
         let last = match sys.run_complete_stdout(&ioreg_root_cmd()) {
             Ok(ran) if ran.success() => match session_locked(&ran.stdout, uid) {
@@ -149,6 +158,41 @@ mod tests {
         );
         assert_eq!(code, ExitCode::FAILURE);
         assert_eq!(fake.calls(), ["lock-screen"]);
+    }
+
+    #[test]
+    fn a_scheduled_console_read_can_follow_an_unlocked_reading() {
+        let fake = admin_fake();
+        fake.on(
+            &ioreg_key(),
+            Ran::ok(&String::from_utf8_lossy(IOREG_UNLOCKED)),
+        );
+        fake.on(
+            &ioreg_key(),
+            Ran::ok(&String::from_utf8_lossy(IOREG_LOCKED)),
+        );
+        let mut out = Vec::new();
+        let code = lock_screen_with_start(&fake, &mut out, LOCK_HANG, || {
+            Instant::now() - Duration::from_secs(11)
+        });
+        assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&out));
+        assert_eq!(out, b"locked\n");
+        assert_eq!(fake.calls().len(), 3);
+
+        let fake = admin_fake();
+        fake.on(
+            &ioreg_key(),
+            Ran::ok(&String::from_utf8_lossy(IOREG_UNLOCKED)),
+        );
+        let mut out = Vec::new();
+        assert_eq!(
+            lock_screen_with_start(&fake, &mut out, LOCK_HANG, || {
+                Instant::now() - Duration::from_secs(61)
+            }),
+            ExitCode::FAILURE,
+        );
+        assert!(String::from_utf8_lossy(&out).starts_with("not locked:"));
+        assert_eq!(fake.calls().len(), 2);
     }
 
     #[test]

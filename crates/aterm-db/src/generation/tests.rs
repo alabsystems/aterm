@@ -1932,3 +1932,152 @@ fn a_selection_whose_paths_are_not_utf8_reads_back_as_the_same_paths() {
         );
     }
 }
+
+/// A successor home's table read observes its predecessor once, after it has opened the
+/// selected home's custody: the session keeps that observation ([`Session::observe_selected`]),
+/// and its generation checks take none of the predecessor's custody. So a holder of the
+/// predecessor's custody that comes after the observation keeps the read from nothing, though
+/// every wait for a holder is already spent: only `read_by` is the read's gate. m14,
+/// 2026-11-07: one registry read observed its predecessor twice per pass under one 2 s bound
+/// and, on a loaded Mac, ran out of it.
+/// NEGATIVE CONTROL: with `observe_selected` observing the predecessors again
+/// (`Observation::observe_within(bootstrap.paths(), read_by, &Instant::now)`), the read meets the
+/// held lock at once and is busy; with the session bounded by the spent wait instead of `read_by`,
+/// it runs out of time.
+#[test]
+fn a_successor_homes_read_observes_its_predecessor_once() {
+    use crate::documents::application::{observe_store_if_declared_within, seams};
+    use std::{cell::RefCell, rc::Rc};
+
+    let mut lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let original = lab.paths[0].clone();
+    data(&lab);
+    let mut selection = reserved(&lab);
+    move_admitted_candidate(&mut lab);
+    import(&mut selection).unwrap();
+    let read_by = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    for lock in ["commons.lock", "commons-device.lock"] {
+        let holder = Rc::new(RefCell::new(None));
+        seams::after_selection({
+            let (holder, dir) = (holder.clone(), original.dir.clone());
+            move || {
+                let held = PrivateLock::take(&dir, lock, Duration::ZERO, "held").unwrap();
+                *holder.borrow_mut() = Some(held);
+            }
+        });
+        let read = observe_store_if_declared_within(
+            &original,
+            |bootstrap| Descriptor::application(bootstrap.trust(), "recovery-test", "records", 1),
+            read_by,
+            &Instant::now,
+            |session, store, _| Ok(store.catalog(session)?.len()),
+        );
+        assert!(holder.borrow_mut().take().is_some(), "{lock}: never held");
+        assert_eq!(read.unwrap(), Some(1), "{lock}");
+    }
+}
+
+/// A generation check whose deadline has passed says it ran out of time, not that the generation
+/// is unavailable or changed: it learned nothing about the generation, and given time the same
+/// reads pass. Every deadline gate goes through `within`; this asks each entry readers and
+/// writers call.
+/// NEGATIVE CONTROL: with `within` refusing as `fail()` again, every assertion fails.
+#[test]
+fn a_spent_deadline_is_out_of_time_not_a_changed_generation() {
+    let mut lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let original = lab.paths[0].clone();
+    data(&lab);
+    let mut selection = reserved(&lab);
+    let next = move_admitted_candidate(&mut lab);
+    import(&mut selection).unwrap();
+    let spent = Instant::now();
+    let out = out_of_time().to_string();
+    let refused = |error: Error| assert_eq!(error.to_string(), out);
+    refused(observed_paths_until(&original, spent).err().unwrap());
+    refused(selected_until(&original, spent).err().unwrap());
+    refused(guard_until(&next, false, spent).unwrap_err());
+    refused(lineage_until(&original, spent).err().unwrap());
+    refused(Observation::observe(&next, spent).err().unwrap());
+    refused(Observation::capture(&next, spent).err().unwrap());
+    let given_time = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let observation = observed_selection_within(&original, given_time, &|| given_time).unwrap();
+    refused(observation.check(false, false, spent).unwrap_err());
+    assert_eq!(observation.paths(), &next);
+    assert_eq!(observed_paths_until(&original, given_time).unwrap(), next);
+}
+
+/// A fleet label's registry read ([`crate::alab::Registry::view_until`]) reads the generation of
+/// the registry under its own `read_by`, so a read out of time says so rather than reading the
+/// first generation in place of the one this Mac's catalog names; given time, it reads the
+/// registry a successor home imported.
+/// NEGATIVE CONTROL: with `Handle::at_until` taking the generation from `current`, which reads
+/// the first generation when the catalog cannot be read, the spent read is answered.
+#[test]
+fn a_successor_homes_registry_reads_under_its_own_bound() {
+    let mut lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let original = lab.paths[0].clone();
+    crate::alab::Registry::at(original.clone()).open().unwrap();
+    let mut selection = reserved(&lab);
+    move_admitted_candidate(&mut lab);
+    import(&mut selection).unwrap();
+    let registry = crate::alab::Registry::at(original);
+    let spent = registry.view_until(Instant::now()).err().unwrap();
+    assert_eq!(spent.to_string(), out_of_time().to_string());
+    let read_by = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    assert!(registry.view_until(read_by).unwrap().complete);
+}
+
+/// A vault writer that takes a predecessor's state lock while a generation check judges this
+/// Mac's standing there (whether that vault denies this Mac, and whether the check's access is
+/// still current) makes the check busy, which a read observes again
+/// ([`crate::att::reopened`]), not [`fail`]'s changed generation: it judged nothing. The
+/// predecessor's access is log-backed, as a Mac's is since F18, so both questions read its vault.
+/// On m14 (2026-11-07, read from the source) every registry view runs dozens of these checks
+/// beside the vault's own writers.
+/// NEGATIVE CONTROL: with `check` asking `local_recipient_denied_in_roster` again, the
+/// `BeforeDenial` case fails as a changed generation; with it asking `Access::is_current`, the
+/// `BeforeCurrent` case does.
+#[test]
+fn a_vault_writer_during_a_check_is_busy_not_a_changed_generation() {
+    use std::{cell::RefCell, rc::Rc};
+
+    let mut lab = Lab::with_foundation(&[Role::Writer, Role::Writer]);
+    let original = lab.paths[0].clone();
+    client::seed_vault_genesis(&original, &lab._home.path().join("genesis.v2")).unwrap();
+    let records = client::load_records(&original).unwrap().encode();
+    client::save_records(&lab.paths[1], &records).unwrap();
+    data(&lab);
+    let mut selection = reserved(&lab);
+    move_admitted_candidate(&mut lab);
+    import(&mut selection).unwrap();
+    let given_time = || Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let observation = observed_selection_within(&original, given_time(), &given_time).unwrap();
+    assert!(
+        observation.ancestors[0].access.is_log_backed(),
+        "CONTROL: the predecessor's log backs its access"
+    );
+    let outcomes: Vec<_> = [seams::Point::BeforeDenial, seams::Point::BeforeCurrent]
+        .into_iter()
+        .map(|point| {
+            let writer = Rc::new(RefCell::new(None));
+            seams::at(point, {
+                let (writer, original) = (writer.clone(), original.clone());
+                move || {
+                    let held = client::test_hold_state_lock(&original).unwrap();
+                    *writer.borrow_mut() = Some(held);
+                }
+            });
+            let checked = observation.check(false, false, given_time());
+            let held = writer.borrow_mut().take().is_some();
+            let busy = checked.as_ref().is_err_and(Error::is_busy);
+            let after = observation.check(false, false, given_time()).is_ok();
+            (point, held, busy, after, format!("{checked:?}"))
+        })
+        .collect();
+    assert!(
+        outcomes
+            .iter()
+            .all(|(_, held, busy, after, _)| *held && *busy && *after),
+        "(point, writer held, check busy, next check passes, check): {outcomes:?}"
+    );
+}

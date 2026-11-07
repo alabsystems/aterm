@@ -18,13 +18,9 @@ use std::time::{Duration, Instant};
 /// How long a spawned child that has exited has to become reapable. A live read refuses a process
 /// before `wait` can reap it, for about 300 µs when it is a few milliseconds old, as a launch's
 /// capture finds it; a retried bind can find an older child, for which this was not measured
-/// (`docs/measured/cohort-capture-at-exit-2026-11-04.md`). A test's wait for what must happen is
-/// a hang detector, so there it is a minute.
-const LEAVES_WITHIN: Duration = if cfg!(test) {
-    Duration::from_secs(60)
-} else {
-    Duration::from_secs(1)
-};
+/// (`docs/measured/cohort-capture-at-exit-2026-11-04.md`). Scheduling delay does not prove the
+/// original child unknown: this wait for its reap is a one-minute hang detector.
+const LEAVES_WITHIN: Duration = Duration::from_secs(60);
 
 /// The pause between looks at a child on its way out.
 const LEAVING_LOOK: Duration = Duration::from_micros(100);
@@ -74,11 +70,11 @@ fn exited(child: &Child) -> bool {
     })
 }
 
-/// Looks until a child on its way out has gone, or `deadline` passes with it still leaving.
-fn settled(deadline: Instant, mut look: impl FnMut() -> io::Result<Look>) -> io::Result<Look> {
+/// Looks until a child on its way out has gone, or the hang detector expires still leaving.
+fn settled(started: Instant, mut look: impl FnMut() -> io::Result<Look>) -> io::Result<Look> {
     loop {
         match look()? {
-            Look::Leaving if Instant::now() < deadline => std::thread::sleep(LEAVING_LOOK),
+            Look::Leaving if started.elapsed() < LEAVES_WITHIN => std::thread::sleep(LEAVING_LOOK),
             found => return Ok(found),
         }
     }
@@ -327,7 +323,7 @@ impl Cohort {
     /// # Errors
     /// The attempt's actual owner/scope is stale or its original child was replaced, a still-live
     /// child cannot be captured as this parent's self-led group, an exited child did not become
-    /// reapable within a second or its pid is not a group, or its reap fails (an ended child is
+    /// reapable within a minute or its pid is not a group, or its reap fails (an ended child is
     /// reaped with its resource accounting where the kernel gives it, which its owner reads,
     /// [`Child::usage`]). Members leaving the group still require separate custody.
     pub fn of_spawned(spawned: &mut aterm_uds::spawnfd::Spawned) -> io::Result<Self> {
@@ -338,7 +334,7 @@ impl Cohort {
         }
         let scope = Scope::of_key(spawned.key());
         let child = spawned.child_mut();
-        match settled(Instant::now() + LEAVES_WITHIN, || look(child, &scope))? {
+        match settled(Instant::now(), || look(child, &scope))? {
             Look::Live(cohort) => Ok(cohort),
             Look::Ended if scope.ended_or_unknown().is_none() => {
                 let group = i32::try_from(child.id())
@@ -644,8 +640,8 @@ mod tests {
     #[test]
     fn a_child_on_its_way_out_is_looked_at_until_it_ends() {
         let mut looks = vec![Look::Ended, Look::Leaving, Look::Leaving];
-        let deadline = Instant::now() + Duration::from_secs(60);
-        let found = settled(deadline, || Ok(looks.pop().expect("a look too many"))).unwrap();
+        let started = Instant::now() - Duration::from_secs(2);
+        let found = settled(started, || Ok(looks.pop().expect("a look too many"))).unwrap();
         assert!(matches!(found, Look::Ended));
         assert!(looks.is_empty());
     }
@@ -654,8 +650,7 @@ mod tests {
     #[test]
     fn a_refused_child_is_looked_at_once() {
         let mut looks = 0;
-        let deadline = Instant::now() + Duration::from_secs(60);
-        let found = settled(deadline, || {
+        let found = settled(Instant::now(), || {
             looks += 1;
             Ok(Look::Refused)
         });
@@ -713,7 +708,7 @@ mod tests {
         let (done, ended) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut looks = 0;
-            let found = settled(Instant::now(), || {
+            let found = settled(Instant::now() - Duration::from_secs(61), || {
                 looks += 1;
                 Ok(Look::Leaving)
             });

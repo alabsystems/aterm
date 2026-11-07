@@ -9453,6 +9453,7 @@ fn usage_shows_the_tap_reading_of_its_own_process() {
             &vars,
             Some(&rl),
             env.now - 12,
+            |_| Some(0),
             &mut out,
         );
     };
@@ -9548,6 +9549,7 @@ fn usage_says_why_claude_code_reports_no_five_hour_window() {
         &vars,
         Some(&rl),
         env.now - 5,
+        |_| Some(0),
         &mut Vec::new(),
     );
     let process = FakeClaude::with(&[("HOME", "/home/someone")]);
@@ -9668,6 +9670,7 @@ fn usage_takes_the_usage_cache_only_as_the_default_logins_own_account() {
         &vars,
         Some(&rl),
         env.now - 5,
+        |_| Some(0),
         &mut Vec::new(),
     );
     let a = super::profile::AccountKey::claude(STATS_UUID).expect("a key");

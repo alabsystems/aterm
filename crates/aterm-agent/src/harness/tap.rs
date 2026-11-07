@@ -2,9 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! Claude Code status-line usage tap ([`TAP_REFRESH_S`], [`Reading`], [`rl_dir`],
-//! [`Reading::line`], [`NO_FIGURES`]): launch gating ([`gate`], [`stable_exe`], [`own_login`],
-//! [`is_ours`], [`super::upgrade::rewrite_argv`]) and fresh reading recording ([`Fresh`],
-//! [`Fresh::beside`], [`super::accounts::note_reading`]).
+//! [`Reading::week_words`], [`NO_WEEK`], [`parse_line`], [`Row`]): launch gating ([`gate`],
+//! [`stable_exe`], [`own_login`], [`is_ours`], [`super::upgrade::rewrite_argv`]) and fresh
+//! reading recording ([`Fresh`], [`Fresh::beside`], [`super::accounts::note_reading`]).
 
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -41,8 +41,13 @@ const VALUE_HEAD: &str = r#"{"statusLine":{"type":"command","command":""#;
 /// The value after the command ([`settings_value`]).
 const VALUE_TAIL: &str = r#"","refreshInterval":10}}"#;
 
-/// The row printed when there are no figures ([`Reading::line`]).
-pub const NO_FIGURES: &str = "5h \u{2013} \u{b7} 7d \u{2013}";
+/// The row printed where there is no week figure ([`Reading::week_words`]): never an empty
+/// line, since Claude Code gives a command that prints nothing no row at all (aterm-phase's
+/// `claude-2.1.300-tap-row-silent-command.txt`).
+pub const NO_WEEK: &str = "week \u{b7} no figure yet";
+
+/// What follows a week's figure on the tap's row, before its reset ([`Reading::week_words`]).
+const RESETS: &str = " \u{b7} resets ";
 
 /// Whether `exe` can be named in the status-line command.
 #[must_use]
@@ -291,6 +296,35 @@ impl Window {
     }
 }
 
+/// Which row Claude Code shows for a run of the tap ([`Reading::row`]), as its file says it
+/// (`"row": "own" | "owner"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Row {
+    /// The tap's own words ([`Reading::week_words`]).
+    Own,
+    /// The owner's own statusLine command's ([`Carried::Owner`]).
+    Owner,
+}
+
+impl Row {
+    /// Its word in the file.
+    const fn key(self) -> &'static str {
+        match self {
+            Row::Own => "own",
+            Row::Owner => "owner",
+        }
+    }
+
+    /// The row a file's word names; `None` for any other word, which a later build may write.
+    fn of_key(key: &str) -> Option<Row> {
+        match key {
+            "own" => Some(Row::Own),
+            "owner" => Some(Row::Owner),
+            _ => None,
+        }
+    }
+}
+
 /// One run of the tap, as its file holds it (format [`FORMAT_V`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reading {
@@ -325,6 +359,11 @@ pub struct Reading {
     pub ctx_left: Option<u8>,
     /// How long the verb took up to its write, microseconds.
     pub dur_us: u64,
+    /// The row Claude Code shows for the run that wrote it, decided before the write
+    /// ([`run_carrying`] asks for the owner's command first); `None` for a payload not yet
+    /// recorded ([`Self::of_stdin`]), a file written before the key, or a word this build does
+    /// not know. Only [`Row::Own`] is claimable ([`Self::claimable`]).
+    pub row: Option<Row>,
 }
 
 /// What the tap reads of its environment ([`run`]).
@@ -433,6 +472,7 @@ impl Reading {
                 .and_then(pct_of)
                 .and_then(|(pct, _)| u8::try_from(pct).ok()),
             dur_us: 0,
+            row: None,
         })
     }
 
@@ -442,10 +482,42 @@ impl Reading {
         self.five_hour.is_some() || self.seven_day.is_some()
     }
 
-    /// The row the tap prints.
+    /// THE ROW THE TAP PRINTS (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §5.2): the week
+    /// alone, `week 63% used · resets Sat 10:00`, its figure said as
+    /// [`super::outlook::Figure::Exact`] says it (a figure under 100 is never `100%`) and its
+    /// reset as [`super::outlook::when`] says it on the local clock `offsets` give; [`NO_WEEK`]
+    /// with no week figure. It says `week 63% used` and no reset where:
+    /// - the reset is not ahead of `now` (Claude Code drops a window at its reset, so only a
+    ///   clock apart from the vendor's leaves one);
+    /// - the reset lies further ahead than a week's can ([`accounts::believed_reset`], a week and
+    ///   a day), which no vendor week says and which the clock could not say;
+    /// - `offsets` is `None`: the local zone did not read, and a reset said on another clock
+    ///   (UTC) would name an instant the glass, on the local one, does not.
+    ///
+    /// The five-hour figure is recorded and never printed. [`parse_line`] reads every form back.
     #[must_use]
-    pub fn line(&self) -> String {
-        line_of(self.five_hour, self.seven_day)
+    pub fn week_words(&self, now: i64, offsets: Option<&super::outlook::Offsets>) -> String {
+        let Some(week) = self.seven_day else {
+            return NO_WEEK.to_owned();
+        };
+        let x10 = u16::try_from(week.x10().min(1000)).unwrap_or(1000);
+        let used = super::outlook::Figure::Exact(x10).words();
+        let reset = accounts::believed_reset(Some(week.resets_at), now).filter(|t| *t > now);
+        match (reset, offsets) {
+            (Some(reset), Some(offsets)) => {
+                let reset = super::outlook::when(reset, now, offsets);
+                format!("week {used} used{RESETS}{reset}")
+            }
+            _ => format!("week {used} used"),
+        }
+    }
+
+    /// Whether the glass may take the row under the composer as this reading's (the design's
+    /// §5.2, the claim's second condition): the run that wrote it printed the tap's own words. A
+    /// file with no `row` key, or one that names the owner's row, is not claimable.
+    #[must_use]
+    pub fn claimable(&self) -> bool {
+        self.row == Some(Row::Own)
     }
 
     /// The file's text, one JSON object, keys sorted.
@@ -482,6 +554,10 @@ impl Reading {
             Value::from(self.ctx_left.map(u64::from)),
         );
         o.insert("dur_us".to_owned(), Value::from(self.dur_us));
+        o.insert(
+            "row".to_owned(),
+            Value::from(self.row.map(|row| row.key().to_owned())),
+        );
         aterm_json::to_string(&Value::Object(o)).unwrap_or_default()
     }
 
@@ -549,6 +625,7 @@ impl Reading {
                 Some(v) => Some(u8::try_from(v.as_u64()?).ok().filter(|p| *p <= 100)?),
             },
             dur_us: doc.get("dur_us").and_then(Value::as_u64).unwrap_or(0),
+            row: doc.get("row").and_then(Value::as_str).and_then(Row::of_key),
         })
     }
 
@@ -591,12 +668,43 @@ impl Reading {
     }
 }
 
-/// The tap's row for two windows ([`Reading::line`]).
+/// THE TAP'S WORDS AT THE HEAD OF `text`, a row read from its third cell (Claude Code indents
+/// the statusLine two): their width in cells where `text` starts with exactly a line the tap
+/// prints ([`Reading::week_words`], [`NO_WEEK`]) and nothing follows it but blanks, or a notice
+/// of Claude Code's own two blanks or more away (`Now using usage credits`); `None` for any other
+/// text: an owner's own row, the five-hour-and-week row of builds before this one (`5h 42% · 7d
+/// 61%`), or a figure the tap never prints (`101%`, `07%`, `63.5%`).
 #[must_use]
-pub fn line_of(five_hour: Option<Window>, seven_day: Option<Window>) -> String {
-    let pct =
-        |w: Option<Window>| w.map_or_else(|| "\u{2013}".to_owned(), |w| format!("{}%", w.pct));
-    format!("5h {} \u{b7} 7d {}", pct(five_hour), pct(seven_day))
+pub fn parse_line(text: &str) -> Option<usize> {
+    let words = if text.starts_with(NO_WEEK) {
+        NO_WEEK.len()
+    } else {
+        week_len(text)?
+    };
+    let rest = text.get(words..)?;
+    (rest.trim_start_matches(' ').is_empty() || rest.starts_with("  "))
+        .then(|| text[..words].chars().count())
+}
+
+/// The length in bytes of a figure's row at the head of `text` ([`parse_line`]): `week `, a whole
+/// percent from 0 to 100 as [`super::outlook::Figure::Exact`] prints one, ` used`, then
+/// optionally [`RESETS`] and a reset as [`super::outlook::when`] says it.
+fn week_len(text: &str) -> Option<usize> {
+    let rest = text.strip_prefix("week ")?;
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let figure = rest.get(..digits)?;
+    if !(1..=3).contains(&digits)
+        || (digits > 1 && figure.starts_with('0'))
+        || figure.parse::<u16>().ok()? > 100
+    {
+        return None;
+    }
+    let rest = rest.get(digits..)?.strip_prefix("% used")?;
+    let reset = match rest.strip_prefix(RESETS) {
+        Some(when) => RESETS.len() + super::outlook::when_len(when)?,
+        None => 0,
+    };
+    Some(text.len() - rest.len() + reset)
 }
 
 /// The modification time of the regular file at `path` (Unix seconds), not
@@ -702,35 +810,65 @@ fn read_bytes(stdin: &mut dyn Read) -> Option<Vec<u8>> {
 }
 
 /// Write the reading the payload `payload` gives for the tab and process `vars` name into
-/// `dir` ([`first_reported`]'s stamp), and return it.
+/// `dir` ([`first_reported`]'s stamp), saying Claude Code shows `row` for it, and return it.
 fn record(
     payload: Option<&str>,
     vars: &TapVars,
     dir: Option<&Path>,
     now: i64,
     started: std::time::Instant,
+    row: Row,
 ) -> Option<Reading> {
-    let reading = Reading::of_stdin(payload.unwrap_or(""), vars, now);
-    if let (Some(reading), Some(dir)) = (&reading, dir)
+    let reading = Reading {
+        row: Some(row),
+        ..Reading::of_stdin(payload.unwrap_or(""), vars, now)?
+    };
+    if let Some(dir) = dir
         && let Some(name) = file_name(&reading.sid, reading.pid)
     {
-        let reading = Reading {
-            at: first_reported(&dir.join(&name), reading),
+        let stamped = Reading {
+            at: first_reported(&dir.join(&name), &reading),
             dur_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
             ..reading.clone()
         };
-        let _ = write_reading(dir, &name, &reading.to_json());
+        let _ = write_reading(dir, &name, &stamped.to_json());
     }
-    reading
+    Some(reading)
 }
 
-/// `aterm harness tap`, Claude Code's status-line command.
+/// Print the tap's own row for `reading` ([`Reading::week_words`], [`NO_WEEK`] where there is no
+/// reading): always exactly one line, never an empty one, on the local clock `offset` gives, or
+/// with no reset where that clock does not read ([`super::outlook::Offsets::read_around`]).
+fn print_own(
+    reading: Option<&Reading>,
+    now: i64,
+    offset: fn(i64) -> Option<i64>,
+    out: &mut dyn Write,
+) {
+    let line = reading.map_or_else(
+        || NO_WEEK.to_owned(),
+        |r| {
+            r.week_words(
+                now,
+                super::outlook::Offsets::read_around(now, offset).as_ref(),
+            )
+        },
+    );
+    let _ = writeln!(out, "{line}");
+    let _ = out.flush();
+}
+
+/// `aterm harness tap`, Claude Code's status-line command: it writes the reading (its row
+/// [`Row::Own`]) and prints its own row ([`print_own`]), its reset on the local clock `offset`
+/// gives (the local clock's offset from UTC at an instant, `aterm_uds::zone::local_offset_at`'s
+/// shape: `None` where the zone does not read, and then the row says no reset).
 pub fn run(
     stdin: &mut dyn Read,
     stdin_is_tty: bool,
     vars: &TapVars,
     dir: Option<&Path>,
     now: i64,
+    offset: fn(i64) -> Option<i64>,
     out: &mut dyn Write,
 ) -> std::process::ExitCode {
     let started = std::time::Instant::now();
@@ -739,12 +877,8 @@ pub fn run(
     } else {
         read_bytes(stdin).and_then(|bytes| String::from_utf8(bytes).ok())
     };
-    let reading = record(payload.as_deref(), vars, dir, now, started);
-    let line = reading
-        .as_ref()
-        .map_or_else(|| NO_FIGURES.to_owned(), Reading::line);
-    let _ = writeln!(out, "{line}");
-    let _ = out.flush();
+    let reading = record(payload.as_deref(), vars, dir, now, started, Row::Own);
+    print_own(reading.as_ref(), now, offset, out);
     std::process::ExitCode::SUCCESS
 }
 
@@ -766,16 +900,24 @@ pub enum Carried {
 }
 
 /// `aterm harness tap --carry`, the tap that carries the owner's own statusLine
-/// ([`settings_value_carrying`]): it writes the reading as [`run`] does, then, where `owner`
-/// names the owner's command now ([`read_owner_command`]), prints nothing and hands the payload
-/// on, byte for byte ([`Carried::Owner`]); else it prints its own row as [`run`] does
-/// ([`Carried::Own`]), so a run never shows less than the plain tap.
+/// ([`settings_value_carrying`]): where the payload can be handed on and `owner` names the
+/// owner's command now ([`read_owner_command`]), it writes the reading as [`run`] does with the
+/// row [`Row::Owner`], prints nothing and hands the payload on, byte for byte
+/// ([`Carried::Owner`]); else it writes it with [`Row::Own`] and prints its own row as [`run`]
+/// does ([`Carried::Own`]), so a run never shows less than the plain tap. The owner is asked
+/// before the write, so the file says which row Claude Code shows.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each input of the verb (stdin, its tty bit, the environment, the directory, the \
+              clock and its zone, the owner's command, stdout) is injected for its tests"
+)]
 pub fn run_carrying(
     stdin: &mut dyn Read,
     stdin_is_tty: bool,
     vars: &TapVars,
     dir: Option<&Path>,
     now: i64,
+    offset: fn(i64) -> Option<i64>,
     owner: impl FnOnce() -> Option<String>,
     out: &mut dyn Write,
 ) -> Carried {
@@ -785,18 +927,18 @@ pub fn run_carrying(
     } else {
         read_bytes(stdin)
     };
+    let command = bytes.as_ref().and_then(|_| owner());
+    let row = if command.is_some() {
+        Row::Owner
+    } else {
+        Row::Own
+    };
     let payload = bytes.as_deref().and_then(|b| std::str::from_utf8(b).ok());
-    let reading = record(payload, vars, dir, now, started);
-    if let Some(payload) = bytes
-        && let Some(command) = owner()
-    {
+    let reading = record(payload, vars, dir, now, started, row);
+    if let (Some(payload), Some(command)) = (bytes, command) {
         return Carried::Owner { command, payload };
     }
-    let line = reading
-        .as_ref()
-        .map_or_else(|| NO_FIGURES.to_owned(), Reading::line);
-    let _ = writeln!(out, "{line}");
-    let _ = out.flush();
+    print_own(reading.as_ref(), now, offset, out);
     Carried::Own
 }
 

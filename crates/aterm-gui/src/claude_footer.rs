@@ -11,7 +11,9 @@ use std::time::Duration;
 
 use aterm_agent::harness::accounts;
 use aterm_agent::harness::footer::{self, FactKind, FactMask, FooterFacts, LaunchFacts};
-use aterm_agent::harness::profile::{SubscriptionDisplay, USAGE_SHOWN_S, WeeklyFigure, WeeklyGap};
+use aterm_agent::harness::profile::{
+    SubscriptionDisplay, USAGE_SHOWN_S, WEEKLY_OUT, WeeklyFigure, WeeklyGap,
+};
 use aterm_agent::harness::tap;
 use aterm_core::render::RenderInput;
 use aterm_core::terminal::RenderCell;
@@ -3577,8 +3579,8 @@ fn resolve_facts_at_with_cwd(
 /// the process's tab where its environment does), its own figures (the newer of its usage-tap
 /// reading, [`own_tap_figure`], and the `/usage` cache) say it while current; else a 7d wall in
 /// the transcript, or one the accounts store holds of its own account ([`own_stored_week`]),
-/// says `weekly 0% left`; else the newest figure still shown, its own or the store's; else why
-/// none is ([`WeeklyGap`]).
+/// says the wall ([`WEEKLY_OUT`]), never a percentage; else the newest figure still shown, its
+/// own or the store's; else why none is ([`WeeklyGap`]).
 fn weekly_into(
     sub: &mut SubscriptionDisplay,
     facts: &FooterFacts,
@@ -3609,7 +3611,7 @@ fn weekly_into(
                 own_stored_week(identity, roster, asks, seat.store.as_deref()?, now)
             });
             if walled || store.is_some_and(|week| week.walled) {
-                sub.weekly = Some("weekly 0% left".into());
+                sub.weekly = Some(WEEKLY_OUT.into());
                 (sub.weekly_figure, sub.weekly_gap) = (None, None);
                 return;
             }

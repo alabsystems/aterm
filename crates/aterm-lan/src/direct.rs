@@ -111,6 +111,10 @@ impl aterm_uds::lan::direct::Direct for Direct {
         Ok(allowed)
     }
 
+    fn record(&self) -> Option<std::path::PathBuf> {
+        Some(Path::new(self.plist).to_path_buf())
+    }
+
     fn serve(&self, stream: CtlStream) {
         connection(self.shared(), &stream);
     }

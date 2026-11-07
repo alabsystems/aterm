@@ -2768,3 +2768,136 @@ fn a_need_above_the_screen_in_a_cut_turn_is_posted() {
         "NEGATIVE CONTROL: no history read: {calls:#?}"
     );
 }
+
+/// The park's need as the model wrote it: one line, which a 120-column pane wraps before
+/// `Claude` (`… with the small fix` fills the 118 cells a message's line has), a word the
+/// go-ahead reader's own view does not join.
+const WRAPPED_PARK: &str = "say \"rerun the checks\" so I can build and test my parser branch and \
+                            push it to main with the small fix Claude Code needs.";
+const WRAPPED_REPORT: &str = "Committed the parser fix on my branch.";
+const WRAPPED_AFTER: &str = "Built, tested and pushed the branch; the docs are next.";
+
+/// `NEEDS YOU: {WRAPPED_PARK}` Ink-wrapped in a message's 118 cells, before a capital.
+fn wrapped_need() -> Vec<String> {
+    let wrapped =
+        aterm_phase::prompt::fixtures::ink_wrap(&format!("NEEDS YOU: {WRAPPED_PARK}"), 118);
+    assert!(
+        wrapped.len() == 2 && wrapped[1].starts_with("Claude"),
+        "the pane wraps before a capital: {wrapped:#?}"
+    );
+    wrapped
+}
+
+/// The reply as Claude Code draws it: each line Ink-wrapped in the message's 118 cells.
+fn wrapped_parking() -> Vec<String> {
+    let mut lines = vec![WRAPPED_REPORT.to_string()];
+    lines.extend(wrapped_need());
+    said(&lines.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
+/// A turn too tall for the pane that parks in an earlier message: the person's row, the report
+/// and its park drawn as `need` (its rows), twenty tool calls, then the turn's last words; its
+/// rows through the park are in the history (the first), the rest on the screen.
+fn wrapped_park_above(need: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut lines = vec![
+        "❯ Land the parser.".to_string(),
+        String::new(),
+        format!("⏺ {WRAPPED_REPORT}"),
+    ];
+    lines.extend(need.iter().map(|l| format!("  {l}")));
+    lines.push(String::new());
+    let above = lines.len();
+    for i in 0..20 {
+        lines.push(format!("⏺ Read(crates/aterm-agent/src/part_{i:02}.rs)"));
+        lines.push("  ⎿  Read 40 lines".to_string());
+    }
+    lines.push(String::new());
+    lines.extend(said(&["Fetched main again; nothing moved."]));
+    let shown = lines.split_off(above);
+    (lines, shown)
+}
+
+/// Under Land, the agent parks on `parking`, the history above it `above` where the turn opens
+/// there, gets Land's instruction, and goes on with a report that names no need, whose turn the
+/// screen shows whole; the window's host hears through `host`.
+fn wrapped_park_run(
+    tag: &str,
+    (parking, above): (Vec<String>, Option<Vec<String>>),
+    host: &Arc<Hears>,
+) -> Mock {
+    let mut after = rows(&["❯ Go on.", ""]);
+    after.extend(said(&[WRAPPED_AFTER]));
+    let screens = vec![busy_screen(), parking, busy_screen(), after];
+    let last = u32::try_from(screens.len()).expect("a short script");
+    let (dir, journal) = journal_file(tag);
+    let mut m = Mock::new(screens);
+    m.autopilot = Some("land");
+    m.turn_gates = vec![1];
+    m.vanish_after = Some(last - 1);
+    m.stall_sleep = Some(Duration::from_secs(20));
+    if let Some(above) = above {
+        m.scrollback = Some(above);
+        m.alt_screen = Some(false);
+    }
+    let opts = SuperviseOpts {
+        policy: owners_policy(),
+        journal: Some(journal.clone()),
+        idle_host: Some(Arc::clone(host) as Arc<dyn IdleHost>),
+        ..auto(30)
+    };
+    let _ = record_watch(&mut m, &opts, |s| {
+        s.set_turn_end_timing(TurnEndTiming {
+            short_backoff: Duration::from_millis(30),
+            short_backoff_max: Duration::from_millis(60),
+            ..TurnEndTiming::default()
+        });
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+    m
+}
+
+/// A WRAPPED PARK'S LINE NEVER GOES UP (§15.6): the agent parks on a need Claude Code wrapped
+/// before a capital the go-ahead view does not join; Land's instruction answers the park, whose
+/// line is the one the needs fold stands (the reader's measured lines), so no entry is set and
+/// the host hears no set: in the reply on the screen, and in an earlier message of a turn read
+/// whole from the history above it. CONTROL: the need on one row (a pane wide enough), on the
+/// screen and above it.
+#[test]
+fn a_wrapped_parks_line_never_goes_up_under_lands_instruction() {
+    let land_typed = |m: &Mock| {
+        m.requests
+            .iter()
+            .filter(|r| r.starts_with("turn ") && r.contains("Autopilot is Land"))
+            .count()
+    };
+    let one_row = format!("NEEDS YOU: {WRAPPED_PARK}");
+    let wide = said(&[WRAPPED_REPORT, &one_row]);
+    let above = |need: &[String]| {
+        let (above, shown) = wrapped_park_above(need);
+        assert!(
+            above.iter().any(|r| r.contains("NEEDS YOU"))
+                && !shown.iter().any(|r| r.contains("NEEDS YOU")),
+            "the park is above the screen"
+        );
+        (shown, Some(above))
+    };
+    for (tag, parking) in [
+        ("wrapped-park-one-row", (wide, None)),
+        (
+            "wrapped-park-above-one-row",
+            above(std::slice::from_ref(&one_row)),
+        ),
+        ("wrapped-park-above", above(&wrapped_need())),
+        ("wrapped-park-screen", (wrapped_parking(), None)),
+    ] {
+        let host = Arc::new(Hears::default());
+        let m = wrapped_park_run(tag, parking, &host);
+        assert_eq!(land_typed(&m), 1, "{tag}: {:#?}", m.requests);
+        assert!(
+            m.needs_calls.is_empty() && host.told().is_empty(),
+            "{tag}: Land's instruction answered the park, yet the line went up: {:#?} host {:#?}",
+            m.needs_calls,
+            host.told()
+        );
+    }
+}

@@ -510,7 +510,7 @@ fn bounded_wait<T: Send + 'static>(
     let meter = crate::memory::current();
     let cover = crate::memory::cover();
     let quiet = crate::current_quiet_claim();
-    let memory = crate::current_memory_claim();
+    let resources = crate::current_resource_claim();
     let scope = Close(std::sync::Arc::new(output::Scope::metered(meter.clone())));
     let executor = std::sync::Arc::clone(&scope.0);
     let (tx, rx) = std::sync::mpsc::channel();
@@ -518,7 +518,7 @@ fn bounded_wait<T: Send + 'static>(
         let _metering = crate::memory::metering(meter);
         let _covering = crate::memory::covering(cover);
         let _quiet = crate::holding_quiet_claim(quiet);
-        let _memory = crate::holding_memory_claim(memory);
+        let _resources = crate::holding_resource_claim(resources);
         aterm_uds::output::with_executor(
             std::sync::Arc::new(move |command| executor.output(command)),
             || {
@@ -627,6 +627,35 @@ fn run_captured(cmd: &Cmd, env: ExecEnv<'_>, machine: Option<&mut Result<String,
         && let Some(marker) = crate::memory::cover()
     {
         c.env(aterm_capacity::COVER_ENV, &*marker);
+    }
+    // A repeatable tree stage owns one combined memory/CPU claim. Its actual grant, never the
+    // machine-wide request, bounds every compiler, libtest and doctest child; an explicit smaller
+    // command or run ceiling remains smaller.
+    if let Some(grant) = crate::current_resource_claim()
+        .map(|claim| claim.cores())
+        .filter(|cores| *cores > 0)
+    {
+        let ceiling = |wanted: &str| {
+            cmd.envs
+                .iter()
+                .rev()
+                .find(|(name, _)| name == wanted)
+                .or_else(|| {
+                    if cmd.exact_env {
+                        None
+                    } else {
+                        env.add_env.iter().rev().find(|(name, _)| name == wanted)
+                    }
+                })
+                .and_then(|(_, value)| crate::parse_build_jobs(Some(value.as_os_str())))
+                .map_or(grant, |asked| asked.min(grant))
+        };
+        c.env("CARGO_BUILD_JOBS", ceiling("CARGO_BUILD_JOBS").to_string());
+        c.env(
+            "RUST_TEST_THREADS",
+            ceiling("RUST_TEST_THREADS").to_string(),
+        );
+        c.env("BUILD_SLOT_HELD", "1");
     }
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let marks = if cmd.waits_count {
@@ -1541,12 +1570,16 @@ fn finish(
                 let halts = watch.stop_at_red && matches!(seen, Seen::Red { .. }) && !ending();
                 // A spared case's own block says its machine, not the tree, refused it: it reads
                 // NOT RUN, as its binary's row will; a red or an undecided case reads FAIL.
-                let outcome = if matches!(seen, Seen::Spared { .. }) {
+                let running_long = matches!(seen, Seen::RunningLong { .. });
+                let outcome = if running_long {
+                    "RUNNING"
+                } else if matches!(seen, Seen::Spared { .. }) {
                     "NOT RUN"
                 } else {
                     "FAIL"
                 };
                 let (case, says) = match &seen {
+                    Seen::RunningLong { case } => (Some(case.as_str()), None),
                     Seen::Red { case, marks } | Seen::Spared { case, marks } => {
                         (Some(case.as_str()), block_says(*marks))
                     }
@@ -1555,13 +1588,16 @@ fn finish(
                 eprintln!(
                     "verify-event: {}",
                     aterm_json::json!({
-                        "schema": 1, "event": "test-case-failed", "outcome": outcome,
+                        "schema": 1,
+                        "event": if running_long { "test-case-running-long" } else { "test-case-failed" },
+                        "outcome": outcome,
                         "test": watch.spec, "case": case,
                         "at_unix_ms": aterm_time::unix_millis(),
                         "elapsed_s": begun.elapsed().as_secs_f64(),
                         "binary_completed": false,
                         "halts": halts, "block_says": says,
                         "detail": match seen {
+                            Seen::RunningLong { .. } => "libtest reports this case is still running; no verdict",
                             Seen::Red { .. } => "its block decides its binary a FAIL",
                             Seen::Spared { .. } => "its block says its machine, not the tree",
                             Seen::Undecided { .. } => "its block is decided at its binary's end",
@@ -2963,6 +2999,78 @@ mod tests {
             assert_eq!(dispatched, [Some("0000000000001-7-0".to_string())]);
         }
         assert_eq!(said(&run(&ask, env)), aterm_capacity::NO_COVER);
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A child of a combined stage claim receives that claim's actual CPU grant, including
+    /// through the bounded test workers that retain it. A command's smaller explicit ceiling is
+    /// preserved. NEGATIVE CONTROL: propagating the requested machine width, omitting the held
+    /// marker, or losing custody on a worker fails an exact environment assertion.
+    #[test]
+    fn a_child_is_bounded_by_its_stages_actual_core_grant() {
+        let tmp = crate::mktemp_dir("atv-resource-grant").expect("mktemp");
+        let ledger = aterm_capacity::Ledger::at(tmp.join("ledger"));
+        let machine = aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(48, 40, 14));
+        let ordinary = aterm_capacity::admit_with(
+            &ledger,
+            &machine,
+            aterm_capacity::Need::new("ordinary cores").cores(8),
+            aterm_capacity::Admit::Wait,
+            aterm_capacity::Pace::default(),
+            &mut |_| {},
+        )
+        .expect("ordinary claim");
+        let stage = aterm_capacity::admit_with(
+            &ledger,
+            &machine,
+            aterm_capacity::Need::new("background stage")
+                .mem_gib(4)
+                .cores(14)
+                .covers(),
+            aterm_capacity::Admit::Wait,
+            aterm_capacity::Pace::default(),
+            &mut |_| {},
+        )
+        .expect("stage claim");
+        assert_eq!(
+            stage.cores(),
+            6,
+            "the fixture must exercise a partial grant"
+        );
+        let _resources = crate::holding_resource_claim(Some(std::sync::Arc::new(stage)));
+        let ask = shell(
+            "printf '%s %s %s' \"$CARGO_BUILD_JOBS\" \"$BUILD_SLOT_HELD\" \"$RUST_TEST_THREADS\"",
+            "echo %CARGO_BUILD_JOBS% %BUILD_SLOT_HELD% %RUST_TEST_THREADS%",
+        );
+        assert_eq!(said(&run(&ask, env_in(&tmp))), "6 1 6");
+        assert_eq!(
+            said(&run(
+                &ask.clone().env("CARGO_BUILD_JOBS", "3"),
+                env_in(&tmp)
+            )),
+            "3 1 6"
+        );
+        assert_eq!(
+            said(&run(
+                &ask.clone().env("RUST_TEST_THREADS", "2"),
+                env_in(&tmp)
+            )),
+            "6 1 2"
+        );
+        let added = [("RUST_TEST_THREADS".into(), "4".into())];
+        let mut with_run_ceiling = env_in(&tmp);
+        with_run_ceiling.add_env = &added;
+        assert_eq!(said(&run(&ask, with_run_ceiling)), "6 1 4");
+        assert_eq!(
+            crate::testrun::pool(1, &[0], 1, |_| said(&run(&ask, env_in(&tmp)))),
+            [Some("6 1 6".to_owned())]
+        );
+        assert_eq!(
+            crate::testrun::dispatch_each(1, |_| said(&run(&ask, env_in(&tmp)))),
+            [Some("6 1 6".to_owned())]
+        );
+        drop(_resources);
+        drop(ordinary);
         std::fs::remove_dir_all(&tmp).ok();
     }
 

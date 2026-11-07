@@ -53,7 +53,7 @@ pub use extra::is_combining_mark;
 pub use extra::{
     CellCoord, CellExtra, CellExtras, HyperlinkData, ImageData, ImageFormat, ImageRef,
     ImageScaling, KittyPlacementTag, MAX_IMAGE_LAYERS, SourceRect, UniformExtras,
-    underline_color_sgr,
+    push_underline_color_sgr,
 };
 pub use page::PageStore;
 pub use row::{LineSize, Row, RowFlags};

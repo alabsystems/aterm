@@ -414,8 +414,8 @@ impl TitleState {
 
 /// Notification callbacks (OSC 9, OSC 99/777) and the OSC 99 multi-part accumulation map.
 pub(super) struct NotificationState {
-    /// The callbacks and the host's admission, reached only through a capability
-    /// ([`super::notify_auth`]).
+    /// The callbacks, reached only through a capability ([`super::notify_auth`]), and the
+    /// terminal's own notification pace.
     pub(super) sinks: super::notify_auth::NotificationSinks,
     /// In-progress notifications being built from OSC 99 chunks.
     pub(super) pending: PendingNotificationsMap,

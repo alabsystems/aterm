@@ -11,10 +11,10 @@ use crate::harness::account_series::{Fig, PlanSaid, Said, SeriesRow};
 use crate::harness::accounts::{Class, Mode, Roster, Row, SessionRow, State, TapRead, WindowRead};
 
 /// Sun 25 Oct 2026 19:30, UTC (the words below are said at offset 0).
-const NOW: i64 = 1_792_956_600;
-const MIN: i64 = 60;
-const H: i64 = 3600;
-const D: i64 = 86_400;
+pub(crate) const NOW: i64 = 1_792_956_600;
+pub(crate) const MIN: i64 = 60;
+pub(crate) const H: i64 = 3600;
+pub(crate) const D: i64 = 86_400;
 /// Thu 29 Oct 09:00: `me`'s week resets.
 const THU9: i64 = NOW + 307_800;
 /// Fri 30 Oct 14:00: `alt1`'s week resets.
@@ -22,31 +22,31 @@ const FRI14: i64 = NOW + 412_200;
 /// Thu 22 Oct 11:00: `alt2`'s week reset, passed.
 const THU22: i64 = NOW - 289_800;
 /// Sat 31 Oct 08:00: `pool1`'s week resets.
-const SAT8: i64 = NOW + 477_000;
+pub(crate) const SAT8: i64 = NOW + 477_000;
 const MACHINE: &str = "0a0b";
 
 /// The clock the words below are said on.
-fn utc() -> Offsets {
+pub(crate) fn utc() -> Offsets {
     Offsets::fixed(0)
 }
 
-/// A synthetic roster, state and series.
-struct Fx {
-    roster: Roster,
-    state: State,
-    enrolled: BTreeSet<String>,
-    series: BTreeMap<String, Vec<SeriesRow>>,
-    renewals: BTreeMap<String, String>,
-    mode: Mode,
-    credits: bool,
-    now: i64,
+/// A synthetic roster, state and series (the quota view's tests build on it too).
+pub(crate) struct Fx {
+    pub(crate) roster: Roster,
+    pub(crate) state: State,
+    pub(crate) enrolled: BTreeSet<String>,
+    pub(crate) series: BTreeMap<String, Vec<SeriesRow>>,
+    pub(crate) renewals: BTreeMap<String, String>,
+    pub(crate) mode: Mode,
+    pub(crate) credits: bool,
+    pub(crate) now: i64,
     /// The local clock's offset at each instant.
-    offset: fn(i64) -> i64,
+    pub(crate) offset: fn(i64) -> i64,
 }
 
 impl Fx {
     /// The first row is the default login; the others have their own login, enrolled.
-    fn new(rows: &[(&str, Class)]) -> Fx {
+    pub(crate) fn new(rows: &[(&str, Class)]) -> Fx {
         let roster = Roster {
             rows: rows
                 .iter()
@@ -79,7 +79,13 @@ impl Fx {
     }
 
     /// The tap's reading of `label` at `at`, through the store's own writer, and its series row.
-    fn read(&mut self, label: &str, five: Option<(u32, i64)>, week: Option<(u32, i64)>, at: i64) {
+    pub(crate) fn read(
+        &mut self,
+        label: &str,
+        five: Option<(u32, i64)>,
+        week: Option<(u32, i64)>,
+        at: i64,
+    ) {
         let window = |w: Option<(u32, i64)>| {
             w.map(|(pct_x10, reset)| WindowRead {
                 pct_x10,
@@ -100,7 +106,13 @@ impl Fx {
     }
 
     /// A series `fig` row of `label` at `t`.
-    fn fig(&mut self, label: &str, t: i64, five: Option<(u32, i64)>, week: Option<(u32, i64)>) {
+    pub(crate) fn fig(
+        &mut self,
+        label: &str,
+        t: i64,
+        five: Option<(u32, i64)>,
+        week: Option<(u32, i64)>,
+    ) {
         let fig = |w: Option<(u32, i64)>| {
             w.map(|(pct_x10, reset)| Fig {
                 pct_x10,
@@ -122,7 +134,7 @@ impl Fx {
         rows.sort_by_key(|r| r.t);
     }
 
-    fn plan(&mut self, label: &str, word: &str, tier: Option<&str>, t: i64) {
+    pub(crate) fn plan(&mut self, label: &str, word: &str, tier: Option<&str>, t: i64) {
         let rows = self.series.entry(label.to_owned()).or_default();
         rows.push(SeriesRow {
             t,
@@ -136,7 +148,7 @@ impl Fx {
         rows.sort_by_key(|r| r.t);
     }
 
-    fn ran(&mut self, label: &str, at: i64) {
+    pub(crate) fn ran(&mut self, label: &str, at: i64) {
         self.state
             .accounts
             .entry(label.to_owned())
@@ -144,7 +156,7 @@ impl Fx {
             .ran_at = Some(at);
     }
 
-    fn session(&mut self, sid: &str, label: &str, at: i64) {
+    pub(crate) fn session(&mut self, sid: &str, label: &str, at: i64) {
         self.state.sessions.insert(
             sid.into(),
             SessionRow {
@@ -169,7 +181,7 @@ impl Fx {
         }
     }
 
-    fn outlook(&self) -> Outlook {
+    pub(crate) fn outlook(&self) -> Outlook {
         outlook(&self.inputs())
     }
 }
@@ -245,7 +257,7 @@ fn scenario_a() -> Fx {
 }
 
 /// Scenario B: a gap.
-fn scenario_b() -> Fx {
+pub(crate) fn scenario_b() -> Fx {
     let mut fx = Fx::new(&[("me", Class::Preferred), ("alt1", Class::Preferred)]);
     me_at_today(&mut fx);
     alt1_read(&mut fx, 920);
@@ -253,7 +265,7 @@ fn scenario_b() -> Fx {
 }
 
 /// Scenario C: an account never read.
-fn scenario_c() -> Fx {
+pub(crate) fn scenario_c() -> Fx {
     let mut fx = Fx::new(&[
         ("me", Class::Preferred),
         ("alt1", Class::Preferred),
@@ -265,7 +277,7 @@ fn scenario_c() -> Fx {
 }
 
 /// Scenario D: `me`'s 5h at 81% since 17:00 (32.4 points an hour), `alt1`'s at 95% read 19:20.
-fn scenario_d() -> Fx {
+pub(crate) fn scenario_d() -> Fx {
     let mut fx = Fx::new(&[("me", Class::Preferred), ("alt1", Class::Preferred)]);
     fx.plan("me", "max", Some("20x"), NOW - H);
     for (t, week) in [(NOW - 24 * H, 420), (NOW - 8 * H, 527)] {
@@ -298,11 +310,8 @@ fn labels(pass: &Pass) -> Vec<(&str, i64, i64, Ends)> {
         .collect()
 }
 
-fn stops(pass: &Pass) -> Vec<(i64, i64, i64)> {
-    pass.stops
-        .iter()
-        .map(|s| (s.from, s.to, s.shown_to))
-        .collect()
+fn stops(pass: &Pass) -> Vec<(i64, StopEnd)> {
+    pass.stops.iter().map(|s| (s.from, s.end)).collect()
 }
 
 fn rise_of(fx: &Fx, w: Window, lookback: i64) -> (i64, Option<i64>, bool) {
@@ -798,7 +807,8 @@ fn replay_clock_sanitation_preserves_walls_access_and_refill_cuts() {
         Fresh::Walled
     );
     let glance = out.glance("me", None, true).unwrap();
-    assert!(glance.bar.is_some());
+    // A wall is `out`: no bar of an inferred 100%.
+    assert!(glance.bar.is_none());
     assert_eq!(glance, out.glance("me", Some(0), true).unwrap());
     assert_eq!(fx.state, before);
 }
@@ -1048,7 +1058,8 @@ fn replay_is_the_policy() {
                         d.t,
                     )
                     .is_err();
-                let horizon = d.t >= NOW + accounts::WEEK_WINDOW_S;
+                // Past its pass's horizon a move only ends a stop: no link follows it.
+                let horizon = d.t >= d.horizon;
                 assert!(
                     refused || horizon || taken.contains(&(d.t, to.clone())),
                     "the move to {to} at {} was not taken",
@@ -1127,19 +1138,19 @@ fn scenarios_to_the_minute() {
             ("me", alt1_full, me_full, Ends::Walls),
         ]
     );
-    assert_eq!(stops(week), [(me_full, THU9 + 150, THU9)]);
+    assert_eq!(stops(week), [(me_full, StopEnd::Reset(THU9))]);
     assert_eq!(
         b.verdict,
         Verdict::Stop {
             pass: PassKind::Week,
             from: me_full,
-            to: THU9,
-            at_reset: true,
+            end: StopEnd::Reset(THU9),
             lean: None
         }
     );
     let words = b.verdict_words().unwrap();
-    assert_eq!(words.full, "\u{29d7} stop ~Wed 22:30\u{2013}Thu 09:00");
+    // 75 hours ahead, the start rounds down to the hour; the reset is exact.
+    assert_eq!(words.full, "\u{2573} ~Wed 22:00\u{2013}Thu 09:00");
     assert!(words.warn && words.kept_narrow);
 
     // C: alt1 leaves early onto `pool1` (shared, never read) at Wed 15:00: the worst case is B's
@@ -1152,7 +1163,7 @@ fn scenarios_to_the_minute() {
         ("pool1", leaves + 8 * H + 15 * MIN)
     );
     assert_eq!(lean.why, Fresh::NeverRead);
-    assert_eq!(stops(&lean.worst), [(me_full, THU9 + 150, THU9)]);
+    assert_eq!(stops(&lean.worst), [(me_full, StopEnd::Reset(THU9))]);
     assert!(lean.best.stops.is_empty() && lean.best.lean.is_none());
     assert_eq!(
         c.verdict,
@@ -1160,7 +1171,7 @@ fn scenarios_to_the_minute() {
             until: lean.at,
             row: "pool1".into(),
             why: Fresh::NeverRead,
-            stop: Some((me_full, THU9, true))
+            stop: Some((me_full, StopEnd::Reset(THU9)))
         }
     );
 
@@ -1178,10 +1189,10 @@ fn scenarios_to_the_minute() {
         ]
     );
     let alt1_reset = NOW + 100 * MIN;
-    assert_eq!(stops(working)[0], (alt1_wall, alt1_reset + 150, alt1_reset));
+    assert_eq!(stops(working)[0], (alt1_wall, StopEnd::Reset(alt1_reset)));
     assert_eq!(
         d.verdict_words().unwrap().full,
-        "\u{29d7} 5h stop ~20:10\u{2013}21:10"
+        "\u{2573} ~20:10\u{2013}21:10"
     );
 }
 
@@ -1622,7 +1633,7 @@ fn breaker_pin_off_credits() {
     let first = week.stops.first().expect("a breaker stop");
     assert_eq!(first.from, wall);
     // Nine rotations from 19:00 on four rows (a bound of eight): it holds to 19:01 + 1 h.
-    assert_eq!(first.to, NOW + 31 * MIN);
+    assert_eq!(first.end, StopEnd::About(NOW + 31 * MIN));
     assert!(
         breaker(false).week.unwrap().stops.is_empty(),
         "no breaker, no stop"
@@ -1638,8 +1649,7 @@ fn breaker_pin_off_credits() {
         Verdict::Stop {
             pass: PassKind::Week,
             from: alone,
-            to: THU9,
-            at_reset: true,
+            end: StopEnd::Reset(THU9),
             lean: None
         }
     );
@@ -1826,6 +1836,18 @@ fn replay_is_bounded() {
             .cut_at
             .is_some_and(|at| at < NOW + WORKING_HORIZON_S)
     );
+    // The fills are bounded too: at most `MAX_EVENTS` knots a row, all rows together, none past
+    // the horizon.
+    for pass in out.week.iter().chain(out.working.iter()) {
+        let knots: usize = pass.fills.values().map(Vec::len).sum();
+        assert!(knots <= MAX_EVENTS * names.len(), "{knots} knots");
+        assert!(
+            pass.fills
+                .values()
+                .flatten()
+                .all(|k| k.t >= NOW && k.t <= pass.horizon)
+        );
+    }
 }
 
 /// T16: PLAN MULTIPLES. A Max 5x after a Max 20x spends 4× faster; a row whose plan was not seen
@@ -1876,8 +1898,9 @@ fn plan_multiples() {
 
 /// T17: THE CLI'S TEXT AND JSON ARE ONE MODEL: the same stop instants and the same percents.
 /// Every stop of every pass in scenarios B and D is said in the text at its JSON instant
-/// rounded down; D's 5-hour stop starts off the ten-minute grid, so a rounding shows. Negative
-/// control: a text that rounds its stop's start up says another instant for D.
+/// rounded down by its lead; D's 5-hour stop starts off the ten-minute grid, so a rounding
+/// shows; the verdict's JSON `end` is the vendor reset the text says. Negative control: a text
+/// that rounds its stop's start up says another instant for D.
 #[test]
 fn text_and_json_one_model() {
     let mut off_grid = false;
@@ -1902,8 +1925,11 @@ fn text_and_json_one_model() {
                     .get("from")
                     .and_then(aterm_json::Value::as_i64)
                     .unwrap();
-                off_grid |= round_down(from, &utc()) != round_up(from, &utc());
-                let said = format!("~{} \u{2192}", long_when(round_down(from, &utc()), &utc()));
+                off_grid |= round_down(from, NOW, &utc()) != round_up(from, NOW, &utc());
+                let said = format!(
+                    "~{} \u{2192}",
+                    long_when(round_down(from, NOW, &utc()), &utc())
+                );
                 assert!(
                     text.lines()
                         .any(|l| l.trim_start().starts_with("stop") && l.contains(&said)),
@@ -1927,14 +1953,18 @@ fn text_and_json_one_model() {
         .get("from")
         .and_then(aterm_json::Value::as_i64)
         .unwrap();
-    let to = verdict
-        .get("to")
-        .and_then(aterm_json::Value::as_i64)
-        .unwrap();
+    assert!(verdict.get("to").is_some_and(aterm_json::Value::is_null));
+    let end = verdict.get("end").unwrap();
+    assert_eq!(
+        end.get("kind").and_then(aterm_json::Value::as_str),
+        Some("reset")
+    );
+    let to = end.get("at").and_then(aterm_json::Value::as_i64).unwrap();
+    assert_eq!(to, THU9);
     assert!(
         text.contains(&format!(
             "stop  ~{} \u{2192} {}",
-            long_when(round_down(from, &utc()), &utc()),
+            long_when(round_down(from, NOW, &utc()), &utc()),
             long_when(to, &utc())
         )),
         "{text}"
@@ -1952,6 +1982,7 @@ fn text_and_json_one_model() {
         stop.get("from").and_then(aterm_json::Value::as_i64),
         Some(from)
     );
+    assert_eq!(stop.get("end"), Some(end));
     // Each row's projected percent in its window line and in its JSON.
     for row in &out.rows {
         let lines = out.row_lines(&row.label).join("\n");
@@ -2358,8 +2389,10 @@ fn an_aged_five_hour_figure_is_not_said_bare() {
 }
 
 /// A LEAN'S STOP ENDS ON ITS OWN WORDS: in C the worst case stops to `me`'s reset, the vendor's
-/// instant, said exactly, as a stop's end is. Negative control: the end said as a forecast
-/// instant (`~`, rounded down) says the reset 0 minutes early with a `~`.
+/// instant, said exactly, as a stop's end is, and the stop is a projected gap: `╳`, never the
+/// wall's `⧗`. Negative controls: the end said as a forecast instant (`~`, rounded down) says
+/// the reset 0 minutes early with a `~`; the note marked `⧗` (the words before the glass design)
+/// fails the mark.
 #[test]
 fn a_leans_stop_ends_on_the_reset() {
     let out = scenario_c().outlook();
@@ -2377,6 +2410,10 @@ fn a_leans_stop_ends_on_the_reset() {
         "{note}"
     );
     assert!(!note.contains(&format!("~{}", out.when(THU9))), "{note}");
+    assert!(
+        note.contains("\u{2573} ") && !note.contains('\u{29d7}'),
+        "{note}"
+    );
     assert!(
         out.verdict_spoken().contains(&out.spoken_when(THU9)),
         "{}",
@@ -2422,24 +2459,70 @@ fn every_assumption_is_said_on_the_card_and_in_the_text() {
     }
 }
 
-/// A STOP'S WORDS LEAD WITH ITS MARK: every warn form (full, short and shortest) of every stop
-/// in B and D begins with `⧗`, the mark SPECS names. Negative control: a short form without the
-/// mark fails it.
+/// A STOP'S WORDS LEAD WITH ITS MARK: every warn form (full, short and shortest) of every
+/// projected stop in B and D (the week's and the 5-hour one alike) begins with `╳`, the gap,
+/// and a wall standing now with `⧗`, its one meaning (glass design §4.3). The words never name
+/// the 5-hour window, so the hover title says where D's stop comes from (`(a 5-hour limit)`, as
+/// its spoken `A 5-hour stop` does) and B's says no such thing (§2.3). Negative controls: a
+/// short form without the mark fails it; the projected stop marked `⧗` (the words before the
+/// glass design) fails the first loop; a title made from the words alone (the slice before this
+/// fix) says `stop ~20:10–21:10` for D and fails the title.
 #[test]
 fn a_stops_words_lead_with_its_mark() {
-    for fx in [scenario_b(), scenario_d()] {
-        let words = fx.outlook().verdict_words().expect("a stop");
-        assert!(words.warn);
-        for form in [
+    let forms = |words: &VerdictWords| -> Vec<String> {
+        [
             Some(&words.full),
             Some(&words.short),
             words.shortest.as_ref(),
         ]
         .into_iter()
         .flatten()
-        {
-            assert!(form.starts_with('\u{29d7}'), "{form}");
+        .cloned()
+        .collect()
+    };
+    for (fx, title) in [
+        (scenario_b(), "stop ~Wed 22:00\u{2013}Thu 09:00"),
+        (scenario_d(), "stop ~20:10\u{2013}21:10 (a 5-hour limit)"),
+    ] {
+        let out = fx.outlook();
+        let words = out.verdict_words().expect("a stop");
+        assert!(words.warn);
+        for form in forms(&words) {
+            assert!(form.starts_with("\u{2573} "), "{form}");
+            assert!(!form.contains("5h") && !form.contains("stop"), "{form}");
         }
+        let glance = out.glance("me", None, true).expect("me's glance");
+        assert_eq!(glance.title_verdict.as_deref(), Some(title));
+        assert_eq!(
+            glance
+                .spoken
+                .as_deref()
+                .is_some_and(|s| s.contains("A 5-hour stop")),
+            title.contains("5-hour"),
+            "{:?}",
+            glance.spoken
+        );
+    }
+    let mut walled = Fx::new(&[("me", Class::Preferred)]);
+    walled.read("me", None, Some((1000, THU9)), NOW);
+    accounts::note_wall(
+        &mut walled.state,
+        "me",
+        accounts::WEEK_LIMIT,
+        Some(THU9),
+        NOW,
+        NOW,
+    );
+    let out = walled.outlook();
+    assert!(
+        matches!(out.verdict, Verdict::Walled { to: None, .. }),
+        "{:?}",
+        out.verdict
+    );
+    let words = out.verdict_words().expect("a wall");
+    assert!(words.warn);
+    for form in forms(&words) {
+        assert!(form.starts_with('\u{29d7}'), "{form}");
     }
 }
 
@@ -2492,6 +2575,486 @@ fn a_reset_past_a_daylight_change_is_said_on_its_own_clock() {
     assert_eq!(out.offsets.at(PST_FROM - 1), -7 * H);
     assert_eq!(out.offsets.at(PST_FROM), -8 * H);
     let g = out.glance("me", Some(580), true).unwrap();
-    assert_eq!(g.reset.as_deref(), Some("1 Nov 10:30"));
-    assert_eq!(when(reset, NOW, &Offsets::fixed(-7 * H)), "1 Nov 11:30");
+    assert_eq!(g.reset.as_deref(), Some("Sun 1 Nov 10:30"));
+    assert_eq!(when(reset, NOW, &Offsets::fixed(-7 * H)), "Sun 1 Nov 11:30");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Projection truth (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §3, slice S1)
+
+/// Thu 5 Nov 2026 17:00, UTC: the glass design's now (its §1).
+pub(crate) const T5: i64 = NOW + 941_400;
+/// Sat 7 Nov 10:00: case (b)'s week resets.
+pub(crate) const SAT7: i64 = T5 + 41 * H;
+/// Sat 14 Nov 10:00: the week after.
+pub(crate) const SAT14: i64 = SAT7 + 7 * D;
+
+/// The glass design's case (b): one Max 20x account at 63% of its week at Thu 17:00, its reset
+/// Sat 10:00, read here from 42% a day before (50% by 23:00, flat overnight): 21% a day.
+pub(crate) fn case_b() -> Fx {
+    let mut fx = Fx::new(&[("main", Class::Preferred)]);
+    fx.now = T5;
+    fx.plan("main", "max", Some("20x"), T5 - H);
+    for (t, x10) in [(T5 - 24 * H, 420), (T5 - 18 * H, 500), (T5 - 10 * H, 500)] {
+        fx.fig("main", t, None, Some((x10, SAT7)));
+    }
+    fx.read("main", None, Some((630, SAT7)), T5);
+    fx.ran("main", T5);
+    fx.session("s-main", "main", T5);
+    fx
+}
+
+/// Two Max 20x rows under `wall` mode at 50% of a week a day: `alt1` carries at 90% (its week
+/// resets in 29 h), `main` read now at 30% (its week resets in 41 h).
+fn frees_first() -> Fx {
+    let mut fx = Fx::new(&[("alt1", Class::Preferred), ("main", Class::Preferred)]);
+    fx.mode = Mode::Wall;
+    fx.plan("alt1", "max", Some("20x"), NOW - D);
+    fx.plan("main", "max", Some("20x"), NOW - D);
+    fx.fig("alt1", NOW - 24 * H, None, Some((400, NOW + 29 * H)));
+    fx.read("alt1", None, Some((900, NOW + 29 * H)), NOW);
+    fx.ran("alt1", NOW);
+    fx.session("s-alt1", "alt1", NOW);
+    fx.ran("main", NOW - 4 * H);
+    fx.read("main", None, Some((300, NOW + 41 * H)), NOW);
+    fx
+}
+
+/// `me` carries at 50% of a Max 20x week, 30% a day, its week resetting in a day; `pool1` is a
+/// shared row never read. Early mode leaves `me` at 97.5% of its next week (day 4.25) for
+/// `pool1`: a lean.
+pub(crate) fn worst_case() -> Fx {
+    let mut fx = Fx::new(&[("me", Class::Preferred), ("pool1", Class::Pool)]);
+    fx.plan("me", "max", Some("20x"), NOW - H);
+    fx.fig("me", NOW - 24 * H, None, Some((200, NOW + D)));
+    fx.read("me", None, Some((500, NOW + D)), NOW);
+    fx.ran("me", NOW);
+    fx.session("s-me", "me", NOW);
+    fx
+}
+
+/// A STOP PAST THE HORIZON ENDS AT THE RESET THAT RESUMES IT: in case (b) `main` reaches about
+/// 99% by Sat 10:00; its next week runs out on Thu 12 Nov, inside the 7-day horizon (Thu 12 Nov
+/// 17:00), and stays out to its reset Sat 14 Nov 10:00, past it. The stop ends there, the
+/// vendor's instant said exactly, never at the horizon, and no link follows it. Negative
+/// control: restoring `begin_stop`'s `.min(horizon)` plans the stop to the horizon, its reset
+/// lookup misses there, and it ends `About(Sat 14 Nov 10:02:30)`.
+#[test]
+fn a_stop_past_the_horizon_ends_at_the_reset_that_resumes_it() {
+    let out = case_b().outlook();
+    let week = out.week.as_ref().expect("the week pass");
+    assert_eq!(week.horizon, T5 + 7 * D);
+    let [stop] = week.stops.as_slice() else {
+        panic!("one stop: {:?}", week.stops);
+    };
+    assert!(stop.from > SAT7 && stop.from < week.horizon, "{stop:?}");
+    assert_eq!(stop.end, StopEnd::Reset(SAT14));
+    assert_eq!(
+        out.verdict,
+        Verdict::Stop {
+            pass: PassKind::Week,
+            from: stop.from,
+            end: StopEnd::Reset(SAT14),
+            lean: None
+        }
+    );
+    let words = out.verdict_words().unwrap();
+    assert_eq!(
+        words.full,
+        "\u{2573} ~Thu 12 Nov 04:00\u{2013}Sat 14 Nov 10:00"
+    );
+    assert_eq!(words.short, "\u{2573} ~Thu 12 Nov 04:00");
+    assert!(
+        week.chain.iter().all(|l| l.to <= stop.from),
+        "{:?}",
+        labels(week)
+    );
+    assert!(
+        !out.text().contains(&long_when(week.horizon, &utc())),
+        "the horizon is never said:\n{}",
+        out.text()
+    );
+}
+
+/// A STOP ENDS AT THE FIRST ACCOUNT THAT FREES IT: in [`frees_first`] the work runs alt1, main,
+/// alt1, main, each to its wall, and every account is out from main's second wall (day 5.6)
+/// until alt1's week resets (day 8.2): past the horizon, and before main's own reset (day 8.7).
+/// The policy resumes on alt1 there, so the stop ends `Reset(alt1's)`. Negative control: a stop
+/// past the horizon planned to the carrier's next reset (the shortcut the design rejects) ends
+/// `Reset(main's)`.
+#[test]
+fn a_stop_ends_at_the_first_account_that_frees_it() {
+    let out = frees_first().outlook();
+    let week = out.week.as_ref().expect("the week pass");
+    let (a2, m2) = (NOW + 29 * H + 7 * D, NOW + 41 * H + 7 * D);
+    assert_eq!(
+        labels(week),
+        [
+            ("alt1", NOW, NOW + 17_280, Ends::Walls),
+            ("main", NOW + 17_280, NOW + 138_240, Ends::Walls),
+            ("alt1", NOW + 138_240, NOW + 311_040, Ends::Walls),
+            ("main", NOW + 311_040, NOW + 483_840, Ends::Walls),
+        ]
+    );
+    assert!(week.horizon < a2 && a2 < m2);
+    assert_eq!(stops(week), [(NOW + 483_840, StopEnd::Reset(a2))]);
+}
+
+/// A WORST-CASE STOP NEVER ENDS AT THE INVENTED WALL: in [`worst_case`] `me` leaves for the
+/// unread `pool1` at day 4.25; the worst case walls `pool1` at once, the work goes back to `me`,
+/// which walls two hours later, and every account is out until `me`'s next reset (day 8), past
+/// the horizon. `pool1`'s wall is the worst case's invention, standing to the resume bound, past
+/// every instant the replay steps to, so it is never an event and the stop ends at `me`'s reset.
+/// No flag is needed for that: a flag that kept the invention's instants out of the events
+/// changed no outcome, since they lie at or past the bound by construction (review of S1).
+/// Negative control (run): `assume_worst` noting its wall to the horizon (the replay before this
+/// slice) ends the stop `Reset(horizon)`, the invented instant.
+#[test]
+fn a_worst_case_stop_never_ends_at_the_invented_wall() {
+    let out = worst_case().outlook();
+    let week = out.week.as_ref().expect("the week pass");
+    let lean = week.lean.as_ref().expect("a lean");
+    assert_eq!(lean.row, "pool1");
+    let Verdict::Lean {
+        stop: Some((from, end)),
+        ..
+    } = out.verdict
+    else {
+        panic!("a lean whose worst case stops: {:?}", out.verdict);
+    };
+    assert!(from > lean.at && from < week.horizon, "{from}");
+    assert_eq!(end, StopEnd::Reset(NOW + 8 * D));
+    assert!(lean.best.stops.is_empty(), "the best case runs on");
+}
+
+/// A STOP NOTHING ENDS IS OPEN: `main` alone, 35% of a week whose reset is 14 days and an hour
+/// away (no vendor week is that long: the bound is what is under test), walls at day 6.5 at 10%
+/// a day, its wall believed to that reset, and nothing frees it by the horizon plus a week: the
+/// stop is `Open`, said `╳ from ~…` in every form and `with no end in reach` aloud, and its JSON
+/// end is `{"kind": "open", "at": null}`. Negative control: a finish that ends a stop still
+/// open at the bound `About(bound)` says `╳ ~…–~…`.
+#[test]
+fn a_stop_nothing_ends_is_open() {
+    let mut fx = Fx::new(&[("main", Class::Preferred)]);
+    let far = NOW + 14 * D + H;
+    fx.plan("main", "max", Some("20x"), NOW - H);
+    fx.fig("main", NOW - 24 * H, None, Some((250, far)));
+    fx.read("main", None, Some((350, far)), NOW);
+    fx.ran("main", NOW);
+    fx.session("s-main", "main", NOW);
+    let out = fx.outlook();
+    let Verdict::Stop { from, end, .. } = out.verdict else {
+        panic!("a stop: {:?}", out.verdict);
+    };
+    assert_eq!(from, NOW + 6 * D + 12 * H);
+    assert_eq!(end, StopEnd::Open);
+    let said = format!("\u{2573} from {}", out.about(from));
+    assert_eq!(said, "\u{2573} from ~Sun 1 Nov 07:00");
+    let words = out.verdict_words().unwrap();
+    assert_eq!(
+        (
+            words.full.as_str(),
+            words.short.as_str(),
+            words.shortest.as_deref()
+        ),
+        (said.as_str(), said.as_str(), Some(said.as_str()))
+    );
+    assert!(
+        out.verdict_spoken().contains("with no end in reach"),
+        "{}",
+        out.verdict_spoken()
+    );
+    let json = out.json();
+    let end = json
+        .get("verdict")
+        .and_then(|v| v.get("end"))
+        .expect("the verdict's end");
+    assert_eq!(
+        end.get("kind").and_then(aterm_json::Value::as_str),
+        Some("open")
+    );
+    assert!(end.get("at").is_some_and(aterm_json::Value::is_null));
+}
+
+/// THE FILLS FOLLOW THE CHAIN AND DROP AT RESETS: in [`frees_first`] each link's row has a knot
+/// at the link's start and its end, its fill rising between and full where it walls; each
+/// carried row's reset inside the horizon is a drop, two knots at one instant (alt1 at day 1.2,
+/// main at day 1.7); and in A `pool1`, read and never carried, drops to unknown at its reset.
+/// In [`worst_case`] the worst branch assumes the unread `pool1` full: an assumption, never a
+/// figure, so its every knot there is unknown (never an inferred 100%). Knots are in time order
+/// and never past the horizon. Negative controls: an `on_resets` that pushes no knot draws alt1
+/// rising straight across its reset, with no drop; `assume_worst` noting its week
+/// `Known::Exact` (the slice before this fix) gives `pool1` knots of `Some(1000)`.
+#[test]
+fn fills_follow_the_chain_and_drop_at_resets() {
+    let out = frees_first().outlook();
+    let week = out.week.as_ref().expect("the week pass");
+    let at = |label: &str, t: i64| -> Vec<Option<u16>> {
+        week.fills[label]
+            .iter()
+            .filter(|k| k.t == t)
+            .map(|k| k.x10)
+            .collect()
+    };
+    for knots in week.fills.values() {
+        assert!(knots.windows(2).all(|w| w[0].t <= w[1].t), "{knots:?}");
+        assert!(knots.iter().all(|k| k.t >= NOW && k.t <= week.horizon));
+    }
+    for link in &week.chain {
+        let (start, end) = (at(&link.label, link.from), at(&link.label, link.to));
+        let (Some(Some(start)), Some(Some(end))) = (start.last(), end.first()) else {
+            panic!("{link:?}: {:?}", week.fills[&link.label]);
+        };
+        assert!(start < end, "{link:?} rises");
+        assert_eq!(*end, 1000, "{link:?} walls full");
+    }
+    assert_eq!(at("alt1", NOW + 29 * H), [Some(1000), Some(0)]);
+    assert_eq!(at("main", NOW + 41 * H), [Some(1000), Some(0)]);
+    let a = scenario_a().outlook();
+    let pool = &a.week.as_ref().expect("A's week pass").fills["pool1"];
+    let drop = [
+        Knot {
+            t: SAT8,
+            x10: Some(400),
+        },
+        Knot { t: SAT8, x10: None },
+    ];
+    assert!(pool.windows(2).any(|w| w == drop), "{pool:?}");
+
+    let worst = worst_case().outlook();
+    let lean = worst
+        .week
+        .as_ref()
+        .and_then(|p| p.lean.as_deref())
+        .expect("a lean on pool1");
+    let assumed = &lean.worst.fills["pool1"];
+    assert!(
+        assumed.iter().any(|k| k.t == lean.at) && assumed.iter().all(|k| k.x10.is_none()),
+        "{assumed:?}"
+    );
+}
+
+/// THE NEXT WEEK'S RUN-OUT HAS A CURVE: in case (b) `main`'s projection keeps its first window's
+/// meaning (99% by Sat 10:00), and its fills carry the week after: the drop at Sat 10:00, then a
+/// rise to 100% at the stop's start, flat (out) to the horizon. Negative control: a replay that
+/// keeps only `Proj` (as before this slice) has no point past Sat 10:00.
+#[test]
+fn the_next_weeks_run_out_has_a_curve() {
+    let out = case_b().outlook();
+    let week = out.week.as_ref().expect("the week pass");
+    let proj = out.rows[0]
+        .window(Window::Week)
+        .and_then(|w| w.projection)
+        .expect("the first window's projection");
+    assert_eq!(whole(proj.at_reset_x10), 99);
+    assert!(proj.fills_at.is_none());
+    let stop = week.stops[0].from;
+    let knots = &week.fills["main"];
+    assert_eq!(
+        knots.first(),
+        Some(&Knot {
+            t: T5,
+            x10: Some(630)
+        })
+    );
+    let drop = knots
+        .iter()
+        .position(|k| k.t == SAT7 && k.x10 == Some(0))
+        .expect("the drop at the reset");
+    assert_eq!(
+        knots[drop - 1],
+        Knot {
+            t: SAT7,
+            x10: u16::try_from(proj.at_reset_x10).ok()
+        }
+    );
+    let after = &knots[drop + 1..];
+    assert!(after.windows(2).all(|w| w[0].x10 <= w[1].x10), "{after:?}");
+    assert!(after.contains(&Knot {
+        t: stop,
+        x10: Some(1000)
+    }));
+    assert_eq!(
+        after.last(),
+        Some(&Knot {
+            t: week.horizon,
+            x10: Some(1000)
+        })
+    );
+}
+
+/// A BEAT REPEATS ONLY ITS ROW'S WEEK: a series beat says its figures equal the last `fig`
+/// row's, both windows, `None` included (`account_series::note_within`). So a beat after a row
+/// that read the week repeats that week at the beat's time, and a beat after a row that read
+/// the 5 hours alone repeats no week: [`RowOutlook::read`] never holds a week this Mac did not
+/// read then. Negative control: a `reads_of` whose `last` only a row with a week sets (the
+/// slice before this fix) brings 40% back at the third row's time.
+#[test]
+fn a_beat_repeats_only_its_rows_week() {
+    let reset = NOW + 3 * D;
+    let mut fx = Fx::new(&[("me", Class::Preferred)]);
+    fx.fig("me", NOW - 5 * H, Some((200, NOW + H)), Some((400, reset)));
+    fx.fig("me", NOW - 4 * H, Some((300, NOW + H)), None);
+    fx.fig("me", NOW - 2 * H, Some((350, NOW + H)), Some((450, reset)));
+    let rows = fx.series.get_mut("me").expect("me's series");
+    for t in [NOW - 3 * H, NOW - H] {
+        rows.push(SeriesRow {
+            t,
+            by: MACHINE.into(),
+            said: Said::Beat,
+        });
+    }
+    rows.sort_by_key(|r| r.t);
+    let out = fx.outlook();
+    let read = |t: i64, x10: u16| Read {
+        t,
+        x10,
+        reset,
+        epoch: None,
+    };
+    assert_eq!(
+        out.rows[0].read,
+        [
+            read(NOW - 5 * H, 400),
+            read(NOW - 2 * H, 450),
+            read(NOW - H, 450)
+        ]
+    );
+}
+
+/// FORECAST INSTANTS ROUND BY THEIR LEAD: seen at 19:30, a start rounds down and an end up, to
+/// 10 minutes up to six hours ahead, 30 minutes up to a day, an hour beyond, on the local
+/// clock; the glass design's run-out at 05:50, 6.5 days ahead, reads `~Thu 12 Nov 05:00`; a
+/// vendor reset is said exactly. Negative control: one 10-minute grain (the `ROUND_S` before
+/// this slice) says `~Thu 12 Nov 05:50`.
+#[test]
+fn forecast_instants_round_by_their_lead() {
+    let u = utc();
+    let at = |h: i64, m: i64| NOW + h * H + m * MIN;
+    let both = |t: i64, offsets: &Offsets| (round_down(t, NOW, offsets), round_up(t, NOW, offsets));
+    assert_eq!(both(at(2, 7), &u), (at(2, 0), at(2, 10)));
+    assert_eq!(both(at(5, 57), &u), (at(5, 50), at(6, 0)));
+    assert_eq!(both(at(6, 7), &u), (at(6, 0), at(6, 30)));
+    assert_eq!(both(at(30, 7), &u), (at(29, 30), at(30, 30)));
+    assert_eq!(both(at(30, 30), &u), (at(30, 30), at(30, 30)));
+    // On a half-hour zone's clock the hour is its own: 01:37 UTC is 07:07 in India.
+    let india = Offsets::fixed(5 * H + 30 * MIN);
+    assert_eq!(both(at(30, 7), &india), (at(30, 0), at(31, 0)));
+    let runout = T5 + 6 * D + 12 * H + 50 * MIN;
+    assert_eq!(when(round_down(runout, T5, &u), T5, &u), "Thu 12 Nov 05:00");
+    assert_eq!(when(round_up(runout, T5, &u), T5, &u), "Thu 12 Nov 06:00");
+    let b = scenario_b().outlook();
+    assert!(
+        b.verdict_words()
+            .unwrap()
+            .full
+            .ends_with("\u{2013}Thu 09:00")
+    );
+}
+
+/// WHEN ADDS THE DATE FROM A WEEK: `HH:MM` today, `Ddd HH:MM` one to six days on, `Ddd D Mon
+/// HH:MM` from seven (a day-7 instant shares today's weekday) and for an earlier day; spoken the
+/// same way. Negative controls: the day-7 form with no weekday (`1 Nov 19:30`, before this
+/// slice) and the one with no date (`Sun 19:30`, which reads as today) each fail it.
+#[test]
+fn when_adds_the_date_from_a_week() {
+    let u = utc();
+    assert_eq!(when(NOW + H, NOW, &u), "20:30");
+    assert_eq!(when(NOW + D, NOW, &u), "Mon 19:30");
+    assert_eq!(when(NOW + 6 * D, NOW, &u), "Sat 19:30");
+    assert_eq!(when(NOW + 7 * D, NOW, &u), "Sun 1 Nov 19:30");
+    assert_eq!(when(NOW - D, NOW, &u), "Sat 24 Oct 19:30");
+    assert_eq!(spoken_when(NOW + 3 * D, NOW, &u), "Wednesday 19:30");
+    assert_eq!(spoken_when(NOW + 7 * D, NOW, &u), "Sunday 1 November 19:30");
+    assert_eq!(
+        spoken_when(T5 + 6 * D + 12 * H, T5, &u),
+        "Thursday 12 November 05:00"
+    );
+}
+
+/// A WALL SAYS OUT, NEVER 100: a standing wall's week is `Figure::Out` (`out`; `out until its
+/// reset` aloud), and the glance draws no bar and gives the week no title words (the footer's
+/// own `weekly out` says it, so the account hover never reads `weekly out (out)`), with no
+/// percentage anywhere, though the last reading said 97%; its verdict clause says how long.
+/// Negative controls: the glance's wall-as-1000 path (before this slice) draws a full bar
+/// titled `100% used`; a wall titled `out` (the slice before this fix) fails the title.
+#[test]
+fn a_wall_says_out_never_100() {
+    let mut fx = Fx::new(&[("me", Class::Preferred)]);
+    fx.read("me", None, Some((970, THU9)), NOW - 10 * MIN);
+    accounts::note_wall(
+        &mut fx.state,
+        "me",
+        accounts::WEEK_LIMIT,
+        Some(THU9),
+        NOW,
+        NOW,
+    );
+    let out = fx.outlook();
+    let week = out.rows[0].window(Window::Week).expect("the week");
+    assert_eq!(week.fresh, Fresh::Walled);
+    let figure = Figure::of_week(week, out.as_of);
+    assert_eq!(figure, Figure::Out);
+    assert_eq!(figure.words(), "out");
+    assert_eq!(figure.spoken(), "out until its reset");
+    let g = out.glance("me", Some(970), true).expect("a glance");
+    assert_eq!(g.bar, None);
+    assert_eq!(g.title, None);
+    let clause = g.title_verdict.expect("the wall's clause");
+    assert!(
+        clause.starts_with('\u{29d7}') && !clause.contains('%'),
+        "{clause}"
+    );
+}
+
+/// A LOWER BOUND SAYS AT LEAST: a reading of now is exact (`58%`); a preferred row idle here
+/// since a reading three hours old, or a pool row's, is a bound (`≥31%`, `≥40%`), since another
+/// Mac may have used it since; so is the carrier's own reading an hour and a half old while in
+/// use (`stale`, whose pace is refused but whose figure stays true: `≥58%`, as
+/// [`Figure::of_reading`] says the same reading); a reading whose reset passed is unread (`?`);
+/// under 100 is never said 100; and a bound rounds down, so it stays true (62.5% is `≥62%`),
+/// where an exact figure rounds half up (`63%`). Negative controls: an aged reading said exact
+/// prints `31%` for alt1; `of_week` showing only the classes `shows_figure` admits (the slice
+/// before this fix) says `?` for the stale carrier; a bound rounded half up says `≥63%`.
+#[test]
+fn a_lower_bound_says_at_least() {
+    let out = scenario_a_idle().outlook();
+    let fig = |label: &str| {
+        let row = out.rows.iter().find(|r| r.label == label).unwrap();
+        Figure::of_week(row.window(Window::Week).unwrap(), out.as_of)
+    };
+    assert_eq!(fig("me"), Figure::Exact(580));
+    assert_eq!(fig("me").words(), "58%");
+    assert_eq!(fig("alt1"), Figure::AtLeast(310));
+    assert_eq!(fig("alt1").words(), "\u{2265}31%");
+    assert_eq!(fig("alt1").spoken(), "at least 31 percent used");
+    assert_eq!(fig("pool1").words(), "\u{2265}40%");
+    assert_eq!(fig("alt2"), Figure::Unread);
+    assert_eq!(fig("alt2").words(), "?");
+    assert_eq!(Figure::of_reading(996, THU9, NOW, NOW).words(), "99%");
+    assert_eq!(Figure::of_reading(1000, THU9, NOW, NOW).words(), "100%");
+    assert_eq!(
+        Figure::of_reading(580, THU9, NOW - 2 * H, NOW),
+        Figure::AtLeast(580)
+    );
+
+    let mut aged = scenario_a();
+    aged.state.accounts.remove("me");
+    aged.read("me", None, Some((580, THU9)), NOW - 90 * MIN);
+    let stale = aged.outlook();
+    let me = stale.rows.iter().find(|r| r.label == "me").unwrap();
+    assert_eq!(me.window(Window::Week).unwrap().fresh, Fresh::Stale);
+    assert_eq!(me.figure(stale.as_of), Figure::AtLeast(580));
+    assert_eq!(
+        me.figure(stale.as_of),
+        Figure::of_reading(580, THU9, NOW - 90 * MIN, NOW)
+    );
+    assert_eq!(me.figure(stale.as_of).words(), "\u{2265}58%");
+
+    assert_eq!(Figure::AtLeast(625).words(), "\u{2265}62%");
+    assert_eq!(Figure::AtLeast(625).spoken(), "at least 62 percent used");
+    assert_eq!(Figure::AtLeast(999).words(), "\u{2265}99%");
+    assert_eq!(Figure::AtLeast(1000).words(), "\u{2265}100%");
+    assert_eq!(Figure::Exact(625).words(), "63%");
+    assert_eq!(Figure::Exact(995).words(), "99%");
 }

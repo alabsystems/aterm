@@ -3356,9 +3356,10 @@ fn subscription_account_and_weekly_outlast_workspace_details_without_overflow() 
 /// A WEEKLY FIGURE THE FOOTER HAS NOT GOT IS NOT ON THE RULE: whatever the reason (the tap off,
 /// no reply yet, none told) the rule shows the account and no `weekly –` or `weekly
 /// unavailable`; the reason is the account's hover title's, the Accounts menu's and a screen
-/// reader's. A standing 7d wall still says `weekly 0% left`, and a real figure, aged or not,
-/// stays beside the account and the controls on an 80-column pane, in its narrow form
-/// (`weekly 61.5% · 59m`) where the controls take the room.
+/// reader's. A standing 7d wall says `weekly out`, never a percentage, and a real figure, aged
+/// or not, stays beside the account and the controls on an 80-column pane, in its narrow form
+/// (`weekly 61.5% · 59m`) where the controls take the room. Negative control: the wall's
+/// inferred `weekly 0% left` (before the glass design) fails it.
 #[test]
 fn a_missing_weekly_figure_is_not_on_the_rule() {
     use super::super::profile::{SubscriptionDisplay, WeeklyGap};
@@ -3405,7 +3406,10 @@ fn a_missing_weekly_figure_is_not_on_the_rule() {
         subscription: with(Some(WeeklyGap::NoReply), None).subscription,
         ..narrow_rule_walled()
     };
-    assert_eq!(weekly(&walled).as_deref(), Some("weekly 0% left"));
+    assert_eq!(
+        weekly(&walled).as_deref(),
+        Some(super::super::profile::WEEKLY_OUT)
+    );
     let facts = with(None, Some(AGED_WEEK));
     let room = rule_room(&(0..80));
     let words = weekly(&facts).expect("a weekly segment");
@@ -3838,7 +3842,7 @@ fn subscription_keeps_a_standing_limit_and_controls_before_secondary_facts() {
         subscription: Some(super::super::profile::SubscriptionDisplay {
             email: Some("owner@example.com".into()),
             plan: Some("Max 5x".into()),
-            weekly: Some("weekly 0% left".into()),
+            weekly: Some(super::super::profile::WEEKLY_OUT.into()),
             ..Default::default()
         }),
         ..narrow_rule_walled()
@@ -6846,7 +6850,7 @@ fn recovery_ladders_keep_a_joined_weekly_with_its_account() {
             let facts = FooterFacts {
                 subscription: Some(super::super::profile::SubscriptionDisplay {
                     email: email.map(str::to_owned),
-                    weekly: Some("weekly 0% left".into()),
+                    weekly: Some(super::super::profile::WEEKLY_OUT.into()),
                     ..Default::default()
                 }),
                 account_progress: progress.clone(),

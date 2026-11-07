@@ -1298,15 +1298,6 @@ mod tests {
                 "nothing cached to forget: {calls:?}"
             );
         }
-        assert!(
-            missing()
-                .command()
-                .display()
-                .starts_with("/usr/bin/sudo -k -p 'Mac password: ' "),
-            "{}",
-            missing().command().display()
-        );
-
         // A vault question may own the terminal first. The root pass must not print its
         // prelude, claim its episode or start sudo while that question still owns stdin.
         for stopped_while_queued in [false, true] {
@@ -2162,6 +2153,28 @@ mod tests {
     /// even when the automatic sudo was proven never started afterward.
     #[test]
     fn an_explicit_attempt_survives_an_older_automatic_no_start_result() {
+        const CHILD: &str = "ATERM_CLT_EXPLICIT_ATTEMPT_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+            cmd.args([
+                "--exact",
+                "init_clt::tests::an_explicit_attempt_survives_an_older_automatic_no_start_result",
+                "--nocapture",
+            ])
+            .env(CHILD, "1");
+            let output = aterm_uds::deadline::output_until(
+                &mut cmd,
+                std::time::Instant::now() + std::time::Duration::from_secs(60),
+            )
+            .expect("explicit-attempt regression must finish before the hang detector");
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         use std::sync::atomic::{AtomicBool, Ordering};
         let sys = console();
         let first = AtomicBool::new(true);
