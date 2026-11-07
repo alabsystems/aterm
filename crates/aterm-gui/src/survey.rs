@@ -799,7 +799,6 @@ fn session_row(
         goal,
         build_wait,
         work,
-        need_ids,
     ) = {
         let timeline = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
         let need = timeline.need();
@@ -833,14 +832,6 @@ fn session_row(
             // Only a content row says where its agent works, as only it says `cwd=`.
             (level == SurveyLevel::Content)
                 .then(|| timeline.work().cloned())
-                .flatten(),
-            // The ids a peer's herald tells this ask's needs by, beside its words: content only.
-            (level == SurveyLevel::Content)
-                .then(|| {
-                    need.need
-                        .as_ref()
-                        .and_then(crate::status_item::need_ids_row)
-                })
                 .flatten(),
         )
     };
@@ -1001,7 +992,7 @@ fn session_row(
         let step = task.as_ref().and_then(|_| last_words(h, finished));
         let _ = write!(
             row,
-            " user_title={} title={} cwd={} branch={} prompt={} said={} cmd={} rows={} need_ids={} step={}",
+            " user_title={} title={} cwd={} branch={} prompt={} said={} cmd={} rows={} step={}",
             excerpt_token(user_title.as_deref()),
             excerpt_token(engine.title.as_deref()),
             excerpt_token(cwd.as_deref()),
@@ -1015,7 +1006,6 @@ fn session_row(
             excerpt_token(said),
             excerpt_token(engine.command.as_deref()),
             excerpt_token(engine.rows.as_deref()),
-            need_ids.as_deref().unwrap_or("-"),
             word_token(step.as_deref()),
         );
         if let Some(work) = &work {

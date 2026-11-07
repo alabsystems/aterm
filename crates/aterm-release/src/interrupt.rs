@@ -305,14 +305,25 @@ mod imp {
     /// Cancellation is checked before listing and before every actual send, including after a
     /// listing that outlived the forwarding guard.
     pub(super) fn signal_group(group: i32, sig: i32, active: &dyn Fn() -> bool) {
+        signal_group_with(group, sig, active, &super::listing);
+    }
+
+    /// [`signal_group`] with the process-table read supplied by its caller. The seam keeps the
+    /// real signal-delivery test independent of a legitimately unavailable bounded table read.
+    pub(super) fn signal_group_with(
+        group: i32,
+        sig: i32,
+        active: &dyn Fn() -> bool,
+        listing: &dyn Fn() -> Option<Vec<super::Proc>>,
+    ) {
         let home = i32::try_from(std::process::id()).unwrap_or(0);
         let passes = if sig == SIGKILL { 2 } else { 1 };
         for _ in 0..passes {
             if !active() {
                 return;
             }
-            let members = super::listing()
-                .map_or_else(|| vec![group], |rows| super::signalled(&rows, group, home));
+            let members =
+                listing().map_or_else(|| vec![group], |rows| super::signalled(&rows, group, home));
             for pid in members {
                 if !active() {
                     return;
@@ -920,6 +931,9 @@ mod tests {
         let grandchild = up
             .strip_prefix("up ")
             .expect("the grandchild says it is up");
+        let grandchild_pid = grandchild
+            .parse::<i32>()
+            .expect("the grandchild says its pid");
         let mut standin = command(&trustd)
             .args(["-c", "echo up; /bin/cat; echo \"cat $?\""])
             .process_group(group)
@@ -938,7 +952,30 @@ mod tests {
             "the trustd's cat runs in the group"
         );
 
-        imp::signal_group(group, SIGTERM, &|| true);
+        let home = i32::try_from(std::process::id()).unwrap();
+        let standin_pid = i32::try_from(standin.id()).unwrap();
+        imp::signal_group_with(group, SIGTERM, &|| true, &|| {
+            Some(vec![
+                Proc {
+                    pid: group,
+                    parent: home,
+                    pgid: group,
+                    name: "sh".to_string(),
+                },
+                Proc {
+                    pid: grandchild_pid,
+                    parent: group,
+                    pgid: group,
+                    name: "sh".to_string(),
+                },
+                Proc {
+                    pid: standin_pid,
+                    parent: home,
+                    pgid: group,
+                    name: "trustd".to_string(),
+                },
+            ])
+        });
 
         let status = ended(&mut leader, "the leader");
         assert_eq!(

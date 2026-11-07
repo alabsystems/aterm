@@ -263,6 +263,7 @@ fn an_agent_call_row_is_sampled_from_its_job() {
         ended_ms: 20_000,
         exit: None,
         ended_by: None,
+        leader_exited_ms: None,
         ran: Some("targo".to_owned()),
         peak_bytes: Some(1 << 30),
         cpu_ns: Some(42_000_000_000),
@@ -378,6 +379,7 @@ fn call(ended_by: Option<aterm_vitals::jobs::ExitOf>, stuck: bool) -> aterm_vita
         ended_ms: 20_000,
         exit: None,
         ended_by,
+        leader_exited_ms: ended_by.map(|_| 14_000),
         ran: Some("sleep".to_owned()),
         peak_bytes: None,
         cpu_ns: None,
@@ -438,6 +440,86 @@ fn an_agent_call_is_labelled_by_the_program_it_ran_never_its_wrapper() {
     );
 }
 
+/// A WATCHED CALL'S ROW ENDS AT ITS LEADER'S OWN MOMENT (TM-1 §5): the pass that found the
+/// leader gone came a minute after its exit, as a windowless instance's next reading may, and the
+/// row's `wall_ms` and `at_ms` are still the exit's; an exit stamped past the pass's start (the
+/// read that took it came after) is that far past the pass's wall time. NEGATIVE CONTROL: a call
+/// no watch read ends at the pass.
+#[test]
+fn a_watched_calls_row_ends_at_its_leaders_moment_not_the_pass_that_found_it_gone() {
+    use aterm_vitals::jobs::{Ended, ExitOf};
+    let late = Ended {
+        ended_ms: 74_000,
+        ..call(Some(ExitOf::Code(0)), false)
+    };
+    let row = agent_call_row(&late, 74_000, 1_793_000_074_000, "m14", facts()).expect("row");
+    assert_eq!(
+        row.wall_ms,
+        Fig::Known(4_000),
+        "opened 10 000, exited 14 000"
+    );
+    assert_eq!(row.at_ms, 1_793_000_014_000, "the exit's wall time");
+    let past = Ended {
+        leader_exited_ms: Some(74_003),
+        ..late.clone()
+    };
+    let row = agent_call_row(&past, 74_000, 1_793_000_074_000, "m14", facts()).expect("row");
+    assert_eq!(
+        (row.wall_ms, row.at_ms),
+        (Fig::Known(64_003), 1_793_000_074_003)
+    );
+    let unwatched = Ended {
+        leader_exited_ms: None,
+        ..call(None, false)
+    };
+    let unwatched = Ended {
+        ended_ms: 74_000,
+        ..unwatched
+    };
+    let row = agent_call_row(&unwatched, 74_000, 1_793_000_074_000, "m14", facts()).expect("row");
+    assert_eq!(
+        (row.wall_ms, row.at_ms),
+        (Fig::Known(64_000), 1_793_000_074_000),
+        "no moment: the pass that found it gone"
+    );
+}
+
+/// A CALL THE JOIN NAMED IS KEYED BY ITS COMMAND (TM-1 §5), never by its program, and only once a
+/// pass saw it run one: a call of builtins alone has no key, as a command no read confirmed has
+/// none. NEGATIVE CONTROL: the same call with no hint is keyed by its program
+/// (`an_agent_call_is_labelled_by_the_program_it_ran_never_its_wrapper`).
+#[test]
+fn a_hinted_calls_key_is_its_command_and_only_once_a_program_ran() {
+    use aterm_vitals::jobs::Ended;
+    let hinted = Ended {
+        command: "targo test -p aterm-vitals".to_owned(),
+        ran: Some("targo".to_owned()),
+        ..call(None, false)
+    };
+    let row = agent_call_row(&hinted, 21_000, 0, "m14", facts()).expect("row");
+    assert_eq!(
+        row.key,
+        Some(Digest::key(
+            &Kind::AgentCall,
+            "targo test -p aterm-vitals",
+            None
+        )),
+        "the joined command's class"
+    );
+    assert_ne!(row.key, Some(Digest::key(&Kind::AgentCall, "targo", None)));
+    assert_eq!(row.label, "targo", "labelled by the program all the same");
+    let builtins = Ended {
+        ran: None,
+        ..hinted
+    };
+    let row = agent_call_row(&builtins, 21_000, 0, "m14", facts()).expect("row");
+    assert_eq!(
+        (row.label.as_str(), row.key),
+        ("-", None),
+        "no program seen: no key, whatever the join named"
+    );
+}
+
 /// A live agent call's row for `pid`, its leader started at `start`.
 #[cfg(target_vendor = "apple")]
 fn live_call(pid: u32, start: Option<u64>) -> aterm_vitals::jobs::JobRow {
@@ -459,6 +541,23 @@ fn birth(pid: u32) -> Option<u64> {
     aterm_uds::process::read_birth(i32::try_from(pid).ok()?).map(|b| b.0)
 }
 
+/// A pass's clock: ms past `epoch`.
+#[cfg(target_vendor = "apple")]
+fn pass_clock(epoch: Instant) -> impl Fn() -> u64 {
+    move || u64::try_from(epoch.elapsed().as_millis()).expect("ms")
+}
+
+/// Waits for `calls`'s moment threads to hold `n` stamps (a hang detector, not a latency
+/// budget: AGENTS.md).
+#[cfg(target_vendor = "apple")]
+fn until_stamped(calls: &CallWatch, n: usize) {
+    let deadline = Instant::now() + Duration::from_mins(1);
+    while calls.stamps() < n {
+        assert!(Instant::now() < deadline, "the exit was never stamped");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
 #[cfg(target_vendor = "apple")]
 #[test]
 fn a_watched_leader_hands_the_next_pass_its_status_decoded() {
@@ -474,18 +573,31 @@ fn a_watched_leader_hands_the_next_pass_its_status_decoded() {
             .expect("spawn");
         let pid = child.id();
         let start = birth(pid);
+        let clock = pass_clock(Instant::now());
         let mut calls = CallWatch::new(true);
         calls.watch(&[live_call(pid, start)]);
         assert_eq!(calls.watching(), 1, "a live leader is watched");
-        assert!(calls.read(|_| true).is_empty(), "nothing ended yet");
+        assert!(calls.read(|_| true, &clock).is_empty(), "nothing ended yet");
+        let before = clock();
         drop(child.stdin.take());
         let _ = child.wait();
-        // The sweep no longer lists the reaped leader: its event is read, waited for briefly.
-        let exits = calls.read(|_| false);
+        // The sweep no longer lists the reaped leader: its exit is read, waited for briefly.
+        let exits = calls.read(|_| false, &clock);
+        let after = clock();
+        let at_ms = exits.first().map_or(0, |e| e.at_ms);
         assert_eq!(
             exits,
-            vec![aterm_vitals::jobs::LeaderExit { pid, start, end }],
+            vec![aterm_vitals::jobs::LeaderExit {
+                pid,
+                start,
+                end,
+                at_ms
+            }],
             "{script}"
+        );
+        assert!(
+            (before..=after).contains(&at_ms),
+            "{before} {at_ms} {after}"
         );
         assert_eq!(calls.watching(), 0, "its watch is let go");
     }
@@ -510,7 +622,7 @@ fn a_pid_taken_anew_or_never_read_is_never_watched_as_the_calls() {
     assert_eq!(calls.watching(), 1, "the true start is watched");
     // A read never lets a watch go without a status, even of a leader its sweep did not list;
     // only `watch_with`, once the engine holds the call no longer open, does.
-    assert!(calls.read(|_| false).is_empty());
+    assert!(calls.read(|_| false, pass_clock(Instant::now())).is_empty());
     assert_eq!(
         calls.watching(),
         1,
@@ -554,15 +666,203 @@ fn past_the_cap_a_call_waits_for_a_free_watch() {
     }
 }
 
+/// THE `missed=` COUNT (TM-1 §5): each agent call a pass ended with no status counts, in a
+/// process that writes no row (no host: a unit test's, a window whose writer did not start) as in
+/// one that does, which writes a row of each call; a call with a status and a block's job count
+/// none. The watch's own counts are its process's `calls` line (`call_counts`).
 #[test]
-fn a_call_that_ends_with_no_status_is_counted_missed() {
+fn a_call_that_ends_with_no_status_is_counted_missed_with_a_row_or_none() {
     use aterm_vitals::jobs::{ExitOf, JobKind};
+    static COUNTS: CallCounts = CallCounts::new();
+    let calls = CallWatch::counting(false, &COUNTS);
     let shell = aterm_vitals::jobs::Ended {
         kind: JobKind::Shell,
         ..call(None, false)
     };
     let ended = [call(None, false), call(Some(ExitOf::Code(0)), false), shell];
-    assert_eq!(count_missed(&ended), 1, "only the call with no status");
+    calls_ended(&ended, (21_000, 0), calls.counts, None, |row| {
+        panic!("no host, no row: {row:?}")
+    });
+    assert_eq!(COUNTS.get(), (0, 0, 1), "only the call with no status");
+    let mut rows = Vec::new();
+    calls_ended(
+        &ended,
+        (21_000, 0),
+        calls.counts,
+        Some(("m14", facts())),
+        |r| {
+            rows.push(r);
+        },
+    );
+    assert_eq!(COUNTS.get(), (0, 0, 2));
+    assert_eq!(
+        rows.iter().map(|r| r.outcome).collect::<Vec<_>>(),
+        [Outcome::Unknown, Outcome::Ok],
+        "a row of each call, none of the block's job"
+    );
+    assert!(
+        std::ptr::eq(CallWatch::new(false).counts, &CALLS),
+        "the window's watch counts what the verb reads"
+    );
+}
+
+/// THE `watched=` AND `read=` COUNTS (TM-1 §5): a leader proved the call's counts watched once,
+/// its status read counts read once, and a pass that reads nothing counts nothing.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_watched_leader_counts_watched_then_read() {
+    static COUNTS: CallCounts = CallCounts::new();
+    let mut child = aterm_uds::spawnfd::command("/bin/sleep")
+        .arg("600")
+        .spawn()
+        .expect("spawn");
+    let pid = child.id();
+    let clock = pass_clock(Instant::now());
+    let mut calls = CallWatch::counting(true, &COUNTS);
+    let row = live_call(pid, birth(pid));
+    calls.watch_with(std::slice::from_ref(&row), birth);
+    calls.watch_with(std::slice::from_ref(&row), birth);
+    assert_eq!(COUNTS.get(), (1, 0, 0), "watched once");
+    assert!(calls.read(|_| true, &clock).is_empty());
+    assert_eq!(COUNTS.get(), (1, 0, 0), "nothing read");
+    child.kill().expect("kill");
+    let _ = child.wait();
+    let exits = calls.read_within(|_| false, &clock, Duration::from_mins(1));
+    assert_eq!(exits.len(), 1, "{exits:?}");
+    assert_eq!(COUNTS.get(), (1, 1, 0), "read once");
+    assert!(calls.read(|_| false, &clock).is_empty());
+    assert_eq!(COUNTS.get(), (1, 1, 0), "a status is read once");
+}
+
+/// THE CALL'S MOMENT IS ITS LEADER'S EXIT (TM-1 §5), stamped by the moment's thread as the
+/// kernel reported it, never the read that took it: the pass reads the status 300 ms after, and
+/// the moment on the pass's clock is still the exit's.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_watched_leaders_moment_is_its_exit_not_the_read_that_took_it() {
+    let mut child = aterm_uds::spawnfd::command("/bin/sh")
+        .args(["-c", "read _; exit 3"])
+        .stdin(aterm_uds::spawnfd::Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let pid = child.id();
+    let clock = pass_clock(Instant::now());
+    let mut calls = CallWatch::new(true);
+    calls.watch(&[live_call(pid, birth(pid))]);
+    assert_eq!(calls.watching(), 1);
+    let before = clock();
+    drop(child.stdin.take());
+    let _ = child.wait();
+    until_stamped(&calls, 1);
+    let stamped_by = clock();
+    std::thread::sleep(Duration::from_millis(300));
+    let read_at = clock();
+    let exits = calls.read(|_| false, &clock);
+    let [exit] = exits.as_slice() else {
+        panic!("one exit: {exits:?}");
+    };
+    assert_eq!(exit.end, aterm_vitals::jobs::ExitOf::Code(3));
+    assert!(read_at >= stamped_by + 300, "the read came after");
+    // The moment comes back through one reading of both clocks, which a preempted read can
+    // only make later: never before the exit, and far from the read 300 ms after its stamp.
+    assert!(
+        before <= exit.at_ms && exit.at_ms + 100 < read_at,
+        "the exit's moment: {before} <= {} (stamped by {stamped_by}), read at {read_at}",
+        exit.at_ms
+    );
+}
+
+/// THE GONE-LEADER WAIT (`GONE_WAIT`, TM-1 §5): a leader the sweep no longer lists whose exit the
+/// kernel has not reported yet holds the read, and an exit reported within the wait is read by
+/// that pass. A live leader that never exits holds the read for `GONE_WAIT` and keeps its watch.
+/// Then the exit comes 50 ms after the sweep stopped listing the leader, and the read waits for
+/// it (bounded by a hang detector rather than the 10 ms, so the test never races the machine).
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_leader_the_sweep_no_longer_lists_is_waited_for() {
+    let spawn = || {
+        aterm_uds::spawnfd::command("/bin/sleep")
+            .arg("600")
+            .spawn()
+            .expect("spawn")
+    };
+    let clock = pass_clock(Instant::now());
+    let mut lives = spawn();
+    let mut calls = CallWatch::new(true);
+    calls.watch(&[live_call(lives.id(), birth(lives.id()))]);
+    let t = Instant::now();
+    assert!(calls.read(|_| false, &clock).is_empty());
+    assert!(t.elapsed() >= GONE_WAIT, "waited {:?}", t.elapsed());
+    assert_eq!(calls.watching(), 1, "a watch with no status is kept");
+    let _ = lives.kill();
+    let _ = lives.wait();
+
+    let dies = std::sync::Mutex::new(Some(spawn()));
+    let pid = dies.lock().unwrap().as_ref().expect("child").id();
+    let mut calls = CallWatch::new(true);
+    calls.watch(&[live_call(pid, birth(pid))]);
+    let killer = std::sync::Mutex::new(None);
+    let gone = |p: u32| {
+        assert_eq!(p, pid);
+        let mut child = dies.lock().unwrap().take().expect("asked once");
+        *killer.lock().unwrap() = Some(std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            child.kill().expect("kill");
+            let _ = child.wait();
+        }));
+        false
+    };
+    let exits = calls.read_within(gone, &clock, Duration::from_mins(1));
+    killer
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the sweep was asked")
+        .join()
+        .expect("killed");
+    assert_eq!(
+        exits.iter().map(|e| (e.pid, e.end)).collect::<Vec<_>>(),
+        [(pid, aterm_vitals::jobs::ExitOf::Signal(9))],
+        "the exit came within the wait"
+    );
+}
+
+/// REGISTERED, THEN RE-READ (TM-1 §5): the watch registers on the leader before its start is
+/// re-read, so it holds the exit of the very process the re-read proved, even one that dies just
+/// after it. Here the leader is killed and reaped inside the re-read: a watch registered after it
+/// would find the pid gone and refuse the call. NEGATIVE CONTROL:
+/// `a_pid_taken_anew_or_never_read_is_never_watched_as_the_calls`, where the re-read names
+/// another process.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_watch_registered_before_the_reread_holds_the_exit_of_the_process_it_proved() {
+    let child = aterm_uds::spawnfd::command("/bin/sleep")
+        .arg("600")
+        .spawn()
+        .expect("spawn");
+    let pid = child.id();
+    let start = birth(pid).expect("a live child's birth");
+    let child = std::cell::RefCell::new(Some(child));
+    let mut calls = CallWatch::new(true);
+    calls.watch_with(&[live_call(pid, Some(start))], |p| {
+        let mut c = child.borrow_mut().take().expect("re-read once");
+        c.kill().expect("kill");
+        let _ = c.wait();
+        (p == pid).then_some(start)
+    });
+    assert_eq!(calls.watching(), 1, "watched as it was proved");
+    let exits = calls.read_within(
+        |_| false,
+        pass_clock(Instant::now()),
+        Duration::from_mins(1),
+    );
+    assert_eq!(
+        exits
+            .iter()
+            .map(|e| (e.pid, e.start, e.end))
+            .collect::<Vec<_>>(),
+        [(pid, Some(start), aterm_vitals::jobs::ExitOf::Signal(9))]
+    );
 }
 
 #[cfg(target_vendor = "apple")]

@@ -141,6 +141,9 @@ aterm-messages = { workspace = true }
 # A loopback GitHub (api, uploads, web and CDN origins): the release's REST lane
 # (src/github.rs) is tested against it through the real /usr/bin/curl, never the network.
 agh-fake = { workspace = true }
+# The `kind=admission` rows the Trust lane's launch gate writes, as its tests read them
+# (`aterm_capacity::telemetry::capture`). aterm-capacity already links it.
+aterm-telemetry = { workspace = true }
 
 [lints]
 workspace = true

@@ -737,21 +737,19 @@ fn an_unclean_rc_never_opens_the_gate() {
                 .to_owned(),
         ),
     ];
-    std::thread::scope(|scope| {
-        let runs: Vec<_> = cases
-            .iter()
-            .map(|(name, rules, misbehave)| {
-                scope.spawn(move || an_unclean_run(name, rules, misbehave))
-            })
-            .collect();
-        let ends: Vec<_> = runs
-            .into_iter()
-            .filter_map(|run| run.join().err())
-            .collect();
-        if let Some(end) = worst_end(ends) {
-            std::panic::resume_unwind(end);
-        }
-    });
+    // Each case first samples a clean boot. A different case's deliberately
+    // orphaned daemon is indistinguishable from an escape in that sample, so
+    // these fixtures must finish one at a time. Still run every case and report
+    // a real failed assertion ahead of a machine that could not be sampled.
+    let ends = cases
+        .iter()
+        .filter_map(|(name, rules, misbehave)| {
+            std::panic::catch_unwind(|| an_unclean_run(name, rules, misbehave)).err()
+        })
+        .collect();
+    if let Some(end) = worst_end(ends) {
+        std::panic::resume_unwind(end);
+    }
 }
 
 fn worst_end(

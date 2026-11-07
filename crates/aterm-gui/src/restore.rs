@@ -6597,6 +6597,9 @@ metadata = "opaque=copy-me"
 
     #[test]
     fn the_manifest_journals_and_cell_metrics_follow_the_state_home_seam() {
+        if !crate::test_alone::alone() {
+            return;
+        }
         let scratch = aterm_tempfile::Builder::new()
             .prefix("aterm-restore-state-home")
             .tempdir()

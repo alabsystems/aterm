@@ -14,6 +14,9 @@ fn only_a_headless_launch_that_may_use_a_gpu_defers_the_device() {
 #[cfg(target_os = "macos")]
 #[test]
 fn a_headless_boot_claims_no_first_frame_warm() {
+    if !crate::test_alone::alone() {
+        return;
+    }
     let dir = aterm_tempfile::tempdir().expect("scratch dir");
     crate::test_env::scoped("XDG_CONFIG_HOME", dir.path(), || {
         let warm = super::warm_config(true, crate::app_config::CarriedZoom::default());
@@ -66,7 +69,9 @@ fn the_settings_capability_read_follows_the_intent_the_app_holds() {
 
 #[test]
 fn a_declined_redemption_restores_the_cpu_only_warnings_boot_withheld() {
-    let _lane = crate::message_inbox::lane_test_guard();
+    if !crate::message_inbox::lane_zero_alone() {
+        return;
+    }
     let mut app = super::App::headless_for_test();
     let _ = crate::message_inbox::take_queued();
     app.render_knobs.background_opacity = 0.5;

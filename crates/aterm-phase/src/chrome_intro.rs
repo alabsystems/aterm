@@ -272,6 +272,7 @@ fn intro(
         title: heading_text.to_string(),
         command_rows: Vec::new(),
         description_rows: 0,
+        spellings: None,
         gutter: false,
         command: heading_text.to_string(),
         description: said.join(" "),

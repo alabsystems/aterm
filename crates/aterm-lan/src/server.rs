@@ -51,26 +51,43 @@ pub(crate) enum Admission {
         not(target_os = "macos"),
         expect(dead_code, reason = "code is checked on macOS")
     )]
-    Code(aterm_keeper::identity::Identity),
+    Code(Arc<aterm_keeper::identity::Identity>),
+}
+
+/// Resolve this image once. Only the canonical team branch supplies an update
+/// checker; an ad-hoc designated peer requirement grants no adoption policy.
+struct ImageAdmission {
+    peers: Admission,
+    #[cfg(target_os = "macos")]
+    updates: Option<Arc<aterm_keeper::identity::Identity>>,
 }
 
 impl Admission {
     /// The broker's admission: in a test binary the same uid; on macOS the team requirement of
     /// the running image's team, or (an ad-hoc image) its own designated requirement.
-    fn of_this_image() -> io::Result<Self> {
+    fn of_this_image() -> io::Result<ImageAdmission> {
         if aterm_uds::test_binary::scratch_root().is_some() {
-            return Ok(Self::SameUid);
+            return Ok(ImageAdmission {
+                peers: Self::SameUid,
+                #[cfg(target_os = "macos")]
+                updates: None,
+            });
         }
         #[cfg(target_os = "macos")]
         {
             use aterm_keeper::identity::{Identity, IdentityPolicy};
-            let identity = match aterm_keeper::identity::own_team().map_err(io::Error::other)? {
-                Some(team) => Identity::for_requirement(&team_requirement(&team)?),
-                None => Identity::for_self(IdentityPolicy::Designated),
-            }
-            .map_err(io::Error::other)?;
+            let (identity, team) =
+                match aterm_keeper::identity::own_team().map_err(io::Error::other)? {
+                    Some(team) => (Identity::for_requirement(&team_requirement(&team)?), true),
+                    None => (Identity::for_self(IdentityPolicy::Designated), false),
+                };
+            let identity = identity.map_err(io::Error::other)?;
             log(format_args!("admits {}", identity.describe()));
-            Ok(Self::Code(identity.regardless_of_uid()))
+            let identity = Arc::new(identity.regardless_of_uid());
+            Ok(ImageAdmission {
+                peers: Self::Code(Arc::clone(&identity)),
+                updates: team.then_some(identity),
+            })
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -134,7 +151,7 @@ pub fn serve(opts: Opts) -> io::Result<()> {
         ));
     }
     let admission = Admission::of_this_image()?;
-    let server = Server::bind(&opts.socket, admission, bonjour::system())?;
+    let server = Server::bind(&opts.socket, admission.peers, bonjour::system())?;
     log(format_args!(
         "serving {} (protocol {}, build {}), source {}",
         opts.socket.display(),
@@ -143,7 +160,7 @@ pub fn serve(opts: Opts) -> io::Result<()> {
         opts.source.display()
     ));
     #[cfg(target_os = "macos")]
-    crate::adopt::watch(opts.source)?;
+    crate::adopt::watch(opts.source, admission.updates)?;
     server.run()
 }
 

@@ -1039,8 +1039,8 @@ fn a_workers_task_follows_only_the_servers_go() {
 
 /// A WORKER ON THIS MAC IS RECORDED FROM ITS ANSWER, NOT FROM ITS PRINT: a spawn whose answer
 /// cannot be printed (stdout closed: `aterm ctl spawn agent=claude - < task | head -0`, here
-/// this thread's stdout seam) started its worker all the same, so the board holds it, in the
-/// folder its head resolved; the closed stdout is the call's own error alone, which exits 0
+/// this thread's stdout seam) started its worker all the same, so the board holds it (its
+/// aterm's socket lies in the socket folder the spawn reads), in the folder its head resolved; the closed stdout is the call's own error alone, which exits 0
 /// (`exit_for`). The answer is printed once, after the board's record.
 /// NEGATIVE CONTROL: the same spawn with stdout open records the same row, and prints `OK` once.
 #[cfg(unix)]
@@ -1073,19 +1073,25 @@ fn a_spawn_whose_answer_cannot_be_printed_still_records_its_worker() {
         hosting: Vec::new(),
         last: LastTarget::Sock(path),
     };
+    let args: Vec<String> = ["agent=claude", "cwd=w", "-"].map(str::to_owned).into();
     for (n, closed) in [true, false].into_iter().enumerate() {
         let dir = scratch.path().join(format!("board-{n}"));
         let _here = board::HereGuard::at(&dir);
         let worker = HereWorker {
-            head: "spawn agent=claude cwd=/Users//me/work/w from=s-5e1",
-            task,
-            args: ["agent=claude", "cwd=w", "-"].map(str::to_owned).into(),
+            selector: None,
+            args: &args,
             label: Some("dx".to_owned()),
             starter: Some("s-5e1"),
             pwd: Some(Path::new("/Users//me/work")),
+            task,
         };
         let (ended, printed) = stdout_lines_of(closed, || {
-            spawn_worker_here(&targets, worker, Some(std::time::Duration::from_secs(60)))
+            spawn_worker_here(
+                &targets,
+                worker,
+                Some(scratch.path()),
+                Some(std::time::Duration::from_secs(60)),
+            )
         });
         if closed {
             let e = ended.expect_err("stdout closed");
@@ -4590,4 +4596,504 @@ fn test_scratch_dir_stays_under_unix_sun_len_even_for_long_tags() {
         );
         let _listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind socket");
     }
+}
+
+/// A stand-in aterm on `listener` that starts workers ([`serve_workers`]).
+#[cfg(unix)]
+fn worker_instance(
+    listener: aterm_uds::CtlListener,
+    sids: &'static [&'static str],
+) -> std::thread::JoinHandle<Vec<String>> {
+    std::thread::spawn(move || serve_workers(&listener, sids))
+}
+
+/// A stand-in aterm on `listener` that hangs up its first connection unanswered once it read a
+/// line and ran `then`, and starts workers on every one after it ([`serve_workers`]).
+#[cfg(unix)]
+fn hanging_up_first(
+    listener: aterm_uds::CtlListener,
+    sids: &'static [&'static str],
+    then: impl FnOnce() + Send + 'static,
+) -> std::thread::JoinHandle<Vec<String>> {
+    std::thread::spawn(move || {
+        if let Ok((conn, _)) = listener.accept() {
+            let mut line = String::new();
+            let _ = BufReader::new(&conn).read_line(&mut line);
+            then();
+        }
+        serve_workers(&listener, sids)
+    })
+}
+
+/// Start workers on `listener`: each spawn line (after a token's `AUTH` line and the connect
+/// probe, answered) is answered `GO <n>`, its `n` task bytes read, then `OK <sid>`, taking `sids`
+/// in turn. It records each spawn's line, and an empty one for a connection closed with nothing
+/// sent (a probe), until a `stop` line ([`stop_recording`]).
+#[cfg(unix)]
+fn serve_workers(listener: &aterm_uds::CtlListener, sids: &[&str]) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut sids = sids.iter();
+    loop {
+        let Ok((conn, _)) = listener.accept() else {
+            return lines;
+        };
+        let mut reader = BufReader::new(&conn);
+        let mut line = String::new();
+        let _ = reader.read_line(&mut line);
+        if line.starts_with("AUTH ") {
+            let mut probe = String::new();
+            let _ = reader.read_line(&mut probe);
+            let _ = (&conn).write_all(b"OK aterm\n");
+            line.clear();
+            let _ = reader.read_line(&mut line);
+        }
+        if line == "stop\n" {
+            return lines;
+        }
+        if line.is_empty() {
+            lines.push(line);
+            continue;
+        }
+        let len = line
+            .split_whitespace()
+            .find_map(|word| word.strip_prefix("len="))
+            .and_then(|n| n.parse::<usize>().ok())
+            .unwrap_or(0);
+        let go = aterm_types::control_verbs::task_frame_go(len);
+        let _ = (&conn).write_all(go.as_bytes());
+        let mut task = vec![0; len];
+        let _ = reader.read_exact(&mut task);
+        let sid = sids.next().copied().unwrap_or("s-0");
+        let _ = (&conn).write_all(format!("OK {sid}\n").as_bytes());
+        lines.push(line);
+    }
+}
+
+/// A caller in a session (`me`) of this Mac's socket folder (`dir`, whose `graph/` names `me`'s
+/// aterm), with a scratch board as this Mac's.
+#[cfg(unix)]
+struct SpawnWorld {
+    _scratch: aterm_tempfile::TempDir,
+    _here: board::HereGuard,
+    root: PathBuf,
+    dir: PathBuf,
+    board: board::Board,
+}
+
+#[cfg(unix)]
+const SPAWN_CALLER: &str = "s-c9a1";
+
+#[cfg(unix)]
+const SPAWN_TASK: &[u8] = b"land the fix\n";
+
+#[cfg(unix)]
+impl SpawnWorld {
+    fn new(tag: &str) -> Self {
+        let scratch = test_scratch_dir(tag);
+        let root = scratch.path().to_path_buf();
+        let dir = root.join("run");
+        std::fs::create_dir_all(dir.join("graph")).expect("graph dir");
+        let board_dir = root.join("state").join("board");
+        Self {
+            _here: board::HereGuard::at(&board_dir),
+            board: board::Board::at(&board_dir),
+            _scratch: scratch,
+            root,
+            dir,
+        }
+    }
+
+    /// A worker's spawn of `args` (after `spawn`, ending `-`) by the caller, at `sock` (`None`:
+    /// no `--sock`), as `run` sends it.
+    fn spawn(&self, sock: Option<&Path>, args: &[&str]) -> ExitCode {
+        self.spawn_at(
+            sock.map(|s| s.to_str().expect("utf8").to_owned()),
+            None,
+            args,
+        )
+    }
+
+    /// The same spawn with `--pid <pid>`.
+    fn spawn_pid(&self, pid: u32, args: &[&str]) -> ExitCode {
+        self.spawn_at(None, Some(pid), args)
+    }
+
+    fn spawn_at(&self, sock: Option<String>, pid: Option<u32>, args: &[&str]) -> ExitCode {
+        let starter = Some(SPAWN_CALLER);
+        let pinned = sock.is_some() || pid.is_some();
+        let selector = worker_selector(None, pinned, starter);
+        let targets = targets_in(
+            Some(self.dir.clone()),
+            sock,
+            pid,
+            starter.map(str::to_owned),
+            None,
+        )
+        .expect("targets");
+        let (args, label) = board::take_label(&argv(args)).expect("label");
+        spawn_worker_here(
+            &targets,
+            HereWorker {
+                selector: selector.as_deref(),
+                args: &args,
+                label,
+                starter,
+                pwd: Some(Path::new("/w")),
+                task: SPAWN_TASK,
+            },
+            Some(&self.dir),
+            Some(HANG_DETECTOR),
+        )
+        .expect("the spawn")
+    }
+
+    /// Each row of this Mac's board: its worker, its dispatcher (`from`) and its label.
+    fn rows(&self) -> Vec<(String, Option<String>, Option<String>)> {
+        self.board
+            .scan()
+            .rows
+            .into_iter()
+            .map(|row| (row.sid, row.from, row.label))
+            .collect()
+    }
+}
+
+/// A worker sent through `--sock` to an aterm with a socket folder of its own (a lab instance's)
+/// is that aterm's: its spawn names no session of the caller's, which that aterm does not hold,
+/// and this Mac's board takes no row of it, as its keeper would find no such session there.
+#[cfg(unix)]
+#[test]
+fn a_spawn_through_another_aterms_socket_names_no_caller_and_leaves_this_board_be() {
+    let world = SpawnWorld::new("spawn-away");
+    let own = world.dir.join(control_socket::instance_sock_name(4101));
+    publish_entry(&world.dir, SPAWN_CALLER, &own);
+    let away = world.root.join("lab");
+    std::fs::create_dir(&away).expect("the other aterm's folder");
+    let lab = away.join("lab.sock");
+    let mine = worker_instance(
+        aterm_uds::CtlListener::bind(&own).expect("bind own"),
+        &["s-c9b1"],
+    );
+    let theirs = worker_instance(
+        aterm_uds::CtlListener::bind(&lab).expect("bind the other aterm"),
+        &["s-c9c1"],
+    );
+
+    let code = world.spawn(Some(&lab), &["agent=claude", "cwd=/w", "label=pkg", "-"]);
+
+    assert_eq!(code, ExitCode::SUCCESS);
+    assert_eq!(
+        stop_recording(&lab, theirs),
+        [format!(
+            "spawn agent=claude cwd=/w len={}\n",
+            SPAWN_TASK.len()
+        )],
+        "the other aterm was sent no from= of the caller's"
+    );
+    assert_eq!(
+        stop_recording(&own, mine),
+        Vec::<String>::new(),
+        "the caller's own aterm was not so much as connected to"
+    );
+    let scan = world.board.scan();
+    assert!(
+        scan.rows.is_empty(),
+        "this Mac's board took no row: {:?}",
+        scan.rows
+    );
+}
+
+/// The same spawn on the caller's own aterm books it as before: by that aterm's socket named
+/// with `--sock`, or by none, the spawn names the caller (`from=`) and this Mac's board takes the
+/// worker's row, with its label and its dispatcher. Another aterm of this Mac's socket folder is
+/// sent no `from=` (it holds no session of the caller's to mail), and its worker is still on
+/// this Mac's board, which its keeper reaches there.
+#[cfg(unix)]
+#[test]
+fn a_spawn_on_the_callers_own_aterm_names_the_caller_and_books_the_worker_here() {
+    let world = SpawnWorld::new("spawn-own");
+    let own = world.dir.join(control_socket::instance_sock_name(4111));
+    let other = world.dir.join(control_socket::instance_sock_name(4112));
+    publish_entry(&world.dir, SPAWN_CALLER, &own);
+    let mine = worker_instance(
+        aterm_uds::CtlListener::bind(&own).expect("bind own"),
+        &["s-c9b1", "s-c9b2"],
+    );
+    let beside = worker_instance(
+        aterm_uds::CtlListener::bind(&other).expect("bind the other instance"),
+        &["s-c9e1"],
+    );
+
+    let pinned = world.spawn(Some(&own), &["agent=claude", "cwd=/w", "label=pkg", "-"]);
+    let flagless = world.spawn(None, &["agent=claude", "cwd=/w", "-"]);
+    let in_folder = world.spawn(Some(&other), &["agent=claude", "cwd=/w", "-"]);
+
+    assert_eq!([pinned, flagless, in_folder], [ExitCode::SUCCESS; 3]);
+    let len = SPAWN_TASK.len();
+    assert_eq!(
+        stop_recording(&own, mine),
+        [
+            format!("spawn agent=claude cwd=/w from={SPAWN_CALLER} len={len}\n"),
+            format!("@{SPAWN_CALLER} spawn agent=claude cwd=/w from={SPAWN_CALLER} len={len}\n"),
+        ],
+        "the caller's own aterm, pinned or not, is told whose worker it is"
+    );
+    assert_eq!(
+        stop_recording(&other, beside),
+        [format!("spawn agent=claude cwd=/w len={len}\n")],
+        "an aterm that does not hold the caller's session is sent no from= of it"
+    );
+    let rows = world.board.scan().rows;
+    let booked: Vec<_> = rows
+        .iter()
+        .map(|row| {
+            (
+                row.sid.as_str(),
+                row.from.as_deref(),
+                row.label.as_deref(),
+                row.node.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        booked,
+        [
+            ("s-c9b1", Some(SPAWN_CALLER), Some("pkg"), None),
+            ("s-c9b2", Some(SPAWN_CALLER), None, None),
+            ("s-c9e1", Some(SPAWN_CALLER), None, None),
+        ],
+        "each worker of this Mac's socket folder is on this Mac's board"
+    );
+}
+
+/// A `from=` the caller names goes to whichever aterm the spawn reaches, the caller's own or one
+/// with a socket folder of its own: it is the caller's word, not this shell's session.
+#[cfg(unix)]
+#[test]
+fn an_explicit_from_goes_to_whichever_aterm_the_spawn_reaches() {
+    let world = SpawnWorld::new("spawn-from");
+    let own = world.dir.join(control_socket::instance_sock_name(4121));
+    publish_entry(&world.dir, SPAWN_CALLER, &own);
+    let away = world.root.join("lab");
+    std::fs::create_dir(&away).expect("the other aterm's folder");
+    let lab = away.join("lab.sock");
+    let mine = worker_instance(
+        aterm_uds::CtlListener::bind(&own).expect("bind own"),
+        &["s-c9b1"],
+    );
+    let theirs = worker_instance(
+        aterm_uds::CtlListener::bind(&lab).expect("bind the other aterm"),
+        &["s-c9c1"],
+    );
+    let named = "s-c9d1";
+    let from = format!("from={named}");
+
+    let there = world.spawn(Some(&lab), &["agent=claude", "cwd=/w", &from, "-"]);
+    let here = world.spawn(Some(&own), &["agent=claude", "cwd=/w", &from, "-"]);
+
+    assert_eq!([there, here], [ExitCode::SUCCESS; 2]);
+    let line = format!(
+        "spawn agent=claude cwd=/w {from} len={}\n",
+        SPAWN_TASK.len()
+    );
+    assert_eq!(stop_recording(&lab, theirs), std::slice::from_ref(&line));
+    assert_eq!(stop_recording(&own, mine), [line]);
+    let rows = world.board.scan().rows;
+    let booked: Vec<(&str, Option<&str>)> = rows
+        .iter()
+        .map(|row| (row.sid.as_str(), row.from.as_deref()))
+        .collect();
+    assert_eq!(
+        booked,
+        [("s-c9b1", Some(named))],
+        "the row of the caller's own aterm's worker, under the from= named"
+    );
+}
+
+/// A spawn pinned to an aterm that does not hold the caller's session names no caller there,
+/// even where the caller's own aterm is gone (its graph entry left naming a socket nothing
+/// answers) and the pinned one is the newest of the folder: that aterm is this Mac's, so its
+/// worker is on this Mac's board, under the dispatcher.
+#[cfg(unix)]
+#[test]
+fn a_spawn_pinned_to_an_aterm_not_holding_the_callers_session_names_no_caller() {
+    let world = SpawnWorld::new("spawn-gone");
+    let gone = world.dir.join(control_socket::instance_sock_name(4131));
+    let live = world.dir.join(control_socket::instance_sock_name(4132));
+    publish_entry(&world.dir, SPAWN_CALLER, &gone);
+    abandon_socket(&gone);
+    let theirs = worker_instance(
+        aterm_uds::CtlListener::bind(&live).expect("bind the live instance"),
+        &["s-c9e1"],
+    );
+
+    let code = world.spawn_pid(4132, &["agent=claude", "cwd=/w", "-"]);
+
+    assert_eq!(code, ExitCode::SUCCESS);
+    assert_eq!(
+        stop_recording(&live, theirs),
+        [format!(
+            "spawn agent=claude cwd=/w len={}\n",
+            SPAWN_TASK.len()
+        )],
+        "the pinned aterm was sent no from= of a session it does not hold"
+    );
+    assert_eq!(
+        world.rows(),
+        [("s-c9e1".to_owned(), Some(SPAWN_CALLER.to_owned()), None)]
+    );
+}
+
+/// An aterm bound outside this Mac's socket folder that mirrors its sessions' graph entries into
+/// it is one this Mac's board keeper reaches, so its worker is on this Mac's board; it holds no
+/// session of the caller's, so it is sent no `from=`.
+#[cfg(unix)]
+#[test]
+fn a_worker_of_an_aterm_that_mirrors_its_sessions_here_is_booked_here() {
+    let world = SpawnWorld::new("spawn-mirror");
+    let own = world.dir.join(control_socket::instance_sock_name(4161));
+    publish_entry(&world.dir, SPAWN_CALLER, &own);
+    let away = world.root.join("bound");
+    std::fs::create_dir(&away).expect("the other aterm's folder");
+    let bound = away.join("a.sock");
+    publish_entry(&world.dir, "s-c9f1", &bound);
+    let mine = worker_instance(
+        aterm_uds::CtlListener::bind(&own).expect("bind own"),
+        &["s-c9b1"],
+    );
+    let theirs = worker_instance(
+        aterm_uds::CtlListener::bind(&bound).expect("bind the other aterm"),
+        &["s-c9f2"],
+    );
+
+    let code = world.spawn(Some(&bound), &["agent=claude", "cwd=/w", "-"]);
+
+    assert_eq!(code, ExitCode::SUCCESS);
+    assert_eq!(
+        stop_recording(&bound, theirs),
+        [format!(
+            "spawn agent=claude cwd=/w len={}\n",
+            SPAWN_TASK.len()
+        )]
+    );
+    assert_eq!(
+        world.rows(),
+        [("s-c9f2".to_owned(), Some(SPAWN_CALLER.to_owned()), None)],
+        "the worker of an aterm this Mac's folder records is on this Mac's board"
+    );
+    assert_eq!(stop_recording(&own, mine), Vec::<String>::new());
+}
+
+/// The caller's own aterm is known by any path to its socket: a symlink to it, a hard link to
+/// it, or a spelling of its folder that is not the canonical one. Each spawn names the caller and
+/// books its worker here.
+#[cfg(unix)]
+#[test]
+fn the_callers_own_aterm_is_known_by_any_path_to_its_socket() {
+    let world = SpawnWorld::new("spawn-spelt");
+    let own = world.dir.join(control_socket::instance_sock_name(4171));
+    publish_entry(&world.dir, SPAWN_CALLER, &own);
+    let mine = worker_instance(
+        aterm_uds::CtlListener::bind(&own).expect("bind own"),
+        &["s-c9b1", "s-c9b2", "s-c9b3"],
+    );
+    let away = world.root.join("links");
+    std::fs::create_dir(&away).expect("the links' folder");
+    let symlinked = away.join("sym.sock");
+    std::os::unix::fs::symlink(&own, &symlinked).expect("symlink");
+    let hard = away.join("hard.sock");
+    std::fs::hard_link(&own, &hard).expect("hard link");
+    let dotted = world
+        .dir
+        .join("graph")
+        .join("..")
+        .join(control_socket::instance_sock_name(4171));
+
+    for sock in [&symlinked, &hard, &dotted] {
+        let code = world.spawn(Some(sock), &["agent=claude", "cwd=/w", "-"]);
+        assert_eq!(code, ExitCode::SUCCESS, "{}", sock.display());
+    }
+
+    let line = format!(
+        "spawn agent=claude cwd=/w from={SPAWN_CALLER} len={}\n",
+        SPAWN_TASK.len()
+    );
+    assert_eq!(
+        stop_recording(&own, mine),
+        [line.clone(), line.clone(), line],
+        "each path to the caller's own socket is told whose worker it is"
+    );
+    let from = Some(SPAWN_CALLER.to_owned());
+    assert_eq!(
+        world.rows(),
+        [
+            ("s-c9b1".to_owned(), from.clone(), None),
+            ("s-c9b2".to_owned(), from.clone(), None),
+            ("s-c9b3".to_owned(), from, None),
+        ]
+    );
+}
+
+/// A spawn whose first connection is hung up unanswered dials again the aterm it was judged
+/// for, though the `latest` alias it named now points at another: the caller's own aterm, which
+/// would take a spawn that names no caller.
+#[cfg(unix)]
+#[test]
+fn a_spawn_dialled_again_reaches_the_aterm_it_was_judged_for() {
+    let world = SpawnWorld::new("spawn-redial");
+    let own = world.dir.join(control_socket::instance_sock_name(4181));
+    let other = world.dir.join(control_socket::instance_sock_name(4182));
+    let alias = world.dir.join(control_socket::LATEST_SOCK_FILE);
+    publish_entry(&world.dir, SPAWN_CALLER, &own);
+    std::fs::write(world.dir.join("aterm-4182.token"), "deadbeef\n").expect("token");
+    let own_s = own.to_str().expect("utf8").to_owned();
+    aterm_uds::latest::publish(&alias, other.to_str().expect("utf8"));
+    let mine = worker_instance(
+        aterm_uds::CtlListener::bind(&own).expect("bind own"),
+        &["s-c9b1"],
+    );
+    let repoint = alias.clone();
+    let beside = hanging_up_first(
+        aterm_uds::CtlListener::bind(&other).expect("bind the other instance"),
+        &["s-c9e1"],
+        move || aterm_uds::latest::publish(&repoint, &own_s),
+    );
+
+    let code = world.spawn(Some(&alias), &["agent=claude", "cwd=/w", "-"]);
+
+    assert_eq!(code, ExitCode::SUCCESS);
+    assert_eq!(
+        stop_recording(&own, mine),
+        Vec::<String>::new(),
+        "the caller's own aterm took no spawn judged for another"
+    );
+    assert_eq!(
+        stop_recording(&other, beside),
+        [format!(
+            "spawn agent=claude cwd=/w len={}\n",
+            SPAWN_TASK.len()
+        )]
+    );
+}
+
+/// A socket path that does not canonicalize (missing here; on Windows an AF_UNIX socket, a
+/// reparse point nothing follows) is still known by its name in its folder's canonical path.
+#[cfg(unix)]
+#[test]
+fn a_socket_path_that_does_not_canonicalize_is_known_by_its_folder_and_name() {
+    let scratch = test_scratch_dir("spelt-folder");
+    let dir = scratch.path().join("run");
+    std::fs::create_dir(&dir).expect("folder");
+    let link = scratch.path().join("link");
+    std::os::unix::fs::symlink(&dir, &link).expect("folder symlink");
+    let path = |folder: &Path, name: &str| folder.join(name).to_str().expect("utf8").to_owned();
+
+    assert!(
+        same_socket_path(&path(&dir, "aterm-1.sock"), &path(&link, "aterm-1.sock")),
+        "one name in one folder, by either spelling of the folder"
+    );
+    assert!(!same_socket_path(
+        &path(&dir, "aterm-1.sock"),
+        &path(&link, "aterm-2.sock")
+    ));
 }

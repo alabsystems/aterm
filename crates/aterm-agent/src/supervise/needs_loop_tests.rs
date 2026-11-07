@@ -2289,12 +2289,20 @@ fn go_ahead_run(
     host: &Arc<Hears>,
     set: impl FnOnce(&mut Mock),
 ) -> (Mock, RecordedWatch, Vec<String>) {
-    let screens = vec![
-        busy_screen(),
-        parking(beside),
-        busy_screen(),
-        said(&["Built, tested and pushed the branch; the docs are next."]),
-    ];
+    let after = said(&["Built, tested and pushed the branch; the docs are next."]);
+    go_ahead_run_to(tag, beside, after, policy, host, set)
+}
+
+/// [`go_ahead_run`], the turn after the answer drawn as `after`.
+fn go_ahead_run_to(
+    tag: &str,
+    beside: &[&str],
+    after: Vec<String>,
+    policy: SupervisorConfig,
+    host: &Arc<Hears>,
+    set: impl FnOnce(&mut Mock),
+) -> (Mock, RecordedWatch, Vec<String>) {
+    let screens = vec![busy_screen(), parking(beside), busy_screen(), after];
     let last = u32::try_from(screens.len()).expect("a short script");
     let (dir, journal) = journal_file(tag);
     let mut m = Mock::new(screens);
@@ -2481,5 +2489,282 @@ fn a_go_ahead_not_submitted_puts_its_line_up() {
             .is_some_and(|(n, _)| n.iter().any(|n| n.contains("rerun the checks"))),
         "{:#?}",
         host.told()
+    );
+}
+
+/// A turn whose `lines` the session limit cut: the limit's notice under its last message (a line
+/// of `lines` that opens with `⏺` opens a message of its own).
+fn walled(lines: &[&str]) -> Vec<String> {
+    let mut drawn = vec![format!("⏺ {}", lines[0])];
+    drawn.extend(lines[1..].iter().map(|l| match l {
+        l if l.is_empty() || l.starts_with('⏺') => (*l).to_string(),
+        l => format!("  {l}"),
+    }));
+    drawn.extend(
+        [
+            "  ⎿  You've hit your session limit · resets 7:30pm (America/Los_Angeles)",
+            "",
+            "✻ Worked for 3m 2s · done 5:02 PM",
+            "",
+        ]
+        .map(str::to_string),
+    );
+    let mut r = rows(&drawn.iter().map(String::as_str).collect::<Vec<_>>());
+    r.extend(composer("  ⏵⏵ auto mode on (shift+tab to cycle)"));
+    r
+}
+
+/// The needs entry's take-downs a run journaled, by why.
+fn needs_cleared(journal: &Path) -> Vec<String> {
+    journaled(journal, "CLEARED ")
+        .into_iter()
+        .filter(|l| l.contains(&format!(" {CLEARED_NEEDS} ")))
+        .collect()
+}
+
+/// Whether the loop journaled the session limit's wall [`walled`] draws.
+fn read_the_wall(journal: &Path) -> bool {
+    journal_records(journal)
+        .0
+        .iter()
+        .any(|r| r.line.contains("You've hit your session limit"))
+}
+
+/// A NEEDS YOU IN A TURN A WALL CUT GOES UP: the resume the wall gets opens a turn of its own,
+/// whose point reads none of the cut turn's words, so the wall's point folds them, the need right
+/// over the limit's notice and one in a message before the one the wall cut alike.
+/// NEGATIVE CONTROLS: a cut turn's words only add. Its `NEEDS YOU: nothing`, or a defense naming
+/// no need, leave the set standing until the loop's own end takes it down.
+#[test]
+fn a_need_named_before_a_wall_is_posted() {
+    let admin = "grant the org admin role";
+    let need = format!("NEEDS YOU: {admin}");
+    for (tag, lines) in [
+        ("needs-wall", vec!["Pushed the parser fix.", need.as_str()]),
+        (
+            "needs-wall-before",
+            vec![
+                "Pushed the parser fix.",
+                &need,
+                "",
+                "⏺ Running the suite again.",
+            ],
+        ),
+    ] {
+        let (m, dir, journal) = watched(tag, vec![busy_screen(), walled(&lines)], vec![]);
+        let calls = needs_calls(&m);
+        assert_eq!(
+            calls.first(),
+            Some(&format!(
+                "set attention owner=needs kind=ask claude needs you: {admin} — carrying on"
+            )),
+            "{tag}: the cut turn's need goes up: {calls:#?}"
+        );
+        let up = journaled(&journal, &format!("{NEEDS} "));
+        assert!(up.len() == 1 && up[0].ends_with(admin), "{tag}: {up:#?}");
+        assert!(read_the_wall(&journal), "{tag}: the loop read the wall");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    for (tag, words) in [
+        ("needs-wall-none", "NEEDS YOU: nothing"),
+        (
+            "needs-wall-defense",
+            "Nothing left: the fix is on origin/main.",
+        ),
+    ] {
+        let (m, dir, journal) = watched(
+            tag,
+            vec![
+                busy_screen(),
+                needing("Pushed the parser fix; the release is next."),
+                busy_screen(),
+                walled(&["Built the release notes.", words]),
+            ],
+            vec![1],
+        );
+        let calls = needs_calls(&m);
+        assert_eq!(
+            calls.first(),
+            Some(&format!(
+                "set attention owner=needs kind=ask claude needs you: {NEED} — carrying on"
+            )),
+            "{tag}: {calls:#?}"
+        );
+        assert!(read_the_wall(&journal), "{tag}: the loop read the wall");
+        let down = needs_cleared(&journal);
+        assert!(
+            down.iter().all(|l| !l.ends_with("none stands now")),
+            "{tag}: the wall's words take no need down: {down:#?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A turn a wall cut names a need beside the one standing: its words add to the set, never
+/// replace it, for the report that would have named every need again never came.
+/// NEGATIVE CONTROL: the same turn ended with no wall is the whole report, whose need replaces
+/// the set.
+#[test]
+fn a_need_a_cut_turn_names_joins_the_set_standing() {
+    let admin = "NEEDS YOU: grant the org admin role";
+    let run = |tag: &str, last: Vec<String>| {
+        let (m, dir, journal) = watched(
+            tag,
+            vec![
+                busy_screen(),
+                needing("Pushed the parser fix; the release is next."),
+                busy_screen(),
+                last,
+            ],
+            vec![1],
+        );
+        let sets: Vec<String> = needs_calls(&m)
+            .into_iter()
+            .filter(|c| c.starts_with("set "))
+            .collect();
+        let up = journaled(&journal, &format!("{NEEDS} "));
+        let _ = std::fs::remove_dir_all(&dir);
+        (sets, up)
+    };
+    let (sets, up) = run(
+        "needs-wall-join",
+        walled(&["Built the release notes.", admin]),
+    );
+    assert_eq!(sets.len(), 2, "{sets:#?}");
+    assert!(sets[1].contains(&format!("{NEED} (+1 more)")), "{sets:#?}");
+    assert!(up.len() == 2 && up[1].contains(" count=2 "), "{up:#?}");
+    let (sets, up) = run(
+        "needs-wall-join-control",
+        said(&["Built the release notes.", admin]),
+    );
+    assert_eq!(sets.len(), 2, "{sets:#?}");
+    assert!(
+        sets[1].ends_with("needs you: grant the org admin role — carrying on"),
+        "{sets:#?}"
+    );
+    assert!(up.len() == 2 && up[1].contains(" count=1 "), "{up:#?}");
+}
+
+/// A CUT TURN'S NEED JOINS BESIDE A LINE THE GO-AHEAD ANSWERED, WHICH STAYS OFF (§15.6): the
+/// agent parks on the go-ahead, Cruise types it, and the turn after it, cut by a wall, names a
+/// person's need alone. The need goes up by itself: the go-ahead's line stays answered, for the
+/// cut turn never named it again, though the wall's own act is no go-ahead.
+/// NEGATIVE CONTROL: a cut turn that names the go-ahead's line again beside the need puts both
+/// up, as a decision other than the go-ahead's does on a reply that names them.
+#[test]
+fn a_cut_turns_need_leaves_the_go_aheads_answered_line_off() {
+    let admin = "grant the org admin role";
+    let host = Arc::new(Hears::default());
+    let (m, _, up) = go_ahead_run_to(
+        "go-ahead-wall-join",
+        &[],
+        walled(&["Built the branch.", &format!("NEEDS YOU: {admin}")]),
+        owners_policy(),
+        &host,
+        |_| {},
+    );
+    assert_eq!(go_aheads_typed(&m), 1, "{:#?}", m.requests);
+    let sets: Vec<&String> = m
+        .needs_calls
+        .iter()
+        .filter(|c| c.starts_with("set "))
+        .collect();
+    assert_eq!(
+        sets,
+        [&format!(
+            "set attention owner=needs kind=ask claude needs you: {admin} — carrying on"
+        )],
+        "{:#?}",
+        m.needs_calls
+    );
+    assert_eq!(
+        host.told().first().map(|(n, _)| n.clone()),
+        Some(vec![admin.to_string()]),
+        "{:#?}",
+        host.told()
+    );
+    assert!(
+        up.len() == 1 && up[0].contains(" answered=1 ") && up[0].ends_with(admin),
+        "{up:#?}"
+    );
+    let host = Arc::new(Hears::default());
+    let (m, _, _) = go_ahead_run_to(
+        "go-ahead-wall-join-again",
+        &[],
+        walled(&[
+            "Built the branch.",
+            &format!("NEEDS YOU: {GO_AHEAD_NEED}."),
+            &format!("NEEDS YOU: {admin}"),
+        ]),
+        owners_policy(),
+        &host,
+        |_| {},
+    );
+    assert!(
+        m.needs_calls
+            .iter()
+            .any(|c| c.starts_with("set ") && c.contains("rerun the checks")),
+        "NEGATIVE CONTROL: named again, the line goes up: {:#?}",
+        m.needs_calls
+    );
+}
+
+/// A turn too tall for the pane under the person's `❯` row that the session limit cut: a NEEDS
+/// YOU message, twenty tool calls, then its last message over the limit's notice ([`walled`]);
+/// its first `above` rows are in the history, the rest on the screen.
+fn walled_tall(need: &str, above: usize) -> (Vec<String>, Vec<String>) {
+    let mut lines: Vec<String> = [
+        "❯ Fix the parser and land it.",
+        "",
+        "⏺ Merged the lexer and its suites.",
+        &format!("  NEEDS YOU: {need}"),
+        "",
+    ]
+    .map(ToString::to_string)
+    .into();
+    for i in 0..20 {
+        lines.push(format!("⏺ Read(crates/aterm-agent/src/part_{i:02}.rs)"));
+        lines.push("  ⎿  Read 40 lines".to_string());
+    }
+    lines.push(String::new());
+    lines.extend(walled(&["Running the suite again."]));
+    let shown = lines.split_off(above);
+    (lines, shown)
+}
+
+/// A NEEDS YOU ABOVE THE SCREEN IN A TURN A WALL CUT GOES UP: the wall's point reads the turn
+/// whole from the history for its needs (`TurnEndState::reads_turn_whole`), as a clean point
+/// does. NEGATIVE CONTROL: with no history to read, the need above the screen is never seen.
+#[test]
+fn a_need_above_the_screen_in_a_cut_turn_is_posted() {
+    let admin = "grant the org admin role";
+    let run = |tag: &str, history: bool| {
+        let (above, shown) = walled_tall(admin, 5);
+        assert!(
+            above.iter().any(|r| r.contains(admin)) && !shown.iter().any(|r| r.contains(admin)),
+            "the need is above the screen"
+        );
+        let (m, dir, journal) = watched_with(tag, vec![busy_screen(), shown], vec![], |m| {
+            if history {
+                m.scrollback = Some(above);
+            }
+            m.alt_screen = Some(false);
+        });
+        assert!(read_the_wall(&journal), "{tag}: the loop read the wall");
+        let _ = std::fs::remove_dir_all(&dir);
+        needs_calls(&m)
+    };
+    let calls = run("needs-wall-above", true);
+    assert_eq!(
+        calls.first(),
+        Some(&format!(
+            "set attention owner=needs kind=ask claude needs you: {admin} — carrying on"
+        )),
+        "the cut turn's need above the screen goes up: {calls:#?}"
+    );
+    let calls = run("needs-wall-above-unread", false);
+    assert!(
+        calls.is_empty(),
+        "NEGATIVE CONTROL: no history read: {calls:#?}"
     );
 }

@@ -2589,6 +2589,27 @@ fn a_stall_is_the_same_by_its_words_wherever_its_tab_now_stands() {
     };
     assert!(same_stall(&row_a.detail, &windowed(a, 2).detail));
     assert!(same_stall(&windowed(a, 1).detail, &windowed(a, 12).detail));
+    let worker = |name: &str, window: Option<usize>| {
+        let place = worker_place(window, &crate::native_workers::chip_title_of(name));
+        agent_upgrade_stalled(&refused(a), NOW, &place)
+    };
+    assert!(
+        same_stall(
+            &worker("Claude Code", None).detail,
+            &worker("Fix the tab names", Some(2)).detail
+        ),
+        "a worker's place, whatever its tab is titled"
+    );
+    assert!(same_stall(
+        &row_a.detail,
+        &worker("Claude Code", None).detail
+    ));
+    let key = agent_upgrade_key(a);
+    assert_eq!(
+        sentence_lines(Some(&key), &worker("Claude Code", None).detail),
+        sentence_lines(Some(&key), &row_a.detail),
+        "a worker's place ends its sentence as a tab's does"
+    );
     let mut restated = vec!["press it again: another step held the upgrade's lock".to_string()];
     restated.extend(row_a.detail.iter().cloned());
     assert!(same_stall(&restated, &row_a.detail), "{restated:?}");
@@ -2651,6 +2672,9 @@ fn a_stall_is_the_same_by_its_words_wherever_its_tab_now_stands() {
         "in window two, tab 1",
         "in window 2 tab 1",
         "in window 2, tab",
+        "in Workers",
+        "in Workers \u{25b8}",
+        "in window 2, Workers",
     ] {
         let mut odd = row_a.detail.clone();
         odd[STALL_MOVE_LINE] = format!("{head} \u{00b7} {}", old[STALL_MOVE_LINE]);

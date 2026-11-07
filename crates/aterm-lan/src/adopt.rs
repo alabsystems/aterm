@@ -8,10 +8,12 @@
 //! for launchd's `KeepAlive` to start it. An ad-hoc image adopts nothing (the next build's
 //! elevation renews it). The broker also exits when its own image is replaced.
 
+use aterm_keeper::identity::{CheckError, Identity};
 use std::io::{self, Read as _};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use aterm_uds::process::LoadedImage;
@@ -20,37 +22,184 @@ use crate::server::log;
 
 /// How often the source and the image are looked at.
 const LOOK_EVERY: Duration = Duration::from_secs(5);
+/// Operational failures remain recoverable, without cloning an unchanged
+/// failing source at every ordinary look.
+const LONGEST_RETRY: Duration = Duration::from_secs(5 * 60);
 
 /// The executable inside a bundle.
 fn executable_of(bundle: &Path) -> PathBuf {
     bundle.join("Contents").join("MacOS").join("aterm")
 }
 
-/// A file as it is on disk: device, inode, size, modification time.
-type Stamp = (u64, u64, u64, i64);
-
-fn stamp(path: &Path) -> Option<Stamp> {
-    let meta = std::fs::metadata(path)
-        .ok()
-        .filter(std::fs::Metadata::is_file)?;
-    Some((meta.dev(), meta.ino(), meta.size(), meta.mtime()))
+/// Executable scheduling identity, never a bundle-integrity or permission receipt.
+type Stamp = (u64, u64, u64, i64, i64, i64, i64);
+fn stamp(bundle: &Path) -> io::Result<Stamp> {
+    let meta = std::fs::metadata(executable_of(bundle))?;
+    if !meta.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the source executable is not a regular file",
+        ));
+    }
+    Ok((
+        meta.dev(),
+        meta.ino(),
+        meta.len(),
+        meta.mtime(),
+        meta.mtime_nsec(),
+        meta.ctime(),
+        meta.ctime_nsec(),
+    ))
 }
 
-/// Whether two files hold the same bytes (`None`: one could not be read).
-fn same_bytes(a: &Path, b: &Path) -> Option<bool> {
-    let (mut a, mut b) = (std::fs::File::open(a).ok()?, std::fs::File::open(b).ok()?);
-    if a.metadata().ok()?.len() != b.metadata().ok()?.len() {
-        return Some(false);
+/// Whether two files hold the same bytes, retaining an unsuccessful read's error.
+fn same_bytes(a: &Path, b: &Path) -> io::Result<bool> {
+    let (mut a, mut b) = (std::fs::File::open(a)?, std::fs::File::open(b)?);
+    if a.metadata()?.len() != b.metadata()?.len() {
+        return Ok(false);
     }
     let (mut x, mut y) = ([0u8; 32 * 1024], [0u8; 32 * 1024]);
     loop {
-        let n = a.read(&mut x).ok()?;
+        let n = a.read(&mut x)?;
         if n == 0 {
-            return Some(true);
+            return Ok(true);
         }
-        b.read_exact(&mut y[..n]).ok()?;
+        b.read_exact(&mut y[..n])?;
         if x[..n] != y[..n] {
-            return Some(false);
+            return Ok(false);
+        }
+    }
+}
+
+#[derive(Debug)]
+enum Failure {
+    Io(io::Error),
+    Check(CheckError),
+    Refused(String),
+    /// The checked image was published; a subsequent verification or cleanup failed.
+    Published(Box<Failure>),
+}
+
+impl From<io::Error> for Failure {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<CheckError> for Failure {
+    fn from(error: CheckError) -> Self {
+        Self::Check(error)
+    }
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => error.fmt(out),
+            Self::Check(error) => error.fmt(out),
+            Self::Refused(why) => out.write_str(why),
+            Self::Published(error) => write!(out, "image replaced; finalization failed: {error}"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FailureClass {
+    Io,
+    Refused,
+    Unchecked,
+    Unanswered,
+    Published,
+}
+
+impl Failure {
+    fn class(&self) -> FailureClass {
+        match self {
+            Self::Io(_) => FailureClass::Io,
+            Self::Refused(_) | Self::Check(CheckError::Refused(_)) => FailureClass::Refused,
+            Self::Check(CheckError::Unchecked(_)) => FailureClass::Unchecked,
+            Self::Check(CheckError::Unanswered(_)) => FailureClass::Unanswered,
+            Self::Published(_) => FailureClass::Published,
+        }
+    }
+}
+
+/// One ordinary source observation and the real adoption operation share this
+/// retry state; it is scheduling memory, never an admission receipt.
+#[derive(Default)]
+struct Adoption {
+    source: Option<Stamp>,
+    settled: bool,
+    failures: u32,
+    retry_at: Duration,
+    said: Option<(FailureClass, String)>,
+}
+
+enum Round {
+    Quiet,
+    Applied,
+    Failed { error: Failure, report: bool },
+}
+
+impl Adoption {
+    fn failed(&mut self, error: Failure, now: Duration, stable: bool) -> Round {
+        let key = (error.class(), error.to_string());
+        let report = self.said.as_ref() != Some(&key);
+        self.said = Some(key);
+        if error.class() == FailureClass::Refused && stable {
+            self.settled = true;
+        } else {
+            self.failures = self.failures.saturating_add(1);
+            let factor = 1u32 << self.failures.saturating_sub(1).min(31);
+            self.retry_at =
+                now.saturating_add(LOOK_EVERY.saturating_mul(factor).min(LONGEST_RETRY));
+        }
+        Round::Failed { error, report }
+    }
+
+    fn round(
+        &mut self,
+        clock: impl Fn() -> Duration,
+        source: &Path,
+        image: &Path,
+        adopt: impl FnOnce() -> Result<(), Failure>,
+    ) -> Round {
+        let observed = stamp(source);
+        if let Ok(current) = observed.as_ref()
+            && self.source != Some(*current)
+        {
+            *self = Self {
+                source: Some(*current),
+                ..Self::default()
+            };
+        }
+        if self.settled || clock() < self.retry_at {
+            return Round::Quiet;
+        }
+        let before = match observed {
+            Ok(stamp) => stamp,
+            Err(error) => return self.failed(error.into(), clock(), false),
+        };
+        let result = match same_bytes(&executable_of(source), &executable_of(image)) {
+            Ok(true) => {
+                if stamp(source).ok() == Some(before) {
+                    self.settled = true;
+                }
+                return Round::Quiet;
+            }
+            Ok(false) => adopt(),
+            Err(error) => Err(error.into()),
+        };
+        match result {
+            Ok(()) => {
+                self.settled = true;
+                Round::Applied
+            }
+            Err(error @ Failure::Published(_)) => Round::Failed {
+                error,
+                report: true,
+            },
+            Err(error) => self.failed(error, clock(), stamp(source).ok() == Some(before)),
         }
     }
 }
@@ -59,10 +208,9 @@ fn same_bytes(a: &Path, b: &Path) -> Option<bool> {
 ///
 /// # Errors
 /// The thread could not start.
-pub(crate) fn watch(source: PathBuf) -> io::Result<()> {
+pub(crate) fn watch(source: PathBuf, checker: Option<Arc<Identity>>) -> io::Result<()> {
     let own = std::env::current_exe()?;
     let image = LoadedImage::read(i32::try_from(std::process::id()).unwrap_or(0));
-    let checker = adoption_check();
     let adopting = checker.is_some() && own == Path::new(aterm_uds::lan::IMAGE_EXECUTABLE);
     if checker.is_none() {
         log(format_args!(
@@ -78,8 +226,8 @@ pub(crate) fn watch(source: PathBuf) -> io::Result<()> {
     std::thread::Builder::new()
         .name("lan-adopt".into())
         .spawn(move || {
-            let source_exe = executable_of(&source);
-            let mut seen = None;
+            let mut adoption = Adoption::default();
+            let clock = std::time::Instant::now();
             loop {
                 if image.as_ref().and_then(|image| image.matches_file(&own)) == Some(false) {
                     log(format_args!(
@@ -88,57 +236,47 @@ pub(crate) fn watch(source: PathBuf) -> io::Result<()> {
                     ));
                     std::process::exit(0);
                 }
-                let now = stamp(&source_exe);
-                if adopting && now.is_some() && now != seen {
-                    seen = now;
-                    if same_bytes(&source_exe, &own) == Some(false)
-                        && let Some(check) = &checker
-                    {
-                        let image_bundle = Path::new(aterm_uds::lan::IMAGE_BUNDLE);
-                        match adopt(&source, image_bundle, |staged| {
-                            check.admits_code_at_strictly(staged)
-                        }) {
-                            Ok(()) => {
-                                log(format_args!(
-                                    "adopted {} as {}: exiting for launchd to start it",
-                                    source.display(),
-                                    image_bundle.display()
-                                ));
-                                std::process::exit(0);
-                            }
-                            Err(error) => {
-                                log(format_args!("did not adopt {}: {error}", source.display()))
-                            }
+                if adopting && let Some(check) = &checker {
+                    let image_bundle = Path::new(aterm_uds::lan::IMAGE_BUNDLE);
+                    match adoption.round(
+                        || clock.elapsed(),
+                        &source,
+                        image_bundle,
+                        || {
+                            adopt(&source, image_bundle, |staged| {
+                                check.admits_code_at_strictly(staged)
+                            })
+                        },
+                    ) {
+                        Round::Applied => {
+                            log(format_args!(
+                                "adopted {} as {}: exiting for launchd to start it",
+                                source.display(),
+                                image_bundle.display()
+                            ));
+                            std::process::exit(0);
                         }
+                        Round::Failed {
+                            error: error @ Failure::Published(_),
+                            ..
+                        } => {
+                            log(format_args!(
+                                "{}: {error}; exiting for launchd",
+                                source.display()
+                            ));
+                            std::process::exit(0);
+                        }
+                        Round::Failed {
+                            error,
+                            report: true,
+                        } => log(format_args!("did not adopt {}: {error}", source.display())),
+                        Round::Quiet | Round::Failed { report: false, .. } => {}
                     }
                 }
                 std::thread::sleep(LOOK_EVERY);
             }
         })?;
     Ok(())
-}
-
-/// The check a bundle must pass to be adopted: the running image's team requirement, or `None`
-/// for an ad-hoc image (or one whose team cannot be read).
-fn adoption_check() -> Option<aterm_keeper::identity::Identity> {
-    let team = match aterm_keeper::identity::own_team() {
-        Ok(Some(team)) => team,
-        Ok(None) => return None,
-        Err(why) => {
-            log(format_args!(
-                "the running image's team could not be read: {why}"
-            ));
-            return None;
-        }
-    };
-    let requirement = crate::server::team_requirement(&team).ok()?;
-    match aterm_keeper::identity::Identity::for_requirement(&requirement) {
-        Ok(identity) => Some(identity),
-        Err(why) => {
-            log(format_args!("the team requirement did not compile: {why}"));
-            None
-        }
-    }
 }
 
 /// `CLONE_NOFOLLOW`: a link inside the bundle is cloned as the link.
@@ -178,16 +316,14 @@ fn open_folder(from: &Path) -> io::Result<std::os::fd::OwnedFd> {
 /// Clone the bundle `from` (a real folder, recursively; never through a link) to the new name
 /// `to`, owned by this process's user. The clone is made from the folder's descriptor, so what
 /// is cloned is the folder that was opened, whatever is renamed over `from` meanwhile.
-fn clone(from: &Path, to: &Path) -> io::Result<()> {
-    let folder = open_folder(from).map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!(
-                "{} is not a bundle folder (a link is never adopted): {error}",
-                from.display()
-            ),
-        )
-    })?;
+fn clone(from: &Path, to: &Path) -> Result<(), Failure> {
+    if !std::fs::symlink_metadata(from)?.is_dir() {
+        return Err(Failure::Refused(format!(
+            "{} is not a real bundle folder (a link is never adopted)",
+            from.display()
+        )));
+    }
+    let folder = open_folder(from)?;
     let to = c_path(to)?;
     // SAFETY: `folder` is a live descriptor and `to` a NUL-terminated path, both live for the
     // call.
@@ -202,27 +338,24 @@ fn clone(from: &Path, to: &Path) -> io::Result<()> {
     {
         Ok(())
     } else {
-        Err(io::Error::last_os_error())
+        Err(io::Error::last_os_error().into())
     }
 }
 
 /// `Ok` when `path` is a real folder (no link) owned by this process's user.
 ///
 /// # Errors
-/// `PermissionDenied` naming what it is instead, or the `lstat`'s error.
-fn owned_folder(path: &Path) -> io::Result<()> {
+/// A refusal naming what it is instead, or the `lstat`'s operational error.
+fn owned_folder(path: &Path) -> Result<(), Failure> {
     let meta = std::fs::symlink_metadata(path)?;
     let ours = aterm_uds::peer::our_uid();
     if !meta.file_type().is_dir() || meta.uid() != ours {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "{} is not a folder of uid {ours} (a {:?} of uid {})",
-                path.display(),
-                meta.file_type(),
-                meta.uid()
-            ),
-        ));
+        return Err(Failure::Refused(format!(
+            "{} is not a folder of uid {ours} (a {:?} of uid {})",
+            path.display(),
+            meta.file_type(),
+            meta.uid()
+        )));
     }
     Ok(())
 }
@@ -248,20 +381,17 @@ fn stays_inside(target: &Path, depth: usize) -> bool {
 
 /// Take the group and other write bits off everything under `root` (`depth` folders below the
 /// bundle's root), and refuse a link that leads out of the bundle.
-fn strip_write(root: &Path, depth: usize) -> io::Result<()> {
+fn strip_write(root: &Path, depth: usize) -> Result<(), Failure> {
     let meta = std::fs::symlink_metadata(root)?;
     if meta.file_type().is_symlink() {
         let target = std::fs::read_link(root)?;
         // A link's own depth is its folder's.
         if !stays_inside(&target, depth.saturating_sub(1)) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "{} leads out of the bundle ({})",
-                    root.display(),
-                    target.display()
-                ),
-            ));
+            return Err(Failure::Refused(format!(
+                "{} leads out of the bundle ({})",
+                root.display(),
+                target.display()
+            )));
         }
         return Ok(());
     }
@@ -293,18 +423,18 @@ fn swap(a: &Path, b: &Path) -> io::Result<()> {
 /// folder of this process's user (root's), take its group and other write bits off, refuse it
 /// if a link inside leads out of it, let `check` judge the clone (never the person's bundle,
 /// which could change after the check), then swap the clone in for `image` in one rename,
-/// confirm `image` is that real folder, and remove what it replaced. A clone refused at any step
-/// is removed and `image` is left as it was.
+/// confirm `image` is that real folder, and remove what it replaced. A clone refused before
+/// publication is removed and `image` is left as it was.
 ///
 /// # Errors
-/// `source` that is no real folder, the clone's, a clone that is not this user's real folder or
-/// that holds a link out of it, the check's (`PermissionDenied`, its words), the swap's, or an
-/// `image` that is not this user's real folder after it.
-pub(crate) fn adopt(
+/// A source or clone that is no owned real folder, a link out of the clone, or the check's
+/// typed result; filesystem errors remain operational. A failure after publication is marked
+/// separately so cleanup cannot prevent the running broker from relinquishing its old image.
+fn adopt(
     source: &Path,
     image: &Path,
-    check: impl FnOnce(&Path) -> Result<(), String>,
-) -> io::Result<()> {
+    check: impl FnOnce(&Path) -> Result<(), CheckError>,
+) -> Result<(), Failure> {
     let dir = image
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "an image with no folder"))?;
@@ -315,23 +445,24 @@ pub(crate) fn adopt(
     clone(source, &staging)?;
     let judged = owned_folder(&staging)
         .and_then(|()| strip_write(&staging, 0))
-        .map_err(|error| error.to_string())
-        .and_then(|()| check(&staging));
-    if let Err(why) = judged {
+        .and_then(|()| check(&staging).map_err(Failure::Check));
+    if let Err(error) = judged {
         let _ = std::fs::remove_dir_all(&staging);
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied, why));
+        return Err(error);
     }
     if std::fs::symlink_metadata(image).is_ok() {
         if let Err(error) = swap(&staging, image) {
             let _ = std::fs::remove_dir_all(&staging);
-            return Err(error);
+            return Err(error.into());
         }
         // `staging` now names the image that was replaced.
-        std::fs::remove_dir_all(&staging)?;
+        if let Err(error) = std::fs::remove_dir_all(&staging) {
+            return Err(Failure::Published(Box::new(error.into())));
+        }
     } else {
         std::fs::rename(&staging, image)?;
     }
-    owned_folder(image)
+    owned_folder(image).map_err(|error| Failure::Published(Box::new(error)))
 }
 
 #[cfg(test)]
@@ -354,8 +485,11 @@ mod tests {
         );
         bundle(&source, b"new");
         bundle(&image, b"old");
-        let refused = adopt(&source, &image, |_| Err("not the team".to_owned())).unwrap_err();
-        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+        let refused = adopt(&source, &image, |_| {
+            Err(CheckError::Refused("not the team".to_owned()))
+        })
+        .unwrap_err();
+        assert!(matches!(refused, Failure::Check(CheckError::Refused(_))));
         assert_eq!(std::fs::read(executable_of(&image)).unwrap(), b"old");
         let mut judged = None;
         adopt(&source, &image, |staged| {
@@ -377,6 +511,183 @@ mod tests {
             .collect();
         assert_eq!(entries.len(), 1, "no staging left beside the image");
         assert_eq!(std::fs::read(executable_of(&source)).unwrap(), b"new");
+
+        // A temporary staging obstruction is ordinary filesystem failure, not
+        // a code refusal or a new source generation. Its repair must be noticed
+        // by the next ordinary watch round without restarting the broker.
+        bundle(&image, b"old");
+        let image_exe = executable_of(&image);
+        let original = stamp(&source).unwrap();
+        let staging = image
+            .parent()
+            .unwrap()
+            .join(format!(".adopting-{}.app", std::process::id()));
+        std::fs::write(&staging, b"temporary obstruction").unwrap();
+        let mut observation = Adoption::default();
+        let now = std::cell::Cell::new(Duration::ZERO);
+        let first = observation.round(
+            || now.get(),
+            &source,
+            &image,
+            || {
+                adopt(&source, &image, |_| {
+                    panic!("the failed staging cleanup precedes code verification")
+                })
+            },
+        );
+        assert!(matches!(
+            first,
+            Round::Failed {
+                error: Failure::Io(_),
+                report: true
+            }
+        ));
+        assert_eq!(std::fs::read(&image_exe).unwrap(), b"old");
+        std::fs::remove_file(&staging).unwrap();
+        now.set(LOOK_EVERY);
+        let retried = observation.round(
+            || now.get(),
+            &source,
+            &image,
+            || adopt(&source, &image, |_| Ok(())),
+        );
+        assert_eq!(
+            stamp(&source).unwrap(),
+            original,
+            "the source did not change"
+        );
+        assert_eq!(
+            std::fs::read(&image_exe).unwrap(),
+            b"new",
+            "the ordinary round must retry the same source after transient failure"
+        );
+        assert!(matches!(retried, Round::Applied));
+
+        bundle(&source, b"refused");
+        let denied = observation.round(
+            || now.get(),
+            &source,
+            &image,
+            || {
+                adopt(&source, &image, |_| {
+                    Err(CheckError::Refused("different signer".into()))
+                })
+            },
+        );
+        assert!(matches!(
+            denied,
+            Round::Failed {
+                error: Failure::Check(CheckError::Refused(_)),
+                report: true
+            }
+        ));
+        for _ in 0..20 {
+            now.set(now.get() + LOOK_EVERY);
+            assert!(matches!(
+                observation.round(
+                    || now.get(),
+                    &source,
+                    &image,
+                    || panic!("unchanged refused source must not clone or reverify")
+                ),
+                Round::Quiet
+            ));
+        }
+        bundle(&source, b"retry");
+        let last_attempt = std::cell::Cell::new(None);
+        let intervals = std::cell::RefCell::new(Vec::new());
+        let mut reports = 0;
+        for _ in 0..600 {
+            let result = observation.round(
+                || now.get(),
+                &source,
+                &image,
+                || {
+                    adopt(&source, &image, |_| {
+                        if let Some(last) = last_attempt.replace(Some(now.get())) {
+                            intervals.borrow_mut().push(now.get() - last);
+                        }
+                        Err(CheckError::Unanswered(
+                            "the strict check is temporarily unavailable".into(),
+                        ))
+                    })
+                },
+            );
+            reports += usize::from(matches!(result, Round::Failed { report: true, .. }));
+            now.set(now.get() + LOOK_EVERY);
+            if intervals
+                .borrow()
+                .ends_with(&[LONGEST_RETRY, LONGEST_RETRY])
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            reports, 1,
+            "one unchanged operational diagnostic is not logged every round"
+        );
+        assert_eq!(intervals.borrow().first(), Some(&LOOK_EVERY));
+        assert_eq!(intervals.borrow().get(1), Some(&(LOOK_EVERY * 2)));
+        assert!(
+            intervals
+                .borrow()
+                .ends_with(&[LONGEST_RETRY, LONGEST_RETRY]),
+            "operational retry remains live at its bounded rate"
+        );
+        assert!(
+            intervals
+                .borrow()
+                .iter()
+                .all(|interval| *interval <= LONGEST_RETRY)
+        );
+        let pending = observation.round(
+            || now.get(),
+            &source,
+            &image,
+            || panic!("the same retry is not due"),
+        );
+        assert!(matches!(pending, Round::Quiet));
+        bundle(&source, b"a new source bypasses the old backoff");
+        assert!(matches!(
+            observation.round(
+                || now.get(),
+                &source,
+                &image,
+                || adopt(&source, &image, |_| Ok(()))
+            ),
+            Round::Applied
+        ));
+        assert_eq!(
+            std::fs::read(&image_exe).unwrap(),
+            b"a new source bypasses the old backoff"
+        );
+
+        bundle(&source, b"changing");
+        let changed = observation.round(
+            || now.get(),
+            &source,
+            &image,
+            || {
+                adopt(&source, &image, |_| {
+                    bundle(&source, b"after the check started");
+                    Err(CheckError::Refused("the old candidate was refused".into()))
+                })
+            },
+        );
+        assert!(matches!(changed, Round::Failed { .. }));
+        assert!(
+            !observation.settled,
+            "a refusal from a changed source cannot consume its newer generation"
+        );
+        assert!(matches!(
+            observation.round(
+                || now.get(),
+                &source,
+                &image,
+                || adopt(&source, &image, |_| Ok(()))
+            ),
+            Round::Applied
+        ));
     }
 
     #[test]
@@ -418,7 +729,7 @@ mod tests {
             std::os::unix::fs::symlink(out, &escape).unwrap();
             bundle(&real, b"newer");
             let refused = adopt(&real, &image, |_| Ok(())).unwrap_err();
-            assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied, "{out}");
+            assert!(matches!(refused, Failure::Refused(_)), "{out}");
             assert_eq!(
                 std::fs::read(executable_of(&image)).unwrap(),
                 b"new",
@@ -450,14 +761,22 @@ mod tests {
         bundle(&source, b"first");
         adopt(&source, &image, |_| Ok(())).unwrap();
         assert_eq!(std::fs::read(executable_of(&image)).unwrap(), b"first");
-        assert_eq!(
-            same_bytes(&executable_of(&source), &executable_of(&image)),
-            Some(true)
-        );
+        assert!(same_bytes(&executable_of(&source), &executable_of(&image)).unwrap());
         bundle(&source, b"other");
-        assert_eq!(
-            same_bytes(&executable_of(&source), &executable_of(&image)),
-            Some(false)
-        );
+        assert!(!same_bytes(&executable_of(&source), &executable_of(&image)).unwrap());
+        std::fs::remove_file(executable_of(&source)).unwrap();
+        std::fs::create_dir(executable_of(&source)).unwrap();
+        assert!(matches!(
+            Adoption::default().round(
+                || Duration::ZERO,
+                &source,
+                &image,
+                || panic!("an incomplete source must not be cloned or checked")
+            ),
+            Round::Failed {
+                error: Failure::Io(_),
+                ..
+            }
+        ));
     }
 }

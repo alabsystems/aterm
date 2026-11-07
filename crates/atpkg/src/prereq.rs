@@ -280,6 +280,7 @@ pub fn probe_cached(path_var: Option<&OsStr>, host: &CcHost, cache: Option<&CcCa
 /// the Command Line Tools receipt's time, the SDK a build would fall back to and the `PATH`
 /// the build sees. `None` when the compiler cannot be read or an explicit SDK is used:
 /// changes within that SDK have no Apple install receipt to retire a cached success.
+/// The executable-output policy domain retires verdicts made by the weaker output check.
 fn cc_key(
     located: &Located,
     path_var: Option<&OsStr>,
@@ -315,6 +316,7 @@ fn cc_key(
             .unwrap_or_default()
     }
     crate::probe_cache::key([
+        Some("executable-link-v1".to_owned()),
         Some(kind.to_owned()),
         crate::probe_cache::identity(cc),
         Some(developer_dir.display().to_string()),
@@ -441,7 +443,7 @@ const PROBE_SOURCE: &str = "#include <stdio.h>\nint main(void) { return 0; }\n";
 
 /// Make `cc` compile and link [`PROBE_SOURCE`] in a private directory under
 /// `host.tmp_root`, within `host.bound`: `Ready { driver: resolved }` only when it exits 0
-/// and wrote a non-empty program, which is never run. The directory is always removed.
+/// and wrote a non-empty executable program, which is never run. The directory is always removed.
 fn build_probe(cc: &Path, resolved: PathBuf, path_var: Option<&OsStr>, host: &CcHost) -> CcVerdict {
     let scratch = match aterm_tempfile::Builder::new()
         .prefix("atpkg-cc-")
@@ -516,14 +518,14 @@ fn build_probe(cc: &Path, resolved: PathBuf, path_var: Option<&OsStr>, host: &Cc
             bound: host.bound,
         },
         Some(out) if out.status.success() => {
-            let wrote =
-                std::fs::symlink_metadata(&program).is_ok_and(|m| m.is_file() && m.len() > 0);
+            let wrote = std::fs::symlink_metadata(&program)
+                .is_ok_and(|metadata| is_executable_file(&metadata));
             if wrote {
                 CcVerdict::Ready { driver: resolved }
             } else {
                 CcVerdict::Broken {
                     driver: cc.to_path_buf(),
-                    why: "it reported success but wrote no program".to_string(),
+                    why: "it reported success without a nonempty executable output".to_string(),
                 }
             }
         }
@@ -589,9 +591,10 @@ fn ask(bin: &Path, driver: &Path, args: &[&str], host: &CcHost) -> CcVerdict {
 
 /// A nonempty regular file this user may execute (never a directory named `cc`).
 fn is_executable(path: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
+    std::fs::metadata(path).is_ok_and(|metadata| is_executable_file(&metadata))
+}
+
+fn is_executable_file(meta: &std::fs::Metadata) -> bool {
     if !meta.is_file() || meta.len() == 0 {
         return false;
     }
@@ -792,7 +795,7 @@ mod tests {
         script(
             &shim.join("cc"),
             &format!(
-                "echo \"$*\" > '{}'; [ \"$1\" = -o ] && printf x > \"$2\"",
+                "echo \"$*\" > '{}'; [ \"$1\" = -o ] && {{ printf x > \"$2\"; /bin/chmod +x \"$2\"; }}",
                 ran.display()
             ),
         );
@@ -928,6 +931,21 @@ mod tests {
             probe_with(Some(liar.as_os_str()), &host),
             CcVerdict::Broken { driver, .. } if driver == liar.join("cc")
         ));
+        script(
+            &liar.join("cc"),
+            "case \"$1\" in --version) echo cc;; -o) printf x > \"$2\"; /bin/chmod 600 \"$2\";; esac",
+        );
+        assert!(matches!(
+            probe_with(Some(liar.as_os_str()), &host),
+            CcVerdict::Broken { driver, .. } if driver == liar.join("cc")
+        ));
+        building_cc(&liar.join("cc"), &root.join("program-ran"));
+        assert!(matches!(
+            probe_with(Some(liar.as_os_str()), &host),
+            CcVerdict::Ready { .. }
+        ));
+        assert!(!root.join("program-ran").exists());
+        assert!(leftovers(&host.tmp_root).is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1071,7 +1089,7 @@ mod tests {
         script(
             &bin.join("cc"),
             &format!(
-                "echo \"$1\" >> '{}'; case \"$1\" in --version) echo 'cc version 1';; -o) printf x > \"$2\";; esac",
+                "echo \"$1\" >> '{}'; case \"$1\" in --version) echo 'cc version 1';; -o) printf x > \"$2\"; /bin/chmod +x \"$2\";; esac",
                 asked.display()
             ),
         );
@@ -1114,7 +1132,7 @@ mod tests {
         std::fs::write(&usable, "headers and libraries").unwrap();
         script(
             &bin.join("cc"),
-            "case \"$1\" in --version) echo cc;; -o) if [ -f \"$SDKROOT/usable\" ]; then printf x > \"$2\"; else echo 'SDK no longer usable' >&2; exit 1; fi;; esac",
+            "case \"$1\" in --version) echo cc;; -o) if [ -f \"$SDKROOT/usable\" ]; then printf x > \"$2\"; /bin/chmod +x \"$2\"; else echo 'SDK no longer usable' >&2; exit 1; fi;; esac",
         );
         let host = CcHost {
             sdkroot_override: Some(sdk),
@@ -1139,6 +1157,55 @@ mod tests {
     }
 
     #[test]
+    fn a_verdict_kept_before_executable_output_was_required_is_not_reused() {
+        let root = scratch("old-output-policy");
+        let bin = root.join("bin");
+        let cc = bin.join("cc");
+        let asked = root.join("asked");
+        script(
+            &cc,
+            &format!(
+                "echo \"$1\" >> '{}'; case \"$1\" in --version) echo cc;; -o) printf x > \"$2\"; /bin/chmod 600 \"$2\";; esac",
+                asked.display()
+            ),
+        );
+        let host = plain_host(&root);
+        let cache = CcCache {
+            file: root.join("state").join("cc"),
+            receipt: root.join("absent-receipt"),
+        };
+        let developer = host.developer_dir();
+        let clang = clang_paths(&developer)
+            .iter()
+            .map(|path| crate::probe_cache::identity(path).unwrap_or_else(|| "absent".to_owned()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        // The old cache format had these seven parts and no acceptance-policy domain.
+        let old_key = crate::probe_cache::key([
+            Some("plain".to_owned()),
+            crate::probe_cache::identity(&cc),
+            Some(developer.display().to_string()),
+            Some(clang),
+            Some("no receipt".to_owned()),
+            Some("no sdk".to_owned()),
+            Some(bin.display().to_string()),
+        ])
+        .unwrap();
+        crate::probe_cache::put(&cache.file, &old_key, &cc.to_string_lossy());
+        for calls in [2, 4] {
+            assert!(matches!(
+                probe_cached(Some(bin.as_os_str()), &host, Some(&cache)),
+                CcVerdict::Broken { .. }
+            ));
+            assert_eq!(
+                std::fs::read_to_string(&asked).unwrap().lines().count(),
+                calls
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn a_developer_override_controls_discovery_and_retires_the_cached_compiler() {
         let root = scratch("developer-override");
         let shim = root.join("usr-bin");
@@ -1152,7 +1219,7 @@ mod tests {
         script(
             &shim.join("cc"),
             &format!(
-                "echo \"$DEVELOPER_DIR\" >> '{}'; [ \"$1\" = -o ] && printf x > \"$2\"",
+                "echo \"$DEVELOPER_DIR\" >> '{}'; [ \"$1\" = -o ] && {{ printf x > \"$2\"; /bin/chmod +x \"$2\"; }}",
                 asked.display()
             ),
         );
@@ -1202,7 +1269,7 @@ mod tests {
         );
         script(
             &shim.join("cc"),
-            "[ -n \"$DEVELOPER_DIR\" ] && { echo 'setup override reached compiler' >&2; exit 1; }\nprintf x > \"$2\"",
+            "[ -n \"$DEVELOPER_DIR\" ] && { echo 'setup override reached compiler' >&2; exit 1; }\nprintf x > \"$2\"\n/bin/chmod +x \"$2\"",
         );
         let host = CcHost {
             shim_dir: Some(shim.clone()),
@@ -1239,7 +1306,7 @@ mod tests {
         script(
             &shim.join("cc"),
             &format!(
-                "echo \"$1\" >> '{}'; [ \"$1\" = -o ] && printf x > \"$2\"",
+                "echo \"$1\" >> '{}'; [ \"$1\" = -o ] && {{ printf x > \"$2\"; /bin/chmod +x \"$2\"; }}",
                 asked.display()
             ),
         );

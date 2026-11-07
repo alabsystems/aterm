@@ -237,6 +237,84 @@ pub struct DiskTotals {
     pub growth_bps: Option<i64>,
     /// The §10.8 folders across its roots, most entries first.
     pub warnings: Vec<HugeDirFact>,
+    /// `sys disk`'s scope lines, every scope read from one board (flow record §7.12).
+    pub scopes: Vec<ScopeLine>,
+    /// `sys disk`'s pane lines: each pane of the asked scope, where it is and what it adds.
+    pub panes: Vec<PaneLine>,
+}
+
+/// One `scope` line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScopeLine {
+    /// This Mac: the used and total of home's pool.
+    Global {
+        /// Home's pool (`container:disk3`).
+        pool: Option<String>,
+        /// Total − available.
+        used: Option<u64>,
+        /// The volume's size.
+        total: Option<u64>,
+    },
+    /// aterm's or a tab's bytes.
+    Bytes(ScopeBytes),
+}
+
+/// aterm's or one tab's bytes, as the bar draws them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScopeBytes {
+    /// `aterm` or `tab`.
+    pub name: &'static str,
+    /// The tab's number on its window's strip.
+    pub tab: Option<usize>,
+    /// The tab's name where it has no number (a parked worker tab: `Workers ▸ <label>`).
+    pub tab_name: Option<String>,
+    /// The tab's panes (none for aterm).
+    pub keys: Vec<u64>,
+    /// Home's pool.
+    pub pool: Option<String>,
+    /// What the bar draws: the scope's bytes after the clamp.
+    pub bytes: u64,
+    /// Whether it draws: some root counts.
+    pub drawn: bool,
+    /// Why it draws nothing (`walking`, `none_counted`).
+    pub why: Option<&'static str>,
+    /// Every walkable root on home's pool counts.
+    pub complete: bool,
+    /// Its roots.
+    pub roots: usize,
+    /// The roots that count.
+    pub counted: usize,
+    /// Seconds since the oldest walk its bytes sum ended.
+    pub oldest_walk_s: Option<u64>,
+    /// The clamp cut it.
+    pub clamped: bool,
+}
+
+/// One `pane` line.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PaneLine {
+    /// Its session key.
+    pub key: u64,
+    /// Its tab's number on its window's strip.
+    pub tab: Option<usize>,
+    /// Its tab's name where the tab has no number (a parked worker tab).
+    pub tab_name: Option<String>,
+    /// Its place in its tab, 1-based, in layout order (where the focus is moves nothing).
+    pub pane: usize,
+    /// Where its live directory came from (`fg`, `shell`, `osc7`).
+    pub from: Option<&'static str>,
+    /// The program whose directory it is.
+    pub exe: Option<String>,
+    /// The other machine a report named.
+    pub host: Option<String>,
+    /// Its live directory.
+    pub live: Option<String>,
+    /// Its project.
+    pub project: Option<String>,
+    /// Its project is a member of its tab's scope.
+    pub member: bool,
+    /// Why it adds nothing.
+    pub why: Option<&'static str>,
 }
 
 impl DiskTotals {
@@ -332,6 +410,187 @@ pub fn totals_clause(totals: Option<&DiskTotals>, bps_word: impl Fn(f64) -> Stri
         None => {}
     }
     out
+}
+
+fn yes(b: bool) -> &'static str {
+    if b { "yes" } else { "no" }
+}
+
+fn tab_word(tab: Option<usize>, name: Option<&str>, pct: &dyn Fn(&str) -> String) -> String {
+    tab.map_or_else(|| pct(name.unwrap_or("-")), |t| t.to_string())
+}
+
+impl ScopeLine {
+    /// The `scope` line's text (`pct` escapes a free-text value, `unavailable` names a missing one).
+    #[must_use]
+    pub fn text(
+        &self,
+        pct: &dyn Fn(&str) -> String,
+        unavailable: &dyn Fn(&str) -> String,
+    ) -> String {
+        let known =
+            |v: Option<u64>| v.map_or_else(|| unavailable("not_sampled"), |v| v.to_string());
+        let pool = |p: Option<&String>| p.map_or_else(|| unavailable("not_sampled"), |p| pct(p));
+        match self {
+            Self::Global {
+                pool: p,
+                used,
+                total,
+            } => format!(
+                "scope name=global pool={} used_bytes={} total_bytes={}",
+                pool(p.as_ref()),
+                known(*used),
+                known(*total)
+            ),
+            Self::Bytes(b) => {
+                let mut out = format!("scope name={}", b.name);
+                if b.name == "tab" {
+                    out.push_str(&format!(
+                        " tab={}",
+                        tab_word(b.tab, b.tab_name.as_deref(), pct)
+                    ));
+                }
+                out.push_str(&format!(
+                    " pool={} bytes={} drawn={}",
+                    pool(b.pool.as_ref()),
+                    b.bytes,
+                    yes(b.drawn)
+                ));
+                if let Some(why) = b.why {
+                    out.push_str(&format!(" why={why}"));
+                }
+                out.push_str(&format!(
+                    " complete={} roots={} counted={} oldest_walk_s={} clamped={}",
+                    yes(b.complete),
+                    b.roots,
+                    b.counted,
+                    known(b.oldest_walk_s),
+                    yes(b.clamped)
+                ));
+                out
+            }
+        }
+    }
+
+    /// The `scopes` array's object: the line's keys.
+    #[must_use]
+    pub fn json(&self) -> Jv {
+        let known = |v: Option<u64>| Jv::known_or(v, "not_sampled");
+        let pool =
+            |p: Option<&String>| p.map_or_else(|| Jv::why("not_sampled"), |p| Jv::s(p.clone()));
+        match self {
+            Self::Global {
+                pool: p,
+                used,
+                total,
+            } => Jv::obj([
+                ("name", Jv::s("global")),
+                ("pool", pool(p.as_ref())),
+                ("used_bytes", known(*used)),
+                ("total_bytes", known(*total)),
+            ]),
+            Self::Bytes(b) => {
+                let mut o = Jv::obj([("name", Jv::s(b.name))]);
+                if b.name == "tab" {
+                    match (b.tab, b.tab_name.as_ref()) {
+                        (Some(t), _) => o.set("tab", Jv::u(t as u64)),
+                        (None, Some(n)) => o.set("tab_name", Jv::s(n.clone())),
+                        (None, None) => o.set("tab", Jv::why("not_sampled")),
+                    }
+                }
+                o.set("pool", pool(b.pool.as_ref()));
+                o.set("bytes", Jv::u(b.bytes));
+                o.set("drawn", Jv::Bool(b.drawn));
+                if let Some(why) = b.why {
+                    o.set("why_not", Jv::s(why));
+                }
+                o.set("complete", Jv::Bool(b.complete));
+                o.set("roots", Jv::u(b.roots as u64));
+                o.set("counted", Jv::u(b.counted as u64));
+                o.set("oldest_walk_s", known(b.oldest_walk_s));
+                o.set("clamped", Jv::Bool(b.clamped));
+                o
+            }
+        }
+    }
+}
+
+impl PaneLine {
+    /// The `pane` line's text; `path_ok` false prints where its folders lie (`under=`), not them.
+    #[must_use]
+    pub fn text(
+        &self,
+        path_ok: bool,
+        home: Option<&str>,
+        pct: &dyn Fn(&str) -> String,
+        exe_word: &dyn Fn(&str) -> String,
+    ) -> String {
+        let mut out = format!(
+            "pane tab={} pane={}",
+            tab_word(self.tab, self.tab_name.as_deref(), pct),
+            self.pane
+        );
+        out.push_str(&format!(" from={}", self.from.unwrap_or("-")));
+        if let Some(exe) = self.exe.as_deref() {
+            out.push_str(&format!(" exe={}", exe_word(exe)));
+        }
+        if let Some(host) = self.host.as_deref() {
+            out.push_str(&format!(" host={}", pct(host)));
+        }
+        let path = |p: Option<&str>| p.map_or_else(|| "-".to_owned(), pct);
+        match (path_ok, self.live.as_deref()) {
+            (false, Some(live)) => {
+                out.push_str(&format!(" under={}", super::under(live, home)));
+            }
+            _ => out.push_str(&format!(
+                " live={} project={}",
+                path(self.live.as_deref()),
+                path(self.project.as_deref())
+            )),
+        }
+        out.push_str(&format!(" member={}", yes(self.member)));
+        if let Some(why) = self.why {
+            out.push_str(&format!(" why={why}"));
+        }
+        out
+    }
+
+    /// The `panes` array's object: the line's keys.
+    #[must_use]
+    pub fn json(&self, path_ok: bool, home: Option<&str>, exe_word: &dyn Fn(&str) -> String) -> Jv {
+        let mut o = Jv::Obj(Vec::new());
+        match (self.tab, self.tab_name.as_ref()) {
+            (Some(t), _) => o.set("tab", Jv::u(t as u64)),
+            (None, Some(n)) => o.set("tab_name", Jv::s(n.clone())),
+            (None, None) => o.set("tab", Jv::why("not_sampled")),
+        }
+        o.set("pane", Jv::u(self.pane as u64));
+        o.set(
+            "from",
+            self.from.map_or_else(|| Jv::why("not_sampled"), Jv::s),
+        );
+        if let Some(exe) = self.exe.as_deref() {
+            o.set("exe", Jv::s(exe_word(exe)));
+        }
+        if let Some(host) = self.host.as_deref() {
+            o.set("host", Jv::s(host));
+        }
+        match (path_ok, self.live.as_deref()) {
+            (false, Some(live)) => o.set("under", Jv::s(super::under(live, home))),
+            _ => {
+                let path = |p: Option<&String>| {
+                    p.map_or_else(|| Jv::why("not_sampled"), |p| Jv::s(p.clone()))
+                };
+                o.set("live", path(self.live.as_ref()));
+                o.set("project", path(self.project.as_ref()));
+            }
+        }
+        o.set("member", Jv::Bool(self.member));
+        if let Some(why) = self.why {
+            o.set("why_not", Jv::s(why));
+        }
+        o
+    }
 }
 
 /// The scope's JSON balance fields.
@@ -475,6 +734,7 @@ mod tests {
                 entries: 120_000,
                 root: Some(1),
             }],
+            ..DiskTotals::default()
         };
         assert_eq!(
             totals_clause(Some(&t), bps),

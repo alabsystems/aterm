@@ -3,8 +3,10 @@
 
 //! Channel mirror tests over a fake release host.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use atpkg_publish::artifact::upload;
 use atpkg_publish::channel::mirror::{self, MirrorOptions, MirrorReport};
@@ -359,6 +361,39 @@ fn a_public_release_serving_no_manifest_is_refused_with_its_remedy() {
 struct Dark {
     inner: Arc<FakeHost>,
     probe: Probe,
+    gate: Option<Arc<ReadGate>>,
+    failures: BTreeMap<String, String>,
+}
+
+impl Dark {
+    fn new(inner: Arc<FakeHost>, probe: Probe) -> Self {
+        Self {
+            inner,
+            probe,
+            gate: None,
+            failures: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ReadGate {
+    required: usize,
+    entered: Mutex<usize>,
+    changed: Condvar,
+}
+
+impl ReadGate {
+    fn enter(&self) -> bool {
+        let mut entered = self.entered.lock().expect("read gate");
+        *entered += 1;
+        self.changed.notify_all();
+        let (entered, timeout) = self
+            .changed
+            .wait_timeout_while(entered, Duration::from_secs(60), |n| *n < self.required)
+            .expect("read gate detector");
+        !timeout.timed_out() || *entered >= self.required
+    }
 }
 
 impl ReleaseHost for Dark {
@@ -403,6 +438,17 @@ impl ReleaseHost for Dark {
         self.probe.clone()
     }
     fn fetch_public(&self, slug: &Slug, tag: &str, asset: &str, dest: &Path, cap: u64) -> Probe {
+        if asset.ends_with(".toml")
+            && let Some(gate) = &self.gate
+            && !gate.enter()
+        {
+            return Probe::Unknown(
+                "independent reads did not enter before the hang detector".into(),
+            );
+        }
+        if let Some(why) = self.failures.get(tag) {
+            return Probe::Unknown(why.clone());
+        }
         match &self.probe {
             Probe::Unknown(_) => self.probe.clone(),
             _ => self.inner.fetch_public(slug, tag, asset, dest, cap),
@@ -420,10 +466,7 @@ impl ReleaseHost for Dark {
 fn a_create_the_download_host_never_serves_fails_the_run() {
     let (mut rig, q) = setup("mirror-unserved", index());
     let host = rig.host.clone();
-    rig.route(Arc::new(Dark {
-        inner: host,
-        probe: Probe::Absent,
-    }));
+    rig.route(Arc::new(Dark::new(host, Probe::Absent)));
     let e = err(&rig, &q, false);
     assert!(
         e.contains("after the upload — the public repo is private"),
@@ -435,13 +478,150 @@ fn a_create_the_download_host_never_serves_fails_the_run() {
 fn an_unreachable_download_host_decides_nothing() {
     let (mut rig, q) = setup("mirror-down", index());
     let host = rig.host.clone();
-    rig.route(Arc::new(Dark {
-        inner: host,
-        probe: Probe::Unknown("no route".into()),
-    }));
+    rig.route(Arc::new(Dark::new(host, Probe::Unknown("no route".into()))));
     let e = err(&rig, &q, true);
     assert!(e.contains("nothing about atpkg-ay-8256 is known"), "{e}");
     assert!(!rig.host.calls().iter().any(|c| c.contains("alabsystems")));
+}
+
+#[test]
+fn independent_public_reads_overlap_and_each_pack_is_still_verified_once() {
+    let rig = Rig::new("mirror-overlap");
+    let pins = [("ay", 8256), ("clean", 2), ("nn", 3), ("ny", 4), ("ty", 5)];
+    for (program, build) in pins {
+        rig.lay_pack("alabsystems", program, build, &[MAC]);
+    }
+    let dir = rig.path("quad");
+    rig.quad_dir(&dir, &Doc::new(7, &pins));
+    let q = quad::verify_dir(&rig.ctx, &dir).expect("quad");
+    let gate = Arc::new(ReadGate {
+        required: 2,
+        ..ReadGate::default()
+    });
+    let mut host = Dark::new(rig.host.clone(), Probe::Present);
+    host.gate = Some(gate.clone());
+    let mut rig = rig;
+    rig.route(Arc::new(host));
+    let (report, _) = ok(&rig, &q, true);
+    let tags: Vec<_> = pins.iter().map(|(p, b)| upload::tag(p, *b)).collect();
+    assert_eq!(report.skipped, tags);
+    assert_eq!(*gate.entered.lock().expect("read gate"), pins.len());
+    assert!(writes(&rig.host).is_empty());
+    let calls = rig.host.calls();
+    for (program, build) in pins {
+        let tag = upload::tag(program, build);
+        let repo = atpkg_publish::programs::get(program)
+            .expect("known program")
+            .repo;
+        for suffix in [".toml", ".toml.sig"] {
+            let call = format!("fetch alabsystems/{repo} {tag} pkg-{program}-{build}{suffix}");
+            assert_eq!(calls.iter().filter(|c| **c == call).count(), 1, "{call}");
+        }
+    }
+    assert!(!q.dir.join(".mirror").exists());
+}
+
+#[test]
+fn a_later_unknown_preserves_the_earlier_qualified_serial_write_prefix() {
+    let (mut rig, _) = setup("mirror-prefix", index());
+    let dir = rig.path("quad");
+    rig.quad_dir(&dir, &Doc::new(7, &[("ay", 8256), ("nn", 192)]));
+    let q = quad::verify_dir(&rig.ctx, &dir).expect("quad");
+    let mut host = Dark::new(rig.host.clone(), Probe::Present);
+    host.failures
+        .insert("atpkg-nn-192".into(), "later read is unknown".into());
+    rig.route(Arc::new(host));
+    let e = err(&rig, &q, false);
+    assert!(
+        e.contains("atpkg-nn-192") && e.contains("later read is unknown"),
+        "{e}"
+    );
+    assert!(rig.host.release_of(&public(), "atpkg-ay-8256").is_some());
+    assert!(
+        rig.host
+            .release_of(&Slug::new("alabsystems", "nn"), "atpkg-nn-192")
+            .is_none()
+    );
+    assert!(!q.dir.join(".mirror").exists());
+}
+
+#[test]
+fn independent_unknowns_report_the_first_pin_and_all_readers_finish_before_cleanup() {
+    let (mut rig, _) = setup("mirror-unknown-order", index());
+    let dir = rig.path("quad");
+    rig.quad_dir(&dir, &Doc::new(7, &[("ay", 8256), ("nn", 192)]));
+    let q = quad::verify_dir(&rig.ctx, &dir).expect("quad");
+    let gate = Arc::new(ReadGate {
+        required: 2,
+        ..ReadGate::default()
+    });
+    let mut host = Dark::new(rig.host.clone(), Probe::Present);
+    host.gate = Some(gate.clone());
+    host.failures
+        .insert("atpkg-ay-8256".into(), "first pin is unknown".into());
+    host.failures
+        .insert("atpkg-nn-192".into(), "later pin is unknown".into());
+    rig.route(Arc::new(host));
+    let e = err(&rig, &q, true);
+    assert!(
+        e.contains("first pin is unknown") && !e.contains("later pin is unknown"),
+        "{e}"
+    );
+    assert_eq!(*gate.entered.lock().expect("read gate"), 2);
+    assert!(writes(&rig.host).is_empty());
+    assert!(!q.dir.join(".mirror").exists());
+}
+
+#[test]
+fn a_public_manifest_without_its_signature_keeps_its_original_byte_custody() {
+    for differs in [false, true] {
+        let (rig, q) = setup("mirror-partial-pair", index());
+        let pack = rig.pack("ay", 8256, &[MAC]);
+        let mf = "pkg-ay-8256.toml";
+        let mut bytes = pack
+            .files
+            .iter()
+            .find(|(name, _)| name == mf)
+            .expect("manifest")
+            .1
+            .clone();
+        if differs {
+            bytes.extend_from_slice(b"# foreign public bytes\n");
+        }
+        rig.host
+            .put_asset(&public(), "atpkg-ay-8256", mf, bytes.clone());
+        if differs {
+            let e = err(&rig, &q, false);
+            assert!(e.contains("manifest that DIFFERS from staging"), "{e}");
+            assert!(writes(&rig.host).is_empty());
+        } else {
+            let (report, _) = ok(&rig, &q, false);
+            assert_eq!(report.converged.len(), 1);
+            assert!(!report.converged[0].1.contains(&mf.to_string()));
+        }
+        assert_eq!(
+            rig.host
+                .release_of(&public(), "atpkg-ay-8256")
+                .expect("public")
+                .assets[mf],
+            bytes
+        );
+    }
+}
+
+#[test]
+fn public_reads_keep_case_distinct_signed_programs_in_separate_directories() {
+    let rig = Rig::new("mirror-case-custody");
+    let pins = [("AY", 1), ("ay", 1)];
+    for (program, build) in pins {
+        rig.lay_pack("alabsystems", program, build, &[MAC]);
+    }
+    let dir = rig.path("quad");
+    rig.quad_dir(&dir, &Doc::new(7, &pins));
+    let q = quad::verify_dir(&rig.ctx, &dir).expect("quad");
+    let (report, _) = ok(&rig, &q, true);
+    assert_eq!(report.skipped, ["atpkg-AY-1", "atpkg-ay-1"]);
+    assert!(writes(&rig.host).is_empty());
 }
 
 #[test]

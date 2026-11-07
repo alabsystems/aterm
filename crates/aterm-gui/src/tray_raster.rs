@@ -2567,6 +2567,9 @@ fn parse_ui_font(
     Some((Arc::new(font), bytes))
 }
 
+/// How many times the host resolved its UI faces ([`resolve_ui_font_assets`]): once, for
+/// [`prepared_ui_font_assets`]. A test that resolves faces of its own goes past it
+/// ([`resolve_ui_font_assets_with`]), so a test that reads it sees only the host's.
 #[cfg(test)]
 static UI_FONT_RESOLVE_ATTEMPTS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -6401,7 +6404,16 @@ mod tests {
             std::path::Path::new("/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf");
         let debian_bold = std::path::Path::new("/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf");
         if debian_regular.exists() && debian_bold.exists() {
-            let assets = resolve_ui_font_assets();
+            // Past the count: [`UI_FONT_RESOLVE_ATTEMPTS`] counts the host's resolutions, and
+            // a test of this binary that reads it would see this one as its own.
+            let _ = prepared_ui_font_assets();
+            let host = UI_FONT_RESOLVE_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed);
+            let assets = resolve_ui_font_assets_with(&mut UiFontFiles::default());
+            assert_eq!(
+                UI_FONT_RESOLVE_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed),
+                host,
+                "the ladder's resolution counted as the host's"
+            );
             assert!(
                 assets.regular.is_some(),
                 "Noto regular resolves on a host carrying the Debian core cuts"

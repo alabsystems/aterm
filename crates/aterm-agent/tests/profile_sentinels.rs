@@ -73,7 +73,9 @@ struct Requests {
     bytes: usize,
 }
 
-/// Measure allocation requests only. The guard disarms even if `f` unwinds.
+/// Measure allocation requests only. The guard disarms even if `f` unwinds. The counts are the
+/// whole process's, so one section is measured at a time: a second, inside the first or beside
+/// it, is refused at once rather than disarming the first when it ends.
 fn requests<T>(f: impl FnOnce() -> T) -> (T, Requests) {
     struct Disarm;
     impl Drop for Disarm {
@@ -83,8 +85,11 @@ fn requests<T>(f: impl FnOnce() -> T) -> (T, Requests) {
     }
     LARGE_REQUESTS.store(0, Ordering::Relaxed);
     LARGE_BYTES.store(0, Ordering::Relaxed);
+    assert!(
+        !ARMED.swap(true, Ordering::Relaxed),
+        "a measured section began inside another"
+    );
     let disarm = Disarm;
-    ARMED.store(true, Ordering::Relaxed);
     let answer = f();
     drop(disarm);
     let measured = Requests {
@@ -201,5 +206,13 @@ fn the_profile_reader_skips_large_escaped_secrets_without_materializing_them() {
     assert!(
         measured.bytes <= bytes.len().saturating_add(1),
         "reading allocated more than its one bounded input buffer: {measured:?}"
+    );
+
+    // A section begun inside another is refused, and the outer one still disarms as it unwinds.
+    let nested = std::panic::catch_unwind(|| requests(|| requests(|| ())));
+    assert!(nested.is_err(), "a measured section began inside another");
+    assert!(
+        !ARMED.load(Ordering::Relaxed),
+        "the outer section stayed armed"
     );
 }

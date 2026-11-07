@@ -6491,6 +6491,31 @@ struct SetupActivity {
     subjects: Vec<aterm_types::macos_setup::Subject>,
     /// The epoch of the last stage event that could change each row.
     touched: Vec<(aterm_types::macos_setup::Subject, u64)>,
+    /// The workstation stage that owns the current native readback. This is a
+    /// publication fence, not a saved readiness or permission receipt.
+    readback: Option<SetupReadback>,
+    /// Rows read by this owned pass, so its final refresh need not repeat them.
+    readback_subjects: Vec<aterm_types::macos_setup::Subject>,
+    /// Captured before this job reads its execution target, never rebased by START.
+    readback_owner: Option<SetupReadbackScope>,
+    /// The one keeper's actual activation/read-failure batch. It has separate
+    /// custody from a setup stage that may still be finishing its own lease.
+    input_readback: bool,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+struct SetupReadbackScope {
+    revision: Option<u64>,
+    choices: Option<u64>,
+}
+
+#[cfg(target_os = "macos")]
+struct SetupReadback {
+    revision: u64,
+    choices: u64,
+    started: u64,
+    subjects: Vec<aterm_types::macos_setup::Subject>,
 }
 
 #[cfg(target_os = "macos")]
@@ -6503,7 +6528,7 @@ impl SetupActivity {
         subjects: &[aterm_types::macos_setup::Subject],
         running: bool,
     ) {
-        self.epoch += 1;
+        self.touch(subjects);
         if running {
             for setting in settings {
                 if !self.settings.contains(setting) {
@@ -6519,6 +6544,13 @@ impl SetupActivity {
             self.settings.retain(|setting| !settings.contains(setting));
             self.subjects.retain(|subject| !subjects.contains(subject));
         }
+    }
+
+    /// Retire in-flight readings without changing which stages own their rows.
+    fn touch(&mut self, subjects: &[aterm_types::macos_setup::Subject]) {
+        self.epoch += 1;
+        self.readback_subjects
+            .retain(|subject| !subjects.contains(subject));
         for subject in subjects {
             match self.touched.iter_mut().find(|(row, _)| row == subject) {
                 Some(touched) => touched.1 = self.epoch,
@@ -6534,6 +6566,10 @@ static SETUP_ACTIVITY: std::sync::Mutex<SetupActivity> = std::sync::Mutex::new(S
     settings: Vec::new(),
     subjects: Vec::new(),
     touched: Vec::new(),
+    readback: None,
+    readback_subjects: Vec::new(),
+    readback_owner: None,
+    input_readback: false,
 });
 
 /// The admitted revision whose worker is alive (running or parked) in this process.
@@ -7101,7 +7137,7 @@ struct SetupIo {
         &[aterm_types::macos_setup::Subject],
         bool,
         aterm_cli::macos_doctor::ObservationRead,
-    ) -> Vec<aterm_types::macos_setup::Observation>,
+    ) -> aterm_cli::macos_doctor::ObservationBatch,
     /// Save a person's Stop of a run, durably, on the Stop's worker
     /// (`aterm_cli::macos_doctor::request_initial_setup_stop`).
     save_stop: fn(u64) -> Result<(), String>,
@@ -7368,16 +7404,95 @@ fn setup_stop_requested(revision: u64) -> bool {
 /// runs, and they are read again once it ends.
 #[cfg(target_os = "macos")]
 fn setup_stage(event: aterm_cli::macos_doctor::StageEvent<'_>) {
-    if let Ok(mut activity) = SETUP_ACTIVITY.lock() {
-        activity.mark(event.settings, event.subjects, event.running);
-    }
+    let missing = record_setup_stage(event);
     aterm_gui::publish_initial_setup_status(initial_setup_status());
     if !event.running {
-        request_observation(None, event.subjects.to_vec(), false);
+        request_observation(None, missing, false);
     }
     if ends_secrets_stage(&event) {
         (setup_io().converge_setup)();
     }
+}
+
+/// The small input worker updates only already-paid observations. It neither
+/// reads full setup status nor starts healing, private readers or other lanes.
+#[cfg(target_os = "macos")]
+fn setup_readback_stage(event: aterm_cli::macos_doctor::StageEvent<'_>) {
+    let _ = record_setup_stage(event);
+    publish_setup_readings();
+}
+
+#[cfg(target_os = "macos")]
+fn record_setup_stage(
+    event: aterm_cli::macos_doctor::StageEvent<'_>,
+) -> Vec<aterm_types::macos_setup::Subject> {
+    let workstation = event
+        .settings
+        .iter()
+        .any(|setting| setting.is_workstation());
+    let current = !event.running
+        && setup_run() == Some(event.revision)
+        && !setup_stop_requested(event.revision);
+    let mut accepted = Vec::new();
+    if let Ok(mut activity) = SETUP_ACTIVITY.lock()
+        && let Ok(mut rows) = OBSERVED_ROWS.lock()
+    {
+        if event.running {
+            activity.mark(event.settings, event.subjects, true);
+            retire_observed_rows(&mut rows, event.subjects);
+            if workstation {
+                activity.readback = activity.readback_owner.and_then(|owner| {
+                    (owner.revision == Some(event.revision))
+                        .then_some(owner.choices)
+                        .flatten()
+                        .map(|choices| SetupReadback {
+                            revision: event.revision,
+                            choices,
+                            started: activity.epoch,
+                            subjects: event.subjects.to_vec(),
+                        })
+                });
+            }
+        } else {
+            let frame = workstation.then(|| activity.readback.take()).flatten();
+            let readback: Vec<_> = event
+                .readback
+                .observations()
+                .iter()
+                .filter(|seen| {
+                    current
+                        && event.subjects.contains(&seen.subject)
+                        && !(activity.input_readback
+                            && seen.subject
+                                == aterm_types::macos_setup::Subject::Setting(
+                                    aterm_types::macos_setup::Setting::CapsLock,
+                                ))
+                        && frame.as_ref().is_some_and(|frame| {
+                            frame.revision == event.revision
+                                && frame.choices == rows.choices
+                                && frame.subjects.contains(&seen.subject)
+                                && activity.touched.iter().all(|(subject, epoch)| {
+                                    *subject != seen.subject || *epoch <= frame.started
+                                })
+                        })
+                })
+                .cloned()
+                .collect();
+            // Validate before our own end event advances the touched fence.
+            activity.mark(event.settings, event.subjects, false);
+            for seen in readback {
+                accepted.push(seen.subject);
+                activity.readback_subjects.push(seen.subject);
+                replace_observed_row(&mut rows, seen);
+            }
+        }
+    }
+    event
+        .subjects
+        .iter()
+        .copied()
+        .filter(|subject| !accepted.contains(subject))
+        .collect()
 }
 
 /// Whether `event` is the end of the Secrets stage, the one stage whose settings name
@@ -7404,6 +7519,7 @@ fn end_setup_activity() {
         let settings = std::mem::take(&mut activity.settings);
         let subjects = std::mem::take(&mut activity.subjects);
         activity.mark(&settings, &subjects, false);
+        activity.readback = None;
     }
 }
 
@@ -7414,11 +7530,65 @@ fn with_setup_activity<T>(pass: impl FnOnce() -> T) -> T {
         fn drop(&mut self) {
             // A panic may have missed the stage's normal end hook.
             end_setup_activity();
-            // Every row is read again after a pass (System State design §3.5).
-            request_observation(None, aterm_types::macos_setup::Subject::all(), false);
+            let read = SETUP_ACTIVITY.lock().map_or_else(
+                |_| Vec::new(),
+                |mut activity| std::mem::take(&mut activity.readback_subjects),
+            );
+            // A complete owned readback already paid for these native reads. An
+            // interrupted or invalidated stage contributes no such exemption.
+            refresh_observation(
+                aterm_types::macos_setup::Subject::all()
+                    .into_iter()
+                    .filter(|subject| !read.contains(subject))
+                    .collect(),
+            );
         }
     }
+    let _readback = SetupReadbackOwner::begin(capture_setup_readback_scope(setup_run()));
     let _activity = Activity;
+    pass()
+}
+
+#[cfg(target_os = "macos")]
+fn capture_setup_readback_scope(revision: Option<u64>) -> SetupReadbackScope {
+    SetupReadbackScope {
+        revision,
+        choices: OBSERVED_ROWS.lock().ok().map(|rows| rows.choices),
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct SetupReadbackOwner(Option<SetupReadbackScope>);
+
+#[cfg(target_os = "macos")]
+impl SetupReadbackOwner {
+    fn begin(scope: SetupReadbackScope) -> Self {
+        Self(
+            SETUP_ACTIVITY
+                .lock()
+                .ok()
+                .and_then(|mut activity| activity.readback_owner.replace(scope)),
+        )
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for SetupReadbackOwner {
+    fn drop(&mut self) {
+        end_setup_activity();
+        if let Ok(mut activity) = SETUP_ACTIVITY.lock() {
+            activity.readback = None;
+            activity.readback_owner = self.0;
+            // The scoped worker owns no final whole-page refresh.
+            activity.readback_subjects.clear();
+        }
+        publish_setup_readings();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn with_setup_readback<T>(scope: SetupReadbackScope, pass: impl FnOnce() -> T) -> T {
+    let _owner = SetupReadbackOwner::begin(scope);
     pass()
 }
 
@@ -7435,6 +7605,9 @@ struct ObserveRequest {
     forced: bool,
     /// A child ending only requests a reading while its current Repo stage is pending.
     pending_repositories: bool,
+    /// A redundant post-pass refresh may retain a still-valid fact when its
+    /// private reader is not admitted. Other requests retire facts immediately.
+    refresh: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -7469,11 +7642,13 @@ impl ObserveQueue {
                 // An old request can add rows to read, but cannot restore its
                 // plan or its broader personal/network scope.
                 pending.include_subjects(request.subjects);
+                pending.refresh &= request.refresh;
                 return;
             }
             if request.choices > pending.choices {
                 // A person's newer choice retires both pending intents.
                 for previous in self.take_pending().into_iter().flatten() {
+                    request.refresh &= previous.refresh;
                     request.include_subjects(previous.subjects);
                 }
             }
@@ -7485,6 +7660,7 @@ impl ObserveQueue {
         };
         if let Some(previous) = slot.take() {
             request.pending_repositories &= previous.pending_repositories;
+            request.refresh &= previous.refresh;
             if request.plan.is_none() {
                 request.plan = previous.plan;
             }
@@ -7497,6 +7673,7 @@ impl ObserveQueue {
                 .is_some_and(|next| request.compatible_plan(next))
             {
                 let next = self.next.take().unwrap();
+                request.refresh &= next.refresh;
                 if request.plan.is_none() {
                     request.plan = next.plan;
                 }
@@ -7512,6 +7689,7 @@ impl ObserveQueue {
                 check.plan = request.plan;
             }
             check.include_subjects(request.subjects);
+            check.refresh &= request.refresh;
         } else {
             self.next = Some(request);
         }
@@ -7560,6 +7738,66 @@ static OBSERVED_ROWS: std::sync::Mutex<ObservedRows> = std::sync::Mutex::new(Obs
     access_steps: 0,
 });
 
+#[cfg(target_os = "macos")]
+fn retire_observed_rows(
+    rows: &mut ObservedRows,
+    subjects: &[aterm_types::macos_setup::Subject],
+) -> bool {
+    let before = rows.rows.len();
+    rows.rows.retain(|row| !subjects.contains(&row.subject));
+    let changed = rows.rows.len() != before;
+    if changed {
+        rows.generation += 1;
+    }
+    changed
+}
+
+#[cfg(target_os = "macos")]
+fn replace_observed_row(rows: &mut ObservedRows, seen: aterm_types::macos_setup::Observation) {
+    match rows.rows.iter_mut().find(|row| row.subject == seen.subject) {
+        Some(row) if *row == seen => return,
+        Some(row) => *row = seen,
+        None => rows.rows.push(seen),
+    }
+    rows.generation += 1;
+}
+
+/// A source/device/choice transition invalidates before any activation, including
+/// a failed activation. It also fences a read already in flight without ending
+/// the stage that owns that read.
+#[cfg(target_os = "macos")]
+fn invalidate_setup_observations(subjects: &[aterm_types::macos_setup::Subject]) {
+    let changed = if let Ok(mut activity) = SETUP_ACTIVITY.lock()
+        && let Ok(mut rows) = OBSERVED_ROWS.lock()
+    {
+        activity.touch(subjects);
+        retire_observed_rows(&mut rows, subjects)
+    } else {
+        false
+    };
+    if changed {
+        publish_setup_readings();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn invalidate_workstation_observations() {
+    use aterm_types::macos_setup::{Setting, Subject};
+    invalidate_setup_observations(
+        &Setting::ALL
+            .into_iter()
+            .filter(|setting| setting.is_workstation())
+            .map(Subject::Setting)
+            .collect::<Vec<_>>(),
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn invalidate_input_observations() {
+    use aterm_types::macos_setup::{Setting, Subject};
+    invalidate_setup_observations(&[Subject::Setting(Setting::CapsLock)]);
+}
+
 /// Queue a read-only reading of `subjects` on its own worker, never the setup
 /// slot. Requests made while one runs coalesce by ordinary refresh or explicit Check.
 #[cfg(target_os = "macos")]
@@ -7568,12 +7806,32 @@ fn request_observation(
     subjects: Vec<aterm_types::macos_setup::Subject>,
     forced: bool,
 ) -> bool {
+    if subjects.is_empty() {
+        return true;
+    }
+    invalidate_setup_observations(&subjects);
     queue_observation(ObserveRequest {
         plan,
         choices: OBSERVED_ROWS.lock().map_or(0, |rows| rows.choices),
         subjects,
         forced,
         pending_repositories: false,
+        refresh: false,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn refresh_observation(subjects: Vec<aterm_types::macos_setup::Subject>) -> bool {
+    if subjects.is_empty() {
+        return true;
+    }
+    queue_observation(ObserveRequest {
+        plan: None,
+        choices: OBSERVED_ROWS.lock().map_or(0, |rows| rows.choices),
+        subjects,
+        forced: false,
+        pending_repositories: false,
+        refresh: true,
     })
 }
 
@@ -7589,6 +7847,7 @@ fn observe_pending_repositories() {
         )],
         forced: false,
         pending_repositories: true,
+        refresh: false,
     });
 }
 
@@ -7725,13 +7984,14 @@ fn observe_rows(request: ObserveRequest) {
             // retry the failed batch. The worker still drains accepted work;
             // publication below retains its choice, source and stage fences.
             aterm_log::warn!("System State's row reading unwound; the requested rows are unknown");
-            subjects
+            let rows: Vec<_> = subjects
                 .iter()
                 .map(|subject| Observation {
                     note: Some("This reading did not finish. Check again.".into()),
                     ..Observation::unknown(*subject)
                 })
-                .collect()
+                .collect();
+            aterm_cli::macos_doctor::ObservationBatch::from(rows)
         });
     // A child's status supplies no readiness. Only a fresh native reading for the same
     // still-pending plan/revision can settle its park, even when the displayed row was
@@ -7779,6 +8039,7 @@ fn observe_rows(request: ObserveRequest) {
                 subjects: request.subjects,
                 forced: false,
                 pending_repositories: request.pending_repositories,
+                refresh: false,
             });
             return;
         }
@@ -7794,8 +8055,12 @@ fn observe_rows(request: ObserveRequest) {
         let mut wake = rows.access_steps != access_steps;
         rows.access_steps = access_steps;
         // A reading taken while its own stage or Restore ran may be half of a change.
-        for seen in read.into_iter().filter(|seen| {
-            !activity.subjects.contains(&seen.subject)
+        for seen in read.rows.into_iter().filter(|seen| {
+            !(request.refresh && !forced && read.not_admitted.contains(&seen.subject))
+                && !activity.subjects.contains(&seen.subject)
+                && !(activity.input_readback
+                    && seen.subject
+                        == aterm_types::macos_setup::Subject::Setting(Setting::CapsLock))
                 && activity
                     .touched
                     .iter()
@@ -7998,7 +8263,7 @@ fn join_alab_with_phrase(
 }
 
 /// The admitted revision whose worker is alive in this process, if any.
-#[cfg(all(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 fn setup_run() -> Option<u64> {
     SETUP_RUN.lock().ok().and_then(|run| *run)
 }
@@ -8139,6 +8404,7 @@ fn stop_setup_run(revision: u64) {
         *stop = Some(revision);
     }
     save_setup_stop(revision);
+    invalidate_workstation_observations();
 }
 
 /// Hand run `revision`'s Stop to the Stop's worker, unless it is saved or being
@@ -8309,6 +8575,7 @@ fn begin_setup_choice(
         rows.plan = Some(plan.clone());
         rows.choices
     });
+    invalidate_workstation_observations();
     SetupChoice {
         plan: plan.clone(),
         generation,
@@ -8337,11 +8604,17 @@ fn forget_setup_choice(choice: &SetupChoice) {
             stop_setup_run(run);
         }
     }
-    if let Ok(mut rows) = OBSERVED_ROWS.lock()
+    let restored = if let Ok(mut rows) = OBSERVED_ROWS.lock()
         && rows.choices == choice.choices
     {
         rows.choices += 1;
         rows.plan = None;
+        true
+    } else {
+        false
+    };
+    if restored {
+        invalidate_workstation_observations();
     }
     // Startup may already have answered the choice's earlier claim-wait wake.
     // A terminal refusal releases it only after both rollback locks are gone.
@@ -8369,17 +8642,77 @@ fn observed_plan(
 /// Fill the rows' readings and the running stage into `status`.
 #[cfg(target_os = "macos")]
 fn add_setup_readings(status: &mut aterm_gui::SetupStatus) {
-    if let Ok(rows) = OBSERVED_ROWS.lock() {
+    let readings = setup_readings();
+    status.observed = readings.observed;
+    status.observed_generation = readings.observed_generation;
+    status.observed_vault_url = readings.observed_vault_url;
+    status.running = readings.running;
+}
+
+/// One coherent cache snapshot, with no record, native, privacy or healing read.
+#[cfg(target_os = "macos")]
+fn setup_readings() -> aterm_gui::SetupReadings {
+    if let Ok(activity) = SETUP_ACTIVITY.lock()
+        && let Ok(rows) = OBSERVED_ROWS.lock()
+    {
         let order = aterm_types::macos_setup::Subject::all();
         let mut observed = rows.rows.clone();
         observed
             .sort_unstable_by_key(|row| order.iter().position(|subject| *subject == row.subject));
-        status.observed = observed;
-        status.observed_generation = rows.generation;
-        status.observed_vault_url = rows.vault_url.clone();
+        let mut running = activity.settings.clone();
+        if activity.input_readback
+            && !running.contains(&aterm_types::macos_setup::Setting::CapsLock)
+        {
+            running.push(aterm_types::macos_setup::Setting::CapsLock);
+        }
+        return aterm_gui::SetupReadings {
+            observed,
+            observed_generation: rows.generation,
+            observed_vault_url: rows.vault_url.clone(),
+            running,
+        };
     }
-    if let Ok(activity) = SETUP_ACTIVITY.lock() {
-        status.running = activity.settings.clone();
+    aterm_gui::SetupReadings::default()
+}
+
+#[cfg(target_os = "macos")]
+fn publish_setup_readings() {
+    aterm_gui::publish_initial_setup_readings(setup_readings);
+}
+
+/// An actual keeper effect or failed native observation retires the old fact
+/// for its entire batch, including readers that begin after the first touch.
+/// This lease never initiates a full-status/private read or owns another stage.
+#[cfg(target_os = "macos")]
+struct InputReadbackActivity;
+
+#[cfg(target_os = "macos")]
+impl InputReadbackActivity {
+    fn begin() -> Self {
+        use aterm_types::macos_setup::{Setting, Subject};
+        let subjects = [Subject::Setting(Setting::CapsLock)];
+        if let Ok(mut activity) = SETUP_ACTIVITY.lock()
+            && let Ok(mut rows) = OBSERVED_ROWS.lock()
+        {
+            activity.input_readback = true;
+            activity.touch(&subjects);
+            retire_observed_rows(&mut rows, &subjects);
+        }
+        publish_setup_readings();
+        Self
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for InputReadbackActivity {
+    fn drop(&mut self) {
+        if let Ok(mut activity) = SETUP_ACTIVITY.lock() {
+            activity.input_readback = false;
+            activity.touch(&[aterm_types::macos_setup::Subject::Setting(
+                aterm_types::macos_setup::Setting::CapsLock,
+            )]);
+        }
+        publish_setup_readings();
     }
 }
 
@@ -10561,6 +10894,7 @@ mod initial_setup_result_tests {
             backup: std::path::PathBuf::from("original-preferences.json"),
             restore: None,
             page: Some(PassPage {
+                readback: aterm_cli::macos_doctor::WorkstationReadback::EMPTY,
                 outcome: aterm_types::macos_setup::PassOutcome::default(),
                 rows: vec![row("Rust in Spotlight", "unverified", "")],
             }),
@@ -10629,6 +10963,7 @@ mod initial_setup_result_tests {
             backup: std::path::PathBuf::from("original-preferences.json"),
             restore: None,
             page: Some(PassPage {
+                readback: aterm_cli::macos_doctor::WorkstationReadback::EMPTY,
                 outcome: PassOutcome {
                     rolled_back: Some(RestoreOutcome::of([(Some(Setting::Dock), PutBack::Back)])),
                     unfinished: vec![(Setting::Dock, Unfinished::Failed)],
@@ -10757,6 +11092,7 @@ mod initial_setup_result_tests {
         /// Replies bound to each reading when it starts, before a held read
         /// can be overtaken by a choice.
         readings: VecDeque<Vec<Observation>>,
+        not_admitted: Vec<Subject>,
         /// Readings wait while this is set.
         hold: bool,
         /// The next held reading unwinds after releasing the script lock.
@@ -10849,6 +11185,7 @@ mod initial_setup_result_tests {
             reads: Vec::new(),
             read_checks: Vec::new(),
             readings: VecDeque::new(),
+            not_admitted: Vec::new(),
             hold: false,
             panic_read: false,
             stop_attempts: Vec::new(),
@@ -10964,13 +11301,21 @@ mod initial_setup_result_tests {
     /// reads no row of the Mac and writes nothing to the person's state root.
     /// Its automatic claim is the real lock, in a scratch folder. Dropped, it
     /// waits for the readings, the choice and the Stop the test started to end
-    /// before the live [`SetupIo`] is back.
+    /// before the live [`SetupIo`] is back. It holds [`TEST_IO`] for its whole
+    /// life, so no two run at once and one's drop puts back no [`SETUP_IO`]
+    /// another test still scripts.
     struct TestIo {
         _claims: aterm_tempfile::TempDir,
+        _serial: MutexGuard<'static, ()>,
     }
+
+    /// Serialises every [`TestIo`]. Taken inside [`globals`], which every
+    /// test that installs one holds first.
+    static TEST_IO: Mutex<()> = Mutex::new(());
 
     impl TestIo {
         fn install() -> Self {
+            let serial = TEST_IO.lock().unwrap_or_else(PoisonError::into_inner);
             let claims = aterm_tempfile::tempdir().unwrap();
             *CLAIM_ROOT.lock().unwrap_or_else(PoisonError::into_inner) =
                 Some(claims.path().to_owned());
@@ -11013,7 +11358,10 @@ mod initial_setup_result_tests {
                 },
             };
             reset_worker_state();
-            Self { _claims: claims }
+            Self {
+                _claims: claims,
+                _serial: serial,
+            }
         }
 
         fn read(
@@ -11021,7 +11369,7 @@ mod initial_setup_result_tests {
             subjects: &[Subject],
             network: bool,
             admission: aterm_cli::macos_doctor::ObservationRead,
-        ) -> Vec<Observation> {
+        ) -> aterm_cli::macos_doctor::ObservationBatch {
             let mut script = script();
             script
                 .reads
@@ -11031,11 +11379,15 @@ mod initial_setup_result_tests {
                 aterm_cli::macos_doctor::ObservationRead::ExplicitCheck
             ));
             let reading = script.readings.pop_front().unwrap_or_default();
+            let not_admitted = std::mem::take(&mut script.not_admitted);
             let panics = std::mem::take(&mut script.panic_read);
             SCRIPT_MOVED.notify_all();
             drop(wait_while(script, |script| script.hold));
             assert!(!panics, "injected reader unwind");
-            reading
+            aterm_cli::macos_doctor::ObservationBatch {
+                rows: reading,
+                not_admitted,
+            }
         }
 
         fn save_stop(revision: u64) -> Result<(), String> {
@@ -11164,6 +11516,21 @@ mod initial_setup_result_tests {
             plan.selection.set(setting, false);
         }
         plan
+    }
+
+    /// A [`TestIo`] holds [`TEST_IO`] for its whole life and lets it go once
+    /// it drops, so a second one waits for the first rather than replacing its
+    /// [`SETUP_IO`], and no drop puts back the live one under another test.
+    #[test]
+    fn a_test_io_holds_its_tests_lock_while_it_lives() {
+        let _globals = globals();
+        let io = TestIo::install();
+        assert!(
+            TEST_IO.try_lock().is_err(),
+            "a TestIo another test can replace while this one lives"
+        );
+        drop(io);
+        assert!(TEST_IO.try_lock().is_ok(), "a dropped TestIo kept its lock");
     }
 
     /// The window recording Full Disk Access granted starts the follow-up that puts back what
@@ -11379,9 +11746,11 @@ mod initial_setup_result_tests {
         use aterm_types::macos_setup::Setting;
         let event = |settings: &[Setting], running| {
             ends_secrets_stage(&StageEvent {
+                revision: 1,
                 settings,
                 subjects: &[],
                 running,
+                readback: &aterm_cli::macos_doctor::WorkstationReadback::EMPTY,
             })
         };
         assert!(event(&[Setting::Secrets], false), "the Secrets stage ended");
@@ -11548,6 +11917,7 @@ mod initial_setup_result_tests {
                 subjects: vec![Subject::Setting(Setting::Repositories)],
                 forced: false,
                 pending_repositories: true,
+                refresh: false,
             });
             assert_eq!(script().reads.len(), reads, "{name}");
             assert_eq!(SETUP_WAKES.marks().all != seen.all, wakes, "{name}");
@@ -11581,6 +11951,7 @@ mod initial_setup_result_tests {
             subjects: vec![Subject::Setting(Setting::Repositories)],
             forced: false,
             pending_repositories: true,
+            refresh: false,
         });
         assert!(
             script().reads.is_empty(),
@@ -11625,6 +11996,7 @@ mod initial_setup_result_tests {
             subjects: vec![Subject::Setting(Setting::Repositories)],
             forced: false,
             pending_repositories: true,
+            refresh: false,
         });
         wait_until("the retired completion requeue ends", observe_idle);
         assert_eq!(
@@ -11650,6 +12022,7 @@ mod initial_setup_result_tests {
             subjects: vec![Subject::Setting(Setting::Repositories)],
             forced: false,
             pending_repositories: true,
+            refresh: false,
         };
         queue.enqueue(pending());
         queue.enqueue(ObserveRequest {
@@ -11693,6 +12066,7 @@ mod initial_setup_result_tests {
                 subjects,
                 forced,
                 pending_repositories: false,
+                refresh: false,
             });
             assert_eq!(std::mem::take(&mut script().vault_looks), looks, "{forced}");
             assert_eq!(std::mem::take(&mut script().read_checks), [forced]);
@@ -12557,6 +12931,7 @@ mod initial_setup_result_tests {
                         subjects,
                         forced,
                         pending_repositories: false,
+                        refresh: false,
                     },
                     |_| {
                         Err(std::io::Error::other(
@@ -12580,6 +12955,7 @@ mod initial_setup_result_tests {
                         subjects,
                         forced,
                         pending_repositories: false,
+                        refresh: false,
                     },
                     |job| {
                         worker = Some(std::thread::spawn(move || {
@@ -12710,6 +13086,7 @@ mod initial_setup_result_tests {
             subjects: vec![Subject::Setting(Setting::Repositories)],
             forced: true,
             pending_repositories: false,
+            refresh: false,
         };
         let mut second = None;
         let started = queue_observation_with(
@@ -12719,6 +13096,7 @@ mod initial_setup_result_tests {
                 subjects: vec![Subject::Setting(Setting::Dock)],
                 forced: false,
                 pending_repositories: false,
+                refresh: false,
             },
             |_| {
                 let (reached, wait) = std::sync::mpsc::sync_channel(1);
@@ -12812,6 +13190,7 @@ mod initial_setup_result_tests {
                     subjects: vec![preference, personal],
                     forced: false,
                     pending_repositories: false,
+                    refresh: false,
                 },
                 |job| {
                     worker = Some(std::thread::spawn(job));
@@ -12830,6 +13209,7 @@ mod initial_setup_result_tests {
                     subjects: vec![repositories],
                     forced: true,
                     pending_repositories: false,
+                    refresh: false,
                 },
                 |_| panic!("the current worker owns the queued Check"),
             ));
@@ -13088,6 +13468,7 @@ mod initial_setup_result_tests {
                 subjects: Subject::all(),
                 forced: true,
                 pending_repositories: false,
+                refresh: false,
             };
             let mut reviewed = left_as_is();
             reviewed.vault_url = "http://newer-vault.local:7484/v1/team".into();
@@ -13213,6 +13594,7 @@ mod initial_setup_result_tests {
                 subjects: requested,
                 forced: true,
                 pending_repositories: false,
+                refresh: false,
             });
         })));
         wait_until("the old Check's reading starts", || {
@@ -13339,6 +13721,7 @@ mod initial_setup_result_tests {
                 subjects: Vec::new(),
                 forced: false,
                 pending_repositories: false,
+                refresh: false,
             });
             change(|script| {
                 script.reads.clear();
@@ -13359,9 +13742,11 @@ mod initial_setup_result_tests {
                 let _boundary = Boundary(&mut boundary);
                 with_setup_activity(|| {
                     setup_stage(aterm_cli::macos_doctor::StageEvent {
+                        revision: 1,
                         settings: &[Setting::Dock],
                         subjects: &[preference],
                         running: true,
+                        readback: &aterm_cli::macos_doctor::WorkstationReadback::EMPTY,
                     });
                     reader.0 = Some(std::thread::spawn(move || {
                         observe_rows(ObserveRequest {
@@ -13370,6 +13755,7 @@ mod initial_setup_result_tests {
                             subjects: vec![preference, independent],
                             forced: false,
                             pending_repositories: false,
+                            refresh: false,
                         });
                     }));
                     wait_until("the mid-stage reading starts", || script().reads.len() == 1);
@@ -13393,7 +13779,10 @@ mod initial_setup_result_tests {
             reader.0.take().unwrap().join().unwrap();
             {
                 let rows = OBSERVED_ROWS.lock().unwrap();
-                assert!(rows.rows.contains(&failed), "the old success was retired");
+                assert!(
+                    !rows.rows.iter().any(|row| row.subject == preference),
+                    "the old stage fact was retired"
+                );
                 assert!(rows.rows.contains(&unaffected));
             }
             assert_eq!(SETUP_WAKES.count(), wakes, "no false recovery wake");
@@ -13503,6 +13892,7 @@ mod initial_setup_result_tests {
                     subjects: vec![preference, independent],
                     forced: false,
                     pending_repositories: false,
+                    refresh: false,
                 });
             })));
             wait_until("the preference read starts", || script().reads.len() == 1);
@@ -13561,6 +13951,398 @@ mod initial_setup_result_tests {
             assert!(rows.rows.contains(&restored));
             assert!(rows.rows.contains(&vault));
             assert_eq!(script().reads.len(), 2);
+        }
+
+        // The same canonical native producer used by the owned pass supplies
+        // the sidecar. No fabricated observation can enter the stage hook.
+        use aterm_cli::macos_doctor::{
+            InitialSetupAdmissionStopTest, StageEvent, run_workstation_readback,
+        };
+        use aterm_machines::init::{WorkstationGroup, prepare_workstation_selected};
+        let native = InitialSetupAdmissionStopTest::keyboard_system(true);
+        let caps = Subject::Setting(Setting::CapsLock);
+        let mut selection = aterm_types::macos_setup::Selection::none();
+        selection.set(Setting::CapsLock, true);
+        let prepared =
+            prepare_workstation_selected(&native, WorkstationGroup::All, selection).unwrap();
+        let (_, readback) = run_workstation_readback(
+            prepared,
+            &native,
+            WorkstationGroup::All,
+            aterm_machines::model::Mode::Apply,
+        )
+        .unwrap();
+        assert!(readback.observations().iter().any(|row| {
+            row.subject == caps
+                && row.standing == Standing::InPlace
+                && row.now.as_deref() == Some("Control")
+        }));
+        let paid_commands = native.calls();
+        for withdrawal in [
+            "none",
+            "input",
+            "choice",
+            "restore",
+            "revision",
+            "run",
+            "scope",
+            "refresh",
+            "forced",
+            "invalidated",
+            "failed",
+            "stop",
+        ] {
+            *SETUP_STOP.lock().unwrap() = None;
+            set_setup_run(Some(1));
+            let vault = seen(independent, Standing::NeedsYou);
+            {
+                let mut rows = OBSERVED_ROWS.lock().unwrap();
+                rows.plan = Some(plan.clone());
+                rows.rows = vec![Observation::unknown(caps), vault.clone()];
+            }
+            OBSERVE_QUEUE.lock().unwrap().next = None;
+            let stage_subject = if withdrawal == "scope" {
+                Subject::Setting(Setting::Dock)
+            } else {
+                caps
+            };
+            let stage_setting = if withdrawal == "scope" {
+                Setting::Dock
+            } else {
+                Setting::CapsLock
+            };
+            with_setup_activity(|| {
+                setup_stage(StageEvent {
+                    revision: 1,
+                    settings: &[stage_setting],
+                    subjects: &[stage_subject],
+                    running: true,
+                    readback: &aterm_cli::macos_doctor::WorkstationReadback::EMPTY,
+                });
+                assert!(
+                    !OBSERVED_ROWS
+                        .lock()
+                        .unwrap()
+                        .rows
+                        .iter()
+                        .any(|row| row.subject == stage_subject)
+                );
+                match withdrawal {
+                    "input" => invalidate_input_observations(),
+                    "choice" => {
+                        let _ = begin_setup_choice(&plan, false, 0);
+                    }
+                    "stop" => stop_setup_run(1),
+                    "restore" => {
+                        drop(PreferenceReadings::begin(vec![caps]));
+                    }
+                    "run" => set_setup_run(Some(2)),
+                    _ => {}
+                }
+                setup_stage(StageEvent {
+                    revision: if withdrawal == "revision" { 2 } else { 1 },
+                    settings: &[stage_setting],
+                    subjects: &[stage_subject],
+                    running: false,
+                    readback: &readback,
+                });
+            });
+            let ready = OBSERVED_ROWS.lock().unwrap().rows.iter().any(|row| {
+                row.subject == caps
+                    && row.standing == Standing::InPlace
+                    && row.now.as_deref() == Some("Control")
+            });
+            let admitted = matches!(
+                withdrawal,
+                "none" | "refresh" | "forced" | "invalidated" | "failed"
+            );
+            assert_eq!(ready, admitted, "{withdrawal}");
+            assert!(OBSERVED_ROWS.lock().unwrap().rows.contains(&vault));
+            let refresh = OBSERVE_QUEUE.lock().unwrap().next.take().unwrap();
+            assert_eq!(refresh.subjects.contains(&caps), !admitted, "{withdrawal}");
+            assert_eq!(
+                native.calls(),
+                paid_commands,
+                "transporting readback starts no HID reads"
+            );
+            if matches!(withdrawal, "refresh" | "forced" | "invalidated" | "failed") {
+                // A hidden redundant refresh is not an attempted read. A real
+                // invalidation, failed read or forced Check still retires it.
+                let forced = withdrawal == "forced";
+                let attempted = matches!(withdrawal, "forced" | "failed");
+                if withdrawal == "invalidated" {
+                    invalidate_input_observations();
+                }
+                change(|script| {
+                    script.readings.push_back(vec![Observation::unknown(caps)]);
+                    script.not_admitted = if attempted { Vec::new() } else { vec![caps] };
+                });
+                let choices = OBSERVED_ROWS.lock().unwrap().choices;
+                observe_rows(ObserveRequest {
+                    plan: Some(plan.clone()),
+                    choices,
+                    subjects: vec![caps],
+                    forced,
+                    pending_repositories: false,
+                    refresh: true,
+                });
+                let rows = OBSERVED_ROWS.lock().unwrap();
+                assert_eq!(
+                    rows.rows
+                        .iter()
+                        .any(|row| row.subject == caps && row.standing == Standing::InPlace),
+                    withdrawal == "refresh"
+                );
+            }
+        }
+        set_setup_run(None);
+        wait_until("the injected Stop is saved", stop_worker_idle);
+        reset_worker_state();
+
+        // The ordinary scoped coordinator uses the same observation boundary,
+        // without the full window setup/status or an ordinary native reread.
+        use super::input_coordinator::fixture::{Event, Native};
+        use aterm_cli::macos_doctor::InitialSetupAdmissionFault;
+        struct ScopedWorker {
+            root: std::path::PathBuf,
+            revision: u64,
+            native: std::sync::Arc<Native>,
+            worker: Option<std::thread::JoinHandle<()>>,
+        }
+        impl Drop for ScopedWorker {
+            fn drop(&mut self) {
+                let _ = InitialSetupAdmissionStopTest::startup(&self.root)
+                    .and_then(|setup| setup.stop_revision(self.revision));
+                self.native.wake();
+                if let Some(worker) = self.worker.take() {
+                    let _ = worker.join();
+                }
+            }
+        }
+        for (attached, old_choice) in [(true, false), (false, false), (true, true)] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let input_plan = Plan::from(selection);
+            let mut setup = InitialSetupAdmissionStopTest::startup(root.path())
+                .unwrap()
+                .with_plan(input_plan.clone());
+            let revision = setup
+                .persist(InitialSetupAdmissionFault::None)
+                .unwrap()
+                .unwrap();
+            {
+                let mut rows = OBSERVED_ROWS.lock().unwrap();
+                rows.plan = Some(input_plan);
+                rows.rows.clear();
+            }
+            OBSERVE_QUEUE.lock().unwrap().next = None;
+            change(|script| script.reads.clear());
+            let captured = capture_setup_readback_scope(Some(revision));
+            if old_choice {
+                let _ = begin_setup_choice(&plan, false, 0);
+            }
+            let (native, events) = Native::new(root.path().to_owned());
+            native
+                .attached
+                .store(attached, std::sync::atomic::Ordering::Release);
+            let worker = if old_choice {
+                native.start_with(revision, Some(captured))
+            } else {
+                native.start_observing(revision)
+            }
+            .unwrap()
+            .unwrap();
+            let mut owned = ScopedWorker {
+                root: root.path().to_owned(),
+                revision,
+                native,
+                worker: Some(worker),
+            };
+            let event = events.recv_timeout(HANG).unwrap();
+            let ready = setup_readings().observed.iter().any(|row| {
+                row.subject == caps
+                    && row.standing == Standing::InPlace
+                    && row.now.as_deref() == Some("Control")
+            });
+            let rereads = script().reads.len();
+            let queued = OBSERVE_QUEUE.lock().unwrap().next.is_some();
+            if matches!(event, Event::Waiting) {
+                setup.stop_revision(revision).unwrap();
+                owned.native.wake();
+                loop {
+                    if matches!(events.recv_timeout(HANG).unwrap(), Event::Finished) {
+                        break;
+                    }
+                }
+            }
+            owned.worker.take().unwrap().join().unwrap();
+            drop(owned);
+            if attached && !old_choice {
+                let actor = InitialSetupAdmissionStopTest::keyboard_system(true);
+                let (activation, retired) =
+                    super::input_attachments::activate_observing(|invalidate| {
+                        aterm_machines::init::activate_keyboard_attachments(
+                            &actor,
+                            &[41, 42],
+                            &|_| false,
+                            &|| true,
+                            invalidate,
+                        )
+                    });
+                assert!(activation.unwrap());
+                assert!(!retired, "a real no-op does not queue a success refresh");
+                assert!(
+                    setup_readings()
+                        .observed
+                        .iter()
+                        .any(|row| row.subject == caps && row.standing == Standing::InPlace)
+                );
+                assert!(actor.keyboard_changes().is_empty());
+                use aterm_machines::model::PValue;
+                use aterm_machines::port::{Cmd, Ran, System};
+                let census = actor
+                    .run(&aterm_machines::facts::hidutil_keyboards())
+                    .unwrap()
+                    .out();
+                let original = actor
+                    .run(&Cmd::new("/usr/bin/hidutil").arg("dump"))
+                    .unwrap()
+                    .out();
+                let defaults = actor
+                    .run(&Cmd::new("/usr/bin/defaults").arg("-g"))
+                    .unwrap()
+                    .out();
+                let mut unmapped = aterm_machines::plist::parse(original.as_bytes()).unwrap();
+                fn without_user_mapping(value: &mut PValue) {
+                    match value {
+                        PValue::Dict(fields) => {
+                            for (name, value) in fields {
+                                if name == "UserKeyMapping" {
+                                    *value = PValue::Array(Vec::new());
+                                } else {
+                                    without_user_mapping(value);
+                                }
+                            }
+                        }
+                        PValue::Array(values) => values.iter_mut().for_each(without_user_mapping),
+                        _ => {}
+                    }
+                }
+                without_user_mapping(&mut unmapped);
+                let unmapped = aterm_machines::plist::document(&unmapped);
+                actor.simulate(move |_, command| {
+                    let first = command.args.first().and_then(|arg| arg.to_str());
+                    match command.program.file_name().and_then(|name| name.to_str()) {
+                        Some("hidutil") if first == Some("list") => Some(Ran::ok(&census)),
+                        Some("hidutil") if first == Some("property") => Some(Ran::ok("RegistryID Key Value\n29 UserKeyMapping (null)\n2a UserKeyMapping (null)\n")),
+                        Some("hidutil") if first == Some("dump") => Some(Ran::ok(&unmapped)),
+                        Some("defaults") => Some(Ran::ok(&defaults)),
+                        _ => None,
+                    }
+                });
+                let current = setup_readings()
+                    .observed
+                    .into_iter()
+                    .find(|row| row.subject == caps)
+                    .unwrap();
+                let choices = OBSERVED_ROWS.lock().unwrap().choices;
+                let (entered, entering) = std::sync::mpsc::sync_channel(1);
+                let (release, released) = std::sync::mpsc::sync_channel(1);
+                type ActivationReply = (Result<bool, String>, bool, usize);
+                struct Effect {
+                    release: Option<std::sync::mpsc::SyncSender<()>>,
+                    worker: Option<std::thread::JoinHandle<ActivationReply>>,
+                }
+                impl Drop for Effect {
+                    fn drop(&mut self) {
+                        if let Some(release) = self.release.take() {
+                            let _ = release.send(());
+                        }
+                        if let Some(worker) = self.worker.take() {
+                            let _ = worker.join();
+                        }
+                    }
+                }
+                let mut effect = Effect {
+                    release: Some(release),
+                    worker: Some(std::thread::spawn(move || {
+                        let (result, retired) =
+                            super::input_attachments::activate_observing(|invalidate| {
+                                aterm_machines::init::activate_keyboard_attachments(
+                                    &actor,
+                                    &[41, 42],
+                                    &|_| false,
+                                    &|| true,
+                                    &|| {
+                                        invalidate();
+                                        entered.send(()).unwrap();
+                                        released
+                                            .recv_timeout(HANG)
+                                            .expect("effect was not released");
+                                    },
+                                )
+                            });
+                        (result, retired, actor.keyboard_changes().len())
+                    })),
+                };
+                entering.recv_timeout(HANG).unwrap();
+                change(|script| script.readings.push_back(vec![current.clone()]));
+                observe_rows(ObserveRequest {
+                    plan: Some(Plan::from(selection)),
+                    choices,
+                    subjects: vec![caps],
+                    forced: false,
+                    pending_repositories: false,
+                    refresh: false,
+                });
+                let mid_write = setup_readings();
+                change(|script| {
+                    script.hold = true;
+                    script.readings.push_back(vec![current]);
+                });
+                let mut late_reader = Reader(Some(std::thread::spawn(move || {
+                    observe_rows(ObserveRequest {
+                        plan: Some(Plan::from(selection)),
+                        choices,
+                        subjects: vec![caps],
+                        forced: false,
+                        pending_repositories: false,
+                        refresh: false,
+                    });
+                })));
+                wait_until("the reading begins inside the activation lease", || {
+                    script().reads.len() == 2
+                });
+                effect.release.take().unwrap().send(()).unwrap();
+                let (failed, retired, writes) = effect.worker.take().unwrap().join().unwrap();
+                release_readings();
+                late_reader.0.take().unwrap().join().unwrap();
+                assert!(!failed.unwrap() && retired);
+                assert_eq!(
+                    writes, 2,
+                    "the actual setter wrote both services before failed readback"
+                );
+                assert!(mid_write.running.contains(&Setting::CapsLock));
+                assert!(!mid_write.observed.iter().any(|row| row.subject == caps));
+                assert!(
+                    !setup_readings()
+                        .observed
+                        .iter()
+                        .any(|row| row.subject == caps),
+                    "a reader begun mid-write cannot republish after the lease ends"
+                );
+                assert!(setup_readings().running.is_empty());
+            }
+            assert_eq!(
+                ready,
+                attached && !old_choice,
+                "scoped pass attached={attached}, oldchoice={old_choice}"
+            );
+            assert_eq!(
+                rereads, 0,
+                "the owned scoped pass did not start an observer"
+            );
+            assert!(!queued, "the scoped hook owes no whole-page refresh");
+            assert!(SETUP_ACTIVITY.lock().unwrap().subjects.is_empty());
         }
     }
 
@@ -13685,6 +14467,7 @@ mod initial_setup_result_tests {
             subjects: vec![access],
             forced: false,
             pending_repositories: false,
+            refresh: false,
         });
         {
             let rows = OBSERVED_ROWS.lock().unwrap();
@@ -13701,6 +14484,7 @@ mod initial_setup_result_tests {
             subjects: vec![repositories],
             forced: false,
             pending_repositories: false,
+            refresh: false,
         });
         let rows = OBSERVED_ROWS.lock().unwrap();
         assert!(rows.rows.contains(&kept));

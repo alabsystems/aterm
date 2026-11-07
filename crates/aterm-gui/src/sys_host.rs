@@ -51,6 +51,8 @@ pub(crate) struct PaneFact {
     pub(crate) window: u64,
     /// Its tab in that window, 1-based.
     pub(crate) tab: usize,
+    /// Its tab's identity (the disk walker's tab scope), where the loop read it.
+    pub(crate) tab_id: Option<crate::tab_model::TabId>,
 }
 
 /// One snapshot as the workers hold it.
@@ -820,8 +822,23 @@ fn gather(
                 });
             }
         }
-        let tab_of = |k: u64| panes.iter().find(|p| p.key == k).map(|p| p.tab);
-        let (roots, disk) = disk_roots(scope, &keys, &cwds, &tab_of);
+        let mut tabs: Vec<crate::tab_model::TabId> = Vec::new();
+        for p in panes.iter().filter(|p| keys.contains(&p.key)) {
+            if let Some(id) = p.tab_id
+                && !tabs.contains(&id)
+            {
+                tabs.push(id);
+            }
+        }
+        let ask = DiskAsk {
+            scope,
+            tab: me.and_then(|m| m.tab_id),
+            tabs,
+            panes,
+            keys: &keys,
+            lines: q.view == View::Disk,
+        };
+        let (roots, disk) = disk_roots(&ask, &cwds);
         let volume = if q.view == View::Disk {
             cwd.as_deref()
                 .and_then(|c| volume_facts(std::path::Path::new(c)))
@@ -854,27 +871,75 @@ pub(crate) struct PaneCwd {
     pub(crate) path: String,
 }
 
-/// The asked scope's roots and what the disk walker knows of them.
-pub(crate) fn disk_roots(
-    scope: ScopeArg,
-    keys: &[u64],
-    cwds: &[PaneCwd],
-    tab_of: &dyn Fn(u64) -> Option<usize>,
-) -> (Vec<Root>, Option<DiskTotals>) {
-    use crate::diskwalk_host::{DISKWALK, Detail, DiskScope, WalkerState, disk_report};
+/// What `sys disk` and `sys tab` ask of the walker.
+#[derive(Clone, Debug)]
+pub(crate) struct DiskAsk<'a> {
+    /// The asked scope.
+    pub(crate) scope: ScopeArg,
+    /// The target's tab.
+    pub(crate) tab: Option<crate::tab_model::TabId>,
+    /// The tabs the asked scope lists roots of (`window`: the window's; `pane`, `tab`: the
+    /// target's; none for `aterm` and `global`, which list aterm's).
+    pub(crate) tabs: Vec<crate::tab_model::TabId>,
+    /// Every pane's place.
+    pub(crate) panes: &'a [PaneFact],
+    /// The asked scope's panes.
+    pub(crate) keys: &'a [u64],
+    /// `sys disk`: the scope lines and the pane lines too.
+    pub(crate) lines: bool,
+}
+
+impl DiskAsk<'_> {
+    /// The scopes whose roots the reply lists.
+    fn listed(&self) -> Vec<crate::diskwalk_host::DiskScope> {
+        use crate::diskwalk_host::DiskScope;
+        match self.scope {
+            ScopeArg::Aterm | ScopeArg::Global => vec![DiskScope::Aterm],
+            _ => self.tabs.iter().map(|&t| DiskScope::Tab(t)).collect(),
+        }
+    }
+
+    /// The scopes demanded: those listed, and for `sys disk`'s scope lines aterm and the
+    /// target's tab, all read from one board.
+    fn asked(&self) -> Vec<crate::diskwalk_host::DiskScope> {
+        use crate::diskwalk_host::DiskScope;
+        let mut out = self.listed();
+        if self.lines {
+            for s in std::iter::once(DiskScope::Aterm).chain(self.tab.map(DiskScope::Tab)) {
+                if !out.contains(&s) {
+                    out.push(s);
+                }
+            }
+        }
+        out
+    }
+
+    /// The tab number of pane `key`.
+    fn tab_of(&self, key: u64) -> Option<usize> {
+        self.panes.iter().find(|p| p.key == key).map(|p| p.tab)
+    }
+}
+
+/// The asked scope's roots and what the disk walker knows of them, every scope read from one
+/// board, at look pace.
+pub(crate) fn disk_roots(ask: &DiskAsk<'_>, cwds: &[PaneCwd]) -> (Vec<Root>, Option<DiskTotals>) {
+    use crate::diskwalk_host::{DISKWALK, Detail, Pace, WalkerState, disk_reports};
     if DISKWALK.walker_state() != WalkerState::Running {
         return (cwd_roots(cwds, RootSize::NotSampled), None);
     }
     let now = Instant::now();
-    let scopes: Vec<DiskScope> = match scope {
-        ScopeArg::Aterm | ScopeArg::Global => vec![DiskScope::Aterm],
-        _ => keys.iter().map(|&k| DiskScope::Tab(k)).collect(),
+    let (board, reports) = disk_reports(&ask.asked(), Detail::Sizes, Pace::Look, now);
+    let home = aterm_types::dirs::home_dir();
+    let volume = if ask.lines {
+        home.as_deref().and_then(crate::vitals_host::tab_volume)
+    } else {
+        None
     };
-    let reports: Vec<_> = scopes
-        .into_iter()
-        .map(|sc| disk_report(sc, Detail::Sizes, now))
-        .collect();
-    walker_roots(&reports, cwds, tab_of, now)
+    let used = volume
+        .as_ref()
+        .map(|v| (v.total.saturating_sub(v.available), v.total));
+    let (roots, totals) = disk_view(&board, &reports, ask, cwds, used, now);
+    (roots, Some(totals))
 }
 
 fn cwd_roots(cwds: &[PaneCwd], size: RootSize) -> Vec<Root> {
@@ -885,7 +950,7 @@ fn cwd_roots(cwds: &[PaneCwd], size: RootSize) -> Vec<Root> {
             continue;
         }
         roots.push(Root {
-            kinds: vec!["cwd"],
+            kinds: vec!["folder"],
             path: c.path.clone(),
             keys: vec![c.key],
             tab: c.tab,
@@ -896,20 +961,49 @@ fn cwd_roots(cwds: &[PaneCwd], size: RootSize) -> Vec<Root> {
     roots
 }
 
-/// The walker's reports as `sys` rows and the scope's balance.
-pub(crate) fn walker_roots(
-    reports: &[crate::diskwalk_host::DiskReport],
-    cwds: &[PaneCwd],
-    tab_of: &dyn Fn(u64) -> Option<usize>,
-    now: Instant,
-) -> (Vec<Root>, Option<DiskTotals>) {
+/// A scope's word on a root line (`tab:2`, `tab:Workers%20…`, `aterm`).
+fn scope_word(
+    scope: crate::diskwalk_host::DiskScope,
+    board: &crate::diskwalk_host::Published,
+) -> String {
     use crate::diskwalk_host::DiskScope;
+    match scope {
+        DiskScope::Aterm => "aterm".to_owned(),
+        DiskScope::Tab(id) => board.tabs.iter().find(|t| t.id == id).map_or_else(
+            || "tab:-".to_owned(),
+            |t| {
+                t.number.map_or_else(
+                    || format!("tab:{}", aterm_vitals::sys::pct(&t.label)),
+                    |n| format!("tab:{n}"),
+                )
+            },
+        ),
+    }
+}
+
+/// The reply's roots and balance, and `sys disk`'s scope and pane lines, from one board: `used`
+/// is home's pool's (used, total), the clamp's bound.
+pub(crate) fn disk_view(
+    board: &crate::diskwalk_host::Published,
+    reports: &[crate::diskwalk_host::DiskReport],
+    ask: &DiskAsk<'_>,
+    cwds: &[PaneCwd],
+    used: Option<(u64, u64)>,
+    now: Instant,
+) -> (Vec<Root>, DiskTotals) {
+    use crate::diskwalk_host::DiskScope;
+    let listed = ask.listed();
+    let listed: Vec<&crate::diskwalk_host::DiskReport> = reports
+        .iter()
+        .filter(|r| listed.contains(&r.scope))
+        .collect();
+    let tab_of = |k: u64| ask.tab_of(k);
     let mut roots: Vec<Root> = Vec::new();
     let mut warnings: Vec<aterm_vitals::sys::HugeDirFact> = Vec::new();
     let mut walking = false;
     let mut exclusive = 0u64;
     let mut growth: Option<i64> = None;
-    for report in reports {
+    for report in &listed {
         walking |= report.walking;
         exclusive = exclusive.saturating_add(report.exclusive_bytes);
         if let Some(g) = report.growth
@@ -918,18 +1012,25 @@ pub(crate) fn walker_roots(
             growth = Some(growth.unwrap_or(0).saturating_add(bps));
         }
         if report.unknown_tab {
-            queue_cwds(&mut roots, cwds, report.scope);
+            queue_cwds(&mut roots, cwds, report.scope, ask);
             walking = true;
             continue;
         }
+        let mine: Vec<u64> = match report.scope {
+            DiskScope::Tab(id) => board
+                .tabs
+                .iter()
+                .filter(|t| t.id == id)
+                .flat_map(|t| t.panes.iter().copied())
+                .collect(),
+            DiskScope::Aterm => Vec::new(),
+        };
         let base = roots.len();
         let mut renumber: Vec<Option<usize>> = Vec::with_capacity(report.roots.len());
         for row in &report.roots {
             let path = row.claim.path.display().to_string();
-            let mut claimers: Vec<u64> = match report.scope {
-                DiskScope::Tab(k) => vec![k],
-                DiskScope::Aterm => row.counted_in.into_iter().collect(),
-            };
+            let mut claimers: Vec<u64> = mine.clone();
+            claimers.extend(row.counted_in);
             claimers.extend(row.shared_with.iter().copied());
             claimers.sort_unstable();
             claimers.dedup();
@@ -944,13 +1045,13 @@ pub(crate) fn walker_roots(
             }
             renumber.push(Some(roots.len() + 1));
             let owner = match report.scope {
-                DiskScope::Tab(k) => Some(k),
+                DiskScope::Tab(_) => mine.first().copied(),
                 DiskScope::Aterm => row.counted_in,
             };
             let mut tabs: Vec<usize> = row
                 .shared_with
                 .iter()
-                .filter(|k| Some(**k) != owner)
+                .filter(|k| !mine.contains(k) && Some(**k) != owner)
                 .filter_map(|&k| tab_of(k))
                 .collect();
             tabs.sort_unstable();
@@ -960,7 +1061,13 @@ pub(crate) fn walker_roots(
                 path,
                 keys: claimers,
                 tab: owner.and_then(tab_of),
-                size: root_size(&row.record, now),
+                size: if row.pool == crate::diskwalk_host::Pool::Other
+                    && row.record.state == crate::diskwalk_host::RootState::Queued
+                {
+                    RootSize::NotMeasured("other_pool")
+                } else {
+                    root_size(&row.record, now)
+                },
                 dirs: row
                     .record
                     .complete
@@ -979,6 +1086,8 @@ pub(crate) fn walker_roots(
                 inside: None,
                 shared_with: tabs,
                 counted_in: row.counted_in.and_then(tab_of),
+                scopes: row.scopes.iter().map(|s| scope_word(*s, board)).collect(),
+                pool: Some(row.pool.word()),
             });
         }
         for (row, at) in report.roots.iter().zip(&renumber) {
@@ -990,7 +1099,7 @@ pub(crate) fn walker_roots(
             }
         }
         if report.undiscovered {
-            queue_cwds(&mut roots, cwds, report.scope);
+            queue_cwds(&mut roots, cwds, report.scope, ask);
             walking = true;
         }
         for h in &report.warnings {
@@ -1011,15 +1120,21 @@ pub(crate) fn walker_roots(
     }
     // The roots the balance folds: one report's own outermost rows (its totals are the
     // report's), else each root no other root holds.
-    let single = matches!(reports, [one] if !one.unknown_tab);
+    let single = matches!(listed.as_slice(), [one] if !one.unknown_tab);
+    let fold = board.fold_case;
     let folded: Vec<&Root> = roots
         .iter()
         .filter(|r| r.inside.is_none())
         .filter(|r| {
             single
-                || !roots
-                    .iter()
-                    .any(|o| o.path != r.path && std::path::Path::new(&r.path).starts_with(&o.path))
+                || !roots.iter().any(|o| {
+                    o.path != r.path
+                        && aterm_diskwalk::within(
+                            std::path::Path::new(&r.path),
+                            std::path::Path::new(&o.path),
+                            fold,
+                        )
+                })
         })
         .collect();
     let not_measured: Vec<&'static str> = folded
@@ -1030,23 +1145,20 @@ pub(crate) fn walker_roots(
         .iter()
         .map(|r| match &r.size {
             RootSize::Complete(c) => c.alloc,
-            RootSize::Walking {
-                partial_alloc,
-                last,
-                ..
-            } => last
-                .as_ref()
-                .map(|l| l.alloc)
-                .or(*partial_alloc)
-                .unwrap_or(0),
+            RootSize::Walking { last, .. } => last.as_ref().map_or(0, |l| l.alloc),
             _ => 0,
         })
         .fold(0u64, u64::saturating_add);
-    let (total, exclusive) = match reports {
+    let (total, exclusive) = match listed.as_slice() {
         [one] if single => (one.total_bytes, one.exclusive_bytes.min(one.total_bytes)),
         _ => (total, exclusive.min(total)),
     };
     warnings.sort_by_key(|w| std::cmp::Reverse(w.entries));
+    let (scopes, panes) = if ask.lines {
+        (scope_lines(board, ask, used, now), pane_lines(board, ask))
+    } else {
+        (Vec::new(), Vec::new())
+    };
     let totals = DiskTotals {
         total,
         exclusive,
@@ -1055,13 +1167,128 @@ pub(crate) fn walker_roots(
         not_measured,
         growth_bps: growth,
         warnings,
+        scopes,
+        panes,
     };
-    (roots, Some(totals))
+    (roots, totals)
+}
+
+/// `sys disk`'s scope lines: this Mac, aterm and the target's tab, from one board, each scope's
+/// bytes after the clamp to the Mac's used (record §3).
+fn scope_lines(
+    board: &crate::diskwalk_host::Published,
+    ask: &DiskAsk<'_>,
+    used: Option<(u64, u64)>,
+    now: Instant,
+) -> Vec<aterm_vitals::sys::ScopeLine> {
+    use crate::diskwalk_host::{DiskScope, clamp};
+    use aterm_vitals::sys::{ScopeBytes, ScopeLine};
+    let pool = board
+        .home_pool
+        .as_ref()
+        .map(aterm_sysprobe::volumes::VolumeKey::spelled);
+    let aterm = board.figure(DiskScope::Aterm);
+    let tab = ask.tab.map(|id| (id, board.figure(DiskScope::Tab(id))));
+    let cut = clamp(
+        used.map(|(u, _)| u),
+        aterm.bytes,
+        tab.as_ref().map_or(0, |(_, f)| f.bytes),
+    );
+    let bytes =
+        |name: &'static str, f: &crate::diskwalk_host::ScopeFigure, drawn_bytes, clamped| {
+            ScopeBytes {
+                name,
+                pool: pool.clone(),
+                bytes: if f.drawn() { drawn_bytes } else { 0 },
+                drawn: f.drawn(),
+                why: f.why_not_drawn(),
+                complete: f.complete,
+                roots: f.roots,
+                counted: f.counted,
+                oldest_walk_s: f.oldest.map(|t| now.saturating_duration_since(t).as_secs()),
+                clamped: f.drawn() && clamped,
+                ..ScopeBytes::default()
+            }
+        };
+    let mut out = vec![
+        ScopeLine::Global {
+            pool: pool.clone(),
+            used: used.map(|(u, _)| u),
+            total: used.map(|(_, t)| t),
+        },
+        ScopeLine::Bytes(bytes("aterm", &aterm, cut.aterm, cut.aterm_clamped)),
+    ];
+    if let Some((id, f)) = tab {
+        let facts = board.tabs.iter().find(|t| t.id == id);
+        let mut line = bytes("tab", &f, cut.tab, cut.tab_clamped);
+        line.tab = facts.and_then(|t| t.number).or_else(|| {
+            facts
+                .and_then(|t| t.panes.first())
+                .and_then(|&k| ask.tab_of(k))
+        });
+        line.tab_name = facts
+            .filter(|t| t.number.is_none())
+            .map(|t| t.label.clone());
+        line.keys = facts.map(|t| t.panes.clone()).unwrap_or_default();
+        out.push(ScopeLine::Bytes(line));
+    }
+    out
+}
+
+/// `sys disk`'s pane lines: each pane of the asked scope (every pane for aterm and global), in
+/// its tab's layout order, as the newest discovery saw it.
+fn pane_lines(
+    board: &crate::diskwalk_host::Published,
+    ask: &DiskAsk<'_>,
+) -> Vec<aterm_vitals::sys::PaneLine> {
+    use crate::diskwalk_host::PaneWhy;
+    let every = matches!(ask.scope, ScopeArg::Aterm | ScopeArg::Global);
+    let mut out = Vec::new();
+    for t in &board.tabs {
+        for (i, &key) in t.panes.iter().enumerate() {
+            if !every && !ask.keys.contains(&key) {
+                continue;
+            }
+            let view = board.panes.get(&key);
+            let why = view.map_or(Some("unknown"), |v| {
+                v.why.map(|w| match w {
+                    PaneWhy::Refused(r) => refusal_word(r),
+                    PaneWhy::OtherPool => "other_pool",
+                    PaneWhy::Elsewhere => "elsewhere",
+                    PaneWhy::Unknown => "unknown",
+                    PaneWhy::Joining => "joining",
+                })
+            });
+            out.push(aterm_vitals::sys::PaneLine {
+                key,
+                tab: t.number,
+                tab_name: t.number.is_none().then(|| t.label.clone()),
+                pane: i + 1,
+                from: view.and_then(|v| v.from).map(|f| f.word()),
+                exe: view.and_then(|v| v.exe.clone()),
+                host: view.and_then(|v| v.host.clone()),
+                live: view
+                    .and_then(|v| v.live.as_ref())
+                    .map(|p| p.display().to_string()),
+                project: view
+                    .and_then(|v| v.project.as_ref())
+                    .map(|p| p.display().to_string()),
+                member: view.is_some_and(crate::diskwalk_host::PaneView::member),
+                why,
+            });
+        }
+    }
+    out
 }
 
 /// The cwd of each of `scope`'s panes as a root the walker owes: walking, its size unknown,
 /// unless a row already has the folder.
-fn queue_cwds(roots: &mut Vec<Root>, cwds: &[PaneCwd], scope: crate::diskwalk_host::DiskScope) {
+fn queue_cwds(
+    roots: &mut Vec<Root>,
+    cwds: &[PaneCwd],
+    scope: crate::diskwalk_host::DiskScope,
+    ask: &DiskAsk<'_>,
+) {
     use crate::diskwalk_host::DiskScope;
     let queued = RootSize::Walking {
         walked_entries: 0,
@@ -1071,7 +1298,10 @@ fn queue_cwds(roots: &mut Vec<Root>, cwds: &[PaneCwd], scope: crate::diskwalk_ho
     let owed: Vec<PaneCwd> = cwds
         .iter()
         .filter(|c| match scope {
-            DiskScope::Tab(key) => c.key == key,
+            DiskScope::Tab(id) => ask
+                .panes
+                .iter()
+                .any(|p| p.key == c.key && p.tab_id == Some(id)),
             DiskScope::Aterm => true,
         })
         .cloned()

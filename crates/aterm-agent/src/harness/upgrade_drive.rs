@@ -5178,11 +5178,13 @@ impl St {
         if let Some(candidate) = &self.native_account_candidate {
             candidate.write_into(&mut o);
         }
-        if let Some(encoded) = self
-            .native_completed_prepare
-            .as_ref()
-            .and_then(|prepare| super::native_act::Request::Prepare(prepare.clone()).encode())
-        {
+        if let Some(encoded) = self.native_completed_prepare.as_ref().and_then(|prepare| {
+            // A still-running older supervisor can read this completed
+            // observation too. Preserve the exact common representation
+            // where the entire preparation predates token routes.
+            let request = super::native_act::Request::Prepare(prepare.clone());
+            request.encode_legacy_cold().or_else(|| request.encode())
+        }) {
             o.insert("native_completed_prepare".into(), Value::from(encoded));
         }
         if let Some(encoded) = self

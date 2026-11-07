@@ -10,8 +10,10 @@ use aterm_agent::harness::footer::FactsOwner;
 use aterm_agent::harness::session_usage::{ModelTokens, More, UsageFacts};
 use aterm_agent::supervise::BackgroundEvidence;
 use aterm_vitals::jobs::{Consumer, Demand, JobRow, JobsView};
-use aterm_vitals::model::Resource;
+use aterm_vitals::model::{Resource, StripEventKind};
+use aterm_vitals::ring::{GapKind, TimeGap};
 use aterm_vitals::words::{self, Locale, Platform};
+use strip::{BASE_FILE, LEGACY_FILE, StripStore, TAIL_FILE, strip_dir};
 
 fn saved_cpu_anomaly() -> Snapshot {
     use aterm_vitals::hardware::{Bundle, Frame};
@@ -922,6 +924,35 @@ fn a_pull_reads_its_cpu_stats_arming_once_as_it_begins() {
     assert!(snap.hardware.is_some_and(|h| h.channels.is_ok()));
 }
 
+/// A1 §9 (F4′): a control worker's pull reads between the deck's own readings, so each of its
+/// readings stands for an instant in the rings (`Sample::pull`), however long the cadence it
+/// carries for the gap rule, and the deck's next reading keeps its whole slot. CONTROL: a deck
+/// reading at the same request stands for its second.
+#[test]
+fn a_pulls_readings_stand_for_an_instant_in_the_rings() {
+    let req = Request {
+        self_pid: std::process::id(),
+        cadence_ms: 1_000,
+        deck: true,
+        ..Request::default()
+    };
+    let newest_w = |snap: &Snapshot| {
+        snap.resources[Resource::Memory.index()]
+            .recent
+            .last()
+            .map(|r| r.w_ms)
+    };
+    let mut reader = Reader::new(Arc::default());
+    let snap = pull(&mut reader, &mut req.clone(), Some(Instant::now()), false);
+    assert_eq!(newest_w(&snap), Some(1), "the pull's reading: an instant");
+    let mut deck = Reader::new(Arc::default());
+    assert_eq!(
+        newest_w(&deck.reading(&req)),
+        Some(1_000),
+        "CONTROL: the deck's own reading stands for its second"
+    );
+}
+
 #[test]
 #[cfg(unix)]
 fn volume_reads_use_only_complete_local_mount_roots() {
@@ -1556,20 +1587,155 @@ fn hidden_decks_read_the_machine_every_ten_seconds() {
     let t0 = Instant::now();
     let s = Duration::from_secs;
     assert_eq!(
-        due_at(None, None, HIDDEN_PERIOD, t0),
+        due_on_phase(None, None, HIDDEN_PERIOD, t0, None),
         t0,
         "the first at once"
     );
     assert_eq!(
-        due_at(Some(t0), Some(t0 + HIDDEN_PERIOD), HIDDEN_PERIOD, t0 + s(3)),
+        due_on_phase(
+            Some(t0),
+            Some(t0 + HIDDEN_PERIOD),
+            HIDDEN_PERIOD,
+            t0 + s(3),
+            None
+        ),
         t0 + HIDDEN_PERIOD
     );
     let back = t0 + s(3);
-    assert!(due_at(Some(t0), Some(t0 + HIDDEN_PERIOD), FOCUSED_PERIOD, back) <= back);
+    assert!(
+        due_on_phase(
+            Some(t0),
+            Some(t0 + HIDDEN_PERIOD),
+            FOCUSED_PERIOD,
+            back,
+            None
+        ) <= back
+    );
     assert_eq!(
-        due_at(Some(t0), Some(t0), FOCUSED_PERIOD, t0 + s(1) / 10),
+        due_on_phase(Some(t0), Some(t0), FOCUSED_PERIOD, t0 + s(1) / 10, None),
         t0
     );
+}
+
+/// Where each of `n` readings at `period` lands on the wall clock, ms past a multiple of the
+/// period, when each is asked `late` after it was due, `wall0` being the wall clock at the
+/// first; `phase` keeps the cadence to the wall clock ([`due_on_phase`]).
+fn landings(period: Duration, late: Duration, wall0: i64, n: usize, phase: bool) -> Vec<i64> {
+    let t0 = Instant::now();
+    let wall = |at: Instant| wall0 + i64::try_from((at - t0).as_millis()).expect("ms");
+    let p = i64::try_from(period.as_millis()).expect("ms");
+    let mut asked = None;
+    let mut now = t0;
+    (0..n)
+        .map(|_| {
+            let due = due_on_phase(asked, None, period, now, phase.then(|| wall(now)));
+            let at = due.max(now) + late;
+            asked = Some(at);
+            now = at;
+            wall(at).rem_euclid(p)
+        })
+        .collect()
+}
+
+/// Record §5.2: each reading is asked on the half-slot, the first instant at least half a period
+/// after the last ask whose wall time is half a period past a multiple of the period (focused
+/// x.500, a lens x.250 and x.750, the background 2.5 s into each 5 s, hidden 5 s into each 10 s),
+/// so it stands in the middle of its own slot and a late wake never accumulates. CONTROL: a
+/// period counted from each ask drifts by each wake's lateness.
+#[test]
+fn readings_land_mid_slot_on_the_wall_clock() {
+    let late = Duration::from_millis(3);
+    let wall0 = 1_793_000_000_123;
+    for period in [
+        crate::stats_lens::LENS_PERIOD,
+        FOCUSED_PERIOD,
+        BACKGROUND_PERIOD,
+        HIDDEN_PERIOD,
+    ] {
+        let p = i64::try_from(period.as_millis()).expect("ms");
+        let on = landings(period, late, wall0, 200, true);
+        assert_eq!(on[0], wall0.rem_euclid(p) + 3, "the first at once");
+        assert!(
+            on[1..]
+                .iter()
+                .all(|&at| (p / 2 + 3..=p / 2 + 4).contains(&at)),
+            "{period:?}: every later reading on the half-slot, as late as its wake: {on:?}"
+        );
+        let drift = landings(period, late, wall0, 200, false);
+        assert_eq!(
+            drift[199],
+            (wall0 + 199 * (p + 3) + 3).rem_euclid(p),
+            "CONTROL {period:?}: a period after each ask drifts by each wake's lateness"
+        );
+    }
+    let t0 = Instant::now();
+    let ms = Duration::from_millis;
+    assert_eq!(
+        due_on_phase(Some(t0), None, FOCUSED_PERIOD, t0, Some(1_793_000_000_900)),
+        t0 + ms(600),
+        "an ask at x.900 reads next at the half-slot at least half a period on: x+1.500"
+    );
+    assert_eq!(
+        due_on_phase(Some(t0), None, FOCUSED_PERIOD, t0, Some(1_793_000_000_100)),
+        t0 + ms(1_400),
+        "an ask at x.100 reads next at x+1.500: x.500 is under half a period on"
+    );
+    assert_eq!(
+        due_on_phase(
+            Some(t0),
+            Some(t0 + ms(200)),
+            FOCUSED_PERIOD,
+            t0,
+            Some(1_793_000_000_100)
+        ),
+        t0 + ms(200),
+        "an earlier armed reading stands"
+    );
+}
+
+/// The window's cadence keeps to the wall clock it reads ([`Wall`]): a shown deck's first reading
+/// is asked at once, the next is due at the following half-slot, and one asked late keeps to the
+/// half-slot after it. CONTROL: with no wall clock read the next is a period after each ask.
+#[cfg(unix)]
+#[test]
+fn a_shown_decks_readings_are_asked_on_the_half_slot() {
+    static BOARD: JobsBoard = JobsBoard::new();
+    let _bars = crate::stats_deck::tests::attach_stats();
+    let ms = Duration::from_millis;
+    for phased in [true, false] {
+        let mut app = crate::App::headless_for_test();
+        let rx = with_reader(&mut app, &BOARD);
+        let wid = crate::WindowId(0);
+        app.windows.get_mut(&wid).expect("the window").focused = true;
+        let t0 = Instant::now();
+        if phased {
+            app.vitals.wall = Wall::Fixed {
+                at: t0,
+                wall_ms: 1_793_000_000_820,
+            };
+        }
+        assert_eq!(app.vitals_audience(), Audience::Shown);
+        app.service_vitals(t0);
+        assert_eq!(read_req(&rx, "read at once").cadence_ms, 1000);
+        let (next, late) = if phased {
+            (t0 + ms(680), t0 + ms(690))
+        } else {
+            (t0 + FOCUSED_PERIOD, t0 + FOCUSED_PERIOD + ms(10))
+        };
+        assert_eq!(app.vitals_deadline(), Some(next), "phased: {phased}");
+        app.service_vitals(late);
+        assert_eq!(read_req(&rx, "the next reading").cadence_ms, 1000);
+        let after = if phased {
+            t0 + ms(1_680)
+        } else {
+            late + FOCUSED_PERIOD
+        };
+        assert_eq!(
+            app.vitals_deadline(),
+            Some(after),
+            "phased: {phased}: a late wake's lateness carries over only with no wall clock"
+        );
+    }
 }
 
 #[test]
@@ -1663,6 +1829,7 @@ fn the_fullest_peaks_file_fits_its_bound() {
         net_tx: widest(),
         tokens: widest(),
         mem_churn: widest(),
+        proc_starts: widest(),
         disks: (0..aterm_vitals::units::DISK_DEVICES_KEPT as u64)
             .map(|n| aterm_vitals::DiskPeaks {
                 id: format!("{:016x}", u64::MAX - n),
@@ -1682,6 +1849,54 @@ fn the_fullest_peaks_file_fits_its_bound() {
     let path = dir.path().join(PEAKS_FILE);
     std::fs::write(&path, &text).expect("the file");
     assert_eq!(PeakFile::open(Some(path), Instant::now()).1, fullest);
+}
+
+/// Record §9: a peaks file written before the Processes row's start peak (`proc_starts`) reads
+/// with every peak it holds, and the row learns its start peak from zero, saying so
+/// (`CapBasis::Learning`). CONTROL: a file that holds a learned start peak heats the row against
+/// it.
+#[test]
+fn peaks_written_before_proc_starts_restore_and_learn_it_from_zero() {
+    let before = peaks_of(PEAKS_BEFORE_PLAN).expect("a file from before the start peak");
+    assert_eq!(before.proc_starts, aterm_vitals::DailyMax::default());
+    assert_eq!(
+        before.net_rx.peak(20_381),
+        Some(11_000_000.0),
+        "its peaks kept"
+    );
+    let wall0 = 1_793_000_000_500_i64;
+    let read = |peaks: Peaks| {
+        let mut v = aterm_vitals::Vitals::new();
+        v.restore_peaks(peaks);
+        let mut snap = Snapshot::default();
+        for i in 0..60_u64 {
+            snap = v.absorb(&Sample {
+                at_ns: (i + 1) * 1_000_000_000,
+                at_unix_ms: wall0 + 1_000 * i as i64,
+                mono_ms: (i + 1) * 1_000,
+                cadence_ms: 1_000,
+                starts: Some(aterm_vitals::StartCount::Forks(40 * i)),
+                ..Sample::default()
+            });
+        }
+        (
+            snap.resources[Resource::Processes.index()].basis,
+            snap.facts.proc_read_s,
+            v.peaks().clone(),
+        )
+    };
+    let (basis, read_s, learned) = read(before);
+    assert_eq!(basis, aterm_vitals::CapBasis::Learning);
+    assert!(
+        read_s > 0 && read_s < aterm_vitals::peaks::PROC_LEARN_S,
+        "learning from zero: {read_s} s read"
+    );
+    let mut known = learned;
+    known.proc_starts.read_s = aterm_vitals::peaks::PROC_LEARN_S;
+    let text = peaks_json(&known).expect("text");
+    assert!(text.contains("\"proc_starts\""), "{text}");
+    let (basis, _, _) = read(peaks_of(&text).expect("the file with a start peak"));
+    assert_eq!(basis, aterm_vitals::CapBasis::Peak, "CONTROL");
 }
 
 const FREE_MOUNT: &str = "/System/Volumes/Data";
@@ -1704,7 +1919,7 @@ fn the_free_history_round_trips_through_the_json_file() {
         day.note_on(
             FREE_MOUNT,
             FREE_SIZE,
-            at0 + m * 60_000,
+            aterm_vitals::Taken::at(at0 + m * 60_000, 60_000),
             412_345_678_901 - m as u64 * 1_000_000,
         );
     }
@@ -1727,7 +1942,12 @@ fn the_free_history_round_trips_through_the_json_file() {
     );
 
     let mut more = day.clone();
-    more.note_on(FREE_MOUNT, FREE_SIZE, now, 1);
+    more.note_on(
+        FREE_MOUNT,
+        FREE_SIZE,
+        aterm_vitals::Taken::at(now, 60_000),
+        1,
+    );
     file.keep(&more, t0 + PEAKS_EVERY + PEAKS_EVERY / 2, false);
     assert_eq!(
         reopen(now).saved(),
@@ -1766,10 +1986,11 @@ fn the_free_history_round_trips_through_the_json_file() {
         "kept",
         "{",
         "",
-        r#"{"schema":2,"mount":"/","total":1,"buckets":[[1791936000000,5,1]]}"#,
-        r#"{"schema":1,"mount":"/","total":1,"buckets":[[1791936000000,"5",1]]}"#,
-        r#"{"schema":1,"mount":"/","total":-1,"buckets":[[1791936000000,5,1]]}"#,
-        r#"{"schema":1,"mount":"/","buckets":[[1791936000000,5,1]]}"#,
+        r#"{"schema":1,"mount":"/","total":1,"buckets":[[1791936000000,5,1]]}"#,
+        r#"{"schema":3,"mount":"/","total":1,"buckets":[[1791936000000,600000,1,0,5.0,5.0,5.0]]}"#,
+        r#"{"schema":2,"mount":"/","total":1,"buckets":[[1791936000000,600000,1,0,"5",5.0,5.0]]}"#,
+        r#"{"schema":2,"mount":"/","total":-1,"buckets":[[1791936000000,600000,1,0,5.0,5.0,5.0]]}"#,
+        r#"{"schema":2,"mount":"/","buckets":[[1791936000000,600000,1,0,5.0,5.0,5.0]]}"#,
         &peaks,
     ] {
         std::fs::write(&path, damaged).expect("a damaged file");
@@ -1777,7 +1998,7 @@ fn the_free_history_round_trips_through_the_json_file() {
     }
     std::fs::write(
         &path,
-        format!("{text}{}", " ".repeat(PEAKS_MAX_BYTES as usize)),
+        format!("{text}{}", " ".repeat(FREE_MAX_BYTES as usize)),
     )
     .expect("big");
     assert_eq!(reopen(now), FreeHistory::default(), "a file over the bound");
@@ -1797,15 +2018,27 @@ fn the_free_history_round_trips_through_the_json_file() {
             total: u64::MAX,
         },
         rows: (0..aterm_vitals::history::FREE_BUCKETS as i64)
-            .map(|k| (first + k * ten, u64::MAX, u32::MAX))
+            .map(|k| {
+                (
+                    first + k * ten,
+                    aterm_vitals::Agg {
+                        tau_ms: u32::MAX,
+                        n: u16::MAX,
+                        over_ms: u32::MAX,
+                        mean: -f64::MAX,
+                        min: -f64::MAX,
+                        max: -f64::MIN_POSITIVE,
+                    },
+                )
+            })
             .collect(),
     };
     let full = FreeHistory::restored(&widest, first + 143 * ten);
     assert_eq!(full.saved(), Some(widest), "a full day");
     let wide = free_json(&full).expect("text");
     assert!(
-        wide.len() as u64 <= PEAKS_MAX_BYTES,
-        "a full day of the widest rows fits the read bound: {}",
+        wide.len() as u64 * 100 <= FREE_MAX_BYTES * 75,
+        "a full day of the widest rows fits in 75 % of the read bound: {}",
         wide.len()
     );
 }
@@ -1842,7 +2075,12 @@ fn the_probe_thread_reads_on_from_the_kept_history_and_writes_it_at_quit() {
     let dir = aterm_tempfile::tempdir().expect("scratch state");
     let path = dir.path().join(FREE_FILE);
     let mut earlier = FreeHistory::new();
-    earlier.note_on(FREE_MOUNT, FREE_SIZE, unix_ms_now() - 3_600_000, 9_000);
+    earlier.note_on(
+        FREE_MOUNT,
+        FREE_SIZE,
+        aterm_vitals::Taken::at(unix_ms_now() - 3_600_000, 1_000),
+        9_000,
+    );
     std::fs::write(&path, free_json(&earlier).expect("text")).expect("an earlier run's file");
     let mut host = VitalsHost::default();
     host.start(
@@ -2060,8 +2298,29 @@ fn a_probe_past_its_event_loop(dir: &Path, sys: &'static crate::sys_host::Shared
 /// The strip in `dir`, as its probe thread's stop wrote it: whether that stop was clean, and
 /// whether it kept a reading.
 fn stop_written_in(dir: &Path) -> (bool, bool) {
-    let (_, kept) = StripFile::open(Some(dir.join(STRIP_FILE)), Instant::now());
+    let kept = kept_in(dir);
     (kept.clean_stop, kept.last_wall_ms > 0)
+}
+
+/// The strip kept in the state folder `home`: its base with its tail replayed.
+fn kept_in(home: &Path) -> SavedStrip {
+    StripStore::open(Some(strip_dir(home)), None).1
+}
+
+/// The strip's checkpoint in the state folder `home`, as a start opens it, and what it holds.
+fn store_in(home: &Path) -> (StripStore, SavedStrip) {
+    StripStore::open(Some(strip_dir(home)), Some(home.join(LEGACY_FILE)))
+}
+
+/// The strip's base in the state folder `home`.
+fn base_in(home: &Path) -> PathBuf {
+    strip_dir(home).join(BASE_FILE)
+}
+
+/// What the strip's files in `home` hold: its base and its tail, each empty where missing.
+fn strip_bytes(home: &Path) -> (Vec<u8>, Vec<u8>) {
+    let read = |p: PathBuf| std::fs::read(p).unwrap_or_default();
+    (read(base_in(home)), read(strip_dir(home).join(TAIL_FILE)))
 }
 
 #[test]
@@ -6832,11 +7091,11 @@ fn proc_sample_forwards_disk_read_and_host_keeps_crash_notes_on_backpressure() {
 #[test]
 fn strip_file_persists_one_hour_history_and_marks_abrupt_exit_on_reopen() {
     let dir = aterm_tempfile::tempdir().expect("scratch state");
-    let path = dir.path().join(STRIP_FILE);
+    let path = base_in(dir.path());
     let now = Instant::now();
     let t0_ms: i64 = 1_793_000_000_000;
 
-    let (mut file, empty) = StripFile::open(Some(path.clone()), now);
+    let (mut file, empty) = store_in(dir.path());
     assert_eq!(empty.last_wall_ms, 0);
 
     let mut vitals = aterm_vitals::Vitals::new();
@@ -6858,8 +7117,8 @@ fn strip_file_persists_one_hour_history_and_marks_abrupt_exit_on_reopen() {
         });
     }
 
-    // First sample immediately checkpoints `clean_stop = false` because StripFile::open arms `at`.
-    file.keep(&vitals.saved_strip(false), now, false);
+    // The first reading writes the base, `clean_stop = false`: the open makes one due.
+    file.keep(&vitals, now, &mut StripLock::Unlocked);
     assert!(
         path.exists(),
         "first live sample must checkpoint strip file"
@@ -6867,7 +7126,7 @@ fn strip_file_persists_one_hour_history_and_marks_abrupt_exit_on_reopen() {
 
     // Simulate abrupt kill (no `stopping = true` call) and reopen 30 s later.
     let reopen_ms = t0_ms + 150_000;
-    let (_, crashed_saved) = StripFile::open(Some(path.clone()), now + Duration::from_secs(30));
+    let crashed_saved = kept_in(dir.path());
     assert!(!crashed_saved.clean_stop);
     let mut recovered = aterm_vitals::Vitals::new();
     recovered.restore_strip_history(crashed_saved, reopen_ms);
@@ -6908,7 +7167,7 @@ fn strip_file_persists_one_hour_history_and_marks_abrupt_exit_on_reopen() {
         slots
             .iter()
             .any(|hs| hs.slot.age_lo_ms >= 60_000 && hs.cell.heat.is_some_and(|h| h > 0.5)),
-        "pre-crash memory history must survive StripFile round-trip: {slots:?}"
+        "pre-crash memory history must survive the strip's round trip: {slots:?}"
     );
     let live_now = slots.first().expect("live_now slot");
     assert!(live_now.slot.is_live_now);
@@ -6918,14 +7177,14 @@ fn strip_file_persists_one_hour_history_and_marks_abrupt_exit_on_reopen() {
     );
 
     // Graceful shutdown writes `clean_stop = true`.
-    let (mut clean_file, _) = StripFile::open(Some(path.clone()), now + Duration::from_secs(31));
-    clean_file.keep(
-        &recovered.saved_strip(true),
-        now + Duration::from_secs(32),
+    let (mut clean_file, _) = store_in(dir.path());
+    clean_file.stop(
+        &recovered,
         true,
+        now + Duration::from_secs(32),
+        &mut StripLock::Unlocked,
     );
-    let (_, clean_saved) = StripFile::open(Some(path), now + Duration::from_secs(33));
-    assert!(clean_saved.clean_stop);
+    assert!(kept_in(dir.path()).clean_stop);
 }
 
 /// An earlier run's strip in `dir`, its path: the last checkpoint a minute ago, and a live one
@@ -6935,10 +7194,10 @@ fn an_unclean_strip(dir: &Path) -> PathBuf {
     an_earlier_runs_strip(dir, false)
 }
 
-/// An earlier run's strip in `dir`, its path: four readings 10 s apart, the last a minute ago,
-/// written then with `clean_stop` set to `clean`.
+/// An earlier run's strip in `dir`, its base's path: four readings 10 s apart, the last a minute
+/// ago, written then with `clean_stop` set to `clean`.
 fn an_earlier_runs_strip(dir: &Path, clean: bool) -> PathBuf {
-    let path = dir.join(STRIP_FILE);
+    let path = base_in(dir);
     let then = unix_ms_now() - 60_000;
     let mut earlier = aterm_vitals::Vitals::new();
     for step in 0..=3i64 {
@@ -6950,8 +7209,8 @@ fn an_earlier_runs_strip(dir: &Path, clean: bool) -> PathBuf {
             ..Sample::default()
         });
     }
-    let (mut file, _) = StripFile::open(Some(path.clone()), Instant::now());
-    file.keep(&earlier.saved_strip(clean), Instant::now(), false);
+    let (mut file, _) = store_in(dir);
+    assert!(file.put_base(&earlier.saved_strip(clean), 0, Instant::now()));
     last_written_at(&path, then);
     path
 }
@@ -7013,9 +7272,9 @@ fn crash_marks(
 /// wrote over [`an_unclean_strip`].
 fn marks_after_an_unclean_strip(handed_off: bool) -> (Vec<GapKind>, usize) {
     let dir = aterm_tempfile::tempdir().expect("scratch state");
-    let path = an_unclean_strip(dir.path());
+    let _ = an_unclean_strip(dir.path());
     let _ = one_reading_over(dir.path(), handed_off);
-    let (_, kept) = StripFile::open(Some(path), Instant::now());
+    let kept = kept_in(dir.path());
     assert!(kept.clean_stop, "the quit wrote the strip");
     crash_marks(&kept.time_gaps, &kept.strip_events)
 }
@@ -7061,8 +7320,8 @@ fn a_kill_before_the_killed_runs_first_checkpoint_draws_its_crash_from_that_runs
         crash_marks(&drawn.time_gaps, &drawn.strip_events),
         (vec![GapKind::Crash], 1)
     );
-    let path = an_unclean_strip(dir.path());
-    let (_, kept) = StripFile::open(Some(path), Instant::now());
+    let _ = an_unclean_strip(dir.path());
+    let kept = kept_in(dir.path());
     let drawn = one_reading_after(dir.path(), |host| {
         host.note_killed_run_launch(launched_ms - 600_000);
     });
@@ -7081,8 +7340,8 @@ fn a_kill_before_the_killed_runs_first_checkpoint_draws_its_crash_from_that_runs
 #[test]
 fn a_live_peers_checkpoint_draws_no_crash_and_is_not_written_while_it_holds_the_lock() {
     let dir = aterm_tempfile::tempdir().expect("scratch state");
-    let path = an_unclean_strip(dir.path());
-    let left = std::fs::read(&path).expect("the peer's strip");
+    let _ = an_unclean_strip(dir.path());
+    let left = strip_bytes(dir.path());
     let peer = a_peer_holds_the_strip_lock(dir.path());
     let drawn = one_reading_over(dir.path(), false);
     assert_eq!(
@@ -7092,7 +7351,7 @@ fn a_live_peers_checkpoint_draws_no_crash_and_is_not_written_while_it_holds_the_
         drawn.strip_events
     );
     assert_eq!(
-        std::fs::read(&path).expect("the peer's strip"),
+        strip_bytes(dir.path()),
         left,
         "neither the reading's checkpoint nor the quit wrote the strip the peer writes"
     );
@@ -7132,19 +7391,13 @@ fn the_quit_leaves_the_peaks_a_live_peer_writes() {
 #[test]
 fn the_next_checkpoint_after_the_peer_lets_go_takes_the_lock_and_writes() {
     let dir = aterm_tempfile::tempdir().expect("scratch state");
-    let path = an_unclean_strip(dir.path());
-    let left = std::fs::read(&path).expect("the peer's strip");
+    let _ = an_unclean_strip(dir.path());
+    let left = strip_bytes(dir.path());
     let peer = a_peer_holds_the_strip_lock(dir.path());
     let now = Instant::now();
     let mut lock = StripLock::take(Some(dir.path().join(STRIP_LOCK)));
     assert!(lock.peer_holds(), "the peer's description holds it");
-    let (mut file, kept) = open_strip(
-        Some(path.clone()),
-        now,
-        unix_ms_now(),
-        PriorRun::default(),
-        &lock,
-    );
+    let (mut file, kept) = open_strip(Some(dir.path()), unix_ms_now(), PriorRun::default(), &lock);
     assert!(kept.clean_stop, "a live peer's checkpoint is no crash");
     let mut vitals = aterm_vitals::Vitals::new();
     vitals.restore_strip_history(kept, unix_ms_now());
@@ -7153,19 +7406,19 @@ fn the_next_checkpoint_after_the_peer_lets_go_takes_the_lock_and_writes() {
         ..Sample::default()
     });
     let live = vitals.saved_strip(false);
-    file.keep_owned(&live, now, false, &mut lock);
+    file.keep(&vitals, now, &mut lock);
     assert_eq!(
-        std::fs::read(&path).expect("the peer's strip"),
+        strip_bytes(dir.path()),
         left,
         "a due checkpoint is not written while the peer holds the lock"
     );
     drop(peer);
-    file.keep_owned(&live, now + Duration::from_secs(1), false, &mut lock);
+    file.keep(&vitals, now + Duration::from_secs(1), &mut lock);
     assert!(
         matches!(lock, StripLock::Held { .. }),
         "the next checkpoint took the lock"
     );
-    let (_, written) = StripFile::open(Some(path), now);
+    let written = kept_in(dir.path());
     assert_eq!(
         (written.last_wall_ms, written.clean_stop),
         (live.last_wall_ms, false),
@@ -7181,12 +7434,10 @@ fn the_next_checkpoint_after_the_peer_lets_go_takes_the_lock_and_writes() {
 struct RestoredHolder {
     /// The lock it holds.
     lock: StripLock,
-    /// The strip file it keeps, as [`restore_strip`] left it.
-    strip: StripFile,
+    /// The strip checkpoint it keeps, as [`restore_strip`] left it.
+    strip: StripStore,
     /// Its model, the strip restored into it.
     model: aterm_vitals::Vitals,
-    /// The strip's path.
-    path: PathBuf,
     /// The dead run's last reading, on the wall clock.
     dead_ms: i64,
     /// The start's open, on the wall clock.
@@ -7201,8 +7452,8 @@ fn a_holder_restored_a_dead_runs_strip(
     open_at: Instant,
     crash_after: Option<i64>,
 ) -> RestoredHolder {
-    let path = an_unclean_strip(dir);
-    let (_, dead) = StripFile::open(Some(path.clone()), Instant::now());
+    let _ = an_unclean_strip(dir);
+    let dead = kept_in(dir);
     assert!(
         !dead.clean_stop && dead.last_wall_ms > 0,
         "the dead run's live checkpoint"
@@ -7215,7 +7466,7 @@ fn a_holder_restored_a_dead_runs_strip(
     let open_ms = dead.last_wall_ms + 30_000;
     let mut model = aterm_vitals::Vitals::new();
     let strip = restore_strip(
-        Some(path.clone()),
+        Some(dir),
         open_at,
         open_ms,
         PriorRun {
@@ -7229,7 +7480,6 @@ fn a_holder_restored_a_dead_runs_strip(
         lock,
         strip,
         model,
-        path,
         dead_ms: dead.last_wall_ms,
         open_ms,
     }
@@ -7243,12 +7493,12 @@ fn a_holder_that_restored_a_crash_checkpoints_its_first_readings_marks_at_once()
         mut lock,
         mut strip,
         mut model,
-        path,
         dead_ms,
         open_ms,
+        ..
     } = a_holder_restored_a_dead_runs_strip(dir.path(), open_at, Some(4_200));
     let crash_ms = dead_ms + 4_200;
-    let (_, at_open) = StripFile::open(Some(path.clone()), Instant::now());
+    let at_open = kept_in(dir.path());
     assert_eq!(
         (
             at_open.last_wall_ms,
@@ -7293,13 +7543,8 @@ fn a_holder_that_restored_a_crash_checkpoints_its_first_readings_marks_at_once()
         note_events: marks.events,
         ..Sample::default()
     });
-    strip.keep_owned(
-        &model.saved_strip(false),
-        open_at + Duration::from_secs(1),
-        false,
-        &mut lock,
-    );
-    let (_, on_disk) = StripFile::open(Some(path), Instant::now());
+    strip.keep(&model, open_at + Duration::from_secs(1), &mut lock);
+    let on_disk = kept_in(dir.path());
     assert_eq!(
         (on_disk.last_wall_ms, on_disk.clean_stop),
         (first_ms, false),
@@ -7334,14 +7579,13 @@ fn a_holder_that_restored_a_crash_checkpoints_its_first_readings_marks_at_once()
 /// run's last reading.
 fn kept_for(prior: impl FnOnce(i64) -> PriorRun, peer: bool) -> (SavedStrip, i64) {
     let dir = aterm_tempfile::tempdir().expect("scratch state");
-    let path = an_unclean_strip(dir.path());
-    let (_, dead) = StripFile::open(Some(path.clone()), Instant::now());
+    let _ = an_unclean_strip(dir.path());
+    let dead = kept_in(dir.path());
     let holder = peer.then(|| a_peer_holds_the_strip_lock(dir.path()));
     let lock = StripLock::take(Some(dir.path().join(STRIP_LOCK)));
     assert_eq!(lock.peer_holds(), peer);
     let (_, kept) = open_strip(
-        Some(path),
-        Instant::now(),
+        Some(dir.path()),
         unix_ms_now(),
         prior(dead.last_wall_ms),
         &lock,
@@ -7449,7 +7693,7 @@ fn a_quits_clean_write_after_a_crash_file_dates_no_crash_though_its_last_reading
     ] {
         let dir = aterm_tempfile::tempdir().expect("scratch state");
         let path = an_earlier_runs_strip(dir.path(), clean);
-        let (_, stop) = StripFile::open(Some(path.clone()), Instant::now());
+        let stop = kept_in(dir.path());
         assert!(stop.last_wall_ms > 0, "the run's last write");
         last_written_at(&path, stop.last_wall_ms + written_after);
         let lock = StripLock::take(Some(dir.path().join(STRIP_LOCK)));
@@ -7459,8 +7703,7 @@ fn a_quits_clean_write_after_a_crash_file_dates_no_crash_though_its_last_reading
         );
         let crash_ms = stop.last_wall_ms + crash_after;
         let (_, kept) = open_strip(
-            Some(path),
-            Instant::now(),
+            Some(dir.path()),
             unix_ms_now(),
             PriorRun {
                 crashed_at: Some(crash_ms),
@@ -7513,8 +7756,8 @@ fn open_strip_dates_a_kill_beside_a_crash_file_and_the_crash_in_the_order_they_c
         ),
     ] {
         let dir = aterm_tempfile::tempdir().expect("scratch state");
-        let path = an_earlier_runs_strip(dir.path(), true);
-        let (_, earlier) = StripFile::open(Some(path.clone()), Instant::now());
+        let _ = an_earlier_runs_strip(dir.path(), true);
+        let earlier = kept_in(dir.path());
         let lock = StripLock::take(Some(dir.path().join(STRIP_LOCK)));
         assert!(
             matches!(lock, StripLock::Held { .. }),
@@ -7524,8 +7767,7 @@ fn open_strip_dates_a_kill_beside_a_crash_file_and_the_crash_in_the_order_they_c
         let launched_ms = last_ms + 20_000;
         let crash_ms = last_ms + crash_after;
         let (_, kept) = open_strip(
-            Some(path),
-            Instant::now(),
+            Some(dir.path()),
             unix_ms_now(),
             PriorRun {
                 crashed_at: Some(crash_ms),
@@ -7603,18 +7845,17 @@ fn a_start_beside_a_holder_that_has_read_nothing_draws_the_dead_runs_crash_then_
     let dir = aterm_tempfile::tempdir().expect("scratch state");
     let RestoredHolder {
         lock: holder,
-        path,
         dead_ms,
         open_ms,
         ..
     } = a_holder_restored_a_dead_runs_strip(dir.path(), Instant::now(), None);
-    let left = std::fs::read(&path).expect("the holder's strip");
+    let left = strip_bytes(dir.path());
     let mut lock = StripLock::take(Some(dir.path().join(STRIP_LOCK)));
     assert!(lock.peer_holds(), "the holder runs");
     let relaunch_ms = open_ms + 30_000;
     let mut relaunch = aterm_vitals::Vitals::new();
     let _ = restore_strip(
-        Some(path.clone()),
+        Some(dir.path()),
         Instant::now(),
         relaunch_ms,
         PriorRun::default(),
@@ -7648,7 +7889,7 @@ fn a_start_beside_a_holder_that_has_read_nothing_draws_the_dead_runs_crash_then_
         drawn.strip_events
     );
     assert_eq!(
-        std::fs::read(&path).expect("the holder's strip"),
+        strip_bytes(dir.path()),
         left,
         "the start beside the holder wrote nothing"
     );
@@ -7658,11 +7899,11 @@ fn a_start_beside_a_holder_that_has_read_nothing_draws_the_dead_runs_crash_then_
 #[test]
 fn a_holder_that_restored_a_clean_stop_writes_first_at_its_first_reading() {
     let dir = aterm_tempfile::tempdir().expect("scratch state");
-    let path = an_unclean_strip(dir.path());
-    let (mut file, mut stopped) = StripFile::open(Some(path.clone()), Instant::now());
+    let _ = an_unclean_strip(dir.path());
+    let (mut file, mut stopped) = store_in(dir.path());
     stopped.clean_stop = true;
-    file.keep(&stopped, Instant::now(), true);
-    let left = std::fs::read(&path).expect("the earlier run's clean stop");
+    assert!(file.put_base(&stopped, 0, Instant::now()));
+    let left = strip_bytes(dir.path());
     let mut lock = StripLock::take(Some(dir.path().join(STRIP_LOCK)));
     assert!(
         matches!(lock, StripLock::Held { .. }),
@@ -7672,7 +7913,7 @@ fn a_holder_that_restored_a_clean_stop_writes_first_at_its_first_reading() {
     let open_at = Instant::now();
     let mut holder = aterm_vitals::Vitals::new();
     let mut strip = restore_strip(
-        Some(path.clone()),
+        Some(dir.path()),
         open_at,
         open_ms,
         PriorRun::default(),
@@ -7680,7 +7921,7 @@ fn a_holder_that_restored_a_clean_stop_writes_first_at_its_first_reading() {
         &mut holder,
     );
     assert_eq!(
-        std::fs::read(&path).expect("the earlier run's clean stop"),
+        strip_bytes(dir.path()),
         left,
         "a clean stop under a bucket ago is not written back as this run's unclean checkpoint"
     );
@@ -7688,8 +7929,8 @@ fn a_holder_that_restored_a_clean_stop_writes_first_at_its_first_reading() {
         at_unix_ms: open_ms + 1_000,
         ..Sample::default()
     });
-    strip.keep_owned(&holder.saved_strip(false), open_at, false, &mut lock);
-    let (_, written) = StripFile::open(Some(path), Instant::now());
+    strip.keep(&holder, open_at, &mut lock);
+    let written = kept_in(dir.path());
     assert_eq!(
         (written.last_wall_ms, written.clean_stop),
         (open_ms + 1_000, false),
@@ -7700,7 +7941,7 @@ fn a_holder_that_restored_a_clean_stop_writes_first_at_its_first_reading() {
 #[test]
 fn a_strip_lock_that_cannot_be_had_leaves_the_crash_and_the_writes_as_they_were() {
     let dir = aterm_tempfile::tempdir().expect("scratch state");
-    let path = an_unclean_strip(dir.path());
+    let _ = an_unclean_strip(dir.path());
     std::fs::create_dir(dir.path().join(STRIP_LOCK)).expect("a folder where the lock goes");
     assert!(matches!(
         StripLock::take(Some(dir.path().join(STRIP_LOCK))),
@@ -7712,8 +7953,7 @@ fn a_strip_lock_that_cannot_be_had_leaves_the_crash_and_the_writes_as_they_were(
         (vec![GapKind::Crash], 1),
         "an unclean checkpoint with no lock to say who runs is a crash, as before"
     );
-    let (_, kept) = StripFile::open(Some(path), Instant::now());
-    assert!(kept.clean_stop, "the quit wrote the strip");
+    assert!(kept_in(dir.path()).clean_stop, "the quit wrote the strip");
 }
 
 #[test]

@@ -218,9 +218,11 @@ mod tests {
         let before = observation_at(dir.path()).unwrap();
         let ticket = setup.pending_inputs().unwrap().unwrap();
         let pass = setup
-            .native_input_pass(&ticket, || {
-                Box::new(InitialSetupAdmissionStopTest::keyboard_system(true))
-            })
+            .native_input_pass(
+                &ticket,
+                || Box::new(InitialSetupAdmissionStopTest::keyboard_system(true)),
+                SetupHooks::NONE,
+            )
             .unwrap()
             .unwrap();
         assert!(pass.applied, "{}", pass.report.to_text());
@@ -251,9 +253,11 @@ mod tests {
         let (setup, _) = admit(dir.path(), &[Setting::Dock, Setting::Permissions]);
         let ticket = setup.pending_inputs().unwrap().unwrap();
         let pass = setup
-            .native_input_pass(&ticket, || {
-                Box::new(InitialSetupAdmissionStopTest::keyboard_system(false))
-            })
+            .native_input_pass(
+                &ticket,
+                || Box::new(InitialSetupAdmissionStopTest::keyboard_system(false)),
+                SetupHooks::NONE,
+            )
             .unwrap()
             .unwrap();
         assert!(!pass.applied);
@@ -291,9 +295,11 @@ mod tests {
         let before = ledger::load(root, revision).ledger;
         let ticket = setup.pending_inputs().unwrap().unwrap();
         let pass = setup
-            .native_input_pass(&ticket, || {
-                Box::new(InitialSetupAdmissionStopTest::keyboard_system(true))
-            })
+            .native_input_pass(
+                &ticket,
+                || Box::new(InitialSetupAdmissionStopTest::keyboard_system(true)),
+                SetupHooks::NONE,
+            )
             .unwrap()
             .unwrap();
         assert!(pass.applied);
@@ -327,9 +333,11 @@ mod tests {
             let before = observation_at(dir.path()).unwrap();
             assert!(
                 setup
-                    .native_input_pass(&ticket, || Box::new(
-                        InitialSetupAdmissionStopTest::keyboard_system(true)
-                    ))
+                    .native_input_pass(
+                        &ticket,
+                        || Box::new(InitialSetupAdmissionStopTest::keyboard_system(true)),
+                        SetupHooks::NONE
+                    )
                     .unwrap()
                     .is_none()
             );

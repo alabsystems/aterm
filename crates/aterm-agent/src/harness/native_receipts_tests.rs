@@ -16,6 +16,9 @@ mod phase;
 #[path = "native_receipts_account_tests.rs"]
 mod accounts;
 
+#[path = "native_receipts_legacy_cold_tests.rs"]
+mod legacy_cold;
+
 fn fixture() -> (aterm_tempfile::TempDir, Paths, Prepare, Binding) {
     let home = aterm_tempfile::tempdir().unwrap();
     let paths = Paths::for_home(home.path());

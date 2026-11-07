@@ -147,9 +147,13 @@ fn final_view_detach_retires_per_session_chrome_state_exactly_once() {
     app.session_chrome_expiry.after_window = Some(WindowId(0));
     let window = app.windows.get_mut(&WindowId(0)).expect("test window");
     window.tab_title_epochs.insert(0, 7);
-    window
-        .tab_title_cache
-        .insert(0, "private title".to_string());
+    window.tab_title_cache.insert(
+        0,
+        crate::app_tabs::CapturedTitle {
+            title: "private title".to_string(),
+            shell: false,
+        },
+    );
     window
         .tab_chrome_titles
         .insert(0, "private title".to_string());

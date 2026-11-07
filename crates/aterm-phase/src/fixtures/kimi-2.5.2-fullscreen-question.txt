@@ -1,0 +1,51 @@
+# kimi 2.5.2 · MEASURED 2026-11-06, `aterm ctl text` of an `aterm-lab kimi` instance (a private headless aterm, 144x50, aterm 0.161.0, a debug build of main) running the real Kimi Code, launched by path with a scratch `HOME` and `KIMI_CODE_HOME` whose `config.toml` names one `openai`-type provider at `http://127.0.0.1:<port>/v1` with a fake key (a local stub of the Chat Completions API, crates/aterm-lab), no login, in a project folder that is no git work tree (so Kimi asks before writing), and whose `tui.toml` says `tui_mode = "fullscreen"`, so the question panel stands over the transcript in the composer's place with no `context: N%` footer under it (no docked approval panel: its body has no six-row cap and no scrollbar, and it shows at most six options, paging the rest under a `showing a-b of n` row) · the stub asks `AskUserQuestion` `{questions: [{question: "Which checks should the lab run before landing?", header: "Checks", options: Format, Lint, Tests, Cells (each with a description), multi_select: true}]}`: the panel's `question` head, its tabs row `Checks    Submit`, the `? ` row, five unticked `[ ] ` rows (Kimi's own `Other` last) with descriptions six columns deeper, the focus drawn by colour alone, and the key row `↑↓ select  1-5 / ↵ toggle  ←/→/tab switch  esc cancel` · the lab's random project dir is spelled /private/tmp/at.HOk4 here
+      2  line 02 of the notes the lab wrote to fill the box
+      3  line 03 of the notes the lab wrote to fill the box
+      4  line 04 of the notes the lab wrote to fill the box
+      5  line 05 of the notes the lab wrote to fill the box
+      6  line 06 of the notes the lab wrote to fill the box
+      7  line 07 of the notes the lab wrote to fill the box
+      8  line 08 of the notes the lab wrote to fill the box
+      9  line 09 of the notes the lab wrote to fill the box
+     10  line 10 of the notes the lab wrote to fill the box
+   … (30 more lines, 40 total, ctrl+o to expand)
+   Tool "Write" was not run because the user rejected the approval request.
+
+   Rejected: Writing /private/tmp/at.HOk4/proj/notes-for-the-lab.txt
+
+ ● Tool call done. Result: <system>ERROR: Tool execution failed.</system> Tool "Write" was not run because the user rejected the approval
+   request.
+
+ ❯ toolstart six lines
+
+ ✗ Ran a command · $ cat README.md…
+   Tool "Bash" was not run because the user rejected the approval request.
+
+   Rejected: Running: cat README.md
+ ls -la
+ git status
+ git log --oneline …
+
+ ● Tool call done. Result: Wall time: 0.000 seconds <system>ERROR: Tool execution failed.</system> Tool "Bash" was not run because the user
+   rejected the approval request.
+
+ ❯ toolstart ask
+ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  question
+
+   Checks    Submit
+
+  ? Which checks should the lab run before landing?
+
+   [ ] Format
+         trustfmt over the changed crates
+   [ ] Lint
+         tippy with warnings denied
+   [ ] Tests
+         the crate suites
+   [ ] Cells
+         each other OS cell
+   [ ] Other
+
+   ↑↓ select  1-5 / ↵ toggle  ←/→/tab switch  esc cancel
+ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────

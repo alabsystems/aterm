@@ -488,6 +488,7 @@ fn with_cpu_readings(mut snap: Snapshot, at: i64, heat: impl Fn(i64) -> f64) -> 
                 at_ms: t,
                 v: heat(t.div_euclid(1000)) * cap,
                 over: false,
+                w_ms: 1_000,
             }
         })
         .collect();
@@ -504,10 +505,11 @@ fn varied(t: i64) -> f64 {
 /// The owner's ask, "I want to see a shifting to the left animation" (2026-10-24), read outward
 /// from now since the now-left design (§3.4), where they look: the default window, Folded at about
 /// 600 pt and focused. Each reading a second on slides the strip's fine band right by the time it
-/// opened, a whole 1 s box (3 device px at 1x, 6 at 2x; the owner's blocks of 2026-10-26), as
-/// every Folded width's band moves at least two pixels, in whole-pixel moves under half a box,
-/// over the beat's frames; and on the raster a second carries a reading's pixels one fine box
-/// right, measured as two screenshots are. The label over it still names what the strip spans
+/// opened, a whole 1 s box's pitch (2 device px at 1x and 4 at 2x in the four-hour strip the
+/// default window holds since A1's step R5, 3 and 6 in a six-minute one; the owner's blocks of
+/// 2026-10-26), as every Folded width's band moves at least two pixels, in whole-pixel moves of
+/// at most half a box's pitch, over the beat's frames; and on the raster a second carries a
+/// reading's pixels one fine box right, measured as two screenshots are. The label over it still names what the strip spans
 /// (`the_time_scale_marks_how_far_back_at_every_width`).
 #[test]
 fn the_default_window_is_seen_sliding_right() {
@@ -535,8 +537,8 @@ fn the_default_window_is_seen_sliding_right() {
     let d = strips(form, w)[0];
     assert_eq!(
         (d.strip.period_s, d.strip.span_s(), d.strip.pitch),
-        (1, 360, 3.0),
-        "the default window's multi-scale strip spans 6 minutes with fine real-time slots by now"
+        (1, 14_400, 3.0),
+        "the default window's multi-scale strip spans four hours with fine real-time slots by now"
     );
     let band = fine_band_slots(&d.strip.spec.slots()).expect("a fine band");
     let at0 = OPEN + 300;
@@ -582,7 +584,7 @@ fn the_default_window_is_seen_sliding_right() {
         assert_eq!(lags.last(), Some(&0.0), "{s}x: it comes in: {lags:?}");
         for m in lags.windows(2).map(|w| w[0] - w[1]) {
             assert!(
-                m >= 1.0 && m < box_px / 2.0 && m.fract() == 0.0,
+                m >= 1.0 && m <= box_px / 2.0 && m.fract() == 0.0,
                 "{s}x: a frame moved {m} px of a {box_px} px box: {lags:?}"
             );
         }
@@ -608,9 +610,11 @@ fn the_default_window_is_seen_sliding_right() {
         };
         let (a, b) = (raster(&pulse_at(at0)), raster(&pulse_at(at0 + 1_000)));
         let y = (px(d.top, s) + px(d.cell, s) / 2.0) as u32;
-        let (s1_x, s2_x) = (rest[band.start].1, rest[band.start + 1].1);
+        // Each box's middle px: a four-hour strip's 1 s box is a single px at 1x.
+        let mid = |r: &(usize, f32, f32, bool)| r.1 + (r.2 / 2.0).floor();
+        let (s1_x, s2_x) = (mid(&rest[band.start]), mid(&rest[band.start + 1]));
         let px_at = |img: &[u8], x: f32| -> [u8; 4] {
-            let cx = (x + 1.0) as usize;
+            let cx = x as usize;
             let i = (y as usize * g.w as usize + cx) * 4;
             img[i..i + 4].try_into().expect("rgba")
         };
@@ -1884,8 +1888,8 @@ fn deck_live_gallery() {
                 aterm_vitals::Cell {
                     mean: Some(v),
                     max: Some(v),
-                    n: 10.0,
-                    over_n: if ri == 0 && i >= 352 { 10.0 } else { 0.0 },
+                    tau_ms: 10_000.0,
+                    over_ms: if ri == 0 && i >= 352 { 10_000.0 } else { 0.0 },
                 }
             })
             .collect::<Vec<_>>()
@@ -1900,6 +1904,7 @@ fn deck_live_gallery() {
                     at_ms: OPEN - back * 1_000,
                     v: wave * cap,
                     over: ri == 0 && back <= 8,
+                    w_ms: 1_000,
                 }
             })
             .collect();
@@ -2174,7 +2179,7 @@ fn a_blend_patches_the_bars_under_the_percent_to_the_whole_rasters_bytes() {
     };
     let now = DeckLive::STILL;
     for (form, w, s) in [
-        (DeckForm::Folded, 360.0, 2.0),
+        (DeckForm::Folded, 420.0, 2.0),
         (DeckForm::Folded, 450.0, 1.0),
         (DeckForm::Full, 210.0, 2.0),
         (DeckForm::Full, 210.0, 1.0),

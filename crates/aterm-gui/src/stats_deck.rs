@@ -505,7 +505,8 @@ struct RowWords {
     well: Option<(WellMark, InkKind)>,
     heat_now: Option<f32>,
     /// The live box's peak tick and over share: the trailing 10 s's largest reading and the
-    /// share of those readings over ([`ResourceView::live_box`]); its column is `heat_now`.
+    /// share of those readings' read time over ([`ResourceView::live_box`]); its column is
+    /// `heat_now`.
     live_peak: Option<f32>,
     live_over: f32,
     pct: Txt,

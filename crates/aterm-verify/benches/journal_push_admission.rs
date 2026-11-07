@@ -2,7 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! Manual native admission measurement. Build this and the agh helper with `--profile opt-test`.
-//! Arguments: the source checkout, built agh helper and optional `history` comparison.
+//! Arguments: the source checkout, built agh helper and optional `history` or
+//! `history-connectivity` comparison.
 //! All remotes and tokens are fixtures.
 
 #[cfg(all(unix, debug_assertions))]
@@ -16,9 +17,10 @@ mod native {
     use agh_fake::{FakeGithub, RepoSpec};
     use aterm_json::json;
     use std::error::Error;
+    use std::ffi::OsString;
     use std::os::unix::fs::MetadataExt as _;
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex, PoisonError};
     use std::time::{Duration, Instant};
 
     const REF: &str = "refs/aterm/judged";
@@ -143,15 +145,33 @@ mod native {
         remote: PathBuf,
     }
 
+    struct ConnectivityCommand {
+        program: PathBuf,
+        args: Vec<OsString>,
+    }
+
+    #[derive(Default)]
+    struct ConnectivitySpan {
+        began: Option<Instant>,
+        wall: Option<Duration>,
+        child_success: bool,
+        calls: usize,
+    }
+
+    type ConnectivityProbe = Arc<Mutex<ConnectivitySpan>>;
+
     impl Fixture {
         fn client(&self) -> Result<Github, Box<dyn Error>> {
+            self.client_with_fx(agh::Fx::simulated(agh::Fx::live().wall_secs()?))
+        }
+
+        fn client_with_fx(&self, fx: agh::Fx) -> Result<Github, Box<dyn Error>> {
             let env = ["PATH", "USER", "LOGNAME"]
                 .into_iter()
                 .fold(MapEnv::new(), |env, key| {
                     std::env::var(key).map_or(env.clone(), |value| env.with(key, &value))
                 });
             let ports = self.fake.ports();
-            let start = agh::Fx::live().wall_secs()?;
             Ok(GithubBuilder::new(self.router.clone())
                 .transport(Arc::new(agh::wire::http::HttpTransport::direct(Arc::new(
                     env.clone(),
@@ -163,7 +183,7 @@ mod native {
                     ports.cdn,
                 ))
                 .env(Arc::new(env))
-                .fx(Arc::new(agh::Fx::simulated(start)))
+                .fx(Arc::new(fx))
                 .caller("journal-admission-benchmark")
                 .retry(agh::retry::RetryPolicy::NONE)
                 .journal(self.dirs.clone())
@@ -174,6 +194,44 @@ mod native {
                 .git_remote_for_tests(SLUG, &self.remote)
                 .build())
         }
+
+        fn connectivity_client(
+            &self,
+            command: &ConnectivityCommand,
+            calibration_after: &str,
+            after: &str,
+        ) -> Result<(Github, ConnectivityProbe), Box<dyn Error>> {
+            let mut args = command.args.clone();
+            let mut replacements = 0;
+            for arg in &mut args {
+                if arg.as_os_str() == std::ffi::OsStr::new(calibration_after) {
+                    *arg = after.into();
+                    replacements += 1;
+                }
+            }
+            assert_eq!(replacements, 1, "one exact connectivity root is replaced");
+            let span = Arc::new(Mutex::new(ConnectivitySpan::default()));
+            let before = Arc::clone(&span);
+            let after = Arc::clone(&span);
+            let fx = agh::Fx::simulated(agh::Fx::live().wall_secs()?)
+                .with_git_intercept_once_for_tests(
+                    command.program.clone(),
+                    args,
+                    move || {
+                        let mut span = before.lock().unwrap_or_else(PoisonError::into_inner);
+                        span.calls += 1;
+                        span.began = Some(Instant::now());
+                    },
+                    move |result| {
+                        let mut span = after.lock().unwrap_or_else(PoisonError::into_inner);
+                        if let Some(began) = span.began.take() {
+                            span.wall = Some(began.elapsed());
+                        }
+                        span.child_success = result.as_ref().is_ok_and(|out| out.code == Some(0));
+                    },
+                );
+            Ok((self.client_with_fx(fx)?, span))
+        }
     }
 
     pub(super) fn run() -> Result<(), Box<dyn Error>> {
@@ -181,10 +239,13 @@ mod native {
             .skip(1)
             .filter(|a| a != "--bench")
             .collect();
-        if !(args.len() == 2 || (args.len() == 3 && args[2] == "history")) {
-            return Err("usage: journal_push_admission SOURCE_CHECKOUT AGH_HELPER [history] (build both with --profile opt-test)".into());
+        if !(args.len() == 2
+            || (args.len() == 3 && (args[2] == "history" || args[2] == "history-connectivity")))
+        {
+            return Err("usage: journal_push_admission SOURCE_CHECKOUT AGH_HELPER [history|history-connectivity] (build both with --profile opt-test)".into());
         }
         let history = args.len() == 3;
+        let connectivity = args.len() == 3 && args[2] == "history-connectivity";
         let source = std::fs::canonicalize(&args[0])?;
         let helper = std::fs::canonicalize(&args[1])?;
         let source_head = git(&source, &["rev-parse", "HEAD"])?;
@@ -350,7 +411,13 @@ mod native {
         } else {
             json!(null)
         };
-        let comparison = if history { "history" } else { "inventory" };
+        let comparison = if connectivity {
+            "history_connectivity"
+        } else if history {
+            "history"
+        } else {
+            "inventory"
+        };
         let subjects = if let Some(history_batch) = &history_batch {
             [
                 ("journal", &full, &batch),
@@ -359,12 +426,43 @@ mod native {
         } else {
             [("full", &full, &batch), ("journal", &journal, &batch)]
         };
+        let connectivity_command = if connectivity {
+            let client = fixture.client()?;
+            let permit = client
+                .router()
+                .permit(
+                    &RouteRequest::write(RouteTarget::Repo(slug.clone())),
+                    &|_| agh::policy::Presence::Present,
+                )
+                .map_err(|e| format!("fixture permit: {e:?}"))?;
+            client.refs(&slug).check_push(&permit, &full, &batch)?;
+            // Keep only this fixed local command, never publish a ChildSpec or its environment.
+            let commands = client.fx().children_run();
+            let selected: Vec<_> = commands
+                .iter()
+                .filter(|command| command.args.iter().any(|arg| arg == "--connectivity-only"))
+                .collect();
+            assert_eq!(selected.len(), 1, "one connectivity child in calibration");
+            println!("journal_admission_calibration: one_untimed_tiny_journal_call");
+            Some(ConnectivityCommand {
+                program: selected[0].program.clone(),
+                args: selected[0].args.clone(),
+            })
+        } else {
+            None
+        };
         println!(
             "journal_admission_metadata: {}",
-            json!({"comparison":comparison,"source_head":source_head,"before":before,"after":after,"journal_records":64,"journal_commits":git(&full,&["rev-list","--count",&after])?,"history":history_metadata,"full_store":git(&full,&["count-objects","-v"] )?,"journal_store":git(&journal,&["count-objects","-v"] )?,"profile":"opt-test: opt3, debug assertions, no LTO,16CGU","clock":"real Instant wall, not SDK simulated clock","scope":"isolated loopback/local-remote fixtures; dry-run only; source checkout is read-only input; no operator GitHub/vault write or installed-release latency claim"})
+            json!({"comparison":comparison,"source_head":source_head,"before":before,"after":after,"journal_records":64,"journal_commits":git(&full,&["rev-list","--count",&after])?,"history":history_metadata,"connectivity_calibration_calls":usize::from(connectivity),"full_store":git(&full,&["count-objects","-v"] )?,"journal_store":git(&journal,&["count-objects","-v"] )?,"profile":"opt-test: opt3, debug assertions, no LTO,16CGU","clock":"real Instant wall, not SDK simulated clock","scope":"isolated loopback/local-remote fixtures; dry-run only; source checkout is read-only input; no operator GitHub/vault write or installed-release latency claim"})
         );
         let reused = fixture.client()?;
-        for phase in ["fresh_client", "reused_client"] {
+        let phases: &[&str] = if connectivity {
+            &["fresh_client"]
+        } else {
+            &["fresh_client", "reused_client"]
+        };
+        let samples = if connectivity { 6 } else { 3 };
+        for &phase in phases {
             if phase == "reused_client" {
                 let permit = reused
                     .router()
@@ -378,17 +476,24 @@ mod native {
                 }
                 println!("journal_admission_warmup: both_cases_before_reused_client_samples");
             }
-            for sample in 0..3 {
+            for sample in 0..samples {
                 let order = if sample % 2 == 0 {
                     subjects
                 } else {
                     [subjects[1], subjects[0]]
                 };
                 for (position, (variant, store, batch)) in order.into_iter().enumerate() {
-                    let fresh = if phase == "fresh_client" {
-                        Some(fixture.client()?)
+                    let (fresh, probe) = if let Some(command) = &connectivity_command {
+                        let (client, span) = fixture.connectivity_client(
+                            command,
+                            &after,
+                            &batch.updates()[0].after,
+                        )?;
+                        (Some(client), Some(span))
+                    } else if phase == "fresh_client" {
+                        (Some(fixture.client()?), None)
                     } else {
-                        None
+                        (None, None)
                     };
                     let client = fresh.as_ref().unwrap_or(&reused);
                     let permit = client
@@ -401,11 +506,27 @@ mod native {
                     let began = Instant::now();
                     let result = client.refs(&slug).check_push(&permit, store, batch);
                     let elapsed = began.elapsed().as_nanos();
+                    let (connectivity_span, probe_valid) = if let Some(span) = probe {
+                        let span = span.lock().unwrap_or_else(PoisonError::into_inner);
+                        let wall = span.wall.map(|d| d.as_nanos());
+                        let outside = wall.and_then(|wall| elapsed.checked_sub(wall));
+                        let valid = span.calls == 1 && outside.is_some() && span.child_success;
+                        (
+                            json!({"step":"connectivity","wall_ns":wall,"outside_child_ns":outside,"child_success":span.child_success,"calls":span.calls}),
+                            valid,
+                        )
+                    } else {
+                        (json!(null), true)
+                    };
                     println!(
                         "journal_admission_sample: {}",
-                        json!({"comparison":comparison,"phase":phase,"sample":sample,"position":position,"variant":variant,"wall_ns":elapsed,"ok":result.is_ok(),"error":result.as_ref().err().map(|e|format!("{:?}: {}",e.kind,e.why))})
+                        json!({"comparison":comparison,"phase":phase,"sample":sample,"position":position,"variant":variant,"wall_ns":elapsed,"connectivity":connectivity_span,"ok":result.is_ok(),"error":result.as_ref().err().map(|e|format!("{:?}: {}",e.kind,e.why))})
                     );
                     result?;
+                    assert!(
+                        probe_valid,
+                        "one completed real child span is contained by the whole call"
+                    );
                 }
             }
         }

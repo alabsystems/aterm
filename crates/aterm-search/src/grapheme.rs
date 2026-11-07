@@ -494,45 +494,110 @@ impl ColumnMap {
     }
 }
 
-/// Lowered-byte-to-original-byte offset map for case-insensitive search.
-pub(crate) struct LowerByteMap {
-    /// (lower_byte_offset, original_byte_offset) pairs at char boundaries,
-    /// sorted by lower_byte_offset.
-    entries: Vec<(usize, usize)>,
+/// Translate monotone lowered-byte offsets, rounding up to an original character boundary.
+/// Each source character is visited at most once, with no heap storage.
+#[derive(Clone)]
+struct LowerByteCursor<'a, const REV: bool> {
+    remaining: std::str::Chars<'a>,
+    lower: usize,
+    original: usize,
+    /// A reverse visit may stop inside this character's lowered expansion.
+    pending: Option<(usize, usize)>,
 }
 
-impl LowerByteMap {
-    /// Build a lower-byte map from `original` in O(C).
-    pub fn new(original: &str) -> Self {
-        let mut entries = Vec::new();
-        let mut orig_offset: usize = 0;
-        let mut low_offset: usize = 0;
-        for ch in original.chars() {
-            entries.push((low_offset, orig_offset));
-            let orig_len = ch.len_utf8();
-            let low_len: usize = lower_fold_char(ch).map(|c| c.len_utf8()).sum();
-            orig_offset = orig_offset.saturating_add(orig_len);
-            low_offset = low_offset.saturating_add(low_len);
+/// Independent endpoint cursors, sharing progress across gaps between matches.
+pub(crate) struct LowerByteCursors<'a, const REV: bool> {
+    start: LowerByteCursor<'a, REV>,
+    end: LowerByteCursor<'a, REV>,
+}
+
+impl<'a, const REV: bool> LowerByteCursors<'a, REV> {
+    /// `lower_len` is the byte length of the already folded source.
+    pub fn new(original: &'a str, lower_len: usize) -> Self {
+        let start = LowerByteCursor::new(original, lower_len);
+        Self {
+            end: start.clone(),
+            start,
         }
-        entries.push((low_offset, orig_offset));
-        Self { entries }
     }
 
-    /// Map `lower_byte` to the corresponding byte offset in the original text in O(log C).
-    #[inline]
-    #[must_use]
-    pub fn map_to_original(&self, lower_byte: usize) -> usize {
-        let total = self.entries.last().map_or(0, |&(_, orig)| orig);
-        match self
-            .entries
-            .binary_search_by_key(&lower_byte, |&(lo, _)| lo)
-        {
-            Ok(idx) => self.entries.get(idx).map_or(total, |&(_, orig)| orig),
-            Err(idx) if idx < self.entries.len() => {
-                self.entries.get(idx).map_or(total, |&(_, orig)| orig)
+    /// Starts and ends must each follow the selected order. They can interleave
+    /// across overlapping matches, so only copy progress toward the next endpoint.
+    pub fn span(&mut self, start: usize, end: usize) -> (usize, usize) {
+        if REV {
+            let end = self.end.map_to_original(end);
+            if self.end.lower < self.start.lower {
+                self.start = self.end.clone();
             }
-            Err(_) => total,
+            (self.start.map_to_original(start), end)
+        } else {
+            let start = self.start.map_to_original(start);
+            if self.start.lower > self.end.lower {
+                self.end = self.start.clone();
+            }
+            (start, self.end.map_to_original(end))
         }
+    }
+}
+
+impl<'a, const REV: bool> LowerByteCursor<'a, REV> {
+    /// Offsets passed to [`Self::map_to_original`] follow the selected direction;
+    /// repeated offsets are allowed.
+    fn new(original: &'a str, lower_len: usize) -> Self {
+        Self {
+            remaining: original.chars(),
+            lower: if REV { lower_len } else { 0 },
+            original: if REV { original.len() } else { 0 },
+            pending: None,
+        }
+    }
+
+    /// Translate the next offset in the selected order; offsets past the end clamp to it.
+    fn map_to_original(&mut self, lower_byte: usize) -> usize {
+        if !REV {
+            if self.lower >= lower_byte {
+                return self.original;
+            }
+            for ch in self.remaining.by_ref() {
+                self.lower = self.lower.saturating_add(lower_byte_len(ch));
+                self.original = self.original.saturating_add(ch.len_utf8());
+                if self.lower >= lower_byte {
+                    break;
+                }
+            }
+            return self.original;
+        }
+        loop {
+            let (original_len, lower_len) = match self.pending {
+                Some(ready) => ready,
+                None => {
+                    let next = self.remaining.next_back();
+                    let Some(ch) = next else {
+                        return self.original;
+                    };
+                    let ready = (ch.len_utf8(), lower_byte_len(ch));
+                    self.pending = Some(ready);
+                    ready
+                }
+            };
+            let previous = self.lower.saturating_sub(lower_len);
+            if previous < lower_byte {
+                return self.original;
+            }
+            self.lower = previous;
+            self.original = self.original.saturating_sub(original_len);
+            self.pending = None;
+        }
+    }
+}
+
+/// ASCII lowercasing always preserves its one-byte width.
+#[inline]
+fn lower_byte_len(ch: char) -> usize {
+    if ch.is_ascii() {
+        1
+    } else {
+        lower_fold_char(ch).map(char::len_utf8).sum()
     }
 }
 
@@ -565,7 +630,8 @@ mod tests {
     use aterm_grapheme::{GridColumns, GridStep, grid_graphemes_with};
 
     use super::{
-        ColumnMap, LowerByteMap, byte_to_column, display_columns, map_lower_byte_to_original,
+        ColumnMap, LowerByteCursor, LowerByteCursors, byte_to_column, display_columns,
+        map_lower_byte_to_original,
     };
     use crate::cells::LineCells;
 
@@ -878,11 +944,11 @@ mod tests {
         }
     }
 
-    /// `LowerByteMap` maps every lowered byte offset back as the O(C) scan
+    /// The cursors map every lowered byte offset back as the independent O(C) scan
     /// `map_lower_byte_to_original` does, including the Kelvin sign (3 bytes
     /// lowered to 1), Greek, CJK, the empty line and a long mixed line.
     #[test]
-    fn lower_byte_map_matches_map_lower_byte_to_original() {
+    fn lower_byte_cursors_match_the_scalar_oracle_in_both_orders() {
         let long: String = "Hello日本語World".chars().cycle().take(100).collect();
         let texts = [
             "Hello World Test",
@@ -892,16 +958,62 @@ mod tests {
             "ΔΕΛΤΑ",
             "日本語ABC",
             "",
+            "İx\u{301}ΣςK👩🏽‍💻",
             long.as_str(),
         ];
         for text in texts {
-            let map = LowerByteMap::new(text);
-            for offset in 0..=text.to_lowercase().len() {
+            let len = super::lower_fold(text).len();
+            let mut forward = LowerByteCursor::<false>::new(text, len);
+            let mut backward = LowerByteCursor::<true>::new(text, len);
+            for offset in 0..=len + 2 {
                 assert_eq!(
-                    map.map_to_original(offset),
+                    forward.map_to_original(offset),
                     map_lower_byte_to_original(text, offset),
                     "{text:?} at lower offset {offset}"
                 );
+            }
+            for offset in (0..=len + 2).rev() {
+                assert_eq!(
+                    backward.map_to_original(offset),
+                    map_lower_byte_to_original(text, offset)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn paired_cursors_keep_overlaps_gaps_and_expansions_in_both_orders() {
+        for text in ["", "abc", "İaKΣςe\u{301}日本👩🏽‍💻", "long gap before a match"]
+        {
+            let len = super::lower_fold(text).len();
+            for width in 0..=len + 2 {
+                for step in [1, 3, 17] {
+                    let mut forward = LowerByteCursors::<false>::new(text, len);
+                    let mut backward = LowerByteCursors::<true>::new(text, len);
+                    let starts: Vec<_> = (0..=len + 2).step_by(step).collect();
+                    for &start in &starts {
+                        let end = start + width;
+                        assert_eq!(
+                            forward.span(start, end),
+                            (
+                                map_lower_byte_to_original(text, start),
+                                map_lower_byte_to_original(text, end)
+                            ),
+                            "forward {text:?} {start}..{end}"
+                        );
+                    }
+                    for &start in starts.iter().rev() {
+                        let end = start + width;
+                        assert_eq!(
+                            backward.span(start, end),
+                            (
+                                map_lower_byte_to_original(text, start),
+                                map_lower_byte_to_original(text, end)
+                            ),
+                            "backward {text:?} {start}..{end}"
+                        );
+                    }
+                }
             }
         }
     }

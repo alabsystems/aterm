@@ -174,7 +174,7 @@ fn quit_then_drop_hangs_up_a_session_only_once() {
     session.master = master.as_raw_fd();
     session.pid = child.pid;
     session.shell_identity = aterm_pty::record_spawned_shell(child.pid);
-    let hold = aterm_pty::hold_reap_kills_for_test();
+    let hold = aterm_pty::hold_reap_kills_for_test(child.pid);
     session.hang_up_and_reap(false);
     while !count.exists() && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(5));

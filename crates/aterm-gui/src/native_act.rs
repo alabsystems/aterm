@@ -3111,7 +3111,7 @@ fn serve_launcher_step(
                 let Some(seed) = forward.encode() else {
                     return DENIED.into();
                 };
-                let Some(intent) = intent.encode() else {
+                let Some(intent) = intent.encode_for_launcher() else {
                     return DENIED.into();
                 };
                 return format!(

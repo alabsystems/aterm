@@ -438,3 +438,24 @@ fn the_shared_relations_read_every_spelling() {
         Some(p("/private/TMP/x"))
     );
 }
+
+/// A path's place inside an ancestor reads in the ancestor's walk whatever the spelling: folded
+/// case on APFS and the data volume's firmlinked form, and not at all outside it.
+#[test]
+fn a_path_inside_a_root_is_read_relative_to_it_in_either_spelling() {
+    let rel = |p: &str, r: &str, fold: bool| crate::rel_within(Path::new(p), Path::new(r), fold);
+    assert_eq!(
+        rel("/Users//a/src/aterm/crates", "/Users//a/SRC", true),
+        Some(PathBuf::from("aterm/crates"))
+    );
+    assert_eq!(rel("/Users//a/src/aterm", "/Users//a/SRC", false), None);
+    assert_eq!(
+        rel("/System/Volumes/Data/Users//a/src/x", "/Users//a/src", true),
+        Some(PathBuf::from("x"))
+    );
+    assert_eq!(
+        rel("/Users//a/src", "/Users//a/src", true),
+        Some(PathBuf::new())
+    );
+    assert_eq!(rel("/Users//a/srcs", "/Users//a/src", true), None);
+}

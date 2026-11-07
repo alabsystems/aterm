@@ -3418,6 +3418,8 @@ pub fn run_workstation_selected(
 /// profile lock and checks its exact-run Stop before each item, including this process's Stop.
 /// A requested service absent from the model or mapping census stays retryable; each one must
 /// be observed, including services whose explicit settings are intentionally left alone.
+/// `invalidate` retires an older whole-Caps reading before a setter, or when this
+/// attachment-only pass cannot preserve it. It supplies no positive observation.
 ///
 /// # Errors
 /// Console identity, input observations or the local change journal cannot be resolved.
@@ -3426,52 +3428,109 @@ pub fn activate_keyboard_attachments(
     registries: &[u64],
     kept: &dyn Fn(&str) -> bool,
     continues: &dyn Fn() -> bool,
+    invalidate: &dyn Fn(),
 ) -> Result<bool, String> {
-    let mut selected = Selection::none();
-    selected.set(Setting::CapsLock, true);
-    let (ctx, unread) = context_reading_with(
-        sys,
-        WorkstationGroup::InputActivation,
-        selected,
-        KeyboardServices::Attachments,
-    )?;
-    if let Some(why) = unread.unread {
-        return Err(why);
+    struct BeforeChange<'a> {
+        inner: &'a mut dyn Journal,
+        invalidate: &'a dyn Fn(),
     }
-    if ctx.console.is_none() {
-        return Err(outside_console_session(sys));
+    impl Journal for BeforeChange<'_> {
+        fn before_change(
+            &mut self,
+            id: &str,
+            from: &str,
+            to: &str,
+            revert: Option<&str>,
+        ) -> Result<(), String> {
+            self.inner.before_change(id, from, to, revert)?;
+            (self.invalidate)();
+            Ok(())
+        }
+
+        fn failed(&mut self, id: &str, why: &str) -> Result<(), String> {
+            self.inner.failed(id, why)
+        }
     }
-    let items = crate::init_preferences::attachment_items(&ctx, registries)?;
-    let mut journal = sys.journal()?;
-    let mut ready = true;
-    let mut covered = crate::facts::KeyboardCoverage::default();
-    for item in &items {
-        if !continues() {
-            return Ok(false);
+    let invalidated = std::cell::Cell::new(false);
+    let invalidate_once = || {
+        if !invalidated.replace(true) {
+            invalidate();
         }
-        if kept(&item.id()) {
-            covered.include(item.inspect_kept(sys)?);
-            continue;
-        }
-        let bound = crate::engine::bind(
-            [(
-                item as &dyn Item,
-                crate::engine::Place::fleet(item.family(), aterm_converge::Remedy::None),
-            )],
+    };
+    let result = (|| {
+        let mut selected = Selection::none();
+        selected.set(Setting::CapsLock, true);
+        let (ctx, unread) = context_reading_with(
             sys,
-            &ctx,
-        );
-        let rows = aterm_converge::run_with(&bound, Mode::Apply, journal.as_mut(), &mut |_| {})
+            WorkstationGroup::InputActivation,
+            selected,
+            KeyboardServices::Attachments,
+        )?;
+        if let Some(why) = unread.unread {
+            return Err(why);
+        }
+        if ctx.console.is_none() {
+            return Err(outside_console_session(sys));
+        }
+        let items = crate::init_preferences::attachment_items(&ctx, registries)?;
+        let mut journal = sys.journal()?;
+        let mut journal = BeforeChange {
+            inner: journal.as_mut(),
+            invalidate: &invalidate_once,
+        };
+        let mut ready = true;
+        let mut covered = crate::facts::KeyboardCoverage::default();
+        for item in &items {
+            if !continues() {
+                return Ok(false);
+            }
+            if kept(&item.id()) {
+                let observed = item.inspect_kept(sys)?;
+                if registries
+                    .iter()
+                    .any(|id| observed.covers(std::slice::from_ref(id)))
+                {
+                    invalidate_once();
+                }
+                covered.include(observed);
+                continue;
+            }
+            let bound = crate::engine::bind(
+                [(
+                    item as &dyn Item,
+                    crate::engine::Place::fleet(item.family(), aterm_converge::Remedy::None),
+                )],
+                sys,
+                &ctx,
+            );
+            let rows = aterm_converge::run_with(&bound, Mode::Apply, &mut journal, &mut |row| {
+                let observed = item.observed_services();
+                let relevant = registries
+                    .iter()
+                    .any(|id| observed.covers(std::slice::from_ref(id)));
+                if match row.outcome {
+                    Outcome::Ok => false,
+                    Outcome::NotApplicable => relevant,
+                    _ => true,
+                } {
+                    invalidate_once();
+                }
+            })
             .map_err(|why| why.to_string())?;
-        ready &= rows.iter().all(|row| {
-            matches!(
-                row.outcome,
-                Outcome::Ok | Outcome::Changed | Outcome::NotApplicable
-            )
-        });
-        covered.include(item.observed_services());
+            ready &= rows.iter().all(|row| {
+                matches!(
+                    row.outcome,
+                    Outcome::Ok | Outcome::Changed | Outcome::NotApplicable
+                )
+            });
+            covered.include(item.observed_services());
+        }
+        Ok(ready && covered.covers(registries))
+    })();
+    if !matches!(result, Ok(true)) {
+        invalidate_once();
     }
-    Ok(ready && covered.covers(registries))
+    result
 }
 
 /// A workstation pass whose before-images and apply share one resolved account and item set.
@@ -3484,6 +3543,8 @@ pub struct Workstation {
     snapshots: Option<Vec<Result<PreferenceSnapshot, String>>>,
     /// The items this pass leaves alone ([`Workstation::hold`]), by id.
     held: Vec<(String, Hold)>,
+    /// Canonical preparation scope; manual item collections prove no complete setting.
+    preparation: Option<(WorkstationGroup, Selection)>,
 }
 
 type PreferenceSnapshot = Vec<(Target, Read<PValue>)>;
@@ -3546,6 +3607,13 @@ pub struct Attempt {
 }
 
 impl Workstation {
+    /// The scope recorded by canonical workstation preparation. Manually assembled
+    /// passes have none, so a caller cannot label a partial item set as complete.
+    #[must_use]
+    pub fn prepared_scope(&self) -> Option<(WorkstationGroup, Selection)> {
+        self.preparation
+    }
+
     /// Typed before-images of precisely the preference keys this pass would change.
     ///
     /// # Errors
@@ -3642,6 +3710,7 @@ impl Workstation {
             snapshots: None,
             settings: Vec::new(),
             held: Vec::new(),
+            preparation: None,
         }
     }
 
@@ -3884,6 +3953,7 @@ pub fn prepare_workstation_selected(
     selected: Selection,
 ) -> Result<Workstation, String> {
     let selected = group.selected(selected);
+    let preparation = Some((group, selected));
     if selected.is_empty() {
         return Ok(Workstation {
             ctx: Ctx {
@@ -3898,6 +3968,7 @@ pub fn prepare_workstation_selected(
             settings: Vec::new(),
             snapshots: None,
             held: Vec::new(),
+            preparation,
         });
     }
     let (ctx, keyboards) = context_reading(sys, group, selected)?;
@@ -3933,6 +4004,7 @@ pub fn prepare_workstation_selected(
         settings,
         snapshots: None,
         held: Vec::new(),
+        preparation,
     })
 }
 
@@ -3972,6 +4044,7 @@ pub fn run_initial_spotlight(
         settings: Vec::new(),
         snapshots: None,
         held: Vec::new(),
+        preparation: None,
     }
     .run(sys, mode)
 }
@@ -6725,6 +6798,7 @@ mod tests {
             snapshots: None,
             settings: Vec::new(),
             held: Vec::new(),
+            preparation: None,
         };
         let rows = pass.run_recording(&sys, Mode::Apply).unwrap().rows;
         assert_eq!(rows[0].outcome, Outcome::Changed, "{rows:?}");
@@ -6847,6 +6921,7 @@ mod tests {
             snapshots: None,
             settings: Vec::new(),
             held: Vec::new(),
+            preparation: None,
         };
         pass.hold(&[("init.test.dock".into(), Hold::Back("held".into()))]);
         let before = pass.preference_changes(&Fake::root()).unwrap();
@@ -6900,6 +6975,7 @@ mod tests {
             settings: Vec::new(),
             snapshots: None,
             held: Vec::new(),
+            preparation: None,
         };
         let sys = Fake::root();
         let before = pass.preference_changes(&sys).unwrap();
@@ -6968,6 +7044,7 @@ mod tests {
             snapshots: None,
             settings: Vec::new(),
             held: Vec::new(),
+            preparation: None,
         };
         pass.hold(&[
             (
@@ -7040,6 +7117,7 @@ mod tests {
             snapshots: None,
             settings: Vec::new(),
             held: Vec::new(),
+            preparation: None,
         };
         let run = pass.run_recording(&sys, Mode::Apply).unwrap();
         let row = run
@@ -7360,6 +7438,7 @@ mod tests {
                 settings: Vec::new(),
                 snapshots: None,
                 held: Vec::new(),
+                preparation: None,
             };
             pass.preference_changes(&sys).unwrap();
             let recording = pass
@@ -7402,6 +7481,7 @@ mod tests {
             settings: Vec::new(),
             snapshots: None,
             held: Vec::new(),
+            preparation: None,
         };
         assert_eq!(pass.preference_changes(&sys).unwrap().len(), 1);
         let recording = pass
@@ -7441,6 +7521,7 @@ mod tests {
             settings: Vec::new(),
             snapshots: None,
             held: Vec::new(),
+            preparation: None,
         };
         assert!(
             pass.preference_changes(&sys)
@@ -8234,9 +8315,17 @@ mod tests {
     #[test]
     fn attachment_activation_does_not_settle_an_unseen_requested_service() {
         let sys = alice_at(501);
+        let invalidated = std::cell::Cell::new(0);
         assert!(
-            !activate_keyboard_attachments(&sys, &[41], &|_| false, &|| true).unwrap(),
+            !activate_keyboard_attachments(&sys, &[41], &|_| false, &|| true, &|| invalidated
+                .set(invalidated.get() + 1))
+            .unwrap(),
             "a native service missing from the separate model census remains retryable"
+        );
+        assert_eq!(
+            invalidated.get(),
+            1,
+            "uncertain coverage retires an older reading once"
         );
         assert!(sys.keyboard_changes().is_empty());
     }
@@ -8266,7 +8355,8 @@ mod tests {
         );
         assert_eq!(sys.keyboard_service_ids().unwrap(), [41]);
         assert!(
-            !activate_keyboard_attachments(&sys, &[41], &|_| false, &|| true).unwrap_or(false),
+            !activate_keyboard_attachments(&sys, &[41], &|_| false, &|| true, &|| {})
+                .unwrap_or(false),
             "attachment activation still owes the service absent from the model census"
         );
 
@@ -8514,11 +8604,25 @@ mod tests {
             &get.display(),
             Ran::ok("RegistryID Key Value\n29 UserKeyMapping (null)\n"),
         );
-        assert!(activate_keyboard_attachments(&sys, &[41], &|_| true, &|| true).unwrap());
+        let invalidated = std::cell::Cell::new(0);
         assert!(
-            !activate_keyboard_attachments(&sys, &[41, 42], &|_| true, &|| true).unwrap(),
+            activate_keyboard_attachments(&sys, &[41], &|_| true, &|| true, &|| invalidated
+                .set(invalidated.get() + 1))
+            .unwrap()
+        );
+        assert_eq!(
+            invalidated.get(),
+            1,
+            "kept requested coverage is no whole-Caps proof"
+        );
+        invalidated.set(0);
+        assert!(
+            !activate_keyboard_attachments(&sys, &[41, 42], &|_| true, &|| true, &|| invalidated
+                .set(invalidated.get() + 1))
+            .unwrap(),
             "an observed held model cannot cover an unseen requested service"
         );
+        assert_eq!(invalidated.get(), 1, "kept and uncertain coverage coalesce");
         assert!(sys.keyboard_changes().is_empty());
         assert!(
             sys.calls()

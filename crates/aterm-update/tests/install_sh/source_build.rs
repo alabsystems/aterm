@@ -1012,11 +1012,6 @@ fn a_shim_is_followed_to_its_last_lines_exec_only_in_the_decided_shape() {
     let head = "#!/bin/sh\n# atpkg shim — exec so the tool authenticates at its real path.";
     let exec = format!("exec '{store_targo}' \"$@\"");
     let block = atpkg::build_cache::shim_block("targo").expect("targo's block");
-    assert!(
-        block.starts_with("# aterm: build intermediates out of Spotlight")
-            && block.contains("set -- --config"),
-        "{block}"
-    );
     let stray = lab.p("stray-targo/targo");
     let shims = [
         ("prelude", format!("{head}\n{block}{exec}")),

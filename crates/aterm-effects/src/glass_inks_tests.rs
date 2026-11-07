@@ -227,10 +227,18 @@ fn hue_is_a_function_of_the_column() {
     for palette in PALETTES {
         let one = GlassInks::of(palette, night.ground, night.ink, 0x0088_8888);
         let again = GlassInks::solve(one.key());
+        let unmasked = GlassInks::solve(GlassKey {
+            palette,
+            ground: 0xFF00_0000 | night.ground,
+            ink: 0xFF00_0000 | night.ink,
+            rule: 0xFF88_8888,
+        });
+        assert_eq!(unmasked, one, "{palette:?}: solve masks 0x00RRGGBB");
         for col in 0..100 {
             let t = field(col, 100);
             for (a, b) in [
                 (one.rule(t), again.rule(t)),
+                (one.rule(t), unmasked.rule(t)),
                 (one.letter(t), again.letter(t)),
                 (one.mark(t), again.mark(t)),
                 (one.hero(t), again.hero(t)),
@@ -239,6 +247,25 @@ fn hue_is_a_function_of_the_column() {
             }
         }
     }
+    let collision_rule = {
+        let lifted = mix_rgb(
+            CardPalette::Cruise.art(1.0, dark_ground(night.ground)),
+            night.ink,
+            RULE_TOWARD_INK,
+        );
+        mix_rgb(0x0088_8888, lifted, 1.0)
+    };
+    let unmasked_collision = GlassInks::solve(GlassKey {
+        palette: Some(CardPalette::Cruise),
+        ground: 0xFF00_0000 | night.ground,
+        ink: 0xFF00_0000 | night.ink,
+        rule: 0xFF00_0000 | collision_rule,
+    });
+    assert_ne!(
+        unmasked_collision.rule(1.0),
+        collision_rule,
+        "a tinted rule never lands on the grid's own rule grey, even from an unmasked GlassKey"
+    );
     let cruise = GlassInks::of(
         Some(CardPalette::Cruise),
         night.ground,

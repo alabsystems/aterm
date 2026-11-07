@@ -411,16 +411,44 @@ fn end_row(pid: i32, hold: ReapKillHold<'_>) {
 #[test]
 fn overlapping_reap_kill_holds_last_until_every_guard_is_dropped() {
     let holds = ReapKillHolds::new();
-    let first = holds.hold();
-    let second = holds.hold();
-    assert!(holds.held());
+    let first = holds.hold(7);
+    let second = holds.hold(7);
+    assert!(holds.held(7));
     drop(first);
     assert!(
-        holds.held(),
+        holds.held(7),
         "one caller cannot release another caller's hold"
     );
     drop(second);
-    assert!(!holds.held(), "the final guard releases the hold");
+    assert!(!holds.held(7), "the final guard releases the hold");
+}
+
+/// A hold keeps only its own shell's reap: a shell nobody holds is killed at its holdout tick
+/// while another shell's hold lives. A reap that waited for it would wait until the hang
+/// detector let the other hold go.
+#[test]
+fn a_hold_on_another_shell_keeps_no_reap_of_this_one() {
+    let holds = ReapKillHolds::new();
+    let _other = holds.hold(7);
+    assert!(!holds.held(8), "a hold on one shell holds another's reap");
+    let other = hold_reap_kills_for_test(i32::MAX);
+    let (reaped, reaped_rx) = std::sync::mpsc::channel::<()>();
+    let detector = std::thread::spawn(move || {
+        let let_go = reaped_rx.recv_timeout(HANG_DETECTOR).is_err();
+        drop(other);
+        let_go
+    });
+    let (_, kill_tick) = hang_up_and_force_kill("trap '' HUP; printf 'UP\\n'; exec sleep 600");
+    let _ = reaped.send(());
+    assert!(
+        !detector.join().expect("the detector ends"),
+        "the reap was held until the hang detector let another shell's hold go"
+    );
+    assert_eq!(
+        kill_tick,
+        Some(REAP_KILL_AT),
+        "the holdout is SIGKILLed at its holdout tick"
+    );
 }
 
 /// Mid-handler, the master's close is end of file and no second hang-up: a `cat` the HUP trap runs
@@ -433,13 +461,13 @@ fn overlapping_reap_kill_holds_last_until_every_guard_is_dropped() {
 #[test]
 fn the_terminals_close_mid_handler_is_end_of_file_and_no_hang_up() {
     let scratch = aterm_tempfile::tempdir().expect("scratch");
-    let hold = hold_reap_kills_for_test();
     let entered = scratch.path().join("zsh-trap.entered");
     let marker = scratch.path().join("zsh-trap.done");
     let work = format!("print entered > {}; cat > /dev/null", entered.display());
     let (script, rc, text) = handler_row(scratch.path(), "zsh-trap", &work, &marker);
     std::fs::write(rc, text).expect("the rc file");
     let sh = parked_session(&script);
+    let hold = hold_reap_kills_for_test(sh.pid);
     let identity = record_spawned_shell(sh.pid);
     assert!(identity.verify(), "the live leader verifies");
     let hung = hangup_and_reap_shell(identity, sh.master).expect("teardown starts");
@@ -476,7 +504,6 @@ fn a_foreground_jobs_write_back_mid_handler_is_undone_before_the_close() {
     use std::os::fd::AsRawFd as _;
     let scratch = aterm_tempfile::tempdir().expect("scratch");
     for name in ["zsh-zshexit", "bash-exit-trap"] {
-        let hold = hold_reap_kills_for_test();
         let (gate_path, gate) = gate_fifo(scratch.path(), name);
         let (open_path, open_gate) = gate_fifo(scratch.path(), &format!("{name}-open"));
         let cleared = scratch.path().join(format!("{name}.cleared"));
@@ -490,6 +517,7 @@ fn a_foreground_jobs_write_back_mid_handler_is_undone_before_the_close() {
         let (script, rc, text) = handler_row(scratch.path(), name, &work, &marker);
         std::fs::write(rc, text).expect("the rc file");
         let sh = parked_session(&script);
+        let hold = hold_reap_kills_for_test(sh.pid);
         let identity = record_spawned_shell(sh.pid);
         assert!(identity.verify(), "the live leader verifies");
         hangup_and_reap_shell(identity, sh.master).expect("teardown starts");
@@ -547,7 +575,6 @@ fn closing_the_original_master_mid_handler_cuts_no_exit_handler() {
     use std::os::unix::ffi::OsStrExt;
     let scratch = aterm_tempfile::tempdir().expect("scratch");
     for name in ["zsh-zshexit", "bash-exit-trap"] {
-        let hold = hold_reap_kills_for_test();
         let gate_path = scratch.path().join(format!("{name}.fifo"));
         let path = std::ffi::CString::new(gate_path.as_os_str().as_bytes()).unwrap();
         // SAFETY: this test creates and owns its FIFO and descriptor.
@@ -565,6 +592,7 @@ fn closing_the_original_master_mid_handler_cuts_no_exit_handler() {
         let (script, rc, text) = handler_row(scratch.path(), name, &work, &marker);
         std::fs::write(rc, text).unwrap();
         let sh = parked_session(&script);
+        let hold = hold_reap_kills_for_test(sh.pid);
         let identity = record_spawned_shell(sh.pid);
         assert!(identity.verify());
         hangup_and_reap_shell(identity, sh.master).expect("teardown starts");

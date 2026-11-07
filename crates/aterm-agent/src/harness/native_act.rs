@@ -58,7 +58,8 @@ struct ColdIntentWire {
     /// carried `stored_login`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     route: Option<super::accounts::AuthRoute>,
-    /// The route as v0.157.0 and older wrote it, read where `route` is absent; never written.
+    /// The route as v0.157.0 and older wrote it, read where `route` is absent.
+    /// Reproduced for receipt identity, replay and captured older readers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stored_login: Option<bool>,
     conversation: Option<String>,
@@ -100,6 +101,32 @@ fn bounded_cold_text(value: &str) -> bool {
 
 impl ColdIntent {
     pub fn encode(&self) -> Option<String> {
+        self.encode_route(Some(self.route), None)
+    }
+
+    /// Encode the intent for the captured launcher, which can predate this host.
+    /// Stored and outside routes have an exact common encoding. Vault tokens
+    /// require the current format; older launchers cannot describe that route.
+    #[must_use]
+    pub fn encode_for_launcher(&self) -> Option<String> {
+        self.encode_legacy().or_else(|| self.encode())
+    }
+
+    fn encode_legacy(&self) -> Option<String> {
+        use super::accounts::AuthRoute;
+        let stored = match self.route {
+            AuthRoute::Stored => true,
+            AuthRoute::Outside => false,
+            AuthRoute::VaultToken { .. } => return None,
+        };
+        self.encode_route(None, Some(stored))
+    }
+
+    fn encode_route(
+        &self,
+        route: Option<super::accounts::AuthRoute>,
+        stored_login: Option<bool>,
+    ) -> Option<String> {
         let profile = match &self.profile {
             None => None,
             Some(p) => Some(ColdProfileWire {
@@ -115,15 +142,15 @@ impl ColdIntent {
             login: self.login.clone(),
             home: self.home.clone(),
             auth_observed: self.auth_observed,
-            route: Some(self.route),
-            stored_login: None,
+            route,
+            stored_login,
             conversation: self.conversation.clone(),
             profile,
             mode: self.mode.as_str().into(),
             billing: self.billing,
         };
         let text = aterm_json::to_string(&wire).ok()?;
-        (text.len() <= MAX_RESUME && Self::parse(&text).is_some()).then_some(text)
+        (text.len() <= MAX_RESUME && Self::parse(&text).as_ref() == Some(self)).then_some(text)
     }
     pub fn parse(text: &str) -> Option<Self> {
         if text.len() > MAX_RESUME {
@@ -1249,6 +1276,44 @@ impl Request {
     /// an invalid request is never partially sent to a control stream.
     #[must_use]
     pub fn encode(&self) -> Option<String> {
+        self.encode_cold(false)
+    }
+
+    /// The exact older spelling of a supported in-flight cold preparation.
+    /// New token routes and settled images had no representation in that protocol.
+    pub(super) fn encode_legacy_cold(&self) -> Option<String> {
+        let Self::Prepare(prepare) = self else {
+            return None;
+        };
+        let NativePlan::Restart {
+            cold: Some(_),
+            forward,
+            rollback,
+            ..
+        } = &prepare.plan
+        else {
+            return None;
+        };
+        let old_command = |command: &RestartCommand| {
+            command.settles.is_none()
+                && !matches!(
+                    command.account_intent.as_deref(),
+                    Some(super::accounts_pool::ExecutionIntent::Token { .. })
+                )
+        };
+        if !old_command(forward) || !rollback.as_deref().is_none_or(old_command) {
+            return None;
+        }
+        self.encode_cold(true)
+    }
+
+    pub(super) fn matches_retained(&self, retained: &str) -> bool {
+        matches!(self, Self::Prepare(_))
+            && (self.encode().as_deref() == Some(retained)
+                || self.encode_legacy_cold().as_deref() == Some(retained))
+    }
+
+    fn encode_cold(&self, legacy_cold: bool) -> Option<String> {
         use std::fmt::Write;
         let mut out = String::new();
         match self {
@@ -1331,10 +1396,15 @@ impl Request {
                         )
                         .ok()?;
                         if let Some(intent) = cold {
+                            let encoded = if legacy_cold {
+                                intent.encode_legacy()?
+                            } else {
+                                intent.encode()?
+                            };
                             write!(
                                 out,
                                 " cold={}",
-                                aterm_codec::hex::encode_lower(intent.encode()?.as_bytes())
+                                aterm_codec::hex::encode_lower(encoded.as_bytes())
                             )
                             .ok()?;
                         }
@@ -1727,6 +1797,34 @@ pub fn exchange<S: std::io::Read + std::io::Write>(
     sid: &str,
     request: &Request,
 ) -> std::io::Result<Reply> {
+    let tail = request.encode().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid native plan")
+    })?;
+    exchange_encoded(client, sid, &tail)
+}
+
+/// Replay only a complete retained preparation with a supported exact encoding.
+/// This preserves an older receiver's wire format without accepting raw commands.
+pub(super) fn exchange_retained<S: std::io::Read + std::io::Write>(
+    client: &mut crate::RelayClient<S>,
+    sid: &str,
+    request: &Request,
+    retained: &str,
+) -> std::io::Result<Reply> {
+    if !request.matches_retained(retained) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid retained native preparation",
+        ));
+    }
+    exchange_encoded(client, sid, retained)
+}
+
+fn exchange_encoded<S: std::io::Read + std::io::Write>(
+    client: &mut crate::RelayClient<S>,
+    sid: &str,
+    tail: &str,
+) -> std::io::Result<Reply> {
     if sid.is_empty()
         || !sid
             .bytes()
@@ -1737,9 +1835,6 @@ pub fn exchange<S: std::io::Read + std::io::Write>(
             "invalid native session",
         ));
     }
-    let tail = request.encode().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid native plan")
-    })?;
     let line = client.request_line(&format!("@{sid} native-act {tail}"))?;
     Reply::parse(&line)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::PermissionDenied, line))
@@ -2142,11 +2237,22 @@ mod cold_wire_tests {
             "the wire as written"
         );
         for (old, route) in [("true", AuthRoute::Stored), ("false", AuthRoute::Outside)] {
-            let read = ColdIntent::parse(&intent(&format!(r#""stored_login":{old},"#)))
-                .unwrap_or_else(|| panic!("stored_login {old} reads"));
+            let legacy = intent(&format!(r#""stored_login":{old},"#));
+            let read =
+                ColdIntent::parse(&legacy).unwrap_or_else(|| panic!("stored_login {old} reads"));
             assert_eq!(read.route, route);
             assert!(!read.encode().unwrap().contains("stored_login"));
+            assert_eq!(read.encode_for_launcher(), Some(legacy));
         }
+        let mut token = ColdIntent::parse(&current).unwrap();
+        token.route = AuthRoute::VaultToken {
+            entry: super::super::accounts::TokenEntry::parse(
+                "aterm-claude-token-ac-0123456789abcdef",
+            )
+            .unwrap(),
+        };
+        assert!(token.encode_legacy().is_none());
+        assert_eq!(token.encode_for_launcher(), token.encode());
         assert!(ColdIntent::parse(&intent("")).is_none());
         assert!(ColdIntent::parse(&intent(r#""route":"outside","stored_login":false,"#)).is_none());
     }

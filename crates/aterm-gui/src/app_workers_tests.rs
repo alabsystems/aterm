@@ -1226,6 +1226,174 @@ fn a_worker_whose_agent_has_gone_keeps_its_agents_name() {
     assert_eq!(title(workers[3]), "release notes", "a pinned title wins");
 }
 
+/// What the shell's integration writes as it shows its prompt in `folder`
+/// (`aterm_shell_integration.zsh`'s precmd): the tab's title, the folder, then the prompt's marks.
+fn prompt_in(folder: &str) -> Vec<u8> {
+    format!("\x1b]0;{folder}\x07\x1b]133;A\x07% \x1b]133;B\x07").into_bytes()
+}
+
+/// What the shell's integration writes as it starts running `line` at its prompt
+/// (`aterm_shell_integration.zsh`'s preexec): the line for OSC 633;E, encoded as
+/// `__aterm_encode_cmd` encodes it, then the tab's title, the line itself.
+fn line_starts(line: &str) -> Vec<u8> {
+    let encoded: String = line
+        .chars()
+        .map(|c| match c {
+            '\\' => "\\\\".to_owned(),
+            ';' => "\\x3b".to_owned(),
+            ' ' => "\\x20".to_owned(),
+            c if c.is_control() => format!("\\x{:02x}", u32::from(c)),
+            c => c.to_string(),
+        })
+        .collect();
+    format!("\x1b]633;E;{encoded}\x07\x1b]0;{line}\x07\x1b]133;C\x07").into_bytes()
+}
+
+/// A WORKER'S TAB IS NAMED BY ITS PROGRAM WHILE ITS SHELL TITLES IT BY THE LAUNCH LINE: a shell
+/// titles its tab by its folder at a prompt and by each line it starts, and a spawn's line opens
+/// with environment words, so a worker's first Autopilot record named it `Workers ▸
+/// CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 'c` (or by its folder, recorded before its line), and its
+/// landing, once Claude Code had titled the tab, `Workers ▸ Claude Code`. Each names it Claude Code
+/// now, a busy terminal's as the strip last read it, and a worker whose shell runs another agent
+/// by the one in front. CONTROLS: a worker whose Claude Code titled the tab by its topic keeps
+/// that title, and a tab on the strip, a kept worker's or a person's, keeps the line its shell
+/// titled it by, as its chip reads, whatever agent the line starts.
+#[test]
+fn a_workers_tab_is_named_by_its_program_while_its_shell_titles_it_by_the_launch_line() {
+    use aterm_agent::supervise::Autopilot;
+    let (mut app, tabs, workers) = app_with(2, 3);
+    let host = crate::harness_host::HostHandle::for_supervised_test(
+        Vec::new(),
+        std::sync::Arc::new(|_| crate::harness_host::BodyEnd::Stopped),
+    );
+    app.harness = Some(host.clone());
+    let launch = " CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 'claude' --permission-mode 'acceptEdits' \
+                  \"$(cat '/private/tmp/lab/w1/task.md')\"";
+    let ctx = |app: &App, session: u64| app.pool.get(session).expect("pooled").ctx.clone();
+    let term = |app: &App, session: u64| app.pool.get(session).expect("pooled").term.clone();
+    let typed = |app: &App, session: u64, bytes: &[u8]| {
+        crate::term_lock(&term(app, session)).process(bytes);
+    };
+    let claude_worker = |app: &App, session: u64| {
+        mark(app, session, TaskState::Working);
+        ctx(app, session)
+            .timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .set_task_worker(aterm_phase::Program::Claude, None);
+    };
+    let in_front = |app: &App, session: u64, program: &str| {
+        let ctx = ctx(app, session);
+        let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        timeline.note_foreground_group(4242);
+        timeline.set_program(4242, Some(program.to_owned()));
+    };
+    let record_land = |app: &mut App, session: u64| {
+        let sid = app.session_id_text(session).expect("a sid");
+        assert!(
+            crate::session_timeline::apply_autopilot(
+                &ctx(app, session),
+                Some("land".to_owned()),
+                None,
+                aterm_slog::Actor::Aterm,
+                None,
+            )
+            .moved
+        );
+        app.on_meta_changed(session);
+        let key = format!("harness.autopilot.{sid}");
+        app.messages
+            .log()
+            .records()
+            .find(|r| r.key.as_deref() == Some(key.as_str()))
+            .map(|r| (r.title.clone(), r.detail.first().cloned()))
+            .expect("the Autopilot record")
+    };
+    let named = (
+        "Autopilot set to land".to_owned(),
+        Some(format!(
+            "Workers \u{25b8} Claude Code: {}",
+            crate::autopilot::mode_words(Autopilot::Land).record
+        )),
+    );
+    for &worker in &workers {
+        claude_worker(&app, worker);
+        typed(&app, worker, &prompt_in("~/proj"));
+    }
+
+    assert_eq!(
+        record_land(&mut app, workers[0]),
+        named,
+        "a worker recorded at its prompt, before its launcher typed its line, is named by its agent"
+    );
+    typed(&app, workers[0], &line_starts(launch));
+    typed(&app, workers[1], &line_starts(launch));
+    assert_eq!(
+        record_land(&mut app, workers[1]),
+        named,
+        "a tab whose title is still the spawn's launch line is named by its program"
+    );
+
+    app.tab_titles(WID);
+    {
+        let busy = term(&app, workers[1]);
+        let _reading = crate::term_lock(&busy);
+        assert_eq!(
+            app.tab_label_of_session(workers[1]),
+            "Claude Code",
+            "a busy terminal's worker is named as the strip last read its title"
+        );
+    }
+
+    typed(&app, workers[0], b"\x1b]0;\xe2\x9c\xb3 Claude Code\x07");
+    let sid = app.session_id_text(workers[0]).expect("a sid");
+    assert_eq!(
+        (app.upgrade_place(&sid), app.session_place(&sid)),
+        (
+            "in Workers \u{25b8} Claude Code".to_owned(),
+            "in Workers \u{25b8} Claude Code".to_owned()
+        ),
+        "the landing's record names the tab Claude Code titled the same"
+    );
+    typed(
+        &app,
+        workers[1],
+        b"\x1b]0;\xe2\x9c\xb3 Fix the tab names\x07",
+    );
+    assert_eq!(
+        app.tab_label_of_session(workers[1]),
+        "Fix the tab names",
+        "CONTROL: Claude Code's own title names its tab"
+    );
+
+    typed(&app, workers[2], &line_starts("codex --model o3"));
+    in_front(&app, workers[2], "codex");
+    assert_eq!(
+        app.tab_label_of_session(workers[2]),
+        "Codex",
+        "the agent in front names a worker's tab before the one its task started"
+    );
+
+    claude_worker(&app, tabs[0]);
+    typed(&app, tabs[0], &prompt_in("~/proj"));
+    typed(&app, tabs[0], &line_starts("make test"));
+    assert_eq!(
+        app.tab_label_of_session(tabs[0]),
+        "make test",
+        "CONTROL: a worker kept as a tab is named as its chip reads"
+    );
+    let line = "codex --model o3 'fix foo'";
+    typed(&app, tabs[1], &prompt_in("~/proj"));
+    typed(&app, tabs[1], &line_starts(line));
+    in_front(&app, tabs[1], "codex");
+    assert_eq!(
+        app.tab_label_of_session(tabs[1]),
+        line,
+        "CONTROL: a person's tab whose line starts an agent is named as its chip reads"
+    );
+    host.shutdown_and_join();
+}
+
 /// A WORKER THAT NEVER STARTED KEEPS ITS AGENT'S NAME: its tab's title is its shell's, a folder
 /// that names no worker, whichever launch step stopped it. NEGATIVE CONTROL: a launch refused for a
 /// sign-in or an install, or stopped by a shutdown, read as a running agent and showed the folder.
@@ -1292,6 +1460,9 @@ fn the_strip_line_pushes_one_tooltip_per_shown_tab_while_workers_are_parked() {
 /// nothing can write those again. CONTROL: past the Commit a quit drops the rows and the files.
 #[test]
 fn a_candidate_that_ends_before_its_commit_leaves_its_predecessors_results() {
+    if !crate::test_alone::alone() {
+        return;
+    }
     let state = aterm_tempfile::tempdir().expect("tempdir");
     crate::test_env::scoped("ATERM_STATE_HOME", state.path(), || {
         let mut app = App::headless_for_test();

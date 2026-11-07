@@ -8,9 +8,9 @@ use crate::history::Filling;
 use crate::jobs::Verdict;
 use crate::model::{
     CapBasis, DiskLevel, HeatCell, LinkKind, MemSample, NetState, NoFigure, Pressure, ProcScope,
-    Resource, ResourceView, RowFacts, ScopeFig, Snapshot, State, VolumeSample,
+    Resource, ResourceView, RowFacts, ScopeFig, Snapshot, State, TaskRoom, VolumeSample,
 };
-use crate::peaks::{NET_LEARN_S, TOKENS_LEARN_S};
+use crate::peaks::{NET_LEARN_S, PROC_LEARN_S, TOKENS_LEARN_S};
 use crate::ring::BUCKET_MS;
 
 /// Noise gate for CPU core-count motion (`0.1` cores).
@@ -664,7 +664,7 @@ pub fn amount_forms(
         Resource::Disk => disk_amount(view, freed_today(facts), ladder),
         Resource::Network => network_amount(view, ladder),
         Resource::Tokens => tokens_amount(view, ladder),
-        Resource::Processes => processes_amount(view, ladder, loc.platform),
+        Resource::Processes => processes_amount(view, facts, ladder, loc.platform),
     }
 }
 
@@ -843,11 +843,54 @@ fn tokens_amount(view: &ResourceView, ladder: Ladder) -> Vec<String> {
     }
 }
 
-fn processes_amount(view: &ResourceView, ladder: Ladder, platform: Platform) -> Vec<String> {
+/// Whether a Processes row reads process starts a second against their 7-day peak (record
+/// §8.1): on every basis but [`CapBasis::Fixed`], which the count against its limit keeps where
+/// no start counter reads (Windows).
+fn proc_starts(view: &ResourceView) -> bool {
+    view.basis != CapBasis::Fixed
+}
+
+/// Starts a second as the deck says them: a tenth under 10 (`0.4`), whole above (`37`).
+fn starts_figure(v: f64) -> String {
+    let v = if v.is_finite() { v.max(0.0) } else { 0.0 };
+    let one = half_up(v * 10.0) / 10.0;
+    if one < 10.0 {
+        format!("{one:.1}")
+    } else {
+        grouped(half_up(v) as u64)
+    }
+}
+
+/// The Processes run where it reads starts: `37 starts/s · 742 running`, then `37/s` (record
+/// §8.1); without a count, `37 starts/s`. Never a limit: the limits are the lens's Room's.
+fn starts_forms(now: f64, room: &TaskRoom) -> Vec<String> {
+    let n = starts_figure(now);
+    let mut forms = match room.procs {
+        Some(p) => vec![format!("{n} starts/s \u{b7} {} running", grouped(p))],
+        None => vec![format!("{n} starts/s")],
+    };
+    forms.push(format!("{n}/s"));
+    forms
+}
+
+fn processes_amount(
+    view: &ResourceView,
+    facts: &RowFacts,
+    ladder: Ladder,
+    platform: Platform,
+) -> Vec<String> {
     let b = view.binding();
     let Some(now) = b.now else {
         return Vec::new();
     };
+    if proc_starts(view) {
+        let forms = starts_forms(now, &facts.room);
+        return match ladder {
+            Ladder::Det => forms[..1].to_vec(),
+            Ladder::Cols => forms,
+            Ladder::NoCols => forms[forms.len() - 1..].to_vec(),
+        };
+    }
     let n = half_up(now) as u64;
     let threads = platform.counts_threads();
     let unit = if threads { "threads" } else { "processes" };
@@ -855,14 +898,6 @@ fn processes_amount(view: &ResourceView, ladder: Ladder, platform: Platform) -> 
         return vec![format!("{} {unit}", grouped(n))];
     };
     let (n_s, c_s) = (grouped(n), grouped(cap));
-    if second_binds(view) {
-        let tail = if threads { "your threads" } else { "yours" };
-        return of_slash(
-            ladder,
-            format!("{n_s} of {c_s} {tail}"),
-            format!("{n_s}/{c_s} {tail}"),
-        );
-    }
     let of = format!("{n_s} of {c_s} {unit}");
     if threads {
         let slash = format!("{n_s}/{c_s} threads");
@@ -908,13 +943,14 @@ pub fn scope_forms(res: Resource, view: &ResourceView, loc: &Locale) -> ScopeFor
         }
         Some(NoFigure::NoAgent) | None => {}
     }
+    let starts = res == Resource::Processes && proc_starts(view);
     ScopeForms::Each {
-        aterm: scope_cell(res, &view.aterm),
-        tab: scope_cell(res, &view.tab),
+        aterm: scope_cell(res, &view.aterm, starts),
+        tab: scope_cell(res, &view.tab, starts),
     }
 }
 
-fn scope_cell(res: Resource, fig: &ScopeFig) -> ScopeCell {
+fn scope_cell(res: Resource, fig: &ScopeFig, starts: bool) -> ScopeCell {
     let words2 = |s: &str| ScopeCell {
         forms: vec![s.into()],
         ink: InkKind::Words2,
@@ -933,6 +969,10 @@ fn scope_cell(res: Resource, fig: &ScopeFig) -> ScopeCell {
         }
         Resource::Disk => writes_forms(v),
         Resource::Tokens => vec![format!("{}/min", tokens_k(v))],
+        Resource::Processes if starts => {
+            let n = starts_figure(v);
+            vec![format!("{n} starts/s"), format!("{n}/s")]
+        }
         Resource::Processes => {
             let n = half_up(v) as u64;
             let unit = plural(n, "process", "processes");
@@ -1019,6 +1059,16 @@ pub fn strip_words(res: Resource, snap: &Snapshot) -> Option<Vec<String>> {
             Some(vec![
                 format!("learning aterm's token peak: {n} of {of} min"),
                 format!("learning token peak: {n} of {of} min"),
+                format!("learning peak: {n} of {of} min"),
+                format!("learning: {n}/{of} min"),
+                "learning".into(),
+            ])
+        }
+        Resource::Processes if view.basis == CapBasis::Learning => {
+            let (n, of) = (snap.facts.proc_read_s / 60, PROC_LEARN_S / 60);
+            Some(vec![
+                format!("learning its start peak: {n} of {of} min"),
+                format!("learning start peak: {n} of {of} min"),
                 format!("learning peak: {n} of {of} min"),
                 format!("learning: {n}/{of} min"),
                 "learning".into(),
@@ -1746,8 +1796,12 @@ fn tokens_details(snap: &Snapshot, loc: &Locale) -> Vec<Clause> {
     out
 }
 
+/// This user's processes and the per-user limit, where both read: `(897, 10_666)`.
+fn yours_of(room: &TaskRoom) -> Option<(u64, u64)> {
+    room.user_procs.zip(room.user_procs_max.filter(|&c| c > 0))
+}
+
 fn processes_details(snap: &Snapshot) -> Vec<Clause> {
-    let view = &snap.resources[Resource::Processes.index()];
     let mut out: Vec<Clause> = job_marks(snap)
         .into_iter()
         .enumerate()
@@ -1758,23 +1812,15 @@ fn processes_details(snap: &Snapshot) -> Vec<Clause> {
             if i == 0 { c.kept() } else { c }
         })
         .collect();
-    let first = view.first();
-    if let Some(second) = view.second.as_ref() {
-        let (who, s) = if second.binds {
-            ("all", &first)
-        } else {
-            ("yours", second)
-        };
-        if let (Some(n), Some(cap)) = (s.now, s.capacity) {
-            let n = grouped(half_up(n) as u64);
-            out.push(Clause::new(
-                2,
-                vec![
-                    format!("{who} {n} of {}", grouped(half_up(cap) as u64)),
-                    format!("{who} {n}"),
-                ],
-            ));
-        }
+    if let Some((n, cap)) = yours_of(&snap.facts.room) {
+        let n = grouped(n);
+        out.push(Clause::new(
+            2,
+            vec![
+                format!("yours {n} of {}", grouped(cap)),
+                format!("yours {n}"),
+            ],
+        ));
     }
     out
 }
@@ -2022,8 +2068,8 @@ fn capacity_words(res: Resource, view: &ResourceView) -> &'static str {
         (Resource::Network, CapBasis::Peak) => "its 7-day peak",
         (Resource::Network, _) => "its link rate",
         (Resource::Tokens, _) => "aterm's 7-day peak",
-        (Resource::Processes, _) if second_binds(view) => "your limit",
-        (Resource::Processes, _) => "the limit",
+        (Resource::Processes, CapBasis::Fixed) => "the limit",
+        (Resource::Processes, _) => "its 7-day peak",
         _ => "capacity",
     }
 }
@@ -2078,6 +2124,14 @@ fn spoken_amount(res: Resource, view: &ResourceView, facts: &RowFacts, loc: &Loc
                 (None, Some(c)) => format!("aterm only, peak {} output tokens per minute", k(c)),
                 (Some(n), None) => format!("aterm only, {} output tokens per minute", k(n)),
                 (None, None) => "aterm only".into(),
+            }
+        }
+        Resource::Processes if proc_starts(view) => {
+            let n = speak_figure(&starts_figure(view.binding().now.unwrap_or(0.0)));
+            let unit = if n == "1" { "start" } else { "starts" };
+            match facts.room.procs {
+                Some(p) => format!("{n} {unit} a second, {} running", grouped(p)),
+                None => format!("{n} {unit} a second"),
             }
         }
         _ => amount_forms(res, view, facts, Ladder::Det, loc)
@@ -2280,6 +2334,13 @@ pub fn row_sentence(res: Resource, snap: &Snapshot, panes: &[u64], loc: &Locale)
     let view = snap.resource(res, panes);
     let mut out = Vec::new();
     let learning = network_learning(snap).filter(|_| res == Resource::Network);
+    if res == Resource::Processes && view.basis == CapBasis::Learning {
+        out.push(format!(
+            "Processes: learning its start peak, {} of {} minutes.",
+            snap.facts.proc_read_s / 60,
+            PROC_LEARN_S / 60
+        ));
+    }
     if res == Resource::Tokens && view.basis == CapBasis::Learning {
         out.push(format!(
             "Tokens: learning aterm's peak, {} of {} minutes.",
@@ -2346,8 +2407,9 @@ const GLANCE_KB_BELOW_BPS: f64 = 0.95e6;
 /// size less what this user can still write, `docs/DESIGN-stats-deck-flow-2026-11-02.md` §3), so
 /// the legend gives its totals over to the run where one stands. A share of
 /// something other than the row's own capacity keeps its base: Network's peak (`8 of 200 KB/s
-/// peak`), the per-user process limit where it binds (`897 of 10,666 yours`). Processes say no
-/// other maximum (the system's limit is no use as one) and give way to their bare count last.
+/// peak`). Processes say their starts a second and how many run (`37 starts/s · 742 running`,
+/// then `37/s`; record §8.1), never a limit; where no start counter reads they say their count
+/// with no maximum (the system's limit is no use as one), then the bare count.
 /// Network says both directions' live rates where the link's are read (`↓4K ↑3K/s`). Empty where
 /// the row says no figure: the GPU, whose % is its reading, and a row not read yet. aterm's and
 /// this tab's amounts are the bar's segments and the lens's figures, never a run of their own.
@@ -2394,6 +2456,13 @@ pub fn glance_run(
         }
         Resource::Network => glance_network(view),
         Resource::Tokens => return tokens_amount(view, Ladder::Det),
+        Resource::Processes if proc_starts(view) => {
+            return view
+                .binding()
+                .now
+                .map(|now| starts_forms(now, &snap.facts.room))
+                .unwrap_or_default();
+        }
         Resource::Processes => glance_processes(view, loc.platform),
     };
     let Some(mac) = mac else {
@@ -2469,23 +2538,16 @@ fn glance_network(view: &ResourceView) -> (Option<String>, Vec<String>) {
     )
 }
 
-/// The count and what it counts: `897`, `processes` (threads where the platform counts them).
-/// The system's limit (`kern.maxproc`, 16,000) is no maximum worth saying beside a few hundred;
-/// the user's limit is, once it binds: `of 10,666 yours`, then `of 10,666`, before the bare noun.
+/// Where the row counts processes (no start counter reads): the count and what it counts,
+/// `897`, `processes` (threads where the platform counts them). The system's limit
+/// (`kern.maxproc`, 16,000) is no maximum worth saying beside a few hundred.
 fn glance_processes(view: &ResourceView, platform: Platform) -> (Option<String>, Vec<String>) {
     let b = view.binding();
     let Some(now) = b.now else {
         return (None, Vec::new());
     };
     let threads = platform.counts_threads();
-    let mut unit = Vec::new();
-    if second_binds(view)
-        && let Some(c) = b.capacity.map(|c| grouped(half_up(c) as u64))
-    {
-        let what = if threads { "your threads" } else { "yours" };
-        unit.extend([format!("of {c} {what}"), format!("of {c}")]);
-    }
-    unit.push(if threads { "threads" } else { "processes" }.to_owned());
+    let unit = vec![if threads { "threads" } else { "processes" }.to_owned()];
     (Some(grouped(half_up(now) as u64)), unit)
 }
 
@@ -2908,22 +2970,19 @@ pub fn machine_totals(snap: &Snapshot) -> Vec<TotalsForm> {
 }
 
 fn glance_processes_details(snap: &Snapshot) -> Vec<Clause> {
-    let view = &snap.resources[Resource::Processes.index()];
     let mut out: Vec<Clause> = processes_details(snap)
         .into_iter()
         .filter(|c| c.mark.is_some())
         .collect();
-    if let Some(yours) = view.second.as_ref().filter(|s| !s.binds)
-        && let (Some(n), Some(cap)) = (yours.now, yours.capacity)
-        && cap > 0.0
-        && n >= GLANCE_YOURS_NEAR * cap
+    if let Some((n, cap)) = yours_of(&snap.facts.room)
+        && n as f64 >= GLANCE_YOURS_NEAR * cap as f64
     {
-        let n = grouped(half_up(n) as u64);
+        let n = grouped(n);
         out.push(
             Clause::new(
                 2,
                 vec![
-                    format!("yours {n} of {}", grouped(half_up(cap) as u64)),
+                    format!("yours {n} of {}", grouped(cap)),
                     format!("yours {n}"),
                 ],
             )
@@ -3044,8 +3103,8 @@ mod tests {
             .map(|i| Cell {
                 mean: v,
                 max: v,
-                n: 1.0,
-                over_n: if i >= 60 - over { 1.0 } else { 0.0 },
+                tau_ms: 10_000.0,
+                over_ms: if i >= 60 - over { 10_000.0 } else { 0.0 },
             })
             .collect::<Vec<_>>()
             .into();
@@ -3192,9 +3251,14 @@ mod tests {
 
     fn processes_trouble() -> Snapshot {
         let mut s = snap();
-        let mut view = row(897.0, 16_000.0);
-        view.second = Some(series(578.0, 10_666.0, false));
-        set(&mut s, Resource::Processes, view);
+        set(&mut s, Resource::Processes, row(897.0, 16_000.0));
+        s.facts.room = TaskRoom {
+            procs: Some(897),
+            procs_max: Some(16_000),
+            user_procs: Some(578),
+            user_procs_max: Some(10_666),
+            ..TaskRoom::default()
+        };
         s.set_jobs(Some(Arc::new(JobsView {
             rows: vec![
                 job("j1", Verdict::Stuck),
@@ -3463,11 +3527,75 @@ mod tests {
             ])
         );
 
-        let mut yours = row(897.0, 16_000.0);
-        yours.second = Some(series(900.0, 10_666.0, true));
+        // The user's limit is no run's: the count is against the machine's limit.
+        let counts = row(900.0, 16_000.0);
         assert_eq!(
-            amount_forms(Resource::Processes, &yours, &calm, Cols, &MAC),
-            strings(&["900 of 10,666 yours", "900/10,666 yours"])
+            amount_forms(Resource::Processes, &counts, &calm, Cols, &MAC),
+            strings(&["900 of 16,000 processes", "900 of 16,000", "900/16,000"])
+        );
+    }
+
+    /// Record §8.1: where a start counter reads, the Processes run says starts a second and how
+    /// many run (`37 starts/s · 742 running`, then `37/s`), aterm's cell its own starts, the
+    /// spoken sentence the same against "its 7-day peak", and no form names a limit, the
+    /// machine's or the user's (those are the lens's Room's, and Details'). CONTROL: where no
+    /// start counter reads, the count's run names the machine's limit.
+    #[test]
+    fn the_processes_run_says_starts_a_second_and_never_a_limit() {
+        use Ladder::{Cols, Det, NoCols};
+        let mut s = snap();
+        let mut view = row(37.2, 200.0);
+        view.basis = CapBasis::Peak;
+        view.aterm = fig(3.4);
+        set(&mut s, Resource::Processes, view.clone());
+        s.facts.room = TaskRoom {
+            procs: Some(742),
+            procs_max: Some(8_000),
+            user_procs: Some(435),
+            user_procs_max: Some(5_333),
+            ..TaskRoom::default()
+        };
+        let run = glance_run(Resource::Processes, &view, &s, &MAC);
+        assert_eq!(run, strings(&["37 starts/s \u{b7} 742 running", "37/s"]));
+        let ladder = |l| amount_forms(Resource::Processes, &view, &s.facts, l, &MAC);
+        assert_eq!(ladder(Det), strings(&["37 starts/s \u{b7} 742 running"]));
+        assert_eq!(ladder(Cols), run);
+        assert_eq!(ladder(NoCols), strings(&["37/s"]));
+        let mut slow = view.clone();
+        slow.now = Some(0.44);
+        assert_eq!(
+            glance_run(Resource::Processes, &slow, &s, &MAC)[0],
+            "0.4 starts/s \u{b7} 742 running"
+        );
+        let ScopeForms::Each { aterm, .. } = scope_forms(Resource::Processes, &view, &MAC) else {
+            panic!("aterm's cell");
+        };
+        assert_eq!(aterm.forms, strings(&["3.4 starts/s", "3.4/s"]));
+        let said = row_sentence(Resource::Processes, &s, &[], &MAC);
+        assert!(
+            said.contains("of its 7-day peak: 37 starts a second, 742 running."),
+            "{said}"
+        );
+        let all: Vec<String> = [Det, Cols, NoCols]
+            .into_iter()
+            .flat_map(ladder)
+            .chain(run)
+            .chain(aterm.forms)
+            .collect();
+        for form in &all {
+            assert!(
+                !["8,000", "5,333", "yours", "limit"]
+                    .iter()
+                    .any(|w| form.contains(w)),
+                "{form}"
+            );
+        }
+        let counts = row(742.0, 8_000.0);
+        assert!(
+            amount_forms(Resource::Processes, &counts, &s.facts, Cols, &MAC)
+                .iter()
+                .any(|f| f.contains("8,000")),
+            "CONTROL"
         );
     }
 
@@ -4620,8 +4748,8 @@ mod tests {
                 .map(|i| Cell {
                     mean: (i >= unread).then_some(9.0),
                     max: (i >= unread).then_some(9.0),
-                    n: if i >= unread { 1.0 } else { 0.0 },
-                    over_n: 0.0,
+                    tau_ms: if i >= unread { 10_000.0 } else { 0.0 },
+                    over_ms: 0.0,
                 })
                 .collect::<Vec<_>>()
                 .into();
@@ -4811,16 +4939,11 @@ mod tests {
             glance_run(Resource::Network, &slow, &s, &MAC),
             strings(&["18 of 200 KB/s peak", "18 of 200 KB/s", "18 KB/s"])
         );
-        let mut yours = row(897.0, 16_000.0);
-        yours.second = Some(series(9_000.0, 10_666.0, true));
+        let crowded = row(9_000.0, 16_000.0);
         assert_eq!(
-            glance_run(Resource::Processes, &yours, &s, &MAC),
-            strings(&[
-                "9,000 of 10,666 yours",
-                "9,000 of 10,666",
-                "9,000 processes",
-                "9,000"
-            ])
+            glance_run(Resource::Processes, &crowded, &s, &MAC),
+            strings(&["9,000 processes", "9,000"]),
+            "no limit in the run"
         );
         assert!(
             glance_run(Resource::Cpu, &ResourceView::default(), &s, &MAC).is_empty(),
@@ -4979,7 +5102,7 @@ mod tests {
             !marked.is_empty() && marked.iter().all(|c| c.mark.is_some()),
             "the jobs' marks: {marked:?}"
         );
-        p.resources[Resource::Processes.index()].second = Some(series(9_000.0, 10_666.0, false));
+        p.facts.room.user_procs = Some(9_000);
         assert_eq!(
             forms(Resource::Processes, &p).last(),
             Some(&strings(&["yours 9,000 of 10,666", "yours 9,000"]))

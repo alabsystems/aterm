@@ -236,14 +236,12 @@ struct FxDesk {
     drawn: FxDrawn,
 }
 
-/// The rows a park draws from the store and the status item rather than
-/// from a session (`SessionHandoff::from_store`, `App::fleet_told_rows`):
-/// the fleet needs whose notice the owner was told, the bus mirror's closed
-/// sessions, whether a bridge served the mirror, and the workers whose tabs
-/// the reaper closed (`RetiredWorkers::carry_rows`).
+/// The rows a park draws from the store rather than from a session
+/// (`SessionHandoff::from_store`): the bus mirror's closed sessions, whether
+/// a bridge served the mirror, and the workers whose tabs the reaper closed
+/// (`RetiredWorkers::carry_rows`).
 #[derive(Default)]
 struct FxDrawn {
-    fleet_told: Vec<String>,
     mirror_dropped: Vec<String>,
     mirror_served: bool,
     retired_workers: Vec<String>,
@@ -1253,7 +1251,6 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         held: Vec::new(),
         roster_seq: Some(FX_ROSTER_SEQ),
         fabric_attached: desk.fabric_attached.clone(),
-        fleet_told: desk.drawn.fleet_told.clone(),
         mirror_dropped: desk.drawn.mirror_dropped.clone(),
         mirror_served: desk.drawn.mirror_served,
         machine_names: fx_machine_names(),
@@ -4066,10 +4063,6 @@ fn fx_carried_state_desk() -> FxDesk {
         behind.show.key = Some(false);
     }
     let drawn_rows = FxDrawn {
-        fleet_told: vec![crate::fleet_glance::told_row(
-            crate::fleet_glance::herald_key("mac-2", &format!("s-{:020x}", 0x00ee_0000_0001_u64)),
-            aterm_types::needs::NeedWord::Ask,
-        )],
         mirror_dropped: mailbox.mirror_dropped,
         mirror_served: mailbox.mirror_served,
         // A worker the reaper closed once it finished (crate::retired_workers): the park
@@ -4092,11 +4085,6 @@ fn fx_carried_state_desk() -> FxDesk {
         ),
         1,
         "the retired worker's row reads back"
-    );
-    assert_eq!(
-        crate::fleet_glance::parse_told(&drawn_rows.fleet_told).len(),
-        1,
-        "the told need reads back"
     );
     let mut desk = FxDesk {
         name: "carried-state",
@@ -4682,6 +4670,12 @@ const NO_HANDOFF_WRITES_OFF_MACOS: &[(&str, &str)] = &[
 
 const NO_HANDOFF_WRITES: &[(&str, &str)] = &[
     ("control", "Wire.turn_ids"),
+    // Retired with aterm's own fleet notices: the newest recorded release wrote it, so the hold
+    // wants it named here until a release's `fields.toml` omits it. The first one recorded after
+    // the field went does; this row then answers "listed, but no desk reaches it" and
+    // generate_handoff_fixtures fails: remove it then. Older desks keep the field; the reader
+    // skips it.
+    ("manifest", "SessionHandoff.fleet_told"),
     ("manifest", "WindowCarry.presence_row"),
     ("layout", "WindowLayout.presence_row"),
     ("layout", "WindowLayout.maximized"),

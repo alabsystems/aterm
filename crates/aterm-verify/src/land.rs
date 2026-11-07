@@ -888,7 +888,7 @@ impl Git<'_> {
 #[must_use]
 pub fn usage() -> String {
     format!(
-        "usage: targo --unverified verify land\n\n\
+        "usage: targo --unverified verify land [--admit wait|now]\n\n\
          Land this checkout's branch on {REMOTE}/{MAIN}, judged: merge {REMOTE}/{MAIN} (M1), run\n\
          the dev set over the cone since M1, push, and where {MAIN} moved meanwhile compose onto\n\
          it (a clean merge whose new commits touch none of the branch's files) or merge it and\n\
@@ -896,6 +896,8 @@ pub fn usage() -> String {
          main commit merged (M1, or the moved main a re-judge merged), in a crate outside the\n\
          branch's own, is INHERITED: named, not counted. The landing merge carries\n\
          Aterm-Checked, Aterm-Composed-Onto and Aterm-Inherited trailers.\n\n\
+         --admit changes resource admission only, forwarded to every judgment. The full dev\n\
+         set and change cone are unchanged; wait is the default.\n\n\
          GitHub reads and writes use agh (dry-run, expected refs, durable write intents); local\n\
          remotes use git's file protocol only. Required submodules must already be initialised\n\
          and their objects imported: landing never clones or fetches them implicitly.\n\n\
@@ -904,19 +906,33 @@ pub fn usage() -> String {
     )
 }
 
-/// `verify land [--help]`, from `cwd`'s checkout.
+fn admission(args: &[String]) -> Option<aterm_capacity::Admit> {
+    match args {
+        [] => Some(aterm_capacity::Admit::Wait),
+        [flag, value] if flag == aterm_capacity::Admit::FLAG => aterm_capacity::Admit::parse(value),
+        [flag] => flag
+            .strip_prefix("--admit=")
+            .and_then(aterm_capacity::Admit::parse),
+        _ => None,
+    }
+}
+
+/// `verify land [--admit wait|now] [--help]`, from `cwd`'s checkout.
 pub fn run(args: &[String], cwd: &Path) -> i32 {
     match args {
-        [] => {}
         [help] if help == "--help" || help == "-h" => {
             print!("{}", usage());
             return exit::PASS;
         }
-        _ => {
-            eprint!("verify land: takes no arguments\n{}", usage());
+        _ => {}
+    }
+    let admit = match admission(args) {
+        Some(admit) => admit,
+        None => {
+            eprint!("verify land: takes only --admit wait|now\n{}", usage());
             return exit::USAGE;
         }
-    }
+    };
     let Some(root) = crate::checkout_root(cwd) else {
         eprintln!(
             "verify land: COULD NOT RUN — {} is not inside a git checkout",
@@ -934,7 +950,7 @@ pub fn run(args: &[String], cwd: &Path) -> i32 {
         &root,
         &mut Seams {
             git: &git,
-            judge: &mut live_judge,
+            judge: &mut |root, base| live_judge(root, base, admit),
             branch: &mut live_branch,
             lane: &mut live_lane,
             say: &mut say,
@@ -945,7 +961,7 @@ pub fn run(args: &[String], cwd: &Path) -> i32 {
 /// The dev set over the cone since `base`, run as the checkout's own verify (`targo
 /// --unverified verify --base <base>`, so the merged tree's tools judge it), its rows read from
 /// the check-finished events it keeps and its record's end from its run-finished one.
-fn live_judge(root: &Path, base: &str) -> Judged {
+fn live_judge(root: &Path, base: &str, admit: aterm_capacity::Admit) -> Judged {
     let began = Instant::now();
     let not_run = |why: String| {
         println!("verify land: {why}");
@@ -964,10 +980,7 @@ fn live_judge(root: &Path, base: &str) -> Judged {
         Err(e) => return not_run(format!("cannot make a scratch directory: {e}")),
     };
     let events = dir.path().join("verify.events");
-    let mut cmd = aterm_uds::spawnfd::command(&tools.targo);
-    cmd.current_dir(root)
-        .args(["--unverified", "verify", "--base", base, "--events"])
-        .arg(&events);
+    let mut cmd = judgment_command(&tools.targo, root, base, &events, admit);
     let code = match cmd.status() {
         Ok(status) => status.code().unwrap_or(exit::COULD_NOT_RUN),
         Err(e) => return not_run(format!("{} did not start: {e}", tools.targo.display())),
@@ -979,6 +992,21 @@ fn live_judge(root: &Path, base: &str) -> Judged {
         secs: began.elapsed().as_secs(),
         finished: text.lines().rev().find_map(Finished::of_event),
     }
+}
+
+fn judgment_command(
+    targo: &Path,
+    root: &Path,
+    base: &str,
+    events: &Path,
+    admit: aterm_capacity::Admit,
+) -> Command {
+    let mut cmd = aterm_uds::spawnfd::command(targo);
+    cmd.current_dir(root)
+        .args(["--unverified", "verify", "--base", base, "--events"])
+        .arg(events)
+        .args([aterm_capacity::Admit::FLAG, admit.word()]);
+    cmd
 }
 
 /// The seeds of the cone since `base`, as [`crate::changed::resolve`] reads them for the run.

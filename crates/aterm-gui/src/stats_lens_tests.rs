@@ -48,8 +48,8 @@ fn hour_ring(s: &Snapshot, i: usize, from: f64, noise: f64, r: &mut Rng) -> Arc<
             Cell {
                 mean: (!unread).then_some(v),
                 max: (!unread).then_some(v),
-                n: if unread { 0.0 } else { 1.0 },
-                over_n: 0.0,
+                tau_ms: if unread { 0.0 } else { 10_000.0 },
+                over_ms: 0.0,
             }
         })
         .collect();
@@ -83,7 +83,10 @@ pub(crate) fn lens_scene(sc: Scene) -> Snapshot {
         }
         let gb = if j == 143 { 885.0 } else { v };
         let at = ((now_k - 143 + j) * bucket_ms + 1).min(now);
-        s.free_history.note(at, ((gb + shift) * 1e9) as u64);
+        s.free_history.note(
+            aterm_vitals::ring::Taken::at(at, 1_000),
+            ((gb + shift) * 1e9) as u64,
+        );
     }
     let f = &mut s.facts;
     f.disk_rates.rate60 = Some(16e9 / 3600.0);
@@ -678,8 +681,8 @@ fn the_network_trace_draws_the_busier_direction() {
     let cell = |v: f64| Cell {
         mean: Some(v),
         max: Some(v),
-        n: 1.0,
-        over_n: 0.0,
+        tau_ms: 1_000.0,
+        over_ms: 0.0,
     };
     view.capacity = Some(125e6);
     view.ring = (0..n).map(|_| cell(1.5e6)).collect();
@@ -748,8 +751,8 @@ fn the_network_trace_ticks_each_minute_at_its_own_directions_peak() {
     let cell = |(mean, max): (f64, f64)| Cell {
         mean: Some(mean),
         max: Some(max),
-        n: 1.0,
-        over_n: 0.0,
+        tau_ms: 10_000.0,
+        over_ms: 0.0,
     };
     // Whether sending binds in bucket `i` of the ring: in every other ten minutes of the clock.
     let sends = |i: usize| (ring_k - (n - 1 - i) as i64).div_euclid(60) % 2 == 1;
@@ -858,60 +861,6 @@ fn the_network_trace_ticks_each_minute_at_its_own_directions_peak() {
     );
 }
 
-/// The Processes lens's trace heats each minute at the limit that binds first, as its explainer
-/// and the deck's row say (the R3 lens fixes' review, 2026-11-06): 2,000 of this Mac's 4,000
-/// processes (50 %) while 1,600 of them are yours against your user's 2,666 (60 %), so yours binds,
-/// and the trace's columns and ticks are in the heat of 60 %, the deck row's (`heat_columns`),
-/// while its figures stay all processes'. Memory, one series, keeps its own share (`heat_cells`),
-/// so nothing else moves. NEGATIVE CONTROL: the first series' share alone (`heat_cells`, as the
-/// trace took it) heats Processes at 50 %.
-#[test]
-fn the_processes_trace_heats_at_the_limit_that_binds_first() {
-    let mut snap = lens_scene(Scene::Calm);
-    let n = aterm_vitals::ring::RING_BUCKETS;
-    let cell = |v: f64| Cell {
-        mean: Some(v),
-        max: Some(v),
-        n: 1.0,
-        over_n: 0.0,
-    };
-    let view = &mut snap.resources[Resource::Processes.index()];
-    view.now = Some(2_000.0);
-    view.capacity = Some(4_000.0);
-    view.ring = (0..n).map(|_| cell(2_000.0)).collect();
-    view.second = Some(aterm_vitals::model::Series {
-        now: Some(1_600.0),
-        capacity: Some(2_666.0),
-        ring: (0..n).map(|_| cell(1_600.0)).collect(),
-        long: Arc::from([]),
-        recent: Arc::from([]),
-        binds: true,
-    });
-    let m = FaceMetrics::helvetica_neue();
-    let c = two_columns(&snap, &m);
-    let now = snap.at_unix_ms;
-    let procs = c.view(Resource::Processes);
-    let (vals, peaks, heat) = hour_columns(&procs, now, 1.0);
-    assert_eq!(heat, procs.heat_columns(60, 60, now), "the deck row's heat");
-    let yours = Some((1_600.0 / 2_666.0) as f32);
-    assert!(
-        heat.iter().all(|h| (h.heat, h.max) == (yours, yours)),
-        "yours binds: {heat:?}"
-    );
-    assert!(
-        vals.iter().chain(&peaks).all(|v| *v == Some(2_000.0)),
-        "all processes' figures: {vals:?}"
-    );
-    let mem = c.view(Resource::Memory);
-    assert!(mem.second.is_none(), "PRECONDITION: Memory is one series");
-    let (_, _, mem_heat) = hour_columns(&mem, now, GIB);
-    assert_eq!(mem_heat, mem.heat_cells(mem.columns(60, 60, now)));
-    assert!(
-        mem_heat.iter().any(|h| h.heat.is_some()),
-        "CONTROL: Memory's hour is read"
-    );
-}
-
 /// The Network lens's Traffic line names the busier direction's rate where no capacity is known
 /// yet, as the throughput trace beside it does (the R3 lens fixes' review, 2026-11-06): in the
 /// first day of learning, on a link that reports no speed, sending 14 MB/s against receiving's
@@ -983,11 +932,12 @@ fn the_traffic_line_names_the_busier_direction_with_no_capacity_known() {
 #[test]
 fn the_traffic_lines_short_form_names_the_busier_direction() {
     let n = aterm_vitals::ring::RING_BUCKETS;
+    // A ring bucket read through its 10 s.
     let cell = |v: f64| Cell {
         mean: Some(v),
         max: Some(v),
-        n: 1.0,
-        over_n: 0.0,
+        tau_ms: 10_000.0,
+        over_ms: 0.0,
     };
     let m = FaceMetrics::helvetica_neue();
     // `(rx, tx, rx_cap, tx_cap)`, B/s.

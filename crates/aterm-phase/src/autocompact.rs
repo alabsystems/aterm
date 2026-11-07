@@ -258,6 +258,7 @@ pub(crate) fn offer_box(rows: &[String]) -> Option<PromptV2> {
         title: const { crate::anchor!("autocompact.title") }.to_string(),
         command_rows: Vec::new(),
         description_rows: 0,
+        spellings: None,
         gutter: false,
         command: accept_label,
         description,

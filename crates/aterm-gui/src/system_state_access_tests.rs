@@ -4480,14 +4480,17 @@ fn withdrawing_folder_probe(path: &std::path::Path) -> crate::consent_warmup::Re
     crate::consent_warmup::ReadDirOutcome::Refused
 }
 
+/// Releases the held read and empties [`WITHDRAWING_FOLDER_PROBE`], under the dialog lock that
+/// serialises every test filling it (`_serial`), so no other test's probe is emptied.
 #[cfg(target_os = "macos")]
-struct ReleaseWithdrawingFolder {
+struct ReleaseWithdrawingFolder<'a> {
     release: Option<std::sync::mpsc::Sender<()>>,
     gate: crate::consent_warmup::WarmupGate,
+    _serial: &'a std::sync::MutexGuard<'static, ()>,
 }
 
 #[cfg(target_os = "macos")]
-impl Drop for ReleaseWithdrawingFolder {
+impl Drop for ReleaseWithdrawingFolder<'_> {
     fn drop(&mut self) {
         self.gate.set(true);
         if let Some(release) = self.release.take() {
@@ -4507,7 +4510,7 @@ fn check_folder_permission_withdrawal(withdraw: fn(&mut App)) {
     use crate::devtools_helper::test_arms;
     use aterm_types::macos_setup::{MacosDialog, macos_dialog_up};
 
-    let _serial = DIALOG_TEST
+    let serial = DIALOG_TEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (entered_send, entered) = std::sync::mpsc::channel();
@@ -4549,6 +4552,7 @@ fn check_folder_permission_withdrawal(withdraw: fn(&mut App)) {
     let mut cleanup = ReleaseWithdrawingFolder {
         release: Some(release),
         gate: gate.clone(),
+        _serial: &serial,
     };
     assert!(gate.is_open());
     assert!(macos_dialog_up(), "the first read retains the dialog slot");

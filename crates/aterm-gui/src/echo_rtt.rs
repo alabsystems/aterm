@@ -253,30 +253,60 @@ const fn arms_reach_the_statics(_sink: &aterm_session::sink::SinkWriter) -> bool
     true
 }
 
-/// Whether an arm for `sink` may reach the process-global statics: in tests, only the sink
+/// Whether an arm for `sink` may reach the process-global statics: in tests, only a sink
 /// [`arms_for_test`] lets through.
 #[cfg(test)]
 fn arms_reach_the_statics(sink: &aterm_session::sink::SinkWriter) -> bool {
-    ARM_SINK.load(Ordering::Acquire) == std::ptr::from_ref(sink).addr()
+    reaches(std::ptr::from_ref(sink).addr())
 }
 
-/// Tests: the one sink whose arms may reach the process-global statics. Every other test's
-/// keys arm too, on the UI thread and on ordered writer threads, and must not perturb the
-/// tests that read these counters exactly (this module's own).
+/// Tests: the sinks whose arms may reach the process-global statics, one entry per live
+/// [`ArmsLetThrough`]. Every other test's keys arm too, on the UI thread and on ordered writer
+/// threads, and must not perturb the tests that read these counters exactly (this module's own).
+/// Each guard takes out only its own entry, so one test's guard ending lets through no fewer of
+/// another test's arms.
 #[cfg(test)]
-static ARM_SINK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ARM_SINKS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// Whether the sink at `addr` is let through.
+#[cfg(test)]
+fn reaches(addr: usize) -> bool {
+    ARM_SINKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&addr)
+}
+
+/// [`arms_for_test`]'s guard: its sink's entry, taken out when it drops.
+#[cfg(test)]
+pub(crate) struct ArmsLetThrough(usize);
+
+#[cfg(test)]
+impl Drop for ArmsLetThrough {
+    fn drop(&mut self) {
+        let mut sinks = ARM_SINKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(at) = sinks.iter().position(|&addr| addr == self.0) {
+            sinks.swap_remove(at);
+        }
+    }
+}
+
+/// Let the sink at `addr` through for as long as the guard lives.
+#[cfg(test)]
+fn let_through(addr: usize) -> ArmsLetThrough {
+    ARM_SINKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(addr);
+    ArmsLetThrough(addr)
+}
 
 /// Let `sink`'s arms through for as long as the guard lives.
 #[cfg(all(test, unix))]
-pub(crate) fn arms_for_test(sink: &aterm_session::sink::SinkWriter) -> impl Drop + use<> {
-    struct Guard;
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            ARM_SINK.store(0, Ordering::Release);
-        }
-    }
-    ARM_SINK.store(std::ptr::from_ref(sink).addr(), Ordering::Release);
-    Guard
+pub(crate) fn arms_for_test(sink: &aterm_session::sink::SinkWriter) -> ArmsLetThrough {
+    let_through(std::ptr::from_ref(sink).addr())
 }
 
 thread_local! {
@@ -429,6 +459,20 @@ mod tests {
 
     fn fresh() -> std::sync::MutexGuard<'static, ()> {
         fresh_for_test()
+    }
+
+    /// Tests of one binary let their own sinks through at once, each guard ending with its test:
+    /// one guard's end must leave another test's sink let through. One slot the guard clears
+    /// fails here. (Addresses 1 and 2 are no sink's, which are aligned allocations.)
+    #[test]
+    fn a_guard_ending_beside_another_keeps_the_other_sink_let_through() {
+        let first = let_through(1);
+        let second = let_through(2);
+        drop(first);
+        assert!(reaches(2), "one guard's end shut another test's sink out");
+        assert!(!reaches(1), "an ended guard still lets its sink through");
+        drop(second);
+        assert!(!reaches(2));
     }
 
     /// The basic contract: a write arms, that session's next burst closes, and

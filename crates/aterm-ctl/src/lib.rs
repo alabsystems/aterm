@@ -227,11 +227,19 @@ STDIN PAYLOADS:
                   when the app enabled DECSET 2004), not as a raw feed.
     spawn agent=<a> [model=<m>] [cwd=<path>] [label=<word>] -
                   the worker's task (1 byte to 64 KiB); the client writes len=
-                  itself, adds from=$ATERM_PARENT_SESSION_ID and cwd=<this
-                  directory> when absent, and makes a relative cwd= absolute.
-                  Each worker it starts, here or with --host, gets a row on
-                  this Mac's board (`board`), with label=<word> (1-64 of
-                  A-Z a-z 0-9 . _ -), which it never sends.
+                  itself, adds cwd=<this directory> when absent, and makes a
+                  relative cwd= absolute. With no from=, it adds
+                  from=$ATERM_PARENT_SESSION_ID only for an aterm that holds
+                  that session: the one a spawn addressed to it (@self)
+                  reaches, as an aterm refuses one for a session it does not
+                  host, or the one this Mac's socket folder records as its
+                  host. Each worker it starts in an aterm that folder records
+                  (its own, or one bound elsewhere that mirrors its sessions
+                  there), or with --host, gets a row on this Mac's board
+                  (`board`), with label=<word> (1-64 of A-Z a-z 0-9 . _ -),
+                  which it never sends; one sent with --sock to an aterm of
+                  another environment (a `lab instance`) is that aterm's
+                  alone.
     spawn program=<p> [arg=<a>]... [cwd=<path>] [label=<word>] -
                   the same, for a program no harness reads: its task file is
                   the program's standard input, and each of program= and arg=
@@ -2512,14 +2520,48 @@ impl ForeignFacts {
     }
 }
 
+/// Whether `a` and `b` name one socket: one spelling or key; one canonical path; on unix one
+/// file, by its device and inode read through the paths as given (a hard link and a folder's
+/// firmlink spelling share them, though canonicalizing keeps a firmlink and, on macOS, joins a
+/// hard link's folder with another link's name); or, where a socket does not canonicalize (on
+/// Windows an AF_UNIX socket, a reparse point nothing follows), one name in one canonical folder.
 fn same_socket_path(a: &str, b: &str) -> bool {
     if a == b || control_socket::socket_key(a) == control_socket::socket_key(b) {
         return true;
     }
+    let (a, b) = (Path::new(a), Path::new(b));
     match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
-        (Ok(ca), Ok(cb)) => ca == cb,
+        (Ok(ca), Ok(cb)) => ca == cb || same_file(a, b),
+        _ => same_place(a, b),
+    }
+}
+
+#[cfg(unix)]
+fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
         _ => false,
     }
+}
+
+#[cfg(not(unix))]
+const fn same_file(_: &Path, _: &Path) -> bool {
+    false
+}
+
+/// Whether `a` and `b` have one name (by [`control_socket::socket_key`]) in one folder, by the
+/// folder's canonical path (an empty folder is the working directory).
+fn same_place(a: &Path, b: &Path) -> bool {
+    let place = |path: &Path| {
+        let name = control_socket::socket_key(path.file_name()?.to_str()?);
+        let folder = path
+            .parent()
+            .filter(|folder| !folder.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        Some((std::fs::canonicalize(folder).ok()?, name))
+    };
+    place(a).is_some_and(|a| place(b) == Some(a))
 }
 
 fn discovery_targets(
@@ -4156,22 +4198,27 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
         let starter = worker_starter(env::var(SELF_SID_ENV).ok());
         let selector = worker_selector(selector, pinned, starter.as_deref());
         let here = env::current_dir().ok();
-        let head = worker_spawn_head(
+        // Checked before the task is read, in its longest form: the one naming the caller.
+        worker_spawn_head(
             selector.as_deref(),
             &verb_args,
             starter.as_deref(),
             here.as_deref(),
         )?;
-        let payload = read_task_payload()?;
-        let worker = HereWorker {
-            head: &head,
-            task: &payload,
-            args: verb_args,
-            label,
-            starter: starter.as_deref(),
-            pwd: here.as_deref(),
-        };
-        return spawn_worker_here(&targets, worker, deadline);
+        let task = read_task_payload()?;
+        return spawn_worker_here(
+            &targets,
+            HereWorker {
+                selector: selector.as_deref(),
+                args: &verb_args,
+                label,
+                starter: starter.as_deref(),
+                pwd: here.as_deref(),
+                task: &task,
+            },
+            socket_dir().as_deref(),
+            deadline,
+        );
     }
 
     {
@@ -4466,6 +4513,135 @@ fn worker_folder(args: &[String], pwd: Option<&Path>) -> Option<PathBuf> {
     }
 }
 
+/// A worker's spawn on this Mac as its caller asked it, its words judged and its task read
+/// ([`spawn_worker_here`]).
+struct HereWorker<'a> {
+    /// The session or tab it is addressed to ([`worker_selector`]).
+    selector: Option<&'a str>,
+    /// Its words after `spawn`, `label=` taken off (the last `-` kept).
+    args: &'a [String],
+    /// Its `label=`, which the board keeps and the spawn never sends.
+    label: Option<String>,
+    /// The session that starts it ([`worker_starter`]).
+    starter: Option<&'a str>,
+    /// This client's working folder, which a relative `cwd=` (or none) names.
+    pwd: Option<&'a Path>,
+    /// Its task.
+    task: &'a [u8],
+}
+
+impl HereWorker<'_> {
+    /// Where a dial at `sock` sends this spawn, and the caller's session its head names there
+    /// (`from=`): only one an aterm holds. A spawn addressed to the caller's session (`@<sid>`,
+    /// which an aterm refuses unless it hosts it) names it to whichever aterm takes it, and one
+    /// with no caller names none; either is the same for every aterm, so its dial follows the
+    /// `latest` alias as every dial does (an update's successor takes the alias over at its
+    /// Commit). Otherwise the head names the caller where this Mac's socket folder `dir` records
+    /// the aterm as the host of the caller's session (its graph entry), and is sent to the one
+    /// aterm it was judged for: the alias pinned once ([`pin_alias`]), so no connection of the
+    /// dial follows it elsewhere. Read from files alone: no socket is probed.
+    fn aimed(&self, sock: &str, dir: Option<&Path>) -> (String, Option<&str>) {
+        let Some(starter) = self.starter else {
+            return (sock.to_owned(), None);
+        };
+        if self.selector.and_then(|s| s.strip_prefix('@')) == Some(starter) {
+            return (sock.to_owned(), Some(starter));
+        }
+        let pinned = pin_alias(sock);
+        let holds = dir
+            .and_then(|dir| self_instance_sock_in(dir, Some(starter)))
+            .is_some_and(|host| same_socket_path(&pinned, &host));
+        (pinned, holds.then_some(starter))
+    }
+}
+
+/// Whether this Mac's board keeper reaches a worker of the aterm at `sock`: it finds a worker by
+/// its graph entry in this Mac's socket folder `dir`, which an aterm whose socket lies there
+/// writes, and so does one bound elsewhere that mirrors its sessions' entries there. An aterm of
+/// another environment (a `lab instance`'s scratch one) writes none, and a row of its worker
+/// would be closed as failed, the keeper finding no such session here.
+fn keeper_reaches(sock: &str, dir: &Path) -> bool {
+    socket_in(sock, dir) || graph_names(dir, sock)
+}
+
+/// Whether the socket at `sock` lies in the folder `dir`, each as the filesystem resolves it
+/// (the `latest` alias to the instance's own socket).
+fn socket_in(sock: &str, dir: &Path) -> bool {
+    let sock = PathBuf::from(aterm_uds::latest::resolve(sock));
+    let folder = std::fs::canonicalize(&sock).map_or_else(
+        |_| sock.parent().and_then(|p| std::fs::canonicalize(p).ok()),
+        |real| real.parent().map(Path::to_path_buf),
+    );
+    folder.is_some_and(|folder| std::fs::canonicalize(dir).is_ok_and(|dir| dir == folder))
+}
+
+/// Whether a graph entry in `dir` names the socket at `sock` as its session's host.
+fn graph_names(dir: &Path, sock: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir.join("graph")) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        graph_hygiene::read_entry(&entry.path()).is_ok_and(|(body, _)| {
+            control_socket::graph_entry_sock(&body)
+                .is_some_and(|host| same_socket_path(sock, &host))
+        })
+    })
+}
+
+/// A worker's spawn on the first of `targets` that hosts it, `deadline` its reply's: each dial's
+/// head names the caller only where that aterm holds the caller's session
+/// ([`HereWorker::aimed`]), and its task follows once the aterm asks for it
+/// ([`worker_exchange`]); then the board's row of the worker its answer named, from that answer,
+/// only where this Mac's board keeper, reading this Mac's socket folder `dir`, reaches it
+/// ([`keeper_reaches`]); and only then the answer printed ([`print_frame_answer`]). A print that
+/// fails (stdout closed: `… spawn … - | head -0`) is the call's own error and sets its exit
+/// status alone: the worker started all the same, and the board says so.
+fn spawn_worker_here(
+    targets: &Targets,
+    worker: HereWorker<'_>,
+    dir: Option<&Path>,
+    deadline: Option<std::time::Duration>,
+) -> io::Result<ExitCode> {
+    let (answer, sent) = targets.run(|t| {
+        let (path, caller) = worker.aimed(&t.path, dir);
+        let head = worker_spawn_head(worker.selector, worker.args, caller, worker.pwd)?;
+        let head = format!("{head} len={}", worker.task.len());
+        worker_exchange(&path, t.origin, (&head, worker.task), deadline).map(|a| (a, path))
+    })?;
+    let (answer, sid) = match answer {
+        WorkerAnswer::Task(answer, sid) => (answer, sid),
+        WorkerAnswer::Said(code) => return Ok(code),
+    };
+    if let Some(sid) = sid
+        && dir.is_some_and(|dir| keeper_reaches(&sent, dir))
+    {
+        // The row names the folder the worker was sent, as the request's head resolved it.
+        let folder = worker_folder(worker.args, worker.pwd);
+        let mut args: Vec<String> = worker
+            .args
+            .iter()
+            .filter(|a| !a.starts_with("cwd="))
+            .cloned()
+            .collect();
+        if let Some(dir) = folder.as_deref().and_then(Path::to_str) {
+            args.push(format!("cwd={dir}"));
+        }
+        board::record_spawned(&board::spawned(
+            &sid,
+            board::Placed {
+                node: None,
+                host: board::host_name(),
+                account: None,
+            },
+            worker.label,
+            (&args, worker.task),
+            worker.starter,
+            board::now_ms(),
+        ));
+    }
+    print_frame_answer(&answer)
+}
+
 fn worker_spawn_head(
     selector: Option<&str>,
     args: &[String],
@@ -4692,69 +4868,6 @@ fn worker_exchange(
         Ok(WorkerAnswer::Task(answer, sid))
     })?;
     Ok(served.unwrap_or_else(WorkerAnswer::Said))
-}
-
-/// A worker's spawn on this Mac, its words judged and its task read ([`spawn_worker_here`]).
-struct HereWorker<'a> {
-    /// Its request line, without its `len=` ([`worker_spawn_head`]).
-    head: &'a str,
-    /// Its task.
-    task: &'a [u8],
-    /// Its words after `spawn`, `label=` taken off.
-    args: Vec<String>,
-    /// Its `label=`.
-    label: Option<String>,
-    /// The session that starts it ([`worker_starter`]).
-    starter: Option<&'a str>,
-    /// This client's working folder, which a relative `cwd=` (or none) names.
-    pwd: Option<&'a Path>,
-}
-
-/// A worker's spawn on the first of `targets` that hosts it, `deadline` its reply's: the
-/// exchange ([`worker_exchange`]); then the board's row of the worker its answer named, from
-/// that answer; and only then the answer printed ([`print_frame_answer`]). A print that fails
-/// (stdout closed: `… spawn … - | head -0`) is the call's own error and sets its exit status
-/// alone: the worker started all the same, and the board says so.
-fn spawn_worker_here(
-    targets: &Targets,
-    worker: HereWorker<'_>,
-    deadline: Option<std::time::Duration>,
-) -> io::Result<ExitCode> {
-    let HereWorker {
-        head,
-        task,
-        mut args,
-        label,
-        starter,
-        pwd,
-    } = worker;
-    let head = format!("{head} len={}", task.len());
-    let (answer, sid) =
-        match targets.run(|t| worker_exchange(&t.path, t.origin, (&head, task), deadline))? {
-            WorkerAnswer::Task(answer, sid) => (answer, sid),
-            WorkerAnswer::Said(code) => return Ok(code),
-        };
-    if let Some(sid) = sid {
-        // The row names the folder the worker was sent, as the request's head resolved it.
-        let folder = worker_folder(&args, pwd);
-        args.retain(|a| !a.starts_with("cwd="));
-        if let Some(dir) = folder.as_deref().and_then(Path::to_str) {
-            args.push(format!("cwd={dir}"));
-        }
-        board::record_spawned(&board::spawned(
-            &sid,
-            board::Placed {
-                node: None,
-                host: board::host_name(),
-                account: None,
-            },
-            label,
-            (&args, task),
-            starter,
-            board::now_ms(),
-        ));
-    }
-    print_frame_answer(&answer)
 }
 
 fn read_frame_answer<R: BufRead>(reader: &mut R) -> io::Result<String> {

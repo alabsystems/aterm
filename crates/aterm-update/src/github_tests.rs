@@ -315,20 +315,23 @@ fn the_hash_step_books_a_moment_as_a_moment_and_a_mismatch_as_a_verdict() {
     let _ = std::fs::remove_dir_all(&staging.root);
 }
 
-#[test]
-fn a_release_withdrawn_while_it_downloaded_ends_the_check_held() {
-    let manifest = Manifest {
+/// Build 7, signed by machine m11.
+fn signed_by_m11() -> Manifest {
+    Manifest {
         build_number: 7,
         version: "0.0.7".into(),
         machine_id: Some("m11".into()),
         roster_seq: Some(9),
         ..candidate_manifest()
-    };
-    let running = 6;
-    let refused = "stage refused: build 7 was signed by machine m11, which the machine \
-                   roster has revoked — withdrawn while this check was downloading it";
+    }
+}
 
-    let staging = Staging::scratch("stage-withdrawn");
+const WITHDRAWN: &str = "stage refused: build 7 was signed by machine m11, which the machine \
+                         roster has revoked — withdrawn while this check was downloading it";
+
+/// A scratch staging whose machine roster revoked m11 after build 7 was signed.
+fn m11_revoked(label: &str) -> crate::paths::ScratchStaging {
+    let staging = Staging::scratch(label);
     let revoked = vec!["m11".to_string()];
     crate::manifest::Floor::observe_and_write(
         &staging.floor(),
@@ -338,6 +341,16 @@ fn a_release_withdrawn_while_it_downloaded_ends_the_check_held() {
             ..crate::manifest::FloorObservation::default()
         },
     );
+    staging
+}
+
+#[test]
+fn a_release_withdrawn_while_it_downloaded_ends_the_check_held() {
+    let manifest = signed_by_m11();
+    let running = 6;
+    let refused = WITHDRAWN;
+
+    let staging = m11_revoked("stage-withdrawn");
     let end = end_failed_stage(&staging, running, &manifest, refused.into());
     assert_eq!(end, Ok(None), "a hold is a healthy end");
     assert!(crate::manifest::FailedMark::read(&staging.failed()).is_none());
@@ -362,6 +375,26 @@ fn a_release_withdrawn_while_it_downloaded_ends_the_check_held() {
     let end = end_failed_stage(&staging, running, &manifest, refused.into());
     assert_eq!(end, Err(refused.to_string()));
     let _ = std::fs::remove_dir_all(&staging.root);
+}
+
+/// A check's download is its own: another check ending held meanwhile (a test of this binary,
+/// or a second check of the process) leaves this check's download begun, so this check still
+/// reports its own failure when it ends.
+#[test]
+fn another_check_ending_held_leaves_this_checks_download_begun() {
+    let this_check = crate::progress::DownloadBegan::default();
+    this_check.mark();
+    let staging = m11_revoked("stage-withdrawn-beside");
+    assert_eq!(
+        end_failed_stage(&staging, 6, &signed_by_m11(), WITHDRAWN.into()),
+        Ok(None),
+        "PRECONDITION: the other check ends held"
+    );
+    let _ = std::fs::remove_dir_all(&staging.root);
+    assert!(
+        this_check.began(),
+        "another check's held end took this check's download"
+    );
 }
 
 #[test]
@@ -2453,7 +2486,13 @@ fn an_up_to_date_check_reclaims_a_bundle_a_stage_left_once_its_stamp_is_spent() 
             master_pubkeys: &[],
             team: "",
         };
-        let outcome = check_and_stage_in(world, WEB_BUILD, &test_source(), Asked::Schedule);
+        let outcome = check_and_stage_in(
+            world,
+            WEB_BUILD,
+            &test_source(),
+            Asked::Schedule,
+            &crate::progress::DownloadBegan::default(),
+        );
         assert_eq!(outcome, Ok(None), "an up-to-date check stages nothing");
         let status = std::fs::read_to_string(&staging.status).unwrap();
         assert!(status.contains("up to date (channel head"), "{status}");

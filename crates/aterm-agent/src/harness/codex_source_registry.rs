@@ -1601,19 +1601,141 @@ impl Registry {
     }
 
     pub fn reap_gone(&self) {
-        if let Ok(mut state) = lock(&self.state) {
-            state.members.retain(|_, member| !gone(&member.process));
-            state.unrelated.retain(|_, member| !gone(&member.process));
+        let processes = {
+            let Ok(state) = lock(&self.state) else { return };
             state
-                .launches
-                .retain(|_, launch| !launch.process.as_ref().is_some_and(gone));
-            state.actors.retain(|_, actor| !gone(&actor.process));
-            let members: std::collections::BTreeSet<String> =
-                state.members.keys().cloned().collect();
-            state.uses.retain(|key, _| members.contains(key));
-            let actors: std::collections::BTreeSet<String> = state.actors.keys().cloned().collect();
-            state.reservations.retain(|actor, _| actors.contains(actor));
+                .members
+                .values()
+                .map(|item| item.process.clone())
+                .chain(state.unrelated.values().map(|item| item.process.clone()))
+                .chain(state.actors.values().map(|item| item.process.clone()))
+                .chain(
+                    state
+                        .launches
+                        .values()
+                        .filter_map(|item| item.process.clone()),
+                )
+                .collect::<Vec<_>>()
+        };
+        // Process observation stays outside State. Exact process identities are
+        // rechecked below; an unread process is never treated as departed.
+        let departed = processes.into_iter().filter(gone).collect::<Vec<_>>();
+        let is_gone = |process: &Process| departed.iter().any(|old| old == process);
+        let departed_preloads = {
+            let Ok(state) = lock(&self.state) else { return };
+            state
+                .actors
+                .iter()
+                .filter(|(_, actor)| is_gone(&actor.process))
+                .flat_map(|(actor, _)| {
+                    let prefix = format!("{actor}:");
+                    state
+                        .preloads
+                        .iter()
+                        .filter(move |(key, _)| key.starts_with(&prefix))
+                        .map(|(key, pending)| (key.clone(), pending.clone()))
+                })
+                .collect::<Vec<_>>()
+        };
+        for (_, pending) in &departed_preloads {
+            pending.revoke_departed();
         }
+        let Ok(mut state) = lock(&self.state) else {
+            return;
+        };
+        let preloads = departed_preloads
+            .iter()
+            .filter(|(key, pending)| {
+                pending.retired()
+                    && state
+                        .preloads
+                        .get(key)
+                        .is_some_and(|actual| Arc::ptr_eq(actual, pending))
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .filter_map(|key| state.preloads.remove(&key))
+            .collect::<Vec<_>>();
+        let keys = state
+            .members
+            .iter()
+            .filter(|(_, item)| is_gone(&item.process))
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        let scopes = reservation::retire_gone_uses(&mut state, &keys);
+        let members = keys
+            .iter()
+            .filter_map(|key| state.members.remove(key))
+            .collect::<Vec<_>>();
+        let unrelated_keys = state
+            .unrelated
+            .iter()
+            .filter(|(_, item)| is_gone(&item.process))
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        let unrelated = unrelated_keys
+            .iter()
+            .filter_map(|key| state.unrelated.remove(key))
+            .collect::<Vec<_>>();
+        let launch_keys = state
+            .launches
+            .iter()
+            .filter(|(_, item)| item.process.as_ref().is_some_and(is_gone))
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        let launches = launch_keys
+            .iter()
+            .filter_map(|key| state.launches.remove(key))
+            .collect::<Vec<_>>();
+        let actor_keys = state
+            .actors
+            .iter()
+            .filter(|(key, actor)| {
+                is_gone(&actor.process)
+                    && !state
+                        .preloads
+                        .keys()
+                        .any(|member| member.starts_with(&format!("{key}:")))
+                    && !state.uses.iter().any(|(member, _)| {
+                        member.starts_with(&format!("{key}:"))
+                            && reservation::has_credential_uses(&state, member)
+                    })
+            })
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        let actors = actor_keys
+            .iter()
+            .filter_map(|key| state.actors.remove(key))
+            .collect::<Vec<_>>();
+        let reservations = actor_keys
+            .iter()
+            .filter_map(|key| state.reservations.remove(key))
+            .collect::<Vec<_>>();
+        let stale_uses = state
+            .uses
+            .keys()
+            .filter(|key| {
+                !state.members.contains_key(*key) && !reservation::has_credential_uses(&state, key)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let uses = stale_uses
+            .iter()
+            .filter_map(|key| state.uses.remove(key))
+            .collect::<Vec<_>>();
+        drop(state);
+        drop((
+            members,
+            unrelated,
+            launches,
+            actors,
+            reservations,
+            uses,
+            scopes,
+            preloads,
+            departed_preloads,
+        ));
     }
 }
 

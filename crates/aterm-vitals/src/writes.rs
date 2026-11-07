@@ -14,7 +14,7 @@
 use std::collections::{HashSet, VecDeque};
 
 use crate::model::{ProcScope, TOP_WRITERS, Writer};
-use crate::ring::CLAMP_BACK_S;
+use crate::ring::Lands;
 
 /// Milliseconds one slot covers: a minute.
 pub const SLOT_MS: i64 = 60_000;
@@ -81,8 +81,9 @@ impl Program {
 }
 
 /// The last hour of writes per program and scope, in one-minute slots keyed by the wall clock
-/// as [`crate::history::FreeHistory`] keys its own: a reading up to [`CLAMP_BACK_S`] behind the
-/// newest lands in the newest slot, and a longer step back moves the whole hour back with it.
+/// by the rings' one back-step rule ([`crate::ring::lands`]): a reading up to [`crate::ring::CLAMP_BACK_S`]
+/// behind the newest lands in the newest slot, and a longer step back moves the whole hour back
+/// with it, a slot behind the one the reading opens.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct WriteHour {
     /// The newest slot's key (unix minute); `None` before the first reading.
@@ -107,17 +108,16 @@ impl WriteHour {
     /// Move the hour to a reading taken at `at_unix_ms` and give the slot it lands in; what falls
     /// out of the hour goes, and a program with nothing left in it with it.
     pub fn at(&mut self, at_unix_ms: i64) -> i64 {
-        let k = at_unix_ms.div_euclid(SLOT_MS);
-        let mut clamped_back = false;
-        let open = match self.open_k {
-            None => k,
-            Some(open) if k > open => k,
-            Some(open)
-                if k < open
-                    && i128::from(self.last_ms) - i128::from(at_unix_ms)
-                        > i128::from(CLAMP_BACK_S * 1000) =>
-            {
-                let by = open - k;
+        let newest = self.open_k.map(|_| self.last_ms);
+        let landing = crate::ring::lands(self.open_k, newest, at_unix_ms, SLOT_MS);
+        let clamped_back = landing == Lands::Newest && at_unix_ms < self.last_ms;
+        let open = match landing {
+            Lands::First(k) => k,
+            Lands::Ahead(_) => at_unix_ms.div_euclid(SLOT_MS),
+            Lands::Newest => self
+                .open_k
+                .unwrap_or_else(|| at_unix_ms.div_euclid(SLOT_MS)),
+            Lands::Back(by) => {
                 for c in &mut self.covered {
                     c.0 -= by;
                 }
@@ -126,11 +126,7 @@ impl WriteHour {
                         s.0 -= by;
                     }
                 }
-                k
-            }
-            Some(open) => {
-                clamped_back = at_unix_ms < self.last_ms;
-                open
+                at_unix_ms.div_euclid(SLOT_MS)
             }
         };
         if !clamped_back {
@@ -402,10 +398,11 @@ mod tests {
         h.note(T0 - 30_000, 1_000, &[w("cp", ProcScope::Other, MB, 1)]);
         assert_eq!(h.covered.len(), 1, "{:?}", h.covered);
         assert_eq!(h.covered[0].0, open);
-        // Past the clamp the whole hour moves back: the newest minute is the reading's.
+        // Past the clamp the whole hour moves back (the one back-step rule): the newest minute it
+        // held is the one before the reading's, which opens its own.
         let back = h.at(T0 - 30_000 - 2 * SLOT_MS);
         assert_eq!(back, (T0 - 30_000 - 2 * SLOT_MS).div_euclid(SLOT_MS));
-        assert_eq!(h.covered[0].0, back, "moved with the clock");
+        assert_eq!(h.covered[0].0, back - 1, "moved with the clock");
         assert_eq!(names(&h.top()), [("cp", ProcScope::Other, MB)]);
         assert!((h.covered_s() - 1.0).abs() < 1e-9);
     }
@@ -658,6 +655,96 @@ mod tests {
         assert_eq!(
             h.at(T0 + 2 * SLOT_MS - 80_000),
             (T0 + 2 * SLOT_MS - 80_000).div_euclid(SLOT_MS)
+        );
+    }
+
+    /// A1 §1.4 item 9: one back-step rule ([`crate::ring::lands`]) serves the ten-second ring,
+    /// its ten-minute buckets, the free history and this hour alike, and compares a reading with
+    /// the newest reading. Up to `CLAMP_BACK_S` (60 s) behind it, a reading in an earlier bucket
+    /// lands in the newest; further back, every held bucket is re-keyed so the newest held is the
+    /// one before the reading's, and the reading opens its own. Negative control: a `lands` with no
+    /// back step (`Back` taken as `Newest`, main's clamp) fails the re-keyed buckets (the mutant
+    /// the F4′ review ran); the scenario's five minutes back is one ten-minute bucket back, which
+    /// main's one-bucket clamp (`Long`, `FreeHistory`) kept in the newest.
+    #[test]
+    fn one_back_step_rule_rekeys_bucket_ring_long_free_history_and_write_hour_alike() {
+        use crate::history::FreeHistory;
+        use crate::ring::{BUCKET_MS, BucketRing, LONG_BUCKET_MS, Taken};
+        let b = T0 - T0.rem_euclid(LONG_BUCKET_MS) + 5 * LONG_BUCKET_MS;
+        let newest = b + 5_000;
+        let near = newest - 30_000;
+        let far = newest - 300_000;
+        let tk = |at: i64| Taken::at(at, 1_000);
+
+        let mut ring = BucketRing::default();
+        let _ = ring.push(tk(newest), Some(1.0), false);
+        let _ = ring.push(tk(near), Some(1.0), false);
+        assert_eq!(
+            ring.open_k(),
+            Some(newest / BUCKET_MS),
+            "near: the newest bucket"
+        );
+        let _ = ring.push(tk(far), Some(2.0), false);
+        let k = far.div_euclid(BUCKET_MS);
+        assert_eq!(ring.open_k(), Some(k));
+        assert_eq!(ring.bucket(k - 1).map(|a| (a.n, a.max)), Some((2, 1.0)));
+        assert_eq!(ring.bucket(k).map(|a| (a.n, a.max)), Some((1, 2.0)));
+
+        let mut long = BucketRing::default();
+        let _ = long.push(tk(b + 1_000), Some(1.0), false);
+        let _ = long.push(tk(b + 11_000), Some(3.0), false);
+        assert_eq!(long.long_k(), Some(b / LONG_BUCKET_MS));
+        let _ = long.push(tk(b + 11_000 - 30_000), Some(3.0), false);
+        assert_eq!(
+            long.long_k(),
+            Some(b / LONG_BUCKET_MS),
+            "a clamped reading folds nothing"
+        );
+        let _ = long.push(tk(b + 11_000 - 300_000), Some(5.0), false);
+        let folded = (b - 300_000).div_euclid(LONG_BUCKET_MS);
+        assert_eq!(
+            long.long_k(),
+            Some(folded),
+            "the re-keyed bucket folds into its own"
+        );
+        let cells = long.long_cells();
+        let means: Vec<Option<f64>> = cells[cells.len() - 2..].iter().map(|c| c.mean).collect();
+        assert_eq!(
+            means,
+            [Some(1.0), Some(3.0)],
+            "the held one moved before it"
+        );
+
+        let mut free = FreeHistory::new();
+        free.note(tk(newest), 10);
+        free.note(tk(near), 9);
+        assert_eq!(free.last_k(), Some(newest / LONG_BUCKET_MS));
+        free.note(tk(far), 8);
+        let fk = far.div_euclid(LONG_BUCKET_MS);
+        assert_eq!(free.last_k(), Some(fk));
+        let rows: Vec<(i64, u16)> = free
+            .saved_rows()
+            .iter()
+            .map(|(at, a)| (at / LONG_BUCKET_MS, a.n))
+            .collect();
+        assert_eq!(rows, [(fk - 1, 2), (fk, 1)]);
+
+        let mut hour = WriteHour::new();
+        assert_eq!(hour.at(newest), newest / SLOT_MS);
+        assert_eq!(hour.at(near), newest / SLOT_MS);
+        hour.note(near, 1_000, &[w("cp", ProcScope::Other, MB, 1)]);
+        let wk = far.div_euclid(SLOT_MS);
+        assert_eq!(hour.at(far), wk);
+        assert_eq!(hour.covered[0].0, wk - 1);
+
+        assert_eq!(
+            crate::ring::lands(Some(b / LONG_BUCKET_MS), Some(newest), far, LONG_BUCKET_MS),
+            Lands::Back(2)
+        );
+        assert_eq!(
+            b / LONG_BUCKET_MS - fk,
+            1,
+            "the scenario: one bucket back, which a one-bucket clamp keeps in the newest"
         );
     }
 }

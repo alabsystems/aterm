@@ -74,14 +74,26 @@ pub(crate) fn held_now(pid: u32) -> bool {
 }
 
 /// The development build's held stand-in set to a pid until it drops, for a test of what reads it.
+/// The stand-in is one pid, so its holders take [`STAND_IN_TESTS`] for their whole life: a second
+/// test waits for the first to drop rather than replacing its pid, and no drop empties a stand-in
+/// another test still holds.
 #[cfg(all(test, target_os = "macos"))]
-pub(crate) struct HeldStandIn;
+pub(crate) struct HeldStandIn {
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+/// Serialises every [`HeldStandIn`].
+#[cfg(all(test, target_os = "macos"))]
+static STAND_IN_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(all(test, target_os = "macos"))]
 impl HeldStandIn {
     pub(crate) fn of(pid: u32) -> Self {
+        let serial = STAND_IN_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         HELD_STAND_IN.store(pid, Ordering::SeqCst);
-        Self
+        Self { _serial: serial }
     }
 }
 
@@ -532,6 +544,21 @@ mod tests {
         );
         at(2 * MIN + STUCK_AFTER_MS, false);
         assert!(!starts_held(&board), "live again: answering");
+    }
+
+    /// A held stand-in holds its tests' lock for its whole life, so a second test's stand-in
+    /// waits for it rather than replacing its pid, and its drop empties no other test's. (The
+    /// pid is no process's, so no other test's `held_now` reads it.)
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_held_stand_in_keeps_its_tests_lock_while_it_lives() {
+        let held = HeldStandIn::of(u32::MAX);
+        assert!(
+            STAND_IN_TESTS.try_lock().is_err(),
+            "a stand-in another test can replace while this one lives"
+        );
+        assert_eq!(held_stand_in(), Some(u32::MAX));
+        drop(held);
     }
 
     #[test]

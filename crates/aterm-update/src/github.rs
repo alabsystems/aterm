@@ -1021,9 +1021,7 @@ fn end_failed_stage(
         crate::install::unix_now_secs(),
     ) {
         StageBooked::Held(why) => {
-            if crate::progress::take_download_began() {
-                crate::progress::report(crate::progress::Progress::Withheld { detail: why });
-            }
+            crate::progress::report(crate::progress::Progress::Withheld { detail: why });
             Ok(None)
         }
         StageBooked::Moment | StageBooked::Verdict => Err(error),
@@ -1375,7 +1373,8 @@ pub(crate) fn check_and_stage_for(
     }
     RATE_LIMITED.store(false, Ordering::Relaxed);
     StaleStageStamps::check_started();
-    let result = check_and_stage_inner(current_build, source, asked);
+    let container_download = crate::progress::DownloadBegan::default();
+    let result = check_and_stage_inner(current_build, source, asked, &container_download);
     if let Some(staging) = Staging::resolve() {
         StaleStageStamps::check_ended(&staging.stage_lock);
     }
@@ -1388,8 +1387,9 @@ pub(crate) fn check_and_stage_for(
             &format!("update check failed: {error}"),
         );
     }
-    let began = crate::progress::take_download_began();
-    if began && let Err(error) = &result {
+    if container_download.began()
+        && let Err(error) = &result
+    {
         crate::progress::report(crate::progress::Progress::Failed {
             detail: error.clone(),
         });
@@ -1631,6 +1631,7 @@ fn check_and_stage_inner(
     current_build: u64,
     source: &Source,
     asked: Asked,
+    container_download: &crate::progress::DownloadBegan,
 ) -> Result<Option<String>, String> {
     let Some(installed) = bundle::resolve() else {
         return Ok(None);
@@ -1644,15 +1645,17 @@ fn check_and_stage_inner(
         master_pubkeys: aterm_update_core::pins::PAPER_MASTER_PUBKEYS,
         team: crate::effective_team_id(),
     };
-    check_and_stage_in(world, current_build, source, asked)
+    check_and_stage_in(world, current_build, source, asked, container_download)
 }
 
-/// [`check_and_stage_inner`] in `world`.
+/// [`check_and_stage_inner`] in `world`; `container_download` is marked once the check begins
+/// downloading the release's container.
 fn check_and_stage_in(
     world: CheckWorld<'_>,
     current_build: u64,
     source: &Source,
     asked: Asked,
+    container_download: &crate::progress::DownloadBegan,
 ) -> Result<Option<String>, String> {
     let CheckWorld {
         installed_parent,
@@ -1900,6 +1903,7 @@ fn check_and_stage_in(
     let part = staging.download.join(format!("{}.part", artifact.name));
     let container_path = staging.download.join(&artifact.name);
     sweep_download_scratch(&staging);
+    container_download.mark();
     let download_watch = crate::progress::watch_download(&part, &manifest.version, &asset.url);
     let downloaded = aterm_update_core::download_to(
         &asset.url,
@@ -1916,9 +1920,7 @@ fn check_and_stage_in(
                  {container} — backing off, will retry on the next check"
             );
             record_deferral(&staging, current_build, &note);
-            if crate::progress::take_download_began() {
-                crate::progress::report(crate::progress::Progress::Deferred { detail: note });
-            }
+            crate::progress::report(crate::progress::Progress::Deferred { detail: note });
             return Ok(None);
         }
         return book_download_failure(&staging, current_build, &manifest, container, &e, free);
@@ -1979,12 +1981,10 @@ fn check_and_stage_in(
             manifest.version, manifest.build_number
         ),
     );
-    if crate::progress::take_download_began() {
-        crate::progress::report(crate::progress::Progress::Staged {
-            version: manifest.version.clone(),
-            build: manifest.build_number,
-        });
-    }
+    crate::progress::report(crate::progress::Progress::Staged {
+        version: manifest.version.clone(),
+        build: manifest.build_number,
+    });
     Ok(Some(manifest.version))
 }
 

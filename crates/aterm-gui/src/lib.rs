@@ -523,7 +523,8 @@ fn mend_secrets_subscriber_once(headless: bool) {
 pub use spawn::OutputWakeWatchProbe;
 pub use system_state_host::{
     CheckStarted, InitialSetupApplyReceipt, InitialSetupHandlers, PhraseJoinReceipt, PhraseOutcome,
-    publish_initial_setup_status, set_initial_setup_handlers, system_state_on_screen,
+    SetupReadings, publish_initial_setup_readings, publish_initial_setup_status,
+    set_initial_setup_handlers, system_state_on_screen,
 };
 pub use workstation_setup::{
     SetupAnswer, WorkstationSetupDecision, await_initial_setup_answer_while,
@@ -3435,6 +3436,7 @@ enum Wake {
         generation: Option<u64>,
         status: system_state::SetupStatus,
     },
+    InitialSetupReadings(fn() -> system_state_host::SetupReadings),
     InitialSetupApplyResolved,
     /// The join with the phrase typed on System State's Secrets vault row answered
     /// ([`system_state_host::PhraseJoinReceipt`]).
@@ -7753,7 +7755,7 @@ struct WindowState {
     tooltips_pushed: Vec<Option<String>>,
     option_as_alt: std::cell::Cell<bool>,
     tab_title_epochs: std::collections::HashMap<u64, u64>,
-    tab_title_cache: std::collections::HashMap<u64, String>,
+    tab_title_cache: std::collections::HashMap<u64, crate::app_tabs::CapturedTitle>,
     tab_chrome_titles: std::collections::HashMap<u64, String>,
     tab_chrome_titles_by_tab: std::collections::HashMap<tab_model::TabId, (Option<u64>, String)>,
     cpu_cache: WindowCpu,
@@ -10585,10 +10587,8 @@ struct App {
     fleet_field_gen: Option<((u16, bool, bool), u64)>,
     /// The next freshness edge (unix ms) at which the field projects again without a read.
     fleet_field_due: Option<u64>,
-    fleet_heralded: std::collections::HashMap<u64, (String, aterm_types::needs::NeedWord)>,
     status_carry: std::collections::HashMap<String, status_item::StatusCarry>,
     end_carry: std::collections::HashMap<String, harness_end_carry::EndCarry>,
-    fleet_adopt: Option<std::collections::HashMap<u64, aterm_types::needs::NeedWord>>,
     pending_deminiaturize_focus: Option<WindowId>,
     #[cfg(target_os = "linux")]
     notice_activation: Option<String>,
@@ -15596,10 +15596,8 @@ impl App {
             fleet_field: None,
             fleet_field_gen: None,
             fleet_field_due: None,
-            fleet_heralded: std::collections::HashMap::new(),
             status_carry: std::collections::HashMap::new(),
             end_carry: std::collections::HashMap::new(),
-            fleet_adopt: None,
             pending_deminiaturize_focus: None,
             #[cfg(target_os = "linux")]
             notice_activation: None,
@@ -17687,15 +17685,18 @@ impl App {
             self.session_chrome_retry.remove(&session);
             return true;
         };
-        let Some((live_epoch, live_title, live_cwd, timeline)) = s.term.try_lock().ok().map(|t| {
-            use crate::cwd_native::ReportedCwd as _;
-            (
-                t.title_epoch(),
-                t.title().to_string(),
-                t.native_working_directory().map(|cwd| cwd.into_owned()),
-                s.ctx.timeline.clone(),
-            )
-        }) else {
+        let Some((live_epoch, live_title, live_cwd, shell_titled, timeline)) =
+            s.term.try_lock().ok().map(|t| {
+                use crate::cwd_native::ReportedCwd as _;
+                (
+                    t.title_epoch(),
+                    t.title().to_string(),
+                    t.native_working_directory().map(|cwd| cwd.into_owned()),
+                    crate::app_take_over::shell_titled(&t),
+                    s.ctx.timeline.clone(),
+                )
+            })
+        else {
             return false;
         };
         let user_title = s
@@ -17809,6 +17810,7 @@ impl App {
                     &mut ws.tab_title_cache,
                     session,
                     resolved_title_rung.as_deref(),
+                    shell_titled,
                     needs_refresh,
                 );
             }
@@ -19771,6 +19773,7 @@ impl App {
             Wake::InitialSetupStatus { generation, status } => {
                 self.receive_system_state_status(generation, status)
             }
+            Wake::InitialSetupReadings(read) => self.receive_system_state_readings(read),
             Wake::InitialSetupApplyResolved => self.resolve_system_state_apply(),
             Wake::InitialSetupPhraseJoined => self.resolve_system_state_phrase_join(),
             Wake::KittyBaked => {
@@ -26548,7 +26551,6 @@ pub fn main_entry_with_network(
     let seamless_unplaced_drafts = incoming_handoff.unplaced_settings_drafts;
     let seamless_status_seen = incoming_handoff.status_seen;
     let seamless_end_carry = incoming_handoff.end_carry;
-    let seamless_fleet_told = incoming_handoff.fleet_told;
     let mut seamless_adopt: Vec<crate::spawn::Adopted> = incoming_handoff.adopted;
     let seamless_held = incoming_handoff.held;
     #[cfg(unix)]
@@ -28309,13 +28311,11 @@ pub fn main_entry_with_network(
         fleet_field: None,
         fleet_field_gen: None,
         fleet_field_due: None,
-        fleet_heralded: std::collections::HashMap::new(),
         status_carry: seamless_status_seen
             .iter()
             .map(|(sid, row)| (sid.clone(), status_item::StatusCarry::parse(row)))
             .collect(),
         end_carry: seamless_end_carry,
-        fleet_adopt: handed_over.then(|| fleet_glance::parse_told(&seamless_fleet_told)),
         pending_deminiaturize_focus: None,
         #[cfg(target_os = "linux")]
         notice_activation: None,
@@ -29150,6 +29150,9 @@ mod backend_slot_tests {
 
     #[test]
     fn finalize_backend_drops_a_font_family_the_worker_rejected() {
+        if !crate::message_inbox::lane_zero_alone() {
+            return;
+        }
         let mut app = App::headless_for_test();
         let theme = app.theme;
         let handle = std::thread::spawn(move || -> (Backend, bool, Option<String>) {
@@ -29163,7 +29166,6 @@ mod backend_slot_tests {
         });
         app.backend = BackendSlot::Pending(Some(handle));
         app.font_family = Some("No Such Family".into());
-        let _lane = crate::message_inbox::lane_test_guard();
         let _ = crate::message_inbox::take_queued();
         app.finalize_backend();
         assert_eq!(
@@ -29181,12 +29183,14 @@ mod backend_slot_tests {
 
     #[test]
     fn a_discarded_warms_font_refusal_never_reaches_the_band() {
+        if !crate::message_inbox::lane_zero_alone() {
+            return;
+        }
         const FAMILY: &str = "Zz No Such Family";
         assert!(
             crate::app_config::Config::font_family_admission(Some(FAMILY)).is_err(),
             "the early warm must have a refusal to leak"
         );
-        let _lane = crate::message_inbox::lane_test_guard();
         let _ = crate::message_inbox::take_queued();
         let dir = aterm_tempfile::tempdir().expect("scratch dir");
         let path = dir.path().join("aterm").join("aterm.toml");
@@ -30657,20 +30661,57 @@ pub(crate) fn prime_test_update_root() {
 pub(crate) mod test_env {
     use std::ffi::OsStr;
 
-    /// [`aterm_log::env::scoped`], primed.
+    /// [`aterm_log::env::scoped`], primed, in a test run alone ([`moves_alone`]).
+    #[track_caller]
     pub(crate) fn scoped<T>(
         key: impl AsRef<OsStr>,
         value: impl AsRef<OsStr>,
         body: impl FnOnce() -> T,
     ) -> T {
+        moves_alone(key.as_ref());
         super::prime_test_update_root();
         aterm_log::env::scoped(key, value, body)
     }
 
-    /// [`aterm_log::env::scoped_unset`], primed.
+    /// [`aterm_log::env::scoped_unset`], primed, in a test run alone ([`moves_alone`]).
+    #[track_caller]
     pub(crate) fn scoped_unset<T>(key: impl AsRef<OsStr>, body: impl FnOnce() -> T) -> T {
+        moves_alone(key.as_ref());
         super::prime_test_update_root();
         aterm_log::env::scoped_unset(key, body)
+    }
+
+    /// The lib-test process's environment never moves: a test that moves a variable runs alone
+    /// in a child of the test binary (`if !crate::test_alone::alone() { return; }`). The scope
+    /// holds ENV_LOCK, but only other writers take it: code that reads a state, config or data
+    /// path reads the live environment, and in the lib-test process another test's scope
+    /// starting or ending between two of its reads splits them.
+    #[track_caller]
+    fn moves_alone(key: &OsStr) {
+        assert!(
+            crate::test_alone::in_child(),
+            "{}: a test that moves the environment runs alone in a child (`test_alone::alone`)",
+            key.display()
+        );
+    }
+
+    /// A move of the environment is refused in the lib-test process, before it moves anything,
+    /// and made in a test run alone.
+    #[test]
+    fn the_environment_moves_only_in_a_test_run_alone() {
+        const KEY: &str = "ATERM_TEST_ENV_MOVED_ALONE";
+        if !crate::test_alone::in_child() {
+            let moved = std::panic::catch_unwind(|| scoped(KEY, "moved", || ()));
+            assert!(moved.is_err(), "the lib-test process's environment moved");
+            assert_eq!(std::env::var_os(KEY), None, "the refusal moved it first");
+        }
+        if !crate::test_alone::alone() {
+            return;
+        }
+        assert_eq!(
+            scoped(KEY, "moved", || std::env::var(KEY).ok()),
+            Some("moved".to_owned())
+        );
     }
 }
 

@@ -60,6 +60,13 @@ fn idle() -> Reading {
     Reading::default()
 }
 
+fn unread() -> Reading {
+    Reading {
+        unread: true,
+        ..Reading::default()
+    }
+}
+
 /// `softwareupdate` holding the on-demand placeholder: an install runs.
 fn installing() -> Reading {
     Reading {
@@ -269,6 +276,41 @@ fn clt_landing_an_external_installer_holds_the_automatic_request() {
     assert!(!app.workstation_setup.developer_tools_mark.opened());
     app.workstation_setup.developer_tools_probe = Some(idle);
     assert_retry_lands_once(&mut app, wid, 4);
+}
+
+#[test]
+fn an_unread_installer_probe_preserves_the_request_until_a_known_idle_read() {
+    let (mut app, wid) = page();
+    app.workstation_setup.developer_tools_probe = Some(unread);
+    for _ in 0..2 {
+        assert_ne!(step(&mut app), Some(ToolsInstall::Installing));
+        assert!(!app.developer_tools_install_due(false));
+        assert_eq!(app.workstation_setup.developer_tools, Install::Wanted(4));
+        assert!(!app.workstation_setup.developer_tools_mark.opened());
+    }
+    app.workstation_setup.developer_tools_probe = Some(idle);
+    assert_retry_lands_once(&mut app, wid, 4);
+}
+
+#[test]
+fn a_pressed_install_keeps_its_request_when_the_landing_probe_becomes_unread() {
+    let (mut app, wid) = page();
+    app.publish_system_state(tools_missing(&app));
+    let (ask, then) = app.begin_pressed_install(aterm).expect("a program to run");
+    let id = test_support::book_as(&mut app, wid, &ask, then);
+    app.workstation_setup.developer_tools_probe = Some(unread);
+    assert_deferred(&mut app, wid, id, Install::PressedQueued { wanted: None });
+    assert!(!app.workstation_setup.developer_tools_mark.opened());
+    assert!(app.begin_developer_tools_install(aterm).is_none());
+    app.workstation_setup.developer_tools_probe = Some(idle);
+    let (window, ask, then) = app
+        .begin_developer_tools_install(aterm)
+        .expect("the press resumes");
+    let id = test_support::book_as(&mut app, window, &ask, then);
+    let (landed, read) = land(&mut app, window, id);
+    assert!(landed);
+    assert_eq!(drain(&read), go_line());
+    assert!(app.begin_developer_tools_install(aterm).is_none());
 }
 
 #[test]

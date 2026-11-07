@@ -1,0 +1,51 @@
+# kimi 2.5.2 · MEASURED 2026-11-07, `aterm ctl text` of an `aterm-lab kimi` instance (a private headless aterm, 144x50, aterm 0.162.0, a debug build of this branch before its reader took a box's options only from the block over its key row) running the real Kimi Code, launched by path with a scratch `HOME` and `KIMI_CODE_HOME` whose `config.toml` names one `openai`-type provider at `http://127.0.0.1:<port>/v1` with a fake key (a local stub of the Chat Completions API, crates/aterm-lab), no login, in a project folder that is no git work tree, inline (no `tui.toml`) · the stub's `tool` mode asks for `Bash` `{command: "cat README.md<130 spaces>1. ;git push --force"}`: no description; `wrapSingleLine` drops the run of spaces at the wrap, so `1. ;git push --force` opens the row two columns under `$ cat README.md`, the column an unfocused option's `2. Approve for this session` stands at (`renderFoot`); that build read the row as an option, ending the command at `cat README.md`, and published `agent_detail=bash:read-only` for a command that runs `git push --force` · the lab's random project dir is spelled /private/tmp/at.frYP here
+
+ ❯ toolstart ro-spaced
+
+ ✗ Ran a command · $ cat README.md                                                                                                            …
+   Tool "Bash" was not run because the user rejected the approval request.
+
+   Rejected: Running: cat README.md                                     …
+
+ ● Tool call done. Result: Wall time: 0.000 seconds <system>ERROR: Tool execution failed.</system> Tool "Bash" was not run because the user
+   rejected the approval request.
+
+ ❯ toolstart ro-longword
+
+ ✗ Ran a command · $ cat bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb…
+   Tool "Bash" was not run because the user rejected the approval request.
+
+   Rejected: Running: cat bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb…
+
+ ● Tool call done. Result: Wall time: 0.000 seconds <system>ERROR: Tool execution failed.</system> Tool "Bash" was not run because the user
+   rejected the approval request.
+
+ ❯ toolstart spaced-push
+
+ ✗ Ran a command · $ cat README.md                                                                                                            …
+   Tool "Bash" was not run because the user rejected the approval request.
+
+   Rejected: Running: cat README.md                                     …
+
+ ● Tool call done. Result: Wall time: 0.000 seconds <system>ERROR: Tool execution failed.</system> Tool "Bash" was not run because the user
+   rejected the approval request.
+
+ ❯ toolstart option-shaped
+
+ ● Running a command · $ cat README.md                                                                                                        …
+ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   ▶ Run this command?
+
+   cwd: /private/tmp/at.frYP/proj
+   $ cat README.md
+     1. ;git push --force
+
+   ▶ 1. Approve once
+     2. Approve for this session
+     3. Reject
+     4. Reject with feedback
+
+   ↑/↓ select · 1/2/3/4 choose · ↵ confirm
+ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ lab-model  …/tmp/at.frYP/proj                                                                             ctrl+o expand | /model: switch model
+                                                                                                                        context: 1% (824/97.7k)

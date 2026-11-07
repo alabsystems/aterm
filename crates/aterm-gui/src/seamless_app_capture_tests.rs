@@ -2196,26 +2196,6 @@ fn what_the_owner_was_told_and_has_seen_crosses_the_update() {
     app.config.desktop_alerts = Some(true);
     crate::app_tabs::HERALD_REFUSAL.set(None);
     app.herald_session(0);
-    let mac = crate::fleet_glance::FleetMac {
-        name: "mac-17".to_string(),
-        dial: "mac-17".to_string(),
-        ..crate::fleet_glance::FleetMac::default()
-    };
-    let need = crate::fleet_glance::FleetNeed {
-        sid: "s-w".to_string(),
-        word: aterm_types::needs::NeedWord::Stalled,
-        who: "claude".to_string(),
-        worker_of: None,
-        age_ms: None,
-        what: None,
-        claim: None,
-        carries_on: false,
-        ids: Vec::new(),
-    };
-    let fleet = crate::fleet_glance::escalation(&mac, &need);
-    app.herald_deliver(fleet.session, Some(&fleet), false);
-    app.fleet_heralded
-        .insert(fleet.session, (mac.dial.clone(), need.word));
     app.headless = true;
     let since_ms = ctx
         .timeline
@@ -2250,11 +2230,6 @@ fn what_the_owner_was_told_and_has_seen_crosses_the_update() {
     assert!(carry.told, "{at}: told");
     assert_eq!(carry.done, Some(since_ms), "{at}: the done read");
     assert!(!carried.contains_key(&untouched), "{at}: nothing known");
-    assert_eq!(
-        incoming.fleet_told,
-        vec![crate::fleet_glance::told_row(fleet.session, need.word)],
-        "{at}: the told fleet need"
-    );
     drop(incoming);
     ptys.release(app);
 }

@@ -677,9 +677,10 @@ pub struct JobTick {
     /// from then on macOS checks no new program aterm starts (the leftover-processes design's
     /// M13). `None` when not granted or not known.
     pub grant_ms: Option<u64>,
-    /// How each agent call's leader the host watches ended ([`JobRow::leader`]), read since its
-    /// last pass: the kernel's wait status of the process, decoded by the host
-    /// ([`LeaderExit`]). A call whose leader has no line here ends with no status.
+    /// How and when each agent call's leader the host watches ended ([`JobRow::leader`]), read
+    /// since its last pass: the kernel's wait status of the process, decoded by the host, and
+    /// the moment the kernel reported it ([`LeaderExit`]). A call whose leader has no line here
+    /// ends with no status, at the pass that finds it gone.
     pub exits: Vec<LeaderExit>,
 }
 
@@ -703,6 +704,10 @@ pub struct LeaderExit {
     pub start: Option<u64>,
     /// How it ended.
     pub end: ExitOf,
+    /// When it ended, on the tick's clock ([`JobTick::at_ms`]): the moment the host's watch saw
+    /// the kernel report the exit, however long before the pass that read it (at the latest, the
+    /// read itself).
+    pub at_ms: u64,
 }
 
 /// The shells a row may name (`p_comm`, a leading login `-` ignored): an agent call led by one is
@@ -730,7 +735,9 @@ pub struct Want {
 
 /// A job that ended, as its passes read it ([`Jobs::take_ended`]): what its telemetry row is
 /// made of. Its figures are the passes' (every 2 s while a job runs): `ended_ms` is the pass that
-/// found it gone, `peak_bytes` and `cpu_ns` the most any pass read, so lower bounds.
+/// found it gone, `peak_bytes` and `cpu_ns` the most any pass read, so lower bounds. An agent
+/// call whose leader's exit the host read ends at its leader's own moment
+/// ([`Self::leader_exited_ms`]); any other at the pass that found it gone.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ended {
     /// Its tab's key (the session id).
@@ -757,6 +764,9 @@ pub struct Ended {
     pub exit: Option<i32>,
     /// How an agent call's leader ended, where the host watched it ([`JobTick::exits`]).
     pub ended_by: Option<ExitOf>,
+    /// When an agent call's leader ended, host ms, as the host read it ([`LeaderExit::at_ms`]):
+    /// set exactly where [`Self::ended_by`] is.
+    pub leader_exited_ms: Option<u64>,
     /// The program an agent call ran: its leader's name once that names no shell (the leader
     /// `exec`ed the program, or the agent ran it with no wrapper), else the last a member other
     /// than its leader showed, the wrapper's own children first and the wrapper's forks (its

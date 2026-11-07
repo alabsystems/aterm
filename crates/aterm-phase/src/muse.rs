@@ -13,7 +13,7 @@ use crate::wall::{ApiCause, Placement, Wall, WallKind};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 17, "0.17");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 18, "0.18");
 
 #[derive(Debug, Clone, Copy)]
 struct Frame {
@@ -1417,6 +1417,7 @@ fn trust_prompt(
         title: crate::text::trim(&rows[title]).to_string(),
         command_rows: Vec::new(),
         description_rows: 0,
+        spellings: None,
         gutter: false,
         command: path.clone().unwrap_or_default(),
         description: String::new(),
@@ -1744,6 +1745,7 @@ fn approval_prompt(rows: &[String], b: Approval) -> PromptV2 {
         title: trimmed(title_row).to_string(),
         command_rows,
         description_rows: 0,
+        spellings: None,
         gutter: false,
         command,
         description: String::new(),
@@ -1914,6 +1916,7 @@ fn question_prompt(rows: &[String], q: Question) -> PromptV2 {
         title: question_title(rows, q.head, q.first),
         command_rows: Vec::new(),
         description_rows: 0,
+        spellings: None,
         gutter: false,
         command: String::new(),
         description: asked
@@ -2074,6 +2077,7 @@ fn review_prompt(rows: &[String], r: Review) -> PromptV2 {
         title: question_title(rows, r.head, r.keys.0),
         command_rows: Vec::new(),
         description_rows: 0,
+        spellings: None,
         gutter: false,
         command: String::new(),
         description: answers.join(" "),

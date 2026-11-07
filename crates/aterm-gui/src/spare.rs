@@ -3096,6 +3096,7 @@ impl Wake {
             | Wake::DeveloperToolsLowData(_)
             | Wake::RootStepsOwed(_)
             | Wake::InitialSetupStatus { .. }
+            | Wake::InitialSetupReadings(_)
             | Wake::InitialSetupApplyResolved
             | Wake::InitialSetupPhraseJoined
             | Wake::KittyBaked

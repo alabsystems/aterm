@@ -250,8 +250,9 @@ struct Job {
     /// as `member_name` is: the wrapper outlives what it ran, and the pass that finds the call
     /// gone sees none of it.
     ran: String,
-    /// How an agent call's leader ended, once the host read it ([`JobTick::exits`]).
-    ended_by: Option<ExitOf>,
+    /// How an agent call's leader ended and when, host ms, once the host read it
+    /// ([`JobTick::exits`]): one reading, so neither is kept without the other.
+    ended_by: Option<(ExitOf, u64)>,
     members: MemberMap,
     outputs: HashMap<(u64, u64), u64>,
     pty_bytes: Option<u64>,
@@ -1305,7 +1306,7 @@ impl Jobs {
                     && j.key.start.is_some()
                     && j.key.start == exit.start
             }) {
-                job.ended_by = Some(exit.end);
+                job.ended_by = Some((exit.end, exit.at_ms));
             }
         }
 
@@ -2821,7 +2822,8 @@ impl Jobs {
                     last_read_ms: last_read,
                     ended_ms: at,
                     exit: job.exit,
-                    ended_by: job.ended_by,
+                    ended_by: job.ended_by.map(|(end, _)| end),
+                    leader_exited_ms: job.ended_by.map(|(_, at_ms)| at_ms),
                     ran: (job.kind == JobKind::AgentCall && !job.ran.is_empty())
                         .then(|| job.ran.clone()),
                     peak_bytes: job.meter.peak,

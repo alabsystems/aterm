@@ -25,7 +25,9 @@
 //! of the path renamed (a project folder moved, a checkout swapped in) is
 //! heard as well. A file no arm took (a folder refused it, descriptors or
 //! watches ran out, or its folders kept being made or moved while it armed)
-//! is armed again every `REARM_EVERY`, and only while some file is unarmed.
+//! is armed again every `REARM_EVERY`, and only while some file is unarmed;
+//! each round that still finds it unarmed looks at it, so its change is told
+//! with no event to tell of it.
 //!
 //! The watch only tells: the host re-reads the file through the document's
 //! own capability and decides (reload a clean buffer in place, or offer
@@ -274,20 +276,21 @@ pub struct FileWatch {
 }
 
 impl FileWatch {
-    /// Start the watch over this platform's file events, telling `notify`
-    /// each watched key whose file changed.
+    /// Start the watch over this platform's file events on a thread named
+    /// `name`, telling `notify` each watched key whose file changed.
     ///
     /// # Errors
     /// When the platform's event source or the thread cannot start.
-    pub fn platform(notify: Box<dyn FnMut(u64) + Send>) -> io::Result<Self> {
-        Self::spawn(platform_events()?, notify)
+    pub fn platform(name: &str, notify: Box<dyn FnMut(u64) + Send>) -> io::Result<Self> {
+        Self::spawn(name, platform_events()?, notify)
     }
 
-    /// Start the watch over `events`.
+    /// Start the watch over `events` on a thread named `name`.
     ///
     /// # Errors
     /// When the thread cannot start.
     pub fn spawn(
+        name: &str,
         events: Box<dyn FileEvents>,
         notify: Box<dyn FnMut(u64) + Send>,
     ) -> io::Result<Self> {
@@ -296,7 +299,7 @@ impl FileWatch {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stopping = Arc::clone(&stop);
         let thread = std::thread::Builder::new()
-            .name("aterm-document-watch".to_string())
+            .name(name.to_owned())
             .spawn(move || watch_loop(events, &receive, &stopping, notify))?;
         Ok(Self {
             commands,
@@ -400,12 +403,21 @@ fn watch_loop(
         }
         let now = Instant::now();
         for key in unarmed.due(now) {
-            // An arm that takes now is looked at, as a first look is: the
-            // file may have come back with its folder before the arm.
-            if let Some((path, _)) = watched.get(&key)
-                && unarmed.arm(events.as_mut(), key, path, now)
-            {
+            let Some((path, seen)) = watched.get_mut(&key) else {
+                continue;
+            };
+            if unarmed.arm(events.as_mut(), key, path, now) {
+                // An arm that takes now is looked at, as a first look is:
+                // the file may have come back with its folder before the arm.
                 debounce.note(key, now);
+            } else {
+                // Still unarmed, so no event can tell of the file: the round
+                // looks at it itself.
+                let stamp = Seen::Stamp(FileStamp::of(path));
+                if stamp != *seen {
+                    *seen = stamp;
+                    notify(key);
+                }
             }
         }
         for key in &touched {
@@ -428,8 +440,9 @@ fn watch_loop(
 }
 
 /// The watched files no arm took ([`FileEvents::arm`]), which the watch arms
-/// again in batches every [`REARM_EVERY`] while one is left. New failures do
-/// not postpone a pending batch; with none left the watch waits on events alone.
+/// again in batches every [`REARM_EVERY`] while one is left, looking at each
+/// one a batch still could not arm. New failures do not postpone a pending
+/// batch; with none left the watch waits on events alone.
 #[derive(Debug)]
 struct Unarmed {
     keys: BTreeSet<u64>,
@@ -991,21 +1004,49 @@ mod kqueue {
     }
 
     impl KqueueEvents {
-        /// Listen on the nearest folder of `path`'s that is there ([`super::folders_up`]): that
-        /// folder, and the folder just below it that was missing, or `None` where that nearest
-        /// one is `path`'s own.
-        fn listen_folder<'p>(
+        /// Listen on the nearest folder of `path`'s that is there ([`super::folders_up`]): where
+        /// the folders above it are walked from, the folder its listener holds, and the folder
+        /// just below it that was missing, or `None` where that nearest one is `path`'s own.
+        ///
+        /// Where that nearest one is a link to a folder (a dotfiles `~/.config`), which a listen
+        /// refuses, since it opens no link it is not asked to, the listener is on the folder the
+        /// link names, and the walk above starts at the link: its own listener there hears it
+        /// made to name another folder, and the folders behind it are walked too.
+        fn listen_folder(
             &mut self,
             key: u64,
-            path: &'p Path,
+            path: &Path,
             step: &mut impl FnMut(Listen, &Path) -> io::Result<()>,
-        ) -> io::Result<(&'p Path, Option<PathBuf>)> {
+        ) -> io::Result<Folder> {
             for (directory, below) in super::folders_up(path) {
                 let listened = self.listen(key, directory, true, step);
                 step(Listen::Answered, directory)?;
+                let made = (below != path).then(|| below.to_path_buf());
                 match listened {
-                    Ok(()) => return Ok((directory, (below != path).then(|| below.to_path_buf()))),
+                    Ok(()) => {
+                        return Ok(Folder {
+                            from: directory.to_path_buf(),
+                            held: directory.to_path_buf(),
+                            made,
+                        });
+                    }
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error)
+                        if matches!(error.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP))
+                            && std::fs::symlink_metadata(directory)
+                                .is_ok_and(|there| there.file_type().is_symlink()) =>
+                    {
+                        // A link to no folder answers as a link refused: that is all it is.
+                        let named = std::fs::canonicalize(directory).map_err(|_| error)?;
+                        let listened = self.listen(key, &named, true, step);
+                        step(Listen::Answered, &named)?;
+                        listened?;
+                        return Ok(Folder {
+                            from: directory.to_path_buf(),
+                            held: named,
+                            made,
+                        });
+                    }
                     Err(error) => return Err(error),
                 }
             }
@@ -1148,8 +1189,9 @@ mod kqueue {
         /// before it opens below. In the other order a file made between the two has no listener
         /// of its own, and every later write into it goes unheard. The folders above hear the
         /// path renamed out from under both ([`Self::listen_above`]), and still do where the
-        /// file's own folder refused its listen (a link, or one this user cannot read) and the
-        /// file's listener took: that is all the key holds there.
+        /// file's own folder refused its listen (one this user cannot read, or a link that names
+        /// no folder) and the file's listener took: that is all the key holds there. A folder
+        /// that is a link to one is listened on through the link ([`Self::listen_folder`]).
         pub(super) fn arm_around(
             &mut self,
             key: u64,
@@ -1164,8 +1206,10 @@ mod kqueue {
                 match folder {
                     // Made between its failed open and the listen above it, which hears
                     // nothing inside it: arm again, lower.
-                    Ok((_, Some(made))) if made.exists() => {}
-                    Ok((directory, _)) => match self.listen_above(key, directory, directory) {
+                    Ok(Folder {
+                        made: Some(made), ..
+                    }) if made.exists() => {}
+                    Ok(Folder { from, held, .. }) => match self.listen_above(key, &from, &held) {
                         // A folder on the way moved as the walk listened: arm again.
                         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                         above => return above.and(file_answer(file)),
@@ -1211,6 +1255,17 @@ mod kqueue {
                 .map(|(id, above)| (*id, above.keys.iter().copied().collect()))
                 .collect()
         }
+    }
+
+    /// The folder [`KqueueEvents::listen_folder`] listened on for a key.
+    struct Folder {
+        /// Where the folders above are walked from: the nearest folder there, or the link that
+        /// stands for it.
+        from: PathBuf,
+        /// What the listener is on: `from`, or the folder that link names.
+        held: PathBuf,
+        /// The folder just below `from` that was missing, where `from` is not the path's own.
+        made: Option<PathBuf>,
     }
 
     /// Where a listen has got to, for [`KqueueEvents::arm_around`].

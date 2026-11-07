@@ -270,6 +270,7 @@ fn the_first_look_tells_then_an_event_tells_only_when_the_file_really_changed() 
     let events = Scripted::default();
     let (told, heard) = mpsc::channel();
     let watch = FileWatch::spawn(
+        "aterm-document-watch",
         Box::new(events.clone()),
         Box::new(move |key| {
             let _ = told.send(key);
@@ -324,6 +325,7 @@ fn the_platform_hears_a_rewrite_and_a_replace_by_rename() {
         arms: Arc::clone(&arms),
     };
     let watch = FileWatch::spawn(
+        "aterm-document-watch",
         Box::new(events),
         Box::new(move |key| {
             let _ = told.send(key);
@@ -379,6 +381,7 @@ fn the_platform_hears_a_delete_and_the_file_made_again() {
         arms: Arc::clone(&arms),
     };
     let watch = FileWatch::spawn(
+        "aterm-document-watch",
         Box::new(events),
         Box::new(move |key| {
             let _ = told.send(key);
@@ -465,6 +468,7 @@ fn the_platform_hears_a_folder_above_renamed_and_the_path_made_again() {
     std::fs::write(&path, "one\n").unwrap();
     let (told, heard) = mpsc::channel();
     let watch = FileWatch::spawn(
+        "aterm-document-watch",
         platform_events().unwrap(),
         Box::new(move |key| {
             let _ = told.send(key);
@@ -517,6 +521,7 @@ fn the_platform_hears_a_folder_behind_a_link_renamed_away_and_made_again() {
     std::fs::write(&path, "one\n").unwrap();
     let (told, heard) = mpsc::channel();
     let watch = FileWatch::spawn(
+        "aterm-document-watch",
         platform_events().unwrap(),
         Box::new(move |key| {
             let _ = told.send(key);
@@ -913,6 +918,43 @@ fn the_platform_hears_a_folder_behind_a_link_on_the_path_renamed() {
     assert_eq!(touched, [1]);
 }
 
+/// A file not yet made in a folder that is a link to one (a dotfiles `~/.config/aterm`) arms on
+/// the folder the link names, so its making is heard there with no re-arm rounds; and the link
+/// made to name another folder is heard by the link's own listener.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_missing_file_in_a_linked_folder_arms_on_the_folder_the_link_names() {
+    let dir = scratch("amacs-watch-linked-folder");
+    let (real, other) = (dir.path().join("real"), dir.path().join("other"));
+    std::fs::create_dir(&real).unwrap();
+    std::fs::create_dir(&other).unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let path = link.join("absent.txt");
+    let mut events = kqueue::KqueueEvents::new().unwrap();
+    events
+        .arm(1, &path)
+        .expect("armed on the folder the link names");
+
+    let touched = heard_for(&mut events, || {
+        std::fs::write(real.join("absent.txt"), "made\n").unwrap();
+    });
+    assert_eq!(touched, [1], "made where the link points");
+
+    events.arm(1, &path).unwrap();
+    let touched = heard_for(&mut events, || {
+        let next = dir.path().join("link.next");
+        std::os::unix::fs::symlink(&other, &next).unwrap();
+        std::fs::rename(&next, &link).unwrap();
+    });
+    assert_eq!(touched, [1], "the link made to name another folder");
+
+    // The negative control: a link that names no folder is refused, as it was.
+    let dangling = dir.path().join("dangling");
+    std::os::unix::fs::symlink(dir.path().join("gone"), &dangling).unwrap();
+    assert!(events.arm(2, &dangling.join("absent.txt")).is_err());
+}
+
 /// An arm a test refuses while `refuse` holds (the file's folder is gone),
 /// counting the arms it was asked for and keeping each wait's timeout.
 #[derive(Clone, Default)]
@@ -1103,6 +1145,7 @@ fn a_file_no_arm_took_is_armed_again_until_one_takes_and_then_waits_untimed() {
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let (told, heard) = mpsc::channel();
     let watch = FileWatch::spawn(
+        "aterm-document-watch",
         Box::new(events.clone()),
         Box::new(move |key| {
             let _ = told.send(key);
@@ -1141,6 +1184,45 @@ fn a_file_no_arm_took_is_armed_again_until_one_takes_and_then_waits_untimed() {
     assert!(
         heard.try_recv().is_err(),
         "the look after the arm took found the file unchanged"
+    );
+    drop(watch);
+}
+
+/// A file no arm takes hears no event, so each round that arms it again in
+/// vain looks at it: its change is told all the same.
+#[test]
+fn a_file_no_arm_takes_is_looked_at_each_round_and_its_change_told() {
+    let dir = scratch("amacs-watch-unarmed");
+    let path = dir.path().join("doc.txt");
+    std::fs::write(&path, "one\n").unwrap();
+    let events = Refusing::default();
+    events
+        .refuse
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (told, heard) = mpsc::channel();
+    let watch = FileWatch::spawn(
+        "aterm-document-watch",
+        Box::new(events.clone()),
+        Box::new(move |key| {
+            let _ = told.send(key);
+        }),
+    )
+    .unwrap();
+    watch.watch(5, path.clone());
+    assert_eq!(
+        heard.recv_timeout(aterm_spec::wait::MUST_HAPPEN),
+        Ok(5),
+        "the first look"
+    );
+    std::fs::write(&path, "two, longer\n").unwrap();
+    assert_eq!(
+        heard.recv_timeout(aterm_spec::wait::MUST_HAPPEN),
+        Ok(5),
+        "a round's look told the change no event could"
+    );
+    assert!(
+        *events.arms.lock().unwrap() >= 3,
+        "still refused when it told"
     );
     drop(watch);
 }
@@ -1555,6 +1637,7 @@ fn the_platform_hears_a_file_made_in_folders_made_after_the_watch() {
         arms: Arc::clone(&arms),
     };
     let watch = FileWatch::spawn(
+        "aterm-document-watch",
         Box::new(events),
         Box::new(move |key| {
             let _ = told.send(key);

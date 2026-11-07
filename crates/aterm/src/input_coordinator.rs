@@ -108,6 +108,8 @@ trait Ports {
 
 struct Live {
     clock: std::time::Instant,
+    /// Captured before the initial canonical ticket, not when its later stage starts.
+    readback: super::SetupReadbackScope,
 }
 
 impl Ports for Live {
@@ -122,25 +124,9 @@ impl Ports for Live {
         &mut self,
         ticket: &PendingInputAdmission,
     ) -> Result<Option<InitialInputPass>, String> {
-        struct Registration(u64);
-        impl Drop for Registration {
-            fn drop(&mut self) {
-                super::clear_setup_run(self.0);
-            }
-        }
-        // This registration exists only while the shared slot is held. It cannot clear
-        // another whole-plan worker's registration while this task is parked.
-        super::set_setup_run(Some(ticket.revision()));
-        super::start_stop_worker();
-        let _registered = Registration(ticket.revision());
-        aterm_cli::macos_doctor::run_initial_input_pass(
-            ticket,
-            SetupHooks {
-                stop: super::setup_stop_requested,
-                stage: |_| {},
-            },
-        )
-        .result
+        with_input_readback(self.readback, ticket.revision(), |hooks| {
+            aterm_cli::macos_doctor::run_initial_input_pass(ticket, hooks).result
+        })
     }
     fn mark(&mut self, ticket: &PendingInputAdmission) -> InitialSetupParkMark {
         aterm_cli::macos_doctor::initial_setup_input_park_mark(ticket)
@@ -165,9 +151,34 @@ impl Ports for Live {
     }
 }
 
+/// The owned target and its pre-capture choice fence reach the real stage hook
+/// together. No full-profile status or maintenance is part of this boundary.
+fn with_input_readback<T>(
+    scope: super::SetupReadbackScope,
+    revision: u64,
+    apply: impl FnOnce(SetupHooks) -> T,
+) -> T {
+    struct Registration(u64);
+    impl Drop for Registration {
+        fn drop(&mut self) {
+            super::clear_setup_run(self.0);
+        }
+    }
+    super::set_setup_run(Some(revision));
+    super::start_stop_worker();
+    let _registered = Registration(revision);
+    super::with_setup_readback(scope, || {
+        apply(SetupHooks {
+            stop: super::setup_stop_requested,
+            stage: super::setup_readback_stage,
+        })
+    })
+}
+
 pub(super) fn start(revision: u64) -> Result<Option<JoinHandle<()>>, String> {
     let mut ports = Live {
         clock: std::time::Instant::now(),
+        readback: super::capture_setup_readback_scope(Some(revision)),
     };
     let Some(ticket) = ports
         .current()?
@@ -350,6 +361,22 @@ pub(super) mod fixture {
         }
 
         pub fn start(self: &Arc<Self>, revision: u64) -> Result<Option<JoinHandle<()>>, String> {
+            self.start_with(revision, None)
+        }
+
+        pub fn start_observing(
+            self: &Arc<Self>,
+            revision: u64,
+        ) -> Result<Option<JoinHandle<()>>, String> {
+            let scope = super::super::capture_setup_readback_scope(Some(revision));
+            self.start_with(revision, Some(scope))
+        }
+
+        pub fn start_with(
+            self: &Arc<Self>,
+            revision: u64,
+            readback: Option<super::super::SetupReadbackScope>,
+        ) -> Result<Option<JoinHandle<()>>, String> {
             let setup = InitialSetupAdmissionStopTest::startup(&self.root)?;
             let Some(ticket) = setup
                 .pending_inputs()?
@@ -365,6 +392,7 @@ pub(super) mod fixture {
                 NativePorts {
                     native: Arc::clone(self),
                     clock: std::time::Instant::now(),
+                    readback,
                 },
                 ticket,
                 claim,
@@ -381,6 +409,7 @@ pub(super) mod fixture {
     struct NativePorts {
         native: Arc<Native>,
         clock: std::time::Instant,
+        readback: Option<super::super::SetupReadbackScope>,
     }
 
     impl Drop for NativePorts {
@@ -400,14 +429,21 @@ pub(super) mod fixture {
             &mut self,
             ticket: &PendingInputAdmission,
         ) -> Result<Option<InitialInputPass>, String> {
-            InitialSetupAdmissionStopTest::startup(&self.native.root)?.native_input_pass(
-                ticket,
-                || {
-                    Box::new(InitialSetupAdmissionStopTest::keyboard_system(
-                        self.native.attached.load(Ordering::Acquire),
-                    ))
-                },
-            )
+            let run = |hooks| {
+                InitialSetupAdmissionStopTest::startup(&self.native.root)?.native_input_pass(
+                    ticket,
+                    || {
+                        Box::new(InitialSetupAdmissionStopTest::keyboard_system(
+                            self.native.attached.load(Ordering::Acquire),
+                        ))
+                    },
+                    hooks,
+                )
+            };
+            match self.readback {
+                Some(scope) => with_input_readback(scope, ticket.revision(), run),
+                None => run(SetupHooks::NONE),
+            }
         }
         fn mark(&mut self, ticket: &PendingInputAdmission) -> InitialSetupParkMark {
             InitialSetupAdmissionStopTest::startup(&self.native.root)

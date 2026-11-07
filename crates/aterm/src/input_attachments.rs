@@ -22,6 +22,7 @@ struct Keeper {
 struct Inputs {
     keeper: Keeper,
     pending: Option<(u64, InputServiceSet)>,
+    seen: Option<(InputSetupScope, Option<InputServiceSet>)>,
 }
 
 /// Mutable task ownership outlives a failed sampling thread. Only observations are
@@ -39,6 +40,7 @@ struct Actor {
 #[derive(Clone)]
 struct Notifications {
     changed: fn(),
+    invalidated: fn(),
     console_return: Option<fn() -> Result<(), String>>,
     pending: PendingOwner,
     ended: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -128,6 +130,8 @@ impl Supervisor {
                 actor.said = None;
                 actor.follow_up_said = None;
                 self.actor.clear_poison();
+                drop(actor);
+                (self.notifications.invalidated)();
             }
             self.retry.reaped(Last::Failed, now);
         }
@@ -193,6 +197,10 @@ impl PendingOwner {
 }
 
 impl Inputs {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one input sample keeps its data, activation, wake and invalidation ports explicit"
+    )]
     fn round(
         &mut self,
         at_console: bool,
@@ -201,24 +209,43 @@ impl Inputs {
         services: impl FnOnce() -> Result<Vec<u64>, String>,
         activate: impl FnOnce(u64, &[u64]) -> Result<Option<bool>, String>,
         pending_changed: &dyn Fn(),
+        invalidated: &dyn Fn(),
     ) -> Result<bool, String> {
         if !at_console {
-            *self = Self::default();
+            self.observe(InputSetupScope::Inactive, None, invalidated);
+            self.keeper = Keeper::default();
+            self.pending = None;
             return Ok(false);
         }
-        match scope()? {
+        let scope = scope().inspect_err(|_| {
+            self.seen = None;
+            invalidated();
+        })?;
+        if scope == InputSetupScope::Inactive {
+            self.observe(scope, None, invalidated);
+            self.keeper = Keeper::default();
+            self.pending = None;
+            return Ok(false);
+        }
+        let services = services().and_then(InputServiceSet::new).inspect_err(|_| {
+            self.seen = None;
+            invalidated();
+        })?;
+        // The sample is already paid for. Retire the previous fact before an
+        // activation can fail or before a pending stage can be resumed.
+        self.observe(scope, Some(services.clone()), invalidated);
+        match scope {
             InputSetupScope::Inactive => {
-                *self = Self::default();
-                Ok(false)
+                unreachable!("inactive scope returned before the hardware sample")
             }
             InputSetupScope::Applied(revision) => {
                 self.pending = None;
                 self.keeper
-                    .round(now_ms, Some(revision), services, activate)
+                    .round(now_ms, Some(revision), || Ok(services.into_vec()), activate)
             }
             InputSetupScope::Pending(revision) => {
                 self.keeper = Keeper::default();
-                let current = (revision, InputServiceSet::new(services()?)?);
+                let current = (revision, services);
                 if self.pending.as_ref() != Some(&current) {
                     self.pending = Some(current);
                     // The first sample also nudges: a device can arrive after the parked pass
@@ -230,6 +257,41 @@ impl Inputs {
             }
         }
     }
+
+    fn observe(
+        &mut self,
+        scope: InputSetupScope,
+        services: Option<InputServiceSet>,
+        invalidated: &dyn Fn(),
+    ) {
+        let current = (scope, services);
+        if self.seen.as_ref() != Some(&current) {
+            let completed = self.seen.as_ref().is_some_and(|(before, ids)| {
+                matches!((before, scope), (InputSetupScope::Pending(a), InputSetupScope::Applied(b)) if *a == b)
+                    && ids == &current.1
+            });
+            // The owned pass just supplied the full cohort. Recording its
+            // completion with the same identities is no new hardware/source.
+            if !completed {
+                invalidated();
+            }
+            self.seen = Some(current);
+        }
+    }
+}
+
+/// Retire an actual activation's readings for its whole effect/failed-read
+/// batch. A real no-op produces no lease and owes no redundant observation.
+pub(super) fn activate_observing<T>(activate: impl FnOnce(&dyn Fn()) -> T) -> (T, bool) {
+    let activity = std::cell::RefCell::new(None);
+    let result = activate(&|| {
+        if activity.borrow().is_none() {
+            *activity.borrow_mut() = Some(super::InputReadbackActivity::begin());
+        }
+    });
+    let retired = activity.borrow().is_some();
+    drop(activity.into_inner());
+    (result, retired)
 }
 
 #[derive(Default)]
@@ -396,6 +458,7 @@ fn spawn_background() -> Option<aterm_gui::NodeMaintenance> {
         |changed, console_return, pending| {
             maintenance = supervisor(Notifications {
                 changed,
+                invalidated: || {},
                 console_return,
                 pending,
                 ended: None,
@@ -430,6 +493,7 @@ fn start_background_with(sys: &dyn aterm_machines::port::System, start: impl FnO
 
 pub(super) fn spawn() -> Option<aterm_gui::HostMaintenance> {
     supervisor(Notifications {
+        invalidated: super::invalidate_input_observations,
         changed: || {
             super::request_observation(
                 None,
@@ -500,6 +564,33 @@ fn spawn_worker(
                     }
                 }
                 let scope = aterm_cli::macos_doctor::input_setup_scope();
+                let needs_observation = std::cell::Cell::new(false);
+                let invalidate = || {
+                    needs_observation.set(true);
+                    (notifications.invalidated)();
+                };
+                let observed = inputs.round(
+                    at_console,
+                    now,
+                    || scope.clone(),
+                    || sys.keyboard_service_ids(),
+                    |revision, ids| {
+                        let (result, retired) = activate_observing(|changing| {
+                            aterm_cli::macos_doctor::activate_input_attachments(
+                                revision,
+                                ids,
+                                super::setup_stop_requested,
+                                changing,
+                            )
+                        });
+                        needs_observation.set(needs_observation.get() || retired);
+                        result
+                    },
+                    &notifications.pending.changed(),
+                    &invalidate,
+                );
+                // Retain/reap the real scoped task even when this hardware sample
+                // failed; the source read still controls its ordinary admission.
                 let owned = notifications.pending.coordinate(
                     coordinator,
                     &scope,
@@ -508,25 +599,12 @@ fn spawn_worker(
                     super::input_coordinator::start,
                     super::wake_setup_facts,
                 );
-                let result = owned.and_then(|()| {
-                    inputs.round(
-                        at_console,
-                        now,
-                        || scope,
-                        || sys.keyboard_service_ids(),
-                        |revision, ids| {
-                            aterm_cli::macos_doctor::activate_input_attachments(
-                                revision,
-                                ids,
-                                super::setup_stop_requested,
-                            )
-                        },
-                        &notifications.pending.changed(),
-                    )
-                });
+                let result = observed.and_then(|changed| owned.map(|()| changed));
                 match result {
                     Ok(true) => {
-                        (notifications.changed)();
+                        if needs_observation.get() {
+                            (notifications.changed)();
+                        }
                         *said = None;
                     }
                     Ok(false) => {}
@@ -626,6 +704,7 @@ mod tests {
         let (native, events) = fixture::Native::new(dir.path().to_path_buf());
         let notifications = Notifications {
             changed: || {},
+            invalidated: || {},
             console_return: None,
             pending: PendingOwner::Background,
             ended: None,
@@ -676,6 +755,7 @@ mod tests {
                                 || input_setup_scope_at(&root),
                                 || Ok(vec![41]),
                                 |_, _| panic!("pending input has no setter authority"),
+                                &|| {},
                                 &|| {},
                             )
                             .unwrap();
@@ -743,6 +823,7 @@ mod tests {
         let release_rx = Mutex::new(release_rx);
         let notifications = Notifications {
             changed: || {},
+            invalidated: || {},
             console_return: None,
             pending: PendingOwner::Window(|| {}),
             ended: Some(Arc::new(move || {
@@ -861,6 +942,7 @@ mod tests {
                             },
                             |_, _| panic!("a pending pass has no attachment-setter authority"),
                             &hand_off,
+                            &|| {},
                         )
                         .unwrap()
                 );
@@ -916,6 +998,7 @@ mod tests {
                     || panic!("Stop withholds the pending hardware read"),
                     |_, _| panic!("Stop withholds activation"),
                     &stopped_handoff,
+                    &|| {},
                 )
                 .unwrap();
         });
@@ -1037,6 +1120,8 @@ mod tests {
         assert_eq!(scope().unwrap(), InputSetupScope::Pending(revision));
         let wakes = crate::SetupWakes::new();
         let changed = || wakes.raise_facts();
+        let invalidations = std::cell::Cell::new(0);
+        let invalidate = || invalidations.set(invalidations.get() + 1);
         let mut inputs = Inputs::default();
         let observe = |inputs: &mut Inputs, ids| {
             inputs.round(
@@ -1046,10 +1131,16 @@ mod tests {
                 || Ok(ids),
                 |_, _| panic!("pending observation has no setter authority"),
                 &changed,
+                &invalidate,
             )
         };
         let before = wakes.marks();
         assert!(!observe(&mut inputs, vec![41]).unwrap());
+        assert_eq!(
+            invalidations.get(),
+            1,
+            "first native sample retires old facts"
+        );
         let seeded = wakes.marks();
         assert_ne!(
             seeded.facts, before.facts,
@@ -1058,18 +1149,30 @@ mod tests {
         assert!(!seeded.refreshed_since(before));
         assert!(!seeded.checked_since(before));
         assert!(!observe(&mut inputs, vec![41]).unwrap());
+        assert_eq!(
+            invalidations.get(),
+            1,
+            "an unchanged sample invalidates nothing"
+        );
         assert_eq!(wakes.marks(), seeded, "unchanged samples owe no nudge");
         assert!(!observe(&mut inputs, vec![42, 41]).unwrap());
+        assert_eq!(invalidations.get(), 2);
         let attached = wakes.marks();
         assert_ne!(attached.facts, seeded.facts);
         assert!(!attached.refreshed_since(before));
         assert!(!observe(&mut inputs, vec![41, 42]).unwrap());
+        assert_eq!(
+            invalidations.get(),
+            2,
+            "enumeration order changes no source"
+        );
         assert_eq!(
             wakes.marks(),
             attached,
             "a different enumeration order is no new device"
         );
         assert!(observe(&mut inputs, vec![41, 41]).is_err());
+        assert_eq!(invalidations.get(), 3, "an unread cohort retires old facts");
         assert_eq!(wakes.marks(), attached, "ambiguous IDs supply no fact");
 
         // A new keyboard can already be present when this observer first sees pending setup.
@@ -1080,6 +1183,46 @@ mod tests {
         assert!(!first_after_attach.refreshed_since(before));
         assert!(!first_after_attach.checked_since(before));
 
+        assert!(!observe(&mut inputs, vec![41, 42]).unwrap());
+        let before_completion = invalidations.get();
+        setup
+            .native_workstation_pass(revision, || {
+                Box::new(InitialSetupAdmissionStopTest::keyboard_system(true))
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(scope().unwrap(), InputSetupScope::Applied(revision));
+        let no_op = InitialSetupAdmissionStopTest::keyboard_system(true);
+        assert!(
+            inputs
+                .round(
+                    true,
+                    0,
+                    scope,
+                    || Ok(vec![41, 42]),
+                    |_, ids| aterm_machines::init::activate_keyboard_attachments(
+                        &no_op,
+                        ids,
+                        &|_| false,
+                        &|| true,
+                        &invalidate,
+                    )
+                    .map(Some),
+                    &changed,
+                    &invalidate,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            invalidations.get(),
+            before_completion,
+            "the same owned task's completion does not retire its readback"
+        );
+        assert!(
+            no_op.keyboard_changes().is_empty(),
+            "completion's real activation was a no-op"
+        );
+
         assert!(
             !inputs
                 .round(
@@ -1088,7 +1231,8 @@ mod tests {
                     || panic!("another console reads no setup scope"),
                     || panic!("another console reads no hardware"),
                     |_, _| panic!("another console activates nothing"),
-                    &changed
+                    &changed,
+                    &invalidate,
                 )
                 .unwrap()
         );
@@ -1102,11 +1246,48 @@ mod tests {
                     scope,
                     || panic!("Stop withdraws even pending hardware observation"),
                     |_, _| panic!("Stop withdraws activation"),
-                    &changed
+                    &changed,
+                    &invalidate,
                 )
                 .unwrap()
         );
         assert_eq!(wakes.marks(), first_after_attach);
+        let before = invalidations.get();
+        let mut applied = Inputs::default();
+        assert!(
+            applied
+                .round(
+                    true,
+                    0,
+                    || Ok(InputSetupScope::Applied(revision)),
+                    || Ok(vec![41]),
+                    |_, _| {
+                        assert_eq!(
+                            invalidations.get(),
+                            before + 1,
+                            "retire before a failed activation"
+                        );
+                        Err("injected activation refusal".into())
+                    },
+                    &changed,
+                    &invalidate,
+                )
+                .is_err()
+        );
+        assert!(
+            applied
+                .round(
+                    true,
+                    1,
+                    || Err("injected source read failure".into()),
+                    || panic!("no hardware read after source refusal"),
+                    |_, _| panic!("no activation after source refusal"),
+                    &changed,
+                    &invalidate,
+                )
+                .is_err()
+        );
+        assert_eq!(invalidations.get(), before + 2);
     }
 
     #[test]
@@ -1547,10 +1728,23 @@ mod tests {
                 _ => None,
             }
         });
+        let invalidations = std::cell::Cell::new(0);
         let activate = |revision, ids: &[u64]| {
             assert_eq!(revision, 7);
-            aterm_machines::init::activate_keyboard_attachments(&sys, ids, &|_| false, &|| true)
-                .map(Some)
+            aterm_machines::init::activate_keyboard_attachments(
+                &sys,
+                ids,
+                &|_| false,
+                &|| true,
+                &|| {
+                    assert!(
+                        sys.keyboard_changes().is_empty(),
+                        "retire before the first real native setter"
+                    );
+                    invalidations.set(invalidations.get() + 1);
+                },
+            )
+            .map(Some)
         };
         let mut keeper = Keeper::default();
         assert!(
@@ -1559,6 +1753,11 @@ mod tests {
                 .unwrap()
         );
         assert!(sys.keyboard_changes().is_empty());
+        assert_eq!(
+            invalidations.get(),
+            1,
+            "the missing requested cohort retired the old fact"
+        );
         available.store(true, Ordering::SeqCst);
         assert!(
             !keeper
@@ -1576,6 +1775,11 @@ mod tests {
                 .unwrap()
         );
         let changed = sys.keyboard_changes();
+        assert_eq!(
+            invalidations.get(),
+            2,
+            "the actual native mutation retired before its write"
+        );
         assert_eq!(
             changed.len(),
             1,
@@ -1596,5 +1800,16 @@ mod tests {
                 )
                 .unwrap()
         );
+        assert!(
+            aterm_machines::init::activate_keyboard_attachments(
+                &sys,
+                &[REGISTRY],
+                &|_| false,
+                &|| true,
+                &|| panic!("a real no-op must retain an existing valid observation"),
+            )
+            .unwrap()
+        );
+        assert_eq!(sys.keyboard_changes().len(), 1);
     }
 }

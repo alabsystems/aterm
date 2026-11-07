@@ -313,6 +313,20 @@ impl Tree {
     /// Look up the record at root-relative path `rel`.
     #[must_use]
     pub fn find(&self, rel: &Path) -> Option<DirId> {
+        self.find_folded(rel, false)
+    }
+
+    /// [`Self::find`], each name matched ignoring ASCII case when `fold` is set (as APFS
+    /// matches names, [`crate::Deny::fold_case`]).
+    #[must_use]
+    pub fn find_folded(&self, rel: &Path, fold: bool) -> Option<DirId> {
+        let same = |a: &[u8], b: &[u8]| {
+            if fold {
+                a.eq_ignore_ascii_case(b)
+            } else {
+                a == b
+            }
+        };
         let mut at = DirId::ROOT;
         for c in rel.components() {
             let name = match c {
@@ -322,7 +336,7 @@ impl Tree {
             };
             at = (1..self.dirs.len())
                 .map(|i| DirId(u32::try_from(i).unwrap_or(u32::MAX)))
-                .find(|&id| self.dirs[id.ix()].parent == Some(at) && self.name(id) == name)?;
+                .find(|&id| self.dirs[id.ix()].parent == Some(at) && same(self.name(id), name))?;
         }
         Some(at)
     }
@@ -514,6 +528,9 @@ mod tests {
         assert_eq!(t.find(Path::new("a/./deep/y")), Some(y));
         assert_eq!(t.find(Path::new("a/none")), None);
         assert_eq!(t.find(Path::new("../a")), None);
+        assert_eq!(t.find(Path::new("A/Deep")), None, "names match exactly");
+        assert_eq!(t.find_folded(Path::new("A/Deep"), true), Some(deep));
+        assert_eq!(t.find_folded(Path::new("A/Deep"), false), None);
         assert!(t.is_within(x, a) && t.is_within(a, a) && !t.is_within(b, a));
         assert_eq!(t.biggest_in(deep, 5), vec![x, y]);
         assert_eq!(t.most_entries_in(a, 2), vec![x, y]);

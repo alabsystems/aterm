@@ -779,6 +779,9 @@ fn a_config_edit_during_the_hold_is_warmed_again_before_any_carried_present() {
 /// holds its dial.
 #[test]
 fn a_theme_file_edit_during_the_hold_is_warmed_again() {
+    if !crate::test_alone::alone() {
+        return;
+    }
     let dir = aterm_tempfile::tempdir().expect("scratch dir");
     let themes = dir.path().join("aterm").join("themes");
     std::fs::create_dir_all(&themes).expect("the theme dir");

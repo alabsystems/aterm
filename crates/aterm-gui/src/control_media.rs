@@ -5462,6 +5462,9 @@ mod worker_start_app_tests {
     /// fleet spawn whose `from=` names a session of this Mac has its manager here.
     #[test]
     fn a_started_workers_record_keeps_its_managers_mac_only_for_a_manager_not_here() {
+        if !crate::test_alone::alone() {
+            return;
+        }
         let state = aterm_tempfile::Builder::new()
             .prefix("aterm-worker-manager")
             .tempdir()
@@ -5503,6 +5506,9 @@ mod worker_start_app_tests {
     #[cfg(unix)]
     #[test]
     fn google_worker_preparation_enters_the_apps_scope_before_any_launcher() {
+        if !crate::test_alone::alone() {
+            return;
+        }
         let state = aterm_tempfile::TempDir::new().unwrap();
         crate::test_env::scoped("ATERM_STATE_HOME", state.path(), || {
             let app = App::headless_for_test();
@@ -5565,6 +5571,9 @@ mod worker_start_app_tests {
     #[cfg(unix)]
     #[test]
     fn a_shutdown_while_a_redrawn_prompt_settles_blames_no_shell() {
+        if !crate::test_alone::alone() {
+            return;
+        }
         let state = aterm_tempfile::TempDir::new().unwrap();
         crate::test_env::scoped("ATERM_STATE_HOME", state.path(), || {
             let app = App::headless_for_test();
@@ -5603,6 +5612,9 @@ mod worker_start_app_tests {
     #[cfg(unix)]
     #[test]
     fn a_launch_a_shutdown_stops_says_so_at_every_step() {
+        if !crate::test_alone::alone() {
+            return;
+        }
         let cancelled = |stop: &dyn Fn(crate::task_launch::Launch)| {
             let state = aterm_tempfile::TempDir::new().unwrap();
             crate::test_env::scoped("ATERM_STATE_HOME", state.path(), || {
@@ -5653,6 +5665,9 @@ mod worker_start_app_tests {
     #[cfg(unix)]
     #[test]
     fn a_quit_wakes_a_launch_held_on_its_pool_and_it_says_why_cancelled() {
+        if !crate::test_alone::alone() {
+            return;
+        }
         const HANG_DETECTOR: std::time::Duration = std::time::Duration::from_secs(60);
         let state = aterm_tempfile::TempDir::new().unwrap();
         crate::test_env::scoped("ATERM_STATE_HOME", state.path(), || {
@@ -5701,6 +5716,9 @@ mod worker_start_app_tests {
 
     #[test]
     fn a_worker_that_cannot_start_is_closed_again_and_leaves_no_task_file() {
+        if !crate::test_alone::alone() {
+            return;
+        }
         let state = aterm_tempfile::Builder::new()
             .prefix("aterm-worker-start")
             .tempdir()
@@ -5783,6 +5801,9 @@ mod worker_start_app_tests {
 
     #[test]
     fn a_spawns_autopilot_word_is_its_workers_word_and_fact_line() {
+        if !crate::test_alone::alone() {
+            return;
+        }
         use aterm_agent::supervise::Autopilot;
         let state = aterm_tempfile::Builder::new()
             .prefix("aterm-worker-word")
@@ -5916,6 +5937,9 @@ mod worker_start_app_tests {
     /// pause nothing ends runs out and says go on.
     #[test]
     fn a_startup_stall_ends_a_launchers_retry_pause() {
+        if !crate::test_alone::alone() {
+            return;
+        }
         let state = aterm_tempfile::Builder::new()
             .prefix("aterm-worker-retry-ends")
             .tempdir()
@@ -5976,6 +6000,9 @@ mod worker_start_app_tests {
     /// dispatcher that placed the worker elsewhere never gets a second run days on.
     #[test]
     fn a_startup_stall_ends_a_launchers_hold_and_nothing_starts_later() {
+        if !crate::test_alone::alone() {
+            return;
+        }
         let state = aterm_tempfile::Builder::new()
             .prefix("aterm-worker-hold-ends")
             .tempdir()
@@ -6048,6 +6075,9 @@ mod worker_start_app_tests {
     /// that moved on already says what became of the task, and raises nothing.
     #[test]
     fn a_launchers_refusal_names_its_cause_where_a_dispatcher_reads_it() {
+        if !crate::test_alone::alone() {
+            return;
+        }
         let state = aterm_tempfile::Builder::new()
             .prefix("aterm-worker-refused")
             .tempdir()
@@ -6107,6 +6137,9 @@ mod worker_start_app_tests {
     /// attention at all, its cause only in this Mac's log. A record that moved on raises nothing.
     #[test]
     fn a_refused_admission_names_its_member_and_cause_under_its_own_why() {
+        if !crate::test_alone::alone() {
+            return;
+        }
         use aterm_agent::harness::worker::Refused;
         let state = aterm_tempfile::Builder::new()
             .prefix("aterm-worker-admission")
@@ -6199,6 +6232,9 @@ mod worker_start_app_tests {
     #[cfg(unix)]
     #[test]
     fn a_shell_gone_during_a_pool_hold_is_named_not_the_pool() {
+        if !crate::test_alone::alone() {
+            return;
+        }
         let state = aterm_tempfile::Builder::new()
             .prefix("aterm-worker-shell-gone")
             .tempdir()
@@ -6253,6 +6289,9 @@ mod worker_start_app_tests {
     #[cfg(unix)]
     #[test]
     fn a_line_nothing_took_names_why_where_a_dispatcher_reads_it() {
+        if !crate::test_alone::alone() {
+            return;
+        }
         let state = aterm_tempfile::Builder::new()
             .prefix("aterm-worker-blocked")
             .tempdir()
@@ -6305,6 +6344,9 @@ mod worker_start_app_tests {
     #[cfg(unix)]
     #[test]
     fn a_task_that_moves_on_ends_its_launchers_wait_and_keeps_its_mark() {
+        if !crate::test_alone::alone() {
+            return;
+        }
         let state = aterm_tempfile::Builder::new()
             .prefix("aterm-worker-moved-on")
             .tempdir()
@@ -6367,6 +6409,9 @@ mod worker_start_app_tests {
     #[cfg(unix)]
     #[test]
     fn a_prompt_redrawn_before_its_launch_line_takes_the_line_once_it_settles() {
+        if !crate::test_alone::alone() {
+            return;
+        }
         use crate::task_launch::Untyped;
         #[derive(Clone, Copy, Debug)]
         enum Before {
@@ -6483,6 +6528,9 @@ mod worker_start_app_tests {
     #[cfg(unix)]
     #[test]
     fn a_workers_launcher_starts_only_once_its_reply_is_taken() {
+        if !crate::test_alone::alone() {
+            return;
+        }
         let state = aterm_tempfile::Builder::new()
             .prefix("aterm-worker-reply")
             .tempdir()

@@ -119,10 +119,16 @@ impl std::fmt::Debug for SourceSeal {
     }
 }
 
+#[derive(Clone, Copy)]
+enum UsePhase {
+    Pending,
+    Active,
+    Ending,
+}
 struct CapturedUse {
     key: String,
     counter: u64,
-    pending: bool,
+    phase: UsePhase,
     source: Arc<slot::SourceHandle>,
     gate: SourceGateIdentity,
 }
@@ -203,7 +209,7 @@ impl Snapshot {
                     source_namespace,
                     key,
                     *counter,
-                    true,
+                    UsePhase::Pending,
                     &item.source,
                     &item.gate,
                 )?;
@@ -213,10 +219,22 @@ impl Snapshot {
                     source_namespace,
                     key,
                     *counter,
-                    false,
+                    UsePhase::Active,
                     &item.source,
                     &item.gate,
                 )?;
+            }
+            for (counter, item) in &uses.ending {
+                if !item.settled() {
+                    result.capture_use(
+                        source_namespace,
+                        key,
+                        *counter,
+                        UsePhase::Ending,
+                        &item.source,
+                        &item.gate,
+                    )?;
+                }
             }
         }
         Ok(result)
@@ -226,7 +244,7 @@ impl Snapshot {
         namespace: &slot::SourceNamespaces,
         key: &str,
         counter: u64,
-        pending: bool,
+        phase: UsePhase,
         source: &Arc<slot::SourceHandle>,
         gate: &SourceGateIdentity,
     ) -> Result<(), Error> {
@@ -241,7 +259,7 @@ impl Snapshot {
         self.uses.push(CapturedUse {
             key: key.into(),
             counter,
-            pending,
+            phase,
             source: source.clone(),
             gate: gate.clone(),
         });
@@ -299,21 +317,33 @@ impl Snapshot {
             .uses
             .iter()
             .filter(|(key, _)| key.starts_with(&prefix))
-            .map(|(_, uses)| uses.active.len() + uses.pending.len())
+            .map(|(_, uses)| {
+                uses.active.len()
+                    + uses.pending.len()
+                    + uses
+                        .ending
+                        .values()
+                        .filter(|ending| !ending.settled())
+                        .count()
+            })
             .sum::<usize>();
         total == self.uses.len()
             && self.uses.iter().all(|item| {
                 let Some(uses) = state.uses.get(&item.key) else {
                     return false;
                 };
-                if item.pending {
-                    uses.pending.get(&item.counter).is_some_and(|current| {
+                match item.phase {
+                    UsePhase::Pending => uses.pending.get(&item.counter).is_some_and(|current| {
                         Arc::ptr_eq(&item.source, &current.source) && item.gate == current.gate
-                    })
-                } else {
-                    uses.active.get(&item.counter).is_some_and(|current| {
+                    }),
+                    UsePhase::Active => uses.active.get(&item.counter).is_some_and(|current| {
                         Arc::ptr_eq(&item.source, &current.source) && item.gate == current.gate
-                    })
+                    }),
+                    UsePhase::Ending => uses.ending.get(&item.counter).is_some_and(|current| {
+                        !current.settled()
+                            && Arc::ptr_eq(&item.source, &current.source)
+                            && item.gate == current.gate
+                    }),
                 }
             })
     }

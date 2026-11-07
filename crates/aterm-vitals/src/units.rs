@@ -20,7 +20,7 @@
 
 use crate::model::{CPU_OVER_BUSY, CapBasis, ClusterView, SWAP_OVER_BPS, day_of, note_peak};
 use crate::peaks::{DailyMax, Peaks};
-use crate::ring::{BucketRing, NOW_WINDOW_MS};
+use crate::ring::{BucketRing, NOW_WINDOW_MS, Taken};
 
 /// Seconds of sustained readings before compressor churn or a disk direction has learned its
 /// peak: 3 hours (A1 §4.3, §4.4).
@@ -242,6 +242,9 @@ pub struct Units {
 pub(crate) struct UnitReading<'a> {
     /// The sample's wall clock, unix ms.
     pub now: i64,
+    /// The slot it stands for, ms ([`crate::model::Sample::period_ms`]): the time each of its
+    /// readings stands for ([`crate::ring::Taken`]).
+    pub period_ms: u32,
     /// Its monotonic clock, ns: the disk rates' time base.
     pub at_ns: u64,
     /// Each core's busy fraction this reading, exactly when the CPU row reads their sum.
@@ -335,13 +338,17 @@ impl UnitRings {
                 over: cpu_over(busy, Some(n), Some(load1)),
             });
 
-        let closed = self.churn.push(now, r.churn_bps, false);
+        let closed = self
+            .churn
+            .push(Taken::at(now, r.period_ms), r.churn_bps, false);
         note_peak(&self.churn, closed, &mut peaks.mem_churn);
         let churn = r
             .churn_read
             .then(|| Rate::of(&self.churn, now, &peaks.mem_churn));
 
-        let _ = self.swap.push(now, r.swap_bps, false);
+        let _ = self
+            .swap
+            .push(Taken::at(now, r.period_ms), r.swap_bps, false);
         let swap = r.swap_used.map(|used| Swap {
             used,
             traffic: Level::of(&self.swap, now),
@@ -365,7 +372,7 @@ impl UnitRings {
         }
         let fracs = r.cores.filter(|c| c.len() == n);
         for (i, ring) in self.cores.iter_mut().enumerate() {
-            let _ = ring.push(r.now, fracs.map(|c| c[i]), false);
+            let _ = ring.push(Taken::at(r.now, r.period_ms), fracs.map(|c| c[i]), false);
         }
         self.cores
             .iter()
@@ -406,9 +413,13 @@ impl UnitRings {
             };
             rings.last = Some((r.at_ns, b.write_bytes, b.read_bytes));
             let peak = peaks.disk(&b.id);
-            let closed = rings.write.push(r.now, write_bps, false);
+            let closed = rings
+                .write
+                .push(Taken::at(r.now, r.period_ms), write_bps, false);
             note_peak(&rings.write, closed, &mut peak.write);
-            let closed = rings.read.push(r.now, read_bps, false);
+            let closed = rings
+                .read
+                .push(Taken::at(r.now, r.period_ms), read_bps, false);
             note_peak(&rings.read, closed, &mut peak.read);
             out.push(Disk {
                 id: b.id.clone(),

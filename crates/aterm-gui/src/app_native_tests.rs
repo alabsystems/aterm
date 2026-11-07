@@ -8691,7 +8691,13 @@ fn contended_split_presentation_keeps_its_own_title_rung() {
         .get_mut(&wid)
         .expect("test window")
         .tab_title_cache
-        .insert(0, "~/repo".to_string());
+        .insert(
+            0,
+            crate::app_tabs::CapturedTitle {
+                title: "~/repo".to_string(),
+                shell: false,
+            },
+        );
 
     let flood = crate::term_lock(&term);
     app.refresh_active_split_presentation(wid);

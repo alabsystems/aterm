@@ -930,6 +930,35 @@ fn live_admitted_login_reaches_the_saved_plan_before_a_held_execution() {
 }
 
 #[test]
+fn a_binding_without_its_preparation_never_bypasses_relaunch_recovery() {
+    let world = aterm_tempfile::tempdir().unwrap();
+    let opts = options(world.path());
+    let mut st = state(true);
+    st.native = Some(super::super::native_act::Binding {
+        id: "ab".repeat(16),
+        capability: "cd".repeat(32),
+    });
+    let original = st.clone();
+    let (mut client, worker) = endpoint_with(|line| {
+        if line.contains(" lease acquire ") || line.contains(" lease release ") {
+            "ERR busy\n".into()
+        } else {
+            "OK native-act state=unknown\n".into()
+        }
+    });
+    let result = relaunch(&opts, report(), &mut st, &mut client, SESSION, &Live);
+    assert_eq!(result.step, "wait:native-recovery");
+    assert_eq!(st, original, "invalid recovery retains the original debt");
+    assert!(load(&opts, SESSION).is_none());
+    drop(client);
+    let seen = worker.join().unwrap();
+    assert!(
+        seen.iter()
+            .all(|line| line.contains(" lease acquire ") || line.contains(" lease release "))
+    );
+}
+
+#[test]
 fn disabled_native_kind_relaunch_held_continues_legacy_exit_guard_only_when_fresh() {
     for coordinated in [false, true] {
         let world = aterm_tempfile::tempdir().unwrap();

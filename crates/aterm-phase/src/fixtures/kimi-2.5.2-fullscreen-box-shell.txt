@@ -1,0 +1,51 @@
+# kimi 2.5.2 · MEASURED 2026-11-06, `aterm ctl text` of an `aterm-lab kimi` instance (a private headless aterm, 144x50, aterm 0.161.0, a debug build of this branch before its reader held every last row at the description's depth for both readings) running the real Kimi Code, launched by path with a scratch `HOME` and `KIMI_CODE_HOME` whose `config.toml` names one `openai`-type provider at `http://127.0.0.1:<port>/v1` with a fake key (a local stub of the Chat Completions API, crates/aterm-lab), no login, in a project folder that is no git work tree, and whose `tui.toml` says `tui_mode = "fullscreen"`, so the panel docks over the transcript in the composer's place with no `context: N%` footer under it and caps its body at six rows (`maxBodyRows`), scrolling one taller under a scrollbar in the screen's last column, one past the rules (`│` its track, `┃` its thumb), and ending its focused key row `· shift+↑/↓ scroll` · the stub's `tool` mode asks for `Bash` `{command: "cat README.md\ngit push --force", description: "Read the readme, then push"}`: `▶ Run this command?`, its cwd row, the first line after `$ `, the second after `· `, the description two columns deeper, all four body rows drawn (no scrollbar), four numbered choices and the key row `↑/↓ select · 1/2/3/4 choose · ↵ confirm`; that build published `agent_detail=bash:not-read-only` · the lab's random project dir is spelled /private/tmp/at.GRJB here
+
+
+ ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │                                                                                                                                            │
+ │  ▐█▛█▛█▌  Welcome to Kimi Code!                                                                                                            │
+ │  ▐█████▌  Send /help for help information.                                                                                                 │
+ │                                                                                                                                            │
+ │  Directory: /private/tmp/at.GRJB/proj                                                                                                      │
+ │  Session:   session_692a7d6b-9384-44f2-b367-35ecc3868b7f                                                                                   │
+ │  Model:     lab-model                                                                                                                      │
+ │  Version:   2.5.2                                                                                                                          │
+ │                                                                                                                                            │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+   No session yet — one will be created on your first message.
+
+ ❯ toolstart fit described
+
+ ● Running a command · $ cat README.md…
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   ▶ Run this command?
+
+   cwd: /private/tmp/at.GRJB/proj
+   $ cat README.md
+   · git push --force
+     Read the readme, then push
+
+   ▶ 1. Approve once
+     2. Approve for this session
+     3. Reject
+     4. Reject with feedback
+
+   ↑/↓ select · 1/2/3/4 choose · ↵ confirm
+ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────

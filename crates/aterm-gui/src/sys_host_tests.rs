@@ -130,7 +130,11 @@ fn every_view_of_a_live_snapshot_answers_and_its_json_keeps_the_contract() {
         assert!(lines.next().unwrap().starts_with("OK 1 sys v=1 "));
         let body = lines.next().expect("one JSON line");
         assert!(lines.next().is_none());
-        assert!(body.starts_with("{\"schema\":1,\"kind\":\"sys."), "{body}");
+        let schema = if view == View::Disk { 2 } else { 1 };
+        assert!(
+            body.starts_with(&format!("{{\"schema\":{schema},\"kind\":\"sys.")),
+            "{body}"
+        );
         let q = SysQuery::parse(&format!("{} --json", view.word())).unwrap();
         let (held, state) = shared.fresh(Duration::from_secs(3600), false);
         let g = gathered();
@@ -722,6 +726,7 @@ fn the_machine_wait_meets_refuses_times_out_and_sees_its_session_exit() {
             key: 0,
             window: 0,
             tab: 1,
+            tab_id: None,
         }],
     );
     let wait = |s: &str| match AwaitSys::parse(s).unwrap() {
@@ -860,6 +865,7 @@ fn a_named_job_that_left_the_view_answers_from_the_ring_or_is_gone() {
             key: 7,
             window: 1,
             tab: 1,
+            tab_id: None,
         }],
     );
     let ended = shared.ended_jobs();
@@ -922,21 +928,25 @@ fn a_machine_wait_reads_its_tab_or_with_scope_aterm_every_tab() {
             key: 1,
             window: 1,
             tab: 1,
+            tab_id: None,
         },
         PaneFact {
             key: 2,
             window: 1,
             tab: 1,
+            tab_id: None,
         },
         PaneFact {
             key: 3,
             window: 1,
             tab: 2,
+            tab_id: None,
         },
         PaneFact {
             key: 4,
             window: 2,
             tab: 1,
+            tab_id: None,
         },
     ];
     assert_eq!(wait_keys(&panes, 2, false), [1, 2]);
@@ -1051,6 +1061,40 @@ fn for_holds_across_snapshots_before_the_wait_answers() {
     assert!(reply.starts_with("OK sys cpu=10% held_ms="), "{reply}");
 }
 
+fn pane_fact(key: u64, tab: usize, id: u64) -> PaneFact {
+    PaneFact {
+        key,
+        window: 1,
+        tab,
+        tab_id: Some(crate::tab_model::TabId::from_stored(id)),
+    }
+}
+
+fn disk_ask<'a>(
+    scope: ScopeArg,
+    panes: &'a [PaneFact],
+    keys: &'a [u64],
+    tab: Option<u64>,
+    lines: bool,
+) -> DiskAsk<'a> {
+    let mut tabs = Vec::new();
+    for p in panes.iter().filter(|p| keys.contains(&p.key)) {
+        if let Some(id) = p.tab_id
+            && !tabs.contains(&id)
+        {
+            tabs.push(id);
+        }
+    }
+    DiskAsk {
+        scope,
+        tab: tab.map(crate::tab_model::TabId::from_stored),
+        tabs,
+        panes,
+        keys,
+        lines,
+    }
+}
+
 #[test]
 fn without_a_walker_the_seam_names_each_panes_folder_and_claims_no_size() {
     let cwds = [
@@ -1070,26 +1114,36 @@ fn without_a_walker_the_seam_names_each_panes_folder_and_claims_no_size() {
             path: "/w/b".into(),
         },
     ];
-    let (roots, disk) = disk_roots(ScopeArg::Aterm, &[1, 2, 3], &cwds, &|_| None);
+    let panes = [pane_fact(1, 1, 1), pane_fact(2, 1, 1), pane_fact(3, 2, 2)];
+    let ask = disk_ask(ScopeArg::Aterm, &panes, &[1, 2, 3], Some(1), true);
+    assert_ne!(
+        crate::diskwalk_host::DISKWALK.walker_state(),
+        crate::diskwalk_host::WalkerState::Running,
+        "a test process starts no walker of its own"
+    );
+    let (roots, disk) = disk_roots(&ask, &cwds);
     assert_eq!(disk, None);
     assert_eq!(roots.len(), 2);
     assert!(
         roots
             .iter()
-            .all(|r| r.kinds == ["cwd"] && r.size == RootSize::NotSampled)
+            .all(|r| r.kinds == ["folder"] && r.size == RootSize::NotSampled)
     );
     assert_eq!(roots[0].keys, [1, 2], "both panes own the shared folder");
     assert_eq!(roots[1].tab, Some(2));
 }
 
-#[test]
-fn the_walkers_report_becomes_roots_sizes_and_a_balance() {
+/// A board of two tabs: Tab 1's panes 1 and 2 at one repository, its build mirror walking
+/// behind its prior figure; Tab 2's pane 3 at home (too broad, named) and pane 4 on another
+/// machine; aterm's state folder; an opt-in inside a protected folder.
+fn sys_board(now: Instant) -> crate::diskwalk_host::Published {
     use crate::diskwalk_host::{
-        Claim, Complete, Detail, DirRow, DiskReport, DiskScope, Growth, RootKind, RootRecord,
-        RootRow, RootState, WalkerState,
+        Claim, Complete, Detail, DirRow, Growth, LiveFrom, PaneView, PaneWhy, Pool, Published,
+        RootKind, RootRecord, RootState, TabFacts,
     };
-    use aterm_vitals::sys::RootSizes;
-    let now = Instant::now();
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::path::PathBuf;
+    use std::sync::Arc;
     let done = |alloc: u64, biggest: Vec<DirRow>| Complete {
         sums: aterm_diskwalk::Sums {
             alloc_fair: alloc,
@@ -1112,106 +1166,191 @@ fn the_walkers_report_becomes_roots_sizes_and_a_balance() {
             over: Duration::from_secs(3),
         }),
     };
-    let row =
-        |n: usize, path: &str, kinds: &[RootKind], state, complete, shared: Vec<u64>| RootRow {
-            n,
-            claim: Claim {
-                path: path.into(),
-                kinds: kinds.iter().copied().collect(),
-                linked_worktree: false,
-            },
-            inside: None,
-            shared_with: shared,
-            counted_in: Some(1),
-            shared_alloc: 0,
-            record: RootRecord {
-                path: path.into(),
-                state,
-                id: None,
-                partial: None,
-                walked_entries: 0,
-                complete,
-                level: Vec::new(),
-                read_from: None,
-                asked: None,
-            },
-        };
-    let mut walking = row(
-        2,
-        "/w/repo/target",
-        &[RootKind::Build],
+    let claim = |p: &str, k: RootKind| Claim {
+        path: PathBuf::from(p),
+        kinds: BTreeSet::from([k]),
+        linked_worktree: false,
+    };
+    let rec = |p: &str, state: RootState, complete: Option<Complete>| {
+        Arc::new(RootRecord {
+            path: PathBuf::from(p),
+            state,
+            id: None,
+            partial: None,
+            walked_entries: 0,
+            complete,
+            level: Vec::new(),
+            read_from: None,
+            asked: None,
+        })
+    };
+    let repo = PathBuf::from("/Users//a/w/repo");
+    let mirror =
+        PathBuf::from("/Users//a/Library/Caches/aterm/.ubd/cargo-build.noindex/Users//a/w/repo");
+    let tab_pane = |key: u64, from: LiveFrom, live: &str| PaneView {
+        key,
+        from: Some(from),
+        exe: Some("zsh".into()),
+        host: None,
+        live: Some(PathBuf::from(live)),
+        project: Some(repo.clone()),
+        why: None,
+        members: vec![
+            claim("/Users//a/w/repo", RootKind::Project),
+            claim(&mirror.display().to_string(), RootKind::Build),
+        ],
+    };
+    let mut walking = (*rec(
+        &mirror.display().to_string(),
         RootState::Walking,
         Some(done(1_000, Vec::new())),
-        Vec::new(),
-    );
-    walking.inside = Some(1);
-    walking.record.walked_entries = 120;
-    walking.record.partial = Some(aterm_diskwalk::Sums {
-        alloc_fair: 400,
+    ))
+    .clone();
+    walking.walked_entries = 120;
+    walking.partial = Some(aterm_diskwalk::Sums {
+        alloc_fair: 400_000,
         ..aterm_diskwalk::Sums::default()
     });
-    let report = DiskReport {
-        scope: DiskScope::Tab(1),
-        label: Some("Tab 1".into()),
-        roots: vec![
-            row(
-                1,
-                "/w/repo",
-                &[RootKind::Cwd, RootKind::Repo],
-                RootState::Complete,
-                Some(done(
-                    9_000,
-                    vec![DirRow {
-                        rel: "target".into(),
-                        alloc: 5_000,
-                        logical: 4_000,
-                        entries: 30,
-                        direct_entries: 3,
-                    }],
-                )),
-                vec![2],
-            ),
-            walking,
-            row(
-                3,
-                "/Users//a/Documents",
-                &[RootKind::Work],
-                RootState::NotMeasured(aterm_diskwalk::Refusal::Protected),
-                None,
-                Vec::new(),
-            ),
-            row(
-                4,
-                "/",
-                &[RootKind::Work],
-                RootState::OneLevel,
-                None,
-                Vec::new(),
-            ),
+    let id = crate::tab_model::TabId::from_stored;
+    Published {
+        tabs: vec![
+            TabFacts {
+                id: id(1),
+                label: "Tab 1".into(),
+                number: Some(1),
+                window: 1,
+                panes: vec![1, 2],
+            },
+            TabFacts {
+                id: id(2),
+                label: "Tab 2".into(),
+                number: Some(2),
+                window: 1,
+                panes: vec![3, 4],
+            },
         ],
-        total_bytes: 9_000,
-        exclusive_bytes: 4_000,
-        shared_bytes: 5_000,
-        walking: true,
-        undiscovered: false,
-        warnings: Vec::new(),
-        growth: None,
-        unknown_tab: false,
-        walker: WalkerState::Running,
-    };
-    let tab_of = |k: u64| Some(usize::try_from(k).unwrap_or(0));
-    let (roots, totals) = walker_roots(std::slice::from_ref(&report), &[], &tab_of, now);
-    assert_eq!(roots.len(), 4);
-    assert_eq!(roots[0].kinds, ["cwd", "repo"]);
-    assert_eq!(
-        roots[0].keys,
-        [1, 2],
-        "the claimers: the pane and who shares it"
-    );
-    assert_eq!(
-        (roots[0].tab, roots[0].shared_with.as_slice()),
-        (Some(1), &[2][..])
-    );
+        panes: BTreeMap::from([
+            (1, tab_pane(1, LiveFrom::Fg, "/Users//a/w/repo/crates")),
+            (2, tab_pane(2, LiveFrom::Shell, "/Users//a/w/repo")),
+            (
+                3,
+                PaneView {
+                    key: 3,
+                    from: Some(LiveFrom::Shell),
+                    exe: Some("zsh".into()),
+                    host: None,
+                    live: Some(PathBuf::from("/Users//a")),
+                    project: None,
+                    why: Some(PaneWhy::Refused(aterm_diskwalk::Refusal::TooBroad)),
+                    members: Vec::new(),
+                },
+            ),
+            (
+                4,
+                PaneView {
+                    key: 4,
+                    from: Some(LiveFrom::Osc7),
+                    exe: None,
+                    host: Some("build-host".into()),
+                    live: None,
+                    project: None,
+                    why: Some(PaneWhy::Elsewhere),
+                    members: Vec::new(),
+                },
+            ),
+        ]),
+        own_claims: vec![claim(
+            "/Users//a/Library/Application Support/aterm",
+            RootKind::Own,
+        )],
+        opt_in: vec![claim("/Users//a/Documents/x", RootKind::OptIn)],
+        pools: [
+            "/Users//a/w/repo",
+            &mirror.display().to_string(),
+            "/Users//a/Library/Application Support/aterm",
+            "/Users//a/Documents/x",
+        ]
+        .iter()
+        .map(|p| (PathBuf::from(p), Pool::Same))
+        .collect(),
+        home_pool: Some(aterm_sysprobe::volumes::VolumeKey::Container(
+            "disk3".into(),
+        )),
+        records: BTreeMap::from([
+            (
+                repo.clone(),
+                rec(
+                    "/Users//a/w/repo",
+                    RootState::Complete,
+                    Some(done(
+                        9_000,
+                        vec![DirRow {
+                            rel: "target".into(),
+                            alloc: 5_000,
+                            logical: 4_000,
+                            entries: 30,
+                            direct_entries: 3,
+                        }],
+                    )),
+                ),
+            ),
+            (mirror.clone(), Arc::new(walking)),
+            (
+                PathBuf::from("/Users//a/Library/Application Support/aterm"),
+                rec(
+                    "/Users//a/Library/Application Support/aterm",
+                    RootState::Complete,
+                    Some(done(2_000, Vec::new())),
+                ),
+            ),
+            (
+                PathBuf::from("/Users//a/Documents/x"),
+                rec(
+                    "/Users//a/Documents/x",
+                    RootState::NotMeasured(aterm_diskwalk::Refusal::Protected),
+                    None,
+                ),
+            ),
+        ]),
+        discovered: BTreeSet::from([crate::diskwalk_host::DiskScope::Aterm]),
+        fold_case: true,
+        ..Published::default()
+    }
+}
+
+fn sys_reports(
+    board: &crate::diskwalk_host::Published,
+    ask: &DiskAsk<'_>,
+) -> Vec<crate::diskwalk_host::DiskReport> {
+    ask.asked()
+        .into_iter()
+        .map(|s| {
+            crate::diskwalk_host::build_report(s, board, crate::diskwalk_host::WalkerState::Running)
+        })
+        .collect()
+}
+
+#[test]
+fn the_walkers_report_becomes_roots_sizes_and_a_balance() {
+    use aterm_vitals::sys::RootSizes;
+    let now = Instant::now();
+    let board = sys_board(now);
+    let panes = [
+        pane_fact(1, 1, 1),
+        pane_fact(2, 1, 1),
+        pane_fact(3, 2, 2),
+        pane_fact(4, 2, 2),
+    ];
+    let ask = disk_ask(ScopeArg::Tab, &panes, &[1, 2], Some(1), false);
+    let reports = sys_reports(&board, &ask);
+    let (roots, t) = disk_view(&board, &reports, &ask, &[], None, now);
+    assert_eq!(roots.len(), 2, "{roots:#?}");
+    assert_eq!(roots[0].path, "/Users//a/w/repo");
+    assert_eq!(roots[0].kinds, ["project"]);
+    assert_eq!(roots[0].keys, [1, 2], "the tab's panes");
+    assert_eq!(roots[0].tab, Some(1));
+    assert_eq!(roots[0].scopes, ["tab:1", "aterm"]);
+    assert_eq!(roots[0].pool, Some("same"));
     match &roots[0].size {
         RootSize::Complete(RootSizes {
             alloc: 9_000,
@@ -1223,179 +1362,198 @@ fn the_walkers_report_becomes_roots_sizes_and_a_balance() {
         other => panic!("{other:?}"),
     }
     assert_eq!(roots[0].dirs[0].rel, "target");
-    assert_eq!(roots[1].inside, Some(1));
+    assert_eq!(roots[1].kinds, ["build"]);
     match &roots[1].size {
         RootSize::Walking {
             walked_entries: 120,
-            partial_alloc: Some(400),
+            partial_alloc: Some(400_000),
             last: Some(last),
         } => assert_eq!(last.alloc, 1_000),
         other => panic!("{other:?}"),
     }
-    assert_eq!(roots[2].size, RootSize::NotMeasured("protected"));
-    assert_eq!(roots[3].size, RootSize::NotMeasured("too_broad"));
-    let t = totals.expect("a walker's balance");
     assert_eq!(
-        (t.total, t.exclusive, t.shared, t.walking),
-        (9_000, 4_000, 5_000, true)
+        (t.total, t.walking),
+        (10_000, true),
+        "the rewalk's prior figure, never its partial"
     );
-    assert_eq!(
-        t.not_measured,
-        ["protected", "too_broad"],
-        "the outermost roots the balance leaves out"
+    assert!(
+        t.scopes.is_empty() && t.panes.is_empty(),
+        "`sys tab` prints none"
     );
-    let unknown = DiskReport {
-        scope: DiskScope::Tab(5),
-        roots: Vec::new(),
-        unknown_tab: true,
-        total_bytes: 0,
-        exclusive_bytes: 0,
-        shared_bytes: 0,
-        walking: false,
-        ..report
-    };
-    let cwds = [PaneCwd {
-        key: 5,
-        tab: Some(3),
-        path: "/w/new".into(),
-    }];
-    let (roots, totals) = walker_roots(&[unknown], &cwds, &tab_of, now);
-    assert_eq!(roots.len(), 1);
-    assert_eq!(
-        (roots[0].path.as_str(), roots[0].keys.as_slice()),
-        ("/w/new", &[5][..])
-    );
-    assert!(matches!(
-        roots[0].size,
-        RootSize::Walking {
-            walked_entries: 0,
-            ..
-        }
-    ));
-    assert!(totals.is_some_and(|t| t.walking && t.total == 0));
+    let aterm = disk_ask(ScopeArg::Aterm, &panes, &[1, 2, 3, 4], Some(1), false);
+    let reports = sys_reports(&board, &aterm);
+    let (roots, t) = disk_view(&board, &reports, &aterm, &[], None, now);
+    let protected = roots
+        .iter()
+        .find(|r| r.path == "/Users//a/Documents/x")
+        .expect("the opt-in's row");
+    assert_eq!(protected.size, RootSize::NotMeasured("protected"));
+    assert!(protected.scopes.is_empty(), "an opt-in is in no scope");
+    assert_eq!(t.total, 12_000);
+    assert_eq!(t.not_measured, ["protected"]);
 }
 
-/// A tab whose only root the walker does not walk (a scratch HOME is too broad) balances as
-/// unavailable(too_broad), never `0 B exclusive`; summed with a measured tab, a lower bound.
+/// SYS DISK'S SCOPE LINES AND JSON AGREE WITH THE BAR: every figure from one board, the bytes
+/// after the clamp to the Mac's used.
+#[test]
+fn sys_disk_scope_lines_and_json_agree_with_the_bar() {
+    use crate::diskwalk_host::{DiskScope, clamp};
+    use aterm_vitals::sys::{ScopeBytes, ScopeLine};
+    let now = Instant::now();
+    let board = sys_board(now);
+    let panes = [
+        pane_fact(1, 1, 1),
+        pane_fact(2, 1, 1),
+        pane_fact(3, 2, 2),
+        pane_fact(4, 2, 2),
+    ];
+    let tab = crate::tab_model::TabId::from_stored(1);
+    for used in [50_000, 11_000, 9_500] {
+        let ask = disk_ask(ScopeArg::Tab, &panes, &[1, 2], Some(1), true);
+        let reports = sys_reports(&board, &ask);
+        let (_, t) = disk_view(&board, &reports, &ask, &[], Some((used, 100_000)), now);
+        let a = board.figure(DiskScope::Aterm);
+        let f = board.figure(DiskScope::Tab(tab));
+        let c = clamp(Some(used), a.bytes, f.bytes);
+        let [
+            ScopeLine::Global {
+                pool,
+                used: u,
+                total,
+            },
+            ScopeLine::Bytes(aterm),
+            ScopeLine::Bytes(tab_line),
+        ] = t.scopes.as_slice()
+        else {
+            panic!("{:#?}", t.scopes);
+        };
+        assert_eq!(
+            (pool.as_deref(), *u, *total),
+            (Some("container:disk3"), Some(used), Some(100_000))
+        );
+        assert_eq!(
+            (aterm.bytes, aterm.clamped, aterm.drawn, aterm.complete),
+            (c.aterm, c.aterm_clamped, true, true),
+            "a rewalk behind its prior figure still counts"
+        );
+        assert_eq!(
+            (tab_line.bytes, tab_line.clamped, tab_line.tab),
+            (c.tab, c.tab_clamped, Some(1))
+        );
+        assert_eq!((aterm.roots, aterm.counted), (a.roots, a.counted));
+        assert!(tab_line.bytes <= aterm.bytes && aterm.bytes <= used);
+        let text = ScopeLine::Bytes(tab_line.clone())
+            .text(&aterm_vitals::sys::pct, &|w| format!("unavailable({w})"));
+        assert!(
+            text.starts_with(&format!(
+                "scope name=tab tab=1 pool=container:disk3 bytes={} drawn=yes complete=yes roots=2 counted=2",
+                c.tab
+            )),
+            "{text}"
+        );
+        assert!(text.ends_with(&format!(
+            " clamped={}",
+            if c.tab_clamped { "yes" } else { "no" }
+        )));
+        let json = ScopeLine::Bytes(tab_line.clone()).json();
+        assert!(contract_violations(&json).is_empty(), "{}", json.to_text());
+        assert_eq!(
+            json.get("bytes"),
+            Some(&aterm_vitals::sys::json::Jv::u(c.tab))
+        );
+        let _: &ScopeBytes = tab_line;
+    }
+    // The pane lines: each pane in its tab's layout order, with its why.
+    let ask = disk_ask(ScopeArg::Aterm, &panes, &[1, 2, 3, 4], Some(1), true);
+    let reports = sys_reports(&board, &ask);
+    let (_, t) = disk_view(&board, &reports, &ask, &[], None, now);
+    let words: Vec<_> = t
+        .panes
+        .iter()
+        .map(|p| (p.tab, p.pane, p.from, p.why, p.member))
+        .collect();
+    assert_eq!(
+        words,
+        [
+            (Some(1), 1, Some("fg"), None, true),
+            (Some(1), 2, Some("shell"), None, true),
+            (Some(2), 1, Some("shell"), Some("too_broad"), false),
+            (Some(2), 2, Some("osc7"), Some("elsewhere"), false),
+        ]
+    );
+    let line = t.panes[0].text(true, Some("/Users//a"), &aterm_vitals::sys::pct, &|e| {
+        aterm_vitals::sys::exe_word(e).to_owned()
+    });
+    assert_eq!(
+        line,
+        "pane tab=1 pane=1 from=fg exe=zsh live=/Users//a/w/repo/crates project=/Users//a/w/repo member=yes"
+    );
+    let hidden = t.panes[0].text(false, Some("/Users//a"), &aterm_vitals::sys::pct, &|e| {
+        aterm_vitals::sys::exe_word(e).to_owned()
+    });
+    assert_eq!(
+        hidden,
+        "pane tab=1 pane=1 from=fg exe=zsh under=home member=yes"
+    );
+    for p in &t.panes {
+        let j = p.json(true, Some("/Users//a"), &|e| {
+            aterm_vitals::sys::exe_word(e).to_owned()
+        });
+        assert!(contract_violations(&j).is_empty(), "{}", j.to_text());
+    }
+}
+
+/// A tab whose only root the walker does not walk balances as unavailable, never `0 B
+/// exclusive`; summed with a measured tab, a lower bound.
 #[test]
 fn a_report_whose_only_root_is_not_measured_balances_as_unavailable_never_zero() {
-    use crate::diskwalk_host::{
-        Claim, Complete, Detail, DiskReport, DiskScope, RootKind, RootRecord, RootRow, RootState,
-        WalkerState,
-    };
     use aterm_vitals::sys::disk::{totals_clause, totals_json};
     let now = Instant::now();
-    let row = |path: &str, state, complete| RootRow {
-        n: 1,
-        claim: Claim {
-            path: path.into(),
-            kinds: [RootKind::Cwd].into_iter().collect(),
-            linked_worktree: false,
-        },
-        inside: None,
-        shared_with: Vec::new(),
-        counted_in: None,
-        shared_alloc: 0,
-        record: RootRecord {
-            path: path.into(),
-            state,
-            id: None,
-            partial: None,
-            walked_entries: 0,
-            complete,
-            level: Vec::new(),
-            read_from: None,
-            asked: None,
-        },
-    };
-    let home = DiskReport {
-        scope: DiskScope::Tab(1),
-        label: Some("Tab 1".into()),
-        roots: vec![row("/Users//scratch", RootState::OneLevel, None)],
-        total_bytes: 0,
-        exclusive_bytes: 0,
-        shared_bytes: 0,
-        walking: false,
-        undiscovered: false,
-        warnings: Vec::new(),
-        growth: None,
-        unknown_tab: false,
-        walker: WalkerState::Running,
-    };
-    let bps = |b: f64| format!("{b} B/s");
-    let tab_of = |k: u64| Some(usize::try_from(k).unwrap_or(0));
-    let (roots, totals) = walker_roots(std::slice::from_ref(&home), &[], &tab_of, now);
-    assert_eq!(roots[0].size, RootSize::NotMeasured("too_broad"));
-    let t = totals.expect("a walker's balance");
+    let mut board = sys_board(now);
+    board.panes.retain(|k, _| *k >= 3);
+    board.own_claims.clear();
+    let panes = [pane_fact(3, 2, 2), pane_fact(4, 2, 2)];
+    let ask = disk_ask(ScopeArg::Aterm, &panes, &[3, 4], None, false);
+    let reports = sys_reports(&board, &ask);
+    let (roots, t) = disk_view(&board, &reports, &ask, &[], None, now);
+    assert_eq!(roots.len(), 1, "the opt-in alone: {roots:#?}");
+    assert_eq!(roots[0].size, RootSize::NotMeasured("protected"));
     assert_eq!((t.total, t.walking), (0, false));
-    assert_eq!(t.not_measured, ["too_broad"]);
-    assert_eq!(totals_clause(Some(&t), bps), "sizes unavailable(too_broad)");
+    assert_eq!(t.not_measured, ["protected"]);
+    let bps = |b: f64| format!("{b} B/s");
+    assert_eq!(totals_clause(Some(&t), bps), "sizes unavailable(protected)");
     let mut o = aterm_vitals::sys::json::Jv::obj::<&str>([]);
     totals_json(Some(&t), &mut o);
     assert!(contract_violations(&o).is_empty(), "{}", o.to_text());
     assert_eq!(
         o.get("exclusive_bytes"),
-        Some(&aterm_vitals::sys::json::Jv::why("too_broad"))
+        Some(&aterm_vitals::sys::json::Jv::why("protected"))
     );
-
-    let measured = Complete {
-        sums: aterm_diskwalk::Sums {
-            alloc_fair: 9_000,
-            ..aterm_diskwalk::Sums::default()
-        },
-        detail: Detail::Sizes,
-        links: None,
-        at: now,
-        took: Duration::from_millis(5),
-        direct_entries_max: 1,
-        biggest: Vec::new(),
-        most_entries: Vec::new(),
-        huge: Vec::new(),
-        not_measured: Vec::new(),
-        growth: None,
-    };
-    let repo = DiskReport {
-        scope: DiskScope::Tab(2),
-        label: Some("Tab 2".into()),
-        roots: vec![row("/w/repo", RootState::Complete, Some(measured))],
-        total_bytes: 9_000,
-        exclusive_bytes: 9_000,
-        ..home.clone()
-    };
-    let (_, totals) = walker_roots(&[home, repo], &[], &tab_of, now);
-    let t = totals.expect("a walker's balance");
-    assert_eq!(
-        (t.total, t.not_measured.as_slice()),
-        (9_000, &["too_broad"][..])
-    );
+    let all = sys_board(now);
+    let panes = [
+        pane_fact(1, 1, 1),
+        pane_fact(2, 1, 1),
+        pane_fact(3, 2, 2),
+        pane_fact(4, 2, 2),
+    ];
+    let ask = disk_ask(ScopeArg::Window, &panes, &[1, 2, 3, 4], Some(1), false);
+    let reports = sys_reports(&all, &ask);
+    let (_, t) = disk_view(&all, &reports, &ask, &[], None, now);
+    assert_eq!(t.total, 10_000);
+    assert!(t.walking, "the mirror's rewalk runs");
     assert_eq!(
         totals_clause(Some(&t), bps),
-        "\u{2265}9 KB exclusive (1 not measured: too_broad)"
+        "\u{2265}10 KB exclusive (walking) · growing 4000 B/s"
     );
 }
 
 /// A scope the walker has not discovered yet (the first `sys disk` a tab makes) reads as its
-/// panes' cwds still walking, sizes unknown, beside whatever roots are derived: never "0 roots".
+/// panes' cwds still walking, sizes unknown: never "0 roots".
 #[test]
 fn an_undiscovered_scope_reads_as_its_cwds_walking_never_as_no_roots() {
-    use crate::diskwalk_host::{
-        Claim, DiskReport, DiskScope, RootKind, RootRecord, RootRow, RootState, WalkerState,
-    };
     let now = Instant::now();
-    let first_ask = DiskReport {
-        scope: DiskScope::Tab(5),
-        label: Some("Tab 3".into()),
-        roots: Vec::new(),
-        total_bytes: 0,
-        exclusive_bytes: 0,
-        shared_bytes: 0,
-        walking: true,
-        undiscovered: true,
-        warnings: Vec::new(),
-        growth: None,
-        unknown_tab: false,
-        walker: WalkerState::Running,
-    };
+    let board = crate::diskwalk_host::Published::default();
+    let panes = [pane_fact(5, 3, 5), pane_fact(6, 4, 6)];
     let cwds = [
         PaneCwd {
             key: 5,
@@ -1408,8 +1566,10 @@ fn an_undiscovered_scope_reads_as_its_cwds_walking_never_as_no_roots() {
             path: "/w/other".into(),
         },
     ];
-    let tab_of = |k: u64| Some(usize::try_from(k).unwrap_or(0));
-    let (roots, totals) = walker_roots(std::slice::from_ref(&first_ask), &cwds, &tab_of, now);
+    let ask = disk_ask(ScopeArg::Tab, &panes, &[5], Some(5), false);
+    let reports = sys_reports(&board, &ask);
+    assert!(reports.iter().all(|r| r.unknown_tab || r.undiscovered));
+    let (roots, t) = disk_view(&board, &reports, &ask, &cwds, None, now);
     assert_eq!(roots.len(), 1, "the pane's own cwd only: {roots:?}");
     assert_eq!(
         (
@@ -1421,56 +1581,13 @@ fn an_undiscovered_scope_reads_as_its_cwds_walking_never_as_no_roots() {
     );
     assert_eq!(roots[0].size.state_word(), Some("walking"));
     assert_eq!(roots[0].size.alloc_text(), "unavailable(walking)");
-    assert!(totals.is_some_and(|t| t.walking && t.total == 0));
-
-    let derived = RootRow {
-        n: 1,
-        claim: Claim {
-            path: "/w/new".into(),
-            kinds: [RootKind::Cwd].into_iter().collect(),
-            linked_worktree: false,
-        },
-        inside: None,
-        shared_with: Vec::new(),
-        counted_in: Some(5),
-        shared_alloc: 0,
-        record: RootRecord {
-            path: "/w/new".into(),
-            state: RootState::Walking,
-            id: None,
-            partial: None,
-            walked_entries: 3,
-            complete: None,
-            level: Vec::new(),
-            read_from: None,
-            asked: None,
-        },
-    };
-    let aterm = DiskReport {
-        scope: DiskScope::Aterm,
-        label: None,
-        roots: vec![derived],
-        ..first_ask
-    };
-    let (roots, totals) = walker_roots(&[aterm], &cwds, &tab_of, now);
+    assert!(t.walking && t.total == 0);
+    let ask = disk_ask(ScopeArg::Aterm, &panes, &[5, 6], Some(5), false);
+    let reports = sys_reports(&board, &ask);
+    let (roots, t) = disk_view(&board, &reports, &ask, &cwds, None, now);
     let paths: Vec<&str> = roots.iter().map(|r| r.path.as_str()).collect();
-    assert_eq!(
-        paths,
-        ["/w/new", "/w/other"],
-        "the derived root once, then the pane not derived yet"
-    );
-    assert!(matches!(
-        roots[0].size,
-        RootSize::Walking {
-            walked_entries: 3,
-            ..
-        }
-    ));
-    assert_eq!(
-        (roots[1].keys.as_slice(), roots[1].tab),
-        (&[6][..], Some(4))
-    );
-    assert!(totals.is_some_and(|t| t.walking));
+    assert_eq!(paths, ["/w/new", "/w/other"]);
+    assert!(t.walking);
 }
 
 #[test]

@@ -16,17 +16,19 @@ use std::path::Path;
 /// beside it or none; a process the kernel names no executable for is neither. So
 /// [`super::activity`] reads an install, and Apple's window with or without the placeholder,
 /// exactly where [`aterm_types::macos_setup::tools_held_by`] does.
+/// Failed process-table or placeholder reads remain unread, distinct from known absence.
 #[cfg(any(target_os = "macos", all(test, unix)))]
 fn reading_from(
-    placeholder: bool,
-    exes: impl IntoIterator<Item = Option<impl AsRef<Path>>>,
+    placeholder: Option<bool>,
+    exes: Option<impl IntoIterator<Item = Option<impl AsRef<Path>>>>,
 ) -> super::Reading {
     use aterm_types::macos_setup::{ToolsInstaller, tools_installer};
     let mut reading = super::Reading {
-        placeholder,
+        placeholder: placeholder.unwrap_or(false),
+        unread: placeholder.is_none() || exes.is_none(),
         ..super::Reading::default()
     };
-    for exe in exes.into_iter().flatten() {
+    for exe in exes.into_iter().flatten().flatten() {
         match tools_installer(exe.as_ref(), is_install_process) {
             Some(ToolsInstaller::CommandLine) => reading.install_process = true,
             Some(ToolsInstaller::AppleWindow) => reading.apple_window = true,
@@ -65,7 +67,7 @@ fn apple_window_pid(
 /// press itself, so a window that closed since the page last read this Mac is none.
 #[cfg(target_os = "macos")]
 pub(super) fn apple_installer_pid() -> Option<u32> {
-    apple_window_pid(processes())
+    apple_window_pid(processes()?)
 }
 
 /// This Mac's [`super::Reading`] now: the placeholder there or not as one `lstat` finds it,
@@ -75,8 +77,11 @@ pub(super) fn apple_installer_pid() -> Option<u32> {
 #[cfg(target_os = "macos")]
 pub(super) fn installing_now() -> super::Reading {
     let path = std::path::Path::new(aterm_types::macos_setup::COMMAND_LINE_TOOLS_INSTALLING);
-    let placeholder = std::fs::symlink_metadata(path).is_ok();
-    let mut reading = reading_from(placeholder, processes().map(|(_, exe)| exe));
+    let placeholder = placeholder_at(path);
+    let mut reading = reading_from(
+        placeholder,
+        processes().map(|rows| rows.map(|(_, exe)| exe)),
+    );
     reading.live_run = stamp_of(path, 0).is_some_and(|stamp| {
         aterm_types::macos_setup::placeholder_held_by_a_live_run(
             &stamp,
@@ -84,6 +89,16 @@ pub(super) fn installing_now() -> super::Reading {
         )
     });
     reading
+}
+
+/// Whether the placeholder exists without following links; an unread path is unknown.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn placeholder_at(path: &Path) -> Option<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Some(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
+    }
 }
 
 /// The stamp in the placeholder at `path`, as `aterm init` reads it: a regular file `owner`
@@ -122,38 +137,64 @@ pub(super) fn installing_now() -> super::Reading {
 /// Every process running now, by its pid, with the executable the kernel names for it (`None`
 /// where it names none); one that exited before its executable was read is left out.
 #[cfg(target_os = "macos")]
-fn processes() -> impl Iterator<Item = (u32, Option<std::path::PathBuf>)> {
-    process_ids()
-        .into_iter()
-        .filter_map(|pid| match aterm_uds::holders::exe_of(pid) {
-            aterm_uds::holders::Exe::At(path) => Some((pid, Some(path))),
-            aterm_uds::holders::Exe::Unnamed => Some((pid, None)),
-            aterm_uds::holders::Exe::Exited => None,
-        })
-}
-
-#[cfg(target_os = "macos")]
-fn process_ids() -> Vec<u32> {
-    // SAFETY: a null buffer asks for the count only.
-    let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
-    let Ok(count) = usize::try_from(count) else {
-        return Vec::new();
-    };
-    let mut pids = vec![0_i32; count + 64];
-    let Ok(bytes) = libc::c_int::try_from(pids.len() * std::mem::size_of::<i32>()) else {
-        return Vec::new();
-    };
-    // SAFETY: `pids` is `bytes` writable bytes.
-    let found = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
-    pids.truncate(usize::try_from(found).unwrap_or(0).min(pids.len()));
-    pids.into_iter()
-        .filter_map(|pid| u32::try_from(pid).ok().filter(|pid| *pid > 0))
-        .collect()
+fn processes() -> Option<impl Iterator<Item = (u32, Option<std::path::PathBuf>)>> {
+    Some(
+        aterm_sysprobe::kproc::records()?
+            .into_iter()
+            .filter(|record| record.pid > 0 && !record.zombie)
+            .filter_map(|record| match aterm_uds::holders::exe_of(record.pid) {
+                aterm_uds::holders::Exe::At(path) => Some((record.pid, Some(path))),
+                aterm_uds::holders::Exe::Unnamed => Some((record.pid, None)),
+                aterm_uds::holders::Exe::Exited => None,
+            }),
+    )
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unread_table_is_no_idle_table_and_live_evidence_still_counts() {
+        use super::super::{Activity, Reading};
+        for placeholder in [false, true] {
+            let unread = reading_from(Some(placeholder), None::<std::iter::Empty<Option<&Path>>>);
+            assert_eq!(super::super::activity(unread), Activity::Unread);
+            let empty = reading_from(Some(placeholder), Some(std::iter::empty::<Option<&Path>>()));
+            assert_eq!(super::super::activity(empty), Activity::Idle);
+            assert_eq!(
+                super::super::activity(Reading {
+                    live_run: true,
+                    ..unread
+                }),
+                if placeholder {
+                    Activity::Installing
+                } else {
+                    Activity::Unread
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_placeholder_stat_is_unread_not_absent() {
+        use super::super::Activity;
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let absent = dir.path().join("absent");
+        assert_eq!(placeholder_at(&absent), Some(false));
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&absent, &link).unwrap();
+        assert_eq!(placeholder_at(&link), Some(true));
+        let parent = dir.path().join("parent");
+        std::fs::write(&parent, b"a file, not a directory").unwrap();
+        assert_eq!(placeholder_at(&parent), Some(true));
+        let unread = placeholder_at(&parent.join("placeholder"));
+        assert_eq!(unread, None);
+        let reading = reading_from(unread, Some(std::iter::empty::<Option<&Path>>()));
+        assert_eq!(super::super::activity(reading), Activity::Unread);
+        let window = reading_from(unread, Some([Some(INSTALLER)]));
+        assert_eq!(super::super::activity(window), Activity::AppleWindow);
+    }
 
     /// [`super::super::activity`] over `paths`, each a running process's executable, beside the
     /// placeholder when `placeholder`.
@@ -161,7 +202,10 @@ mod tests {
         placeholder: bool,
         paths: impl IntoIterator<Item = impl AsRef<Path>>,
     ) -> super::super::Activity {
-        super::super::activity(reading_from(placeholder, paths.into_iter().map(Some)))
+        super::super::activity(reading_from(
+            Some(placeholder),
+            Some(paths.into_iter().map(Some)),
+        ))
     }
 
     const INSTALLER: &str = "/System/Library/CoreServices/Install Command Line Developer Tools.app/Contents/MacOS/Install Command Line Developer Tools";
@@ -193,7 +237,7 @@ mod tests {
                     &[Some("/tmp/softwareupdate"), Some(INSTALLER)],
                     &[Some(INSTALLER), Some("/usr/sbin/softwareupdate")],
                 ] {
-                    let mut reading = reading_from(placeholder, paths.iter().copied());
+                    let mut reading = reading_from(Some(placeholder), Some(paths.iter().copied()));
                     reading.live_run = live_run;
                     let held = aterm_types::macos_setup::tools_held_by(
                         placeholder,

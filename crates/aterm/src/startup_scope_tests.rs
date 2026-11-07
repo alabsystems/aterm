@@ -543,6 +543,10 @@ fn the_secrets_lanes_end_leaves_workstation_running() {
         settings: Vec::new(),
         subjects: Vec::new(),
         touched: Vec::new(),
+        readback: None,
+        readback_subjects: Vec::new(),
+        readback_owner: None,
+        input_readback: false,
     };
     let dock = Subject::Setting(Setting::Dock);
     let secrets = Subject::Setting(Setting::Secrets);

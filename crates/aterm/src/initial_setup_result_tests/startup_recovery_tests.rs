@@ -4,13 +4,25 @@
 use super::*;
 use std::sync::atomic::Ordering;
 
-struct Healing;
+/// [`HEAL_STARTING`] idle for a test, and idle again once the test ends. It
+/// holds [`HEALING`] for its whole life, so no two run at once and one's drop
+/// idles no heal another test has started.
+struct Healing {
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+/// Serialises every [`Healing`]. Taken inside [`globals`], which every test
+/// that idles the heal holds first.
+static HEALING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl Healing {
     fn idle() -> Self {
+        let serial = HEALING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(STARTUP_RUNS.load(Ordering::Acquire), 0);
         HEAL_STARTING.store(false, Ordering::Release);
-        Self
+        Self { _serial: serial }
     }
 }
 
@@ -18,6 +30,23 @@ impl Drop for Healing {
     fn drop(&mut self) {
         HEAL_STARTING.store(false, Ordering::Release);
     }
+}
+
+/// A [`Healing`] holds [`HEALING`] for its whole life and lets it go once it
+/// drops: a second waits for the first rather than idling the heal under it.
+#[test]
+fn a_healing_holds_its_tests_lock_while_it_lives() {
+    let _globals = globals();
+    let healing = Healing::idle();
+    assert!(
+        HEALING.try_lock().is_err(),
+        "a Healing another test can idle under while this one lives"
+    );
+    drop(healing);
+    assert!(
+        HEALING.try_lock().is_ok(),
+        "a dropped Healing kept its lock"
+    );
 }
 
 #[test]

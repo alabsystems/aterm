@@ -202,12 +202,67 @@ where
     );
 }
 
+thread_local! {
+    /// How deep this thread is inside [`panicked`]: its panics are expected and kept quiet.
+    static QUIET: Cell<u32> = const { Cell::new(0) };
+    /// How many of this thread's panics the hook kept quiet.
+    static KEPT_QUIET: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Runs `f`, saying whether it panicked, and keeps its panic off the output. The tests of this
+/// binary run at once, so the process hook is replaced only once, by one that keeps quiet only
+/// a thread inside `panicked`: a hook swapped and put back around each call could be put back
+/// by one test over another's swap, leaving every later failure in the binary silent.
 fn panicked(f: impl FnOnce()) -> bool {
-    let prev = panic::take_hook();
-    panic::set_hook(Box::new(|_| {}));
-    let result = panic::catch_unwind(AssertUnwindSafe(f));
-    panic::set_hook(prev);
-    result.is_err()
+    static QUIET_HOOK: std::sync::Once = std::sync::Once::new();
+    QUIET_HOOK.call_once(|| {
+        let prev = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            if QUIET.with(Cell::get) == 0 {
+                prev(info);
+            } else {
+                KEPT_QUIET.with(|kept| kept.set(kept.get() + 1));
+            }
+        }));
+    });
+    struct Loud;
+    impl Drop for Loud {
+        fn drop(&mut self) {
+            QUIET.with(|quiet| quiet.set(quiet.get() - 1));
+        }
+    }
+    QUIET.with(|quiet| quiet.set(quiet.get() + 1));
+    let _loud = Loud;
+    panic::catch_unwind(AssertUnwindSafe(f)).is_err()
+}
+
+/// A panic [`panicked`] keeps quiet keeps no other thread quiet: one that panics outside it
+/// meanwhile still reaches the hook the binary started with.
+#[test]
+fn a_quiet_panic_keeps_no_other_thread_quiet() {
+    let inside = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let done = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let quiet = std::thread::spawn({
+        let (inside, done) = (inside.clone(), done.clone());
+        move || {
+            panicked(|| {
+                inside.wait();
+                done.wait();
+                panic!("an expected panic");
+            })
+        }
+    });
+    inside.wait();
+    let before = KEPT_QUIET.with(Cell::get);
+    let outside = panic::catch_unwind(|| panic!("a panic outside `panicked`"));
+    let after = KEPT_QUIET.with(Cell::get);
+    done.wait();
+    assert!(outside.is_err());
+    assert!(quiet.join().unwrap(), "the quiet thread's panic was caught");
+    assert_eq!(
+        after, before,
+        "a panic outside `panicked` was kept quiet while another thread was inside it"
+    );
 }
 
 #[derive(Clone, Copy, Debug)]

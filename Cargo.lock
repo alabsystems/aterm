@@ -146,7 +146,7 @@ version = "0.2.0"
 
 [[package]]
 name = "aterm"
-version = "0.163.0"
+version = "0.164.0"
 dependencies = [
  "agh",
  "astream-broker",
@@ -1655,6 +1655,7 @@ dependencies = [
  "aterm-spec",
  "aterm-stamp",
  "aterm-sysprobe",
+ "aterm-telemetry",
  "aterm-tempfile",
  "aterm-toml",
  "aterm-toolchain",
@@ -1714,6 +1715,7 @@ dependencies = [
  "aterm-durable",
  "aterm-json",
  "aterm-sysprobe",
+ "aterm-telemetry",
  "aterm-tempfile",
  "aterm-types",
  "aterm-uds",

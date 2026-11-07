@@ -15,6 +15,9 @@ use std::path::Path;
 #[path = "native_replay_model_tests.rs"]
 mod replay_model;
 
+#[path = "native_restart_legacy_tests.rs"]
+mod legacy;
+
 const SID: &str = "s-native-transport";
 
 #[test]
@@ -466,6 +469,138 @@ fn retirement_replays_a_lost_prepare_ack_without_launching_its_command() {
     }
 }
 
+fn bound_record(opts: &Opts) -> St {
+    let mut st = lost_prepare(opts, &planned());
+    let Request::Prepare(plan) = Request::parse(&st.native_prepare).unwrap() else {
+        panic!("saved Prepare")
+    };
+    st.native = Some(Binding {
+        id: plan.id.clone(),
+        capability: binding().capability,
+    });
+    st
+}
+
+#[test]
+fn recovery_rejects_a_binding_without_its_matching_canonical_preparation() {
+    for invalid in ["absent", "malformed", "non-prepare", "other-operation"] {
+        let world = aterm_tempfile::tempdir().unwrap();
+        let opts = opts(world.path());
+        let mut st = bound_record(&opts);
+        match invalid {
+            "absent" => st.native_prepare.clear(),
+            "malformed" => st.native_prepare = "unreadable retained preparation".into(),
+            "non-prepare" => {
+                st.native_prepare = Request::Query(st.native.clone().unwrap()).encode().unwrap();
+            }
+            "other-operation" => st.native.as_mut().unwrap().id = "fe".repeat(16),
+            _ => unreachable!(),
+        }
+        let original = st.clone();
+        let before = std::fs::read(opts.state.join("upgrade/conversation.json")).unwrap();
+        let (mut client, worker) = endpoint(|_| panic!("invalid recovery dispatched a request"));
+        assert_eq!(
+            recover(&opts, "conversation", &mut client, SID, &mut st),
+            Err("native-plan"),
+            "{invalid}"
+        );
+        assert_eq!(st, original, "{invalid}: debt must be preserved");
+        assert_eq!(
+            std::fs::read(opts.state.join("upgrade/conversation.json")).unwrap(),
+            before,
+            "{invalid}: invalid recovery must not republish the record"
+        );
+        drop(client);
+        assert!(worker.join().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn empty_native_retirement_is_already_complete_even_in_dry_run() {
+    let world = aterm_tempfile::tempdir().unwrap();
+    let mut opts = opts(world.path());
+    opts.dry_run = true;
+    let mut st = St::default();
+    let before = st.clone();
+    let (mut client, worker) = endpoint(|_| panic!("empty retirement dispatched a request"));
+    assert!(retire(&opts, "conversation", &mut client, SID, &mut st));
+    assert_eq!(st, before);
+    assert!(!opts.state.exists());
+    drop(client);
+    assert!(worker.join().unwrap().is_empty());
+}
+
+#[test]
+fn a_loaded_binding_cannot_reconcile_before_its_own_durability_barrier() {
+    let world = aterm_tempfile::tempdir().unwrap();
+    let opts = opts(world.path());
+    let st = bound_record(&opts);
+    let fault = aterm_durable::seam::FailingDirs::with_kind(std::io::ErrorKind::Unsupported);
+    assert!(upgrade_drive::save_checked(&opts, "conversation", &st).is_err());
+    let mut loaded = upgrade_drive::load(&opts, "conversation").unwrap();
+    assert_eq!(
+        loaded.native, st.native,
+        "rename was visible before its barrier"
+    );
+    let expected = Request::Reconcile(st.native.clone().unwrap());
+    let allowed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let at_server = std::sync::Arc::clone(&allowed);
+    let (mut client, worker) = endpoint(move |line| {
+        assert!(
+            at_server.load(std::sync::atomic::Ordering::Acquire),
+            "retirement reached the wire before the directory barrier was repaired"
+        );
+        assert_eq!(request(line), expected);
+        None
+    });
+    let mut dry = opts.clone();
+    dry.dry_run = true;
+    assert!(!retire(&dry, "conversation", &mut client, SID, &mut loaded));
+    assert!(!retire(
+        &opts,
+        "conversation",
+        &mut client,
+        SID,
+        &mut loaded
+    ));
+    assert_eq!(loaded.native, st.native);
+    drop(fault);
+    allowed.store(true, std::sync::atomic::Ordering::Release);
+    assert!(!retire(
+        &opts,
+        "conversation",
+        &mut client,
+        SID,
+        &mut loaded
+    ));
+    drop(client);
+    assert_eq!(
+        worker.join().unwrap().len(),
+        1,
+        "only the durable attempt leaves"
+    );
+}
+
+#[test]
+fn a_stale_bound_record_cannot_reconcile_over_a_newer_status_writer() {
+    let world = aterm_tempfile::tempdir().unwrap();
+    let opts = opts(world.path());
+    let st = bound_record(&opts);
+    upgrade_drive::save_checked(&opts, "conversation", &st).unwrap();
+    let mut stale = upgrade_drive::load(&opts, "conversation").unwrap();
+    let mut current = upgrade_drive::load(&opts, "conversation").unwrap();
+    current.wait = "newer writer".into();
+    upgrade_drive::save_checked(&opts, "conversation", &current).unwrap();
+    let (mut client, worker) = endpoint(|_| panic!("stale state dispatched retirement"));
+    assert!(!retire(&opts, "conversation", &mut client, SID, &mut stale));
+    drop(client);
+    assert!(worker.join().unwrap().is_empty());
+    assert_eq!(
+        upgrade_drive::load(&opts, "conversation").unwrap().wait,
+        "newer writer"
+    );
+}
+
 #[test]
 fn unresolved_prepare_replay_preserves_debt_and_cannot_reconcile_another_id() {
     let world = aterm_tempfile::tempdir().unwrap();
@@ -699,6 +834,19 @@ fn a_cold_completion_keeps_the_selected_intent_and_the_original_seed_with_or_wit
         assert_eq!(st.native_completed_prepare.as_deref(), Some(&original));
         assert_eq!(st.native_observation.as_ref(), observation.as_deref());
         assert!(st.native.is_none() && st.native_prepare.is_empty());
+        let encoded = st.to_json();
+        let record: aterm_json::Value = aterm_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            record.get("native_completed_prepare").unwrap().as_str(),
+            Request::prepare(original.clone())
+                .encode_legacy_cold()
+                .as_deref(),
+            "an older supervisor can still decode its completed observation"
+        );
+        assert_eq!(
+            St::from_json(&encoded).unwrap().native_completed_prepare,
+            st.native_completed_prepare
+        );
         let completed = st.clone();
         assert_eq!(terminal_reply(&mut st, &receipt), Some(Recovery::Completed));
         assert_eq!(st.account_intent, completed.account_intent);

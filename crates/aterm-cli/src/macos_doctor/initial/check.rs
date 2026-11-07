@@ -333,6 +333,7 @@ fn check_with(host: &mut dyn InitialCheckHost, root: &Path, plan: &Plan) -> Repo
 /// (a preference key, a repository) is left to its row's reading, which the same Check takes.
 fn named_rows(rows: &[Row]) -> PassPage {
     PassPage {
+        readback: super::WorkstationReadback::EMPTY,
         outcome: aterm_types::macos_setup::PassOutcome::default(),
         rows: rows
             .iter()

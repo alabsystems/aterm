@@ -39,6 +39,25 @@ impl ObservationRead {
     }
 }
 
+/// One native read batch, including the subjects whose private readers were not admitted.
+/// An attempted read that fails remains an ordinary Unknown row, never an admission skip.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ObservationBatch {
+    /// Conservative readings for every requested subject, including skipped Unknown rows.
+    pub rows: Vec<Observation>,
+    /// Private subjects skipped before their reader ran.
+    pub not_admitted: Vec<Subject>,
+}
+
+impl From<Vec<Observation>> for ObservationBatch {
+    fn from(rows: Vec<Observation>) -> Self {
+        Self {
+            rows,
+            not_admitted: Vec::new(),
+        }
+    }
+}
+
 /// Read `subjects` for `plan` without changing anything. `network` adds the
 /// GitHub repositories row (the network and the token file); without it that row
 /// is left out. A row that cannot be read comes back Unknown with the reason in
@@ -48,7 +67,7 @@ pub fn observe_initial_setup(
     subjects: &[Subject],
     network: bool,
     admission: ObservationRead,
-) -> Vec<Observation> {
+) -> ObservationBatch {
     let unread = |subject: Subject, why: &str| Observation {
         detail: Some(why.to_owned()),
         ..Observation::unknown(subject)
@@ -57,7 +76,8 @@ pub fn observe_initial_setup(
         return subjects
             .iter()
             .map(|subject| unread(*subject, &why))
-            .collect();
+            .collect::<Vec<_>>()
+            .into();
     }
     read_batches(subjects, network, admission, |subjects, network| {
         observe_subjects(plan, subjects, network)
@@ -70,7 +90,7 @@ fn read_batches(
     network: bool,
     admission: ObservationRead,
     mut read: impl FnMut(&[Subject], bool) -> Vec<Observation>,
-) -> Vec<Observation> {
+) -> ObservationBatch {
     let mut safe = Vec::new();
     let mut workstation = Vec::new();
     let mut spotlight = Vec::new();
@@ -86,6 +106,7 @@ fn read_batches(
     } else {
         read(&safe, network)
     };
+    let mut not_admitted = Vec::new();
     // A native batch may wait on another process or the network. Its entry needs the page's
     // current visibility, not the one a queue or an earlier batch saw. FDA and Plan mode
     // establish no permission to query another app's preferences or protected project paths.
@@ -96,6 +117,7 @@ fn read_batches(
         if admission.admits_private() {
             out.extend(read(&private, false));
         } else {
+            not_admitted.extend(private.iter().copied());
             out.extend(private.into_iter().map(|subject| Observation {
                 note: Some("Not read in the background".into()),
                 ..Observation::unknown(subject)
@@ -104,7 +126,11 @@ fn read_batches(
     }
     let order = Subject::all();
     out.sort_by_key(|row| order.iter().position(|subject| *subject == row.subject));
-    out
+    not_admitted.sort_by_key(|subject| order.iter().position(|row| row == subject));
+    ObservationBatch {
+        rows: out,
+        not_admitted,
+    }
 }
 
 /// [`observe_initial_setup`] past its scope check.
@@ -962,7 +988,11 @@ mod tests {
                 "private readers must not be invoked without admission"
             );
             for subject in &subjects {
-                let row = seen.iter().find(|row| row.subject == *subject).unwrap();
+                let row = seen
+                    .rows
+                    .iter()
+                    .find(|row| row.subject == *subject)
+                    .unwrap();
                 let was_read = safe.contains(subject)
                     || (ws_read && workstation.contains(subject))
                     || (sp_read && spotlight.contains(subject));
@@ -975,9 +1005,14 @@ mod tests {
                     }
                 );
                 assert_eq!(row.now.is_some(), was_read);
+                assert_eq!(seen.not_admitted.contains(subject), !was_read);
             }
             assert_eq!(
-                seen.iter().find(|row| row.subject == fda).unwrap().standing,
+                seen.rows
+                    .iter()
+                    .find(|row| row.subject == fda)
+                    .unwrap()
+                    .standing,
                 Standing::InPlace,
                 "a verified FDA row never admits the other-app readers"
             );
@@ -990,8 +1025,26 @@ mod tests {
             |_, _| panic!("a hidden private-only refresh invoked its native reader"),
         );
         assert!(
-            seen.iter()
+            seen.rows
+                .iter()
                 .all(|row| row.standing == Standing::Unknown && row.now.is_none())
+        );
+        assert_eq!(seen.not_admitted, workstation);
+        let attempted = read_batches(
+            &workstation,
+            false,
+            ObservationRead::ExplicitCheck,
+            |subjects, _| subjects.iter().copied().map(Observation::unknown).collect(),
+        );
+        assert!(
+            attempted.not_admitted.is_empty(),
+            "failed attempted reads remain invalidating observations"
+        );
+        assert!(
+            attempted
+                .rows
+                .iter()
+                .all(|row| row.standing == Standing::Unknown)
         );
     }
 

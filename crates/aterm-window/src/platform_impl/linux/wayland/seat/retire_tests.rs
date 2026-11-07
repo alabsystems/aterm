@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use aterm_wayland::protocols::wayland::{wl_buffer, wl_shm, wl_shm_pool, wl_surface};
 
-use super::{TextInput, WinitPointer, RETIRE};
+use super::{TextInput, WinitPointer, RETIRE, RETIRE_TESTS};
 use crate::platform_impl::wayland::event_loop::EventLoop;
 use crate::platform_impl::wayland::state::WinitState;
 use crate::platform_impl::wayland::window::Window;
@@ -233,13 +233,16 @@ fn a_held_pointer_and_text_input_die_on_the_loop_s_thread() {
     let Some(lane) = lane() else {
         return;
     };
-    struct Restore;
+    struct Restore {
+        _serial: std::sync::MutexGuard<'static, ()>,
+    }
     impl Drop for Restore {
         fn drop(&mut self) {
             RETIRE.store(true, Ordering::SeqCst);
         }
     }
-    let _restore = Restore;
+    let _restore =
+        Restore { _serial: RETIRE_TESTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner) };
     let fixed = arm(&lane, true);
     eprintln!("retired: {fixed:?}");
     assert_eq!(

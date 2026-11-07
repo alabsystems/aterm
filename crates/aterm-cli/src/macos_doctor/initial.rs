@@ -37,7 +37,7 @@ pub use authorization::InitialSetupAuthorization;
 pub use authorization::{InitialSetupAdmissionFault, InitialSetupAdmissionStopTest};
 mod access;
 mod observe;
-pub use observe::{ObservationRead, observe_initial_setup};
+pub use observe::{ObservationBatch, ObservationRead, observe_initial_setup};
 pub(super) use observe::{changed_at_login, note_at_login};
 mod scope;
 #[cfg(any(test, debug_assertions))]
@@ -4924,12 +4924,16 @@ trait SecretsLane: Send {
 /// it changes (the page's busy rows) and the rows to read again once it ends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StageEvent<'a> {
+    /// The admitted run whose stage owns this event.
+    pub revision: u64,
     /// The settings whose rows the stage changes.
     pub settings: &'a [Setting],
     /// The System State rows the stage's work can change.
     pub subjects: &'a [Subject],
     /// Whether the stage is starting (`true`) or has ended (`false`).
     pub running: bool,
+    /// Native facts already read by this stage, never an operation's completion stamp.
+    pub readback: &'a WorkstationReadback,
 }
 
 /// What a setup pass asks between its stages.
@@ -6542,21 +6546,34 @@ enum SecretsLaneFinish {
 /// caller retires what a panic cut off.
 struct StageFence<'a> {
     stage: for<'b> fn(StageEvent<'b>),
+    stop: fn(u64) -> bool,
+    revision: u64,
     settings: &'a [Setting],
     subjects: &'a [Subject],
+    readback: WorkstationReadback,
 }
 
 impl<'a> StageFence<'a> {
-    fn open(hooks: SetupHooks, settings: &'a [Setting], subjects: &'a [Subject]) -> Self {
+    fn open(
+        hooks: SetupHooks,
+        revision: u64,
+        settings: &'a [Setting],
+        subjects: &'a [Subject],
+    ) -> Self {
         (hooks.stage)(StageEvent {
+            revision,
             settings,
             subjects,
             running: true,
+            readback: &WorkstationReadback::EMPTY,
         });
         Self {
             stage: hooks.stage,
+            stop: hooks.stop,
+            revision,
             settings,
             subjects,
+            readback: WorkstationReadback::EMPTY,
         }
     }
 }
@@ -6564,10 +6581,20 @@ impl<'a> StageFence<'a> {
 impl Drop for StageFence<'_> {
     fn drop(&mut self) {
         if !std::thread::panicking() {
+            if (self.stop)(self.revision) {
+                self.readback = WorkstationReadback::EMPTY;
+            }
+            let mut selected = Selection::none();
+            for setting in self.settings {
+                selected.set(*setting, true);
+            }
+            self.readback.retain(selected);
             (self.stage)(StageEvent {
+                revision: self.revision,
                 settings: self.settings,
                 subjects: self.subjects,
                 running: false,
+                readback: &self.readback,
             });
         }
     }
@@ -6659,7 +6686,7 @@ fn run_secrets_lane(
     let begun = ledger::Begun::new(root, revision, Stage::Secrets);
     let settings = [Setting::Secrets];
     let subjects = [Subject::Setting(Setting::Secrets)];
-    let fence = StageFence::open(hooks, &settings, &subjects);
+    let fence = StageFence::open(hooks, revision, &settings, &subjects);
     let started = std::time::Instant::now();
     let result = match secrets_try_with(|| lane.configured_vault(), plan, admitted_vault) {
         Ok(SecretsTry::LeaveInPlace(vault)) => {
@@ -7190,13 +7217,16 @@ fn execute_pass_target(
                 progress.running = Some(stage);
             }
             save_progress(root, progress)?;
-            let fence = StageFence::open(hooks, &settings, &subjects);
+            let mut fence = StageFence::open(hooks, progress.revision, &settings, &subjects);
             // The page's words for the stage's rows, where its report has them.
             let mut page = None;
             let result = match stage {
                 Stage::Workstation => {
                     match host.workstation(root, target.workstation_only(progress.only)) {
                         Ok(Some(result)) => {
+                            if let Some(page) = result.page.as_ref() {
+                                fence.readback = page.readback.clone();
+                            }
                             page = result.page;
                             Ok(result.rows)
                         }
@@ -7371,7 +7401,8 @@ fn execute_pass_target(
     };
     let owed_subjects: Vec<Subject> = owed.iter().copied().map(Subject::Setting).collect();
     let followed = {
-        let _fence = (!owed.is_empty()).then(|| StageFence::open(hooks, &owed, &owed_subjects));
+        let _fence = (!owed.is_empty())
+            .then(|| StageFence::open(hooks, progress.revision, &owed, &owed_subjects));
         if target == PassTarget::All {
             host.withheld(root)
         } else {

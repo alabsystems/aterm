@@ -512,10 +512,19 @@ unsafe extern "C" {
     fn setrlimit(resource: i32, limit: *const Rl) -> i32;
 }
 
-fn set_soft_limit(soft: u64) -> u64 {
+/// Serialises this binary's soft-limit writers. A move is a read and then a write, and the tests
+/// run at once: a raise that read before another raise wrote would put back its own, lower
+/// target, under a test that already parked a descriptor above it.
+static SOFT_LIMIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn soft_limit() -> Rl {
     let mut limit = Rl { cur: 0, max: 0 };
     // SAFETY: a live out-parameter.
     assert_eq!(unsafe { getrlimit(NOFILE, &mut limit) }, 0, "getrlimit");
+    limit
+}
+
+fn write_soft_limit(mut limit: Rl, soft: u64) -> u64 {
     limit.cur = soft.min(limit.max);
     // SAFETY: a live, initialised limit that keeps the hard one; moving the soft limit below the
     // hard one needs no privilege.
@@ -523,16 +532,43 @@ fn set_soft_limit(soft: u64) -> u64 {
     limit.cur
 }
 
+fn set_soft_limit(soft: u64) -> u64 {
+    let _serial = SOFT_LIMIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    write_soft_limit(soft_limit(), soft)
+}
+
 /// Raise the soft limit to at least `want` (capped by the hard limit).
 pub(super) fn raise_soft_limit(want: u64) -> u64 {
-    let mut limit = Rl { cur: 0, max: 0 };
-    // SAFETY: a live out-parameter.
-    assert_eq!(unsafe { getrlimit(NOFILE, &mut limit) }, 0, "getrlimit");
+    raise_soft_limit_between(want, || ())
+}
+
+/// [`raise_soft_limit`], running `between` after it read the limit and before it writes one.
+fn raise_soft_limit_between(want: u64, between: impl FnOnce()) -> u64 {
+    let _serial = SOFT_LIMIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let limit = soft_limit();
+    between();
     if limit.cur >= want {
         limit.cur
     } else {
-        set_soft_limit(want)
+        write_soft_limit(limit, want)
     }
+}
+
+/// A raise holds [`SOFT_LIMIT`] from its read to its write, so no other raise of this binary
+/// writes in that span, to be put back by this one.
+#[test]
+fn a_soft_limit_raise_holds_its_lock_from_its_read_to_its_write() {
+    let mut held = None;
+    raise_soft_limit_between(0, || held = Some(SOFT_LIMIT.try_lock().is_err()));
+    assert_eq!(
+        held,
+        Some(true),
+        "a raise another raise can write under between its read and its write"
+    );
 }
 
 #[test]

@@ -5,6 +5,7 @@
 //! the GUI PID merely because the GUI is their common process ancestor.
 use super::*;
 use aterm_capacity::build_cpu::Owner as CpuOwner;
+use aterm_capacity::telemetry::Owed;
 use aterm_capacity::{Need, Polled};
 use aterm_types::resource_admission::Event;
 use std::num::NonZeroU32;
@@ -167,7 +168,7 @@ impl Owner {
             )));
         }
         if pending.claim.is_none() {
-            self.poll_memory(pending)?;
+            self.poll_memory(pending, &Live)?;
             if pending.claim.is_none() {
                 return Ok(Advance::Wait);
             }
@@ -239,40 +240,56 @@ impl Owner {
         }
         Ok(true)
     }
-    fn poll_memory(&mut self, pending: &mut Pending) -> io::Result<()> {
-        if pending.claim.is_none() {
-            if pending.waiter.is_none() {
+    /// One look at `pending`'s memory claim on `machine`, entering its wait at the first. Each
+    /// admission writes one `kind=admission` row where it is decided ([`memory_decided`]): at the
+    /// look that admits it or ends its wait, or at its refusal as an impossible head, never one
+    /// a look; one given up while it waits writes its row as it drops ([`MemoryWait`]).
+    pub(super) fn poll_memory(
+        &mut self,
+        pending: &mut Pending,
+        machine: &dyn aterm_capacity::Machine,
+    ) -> io::Result<()> {
+        if pending.claim.is_some() {
+            return Ok(());
+        }
+        let wait = match pending.waiter.take() {
+            Some(wait) => wait,
+            None => {
                 let need = Need::new(format!(
                     "resource-run: {}",
                     pending.submission.request.label
                 ))
                 .mem(pending.submission.request.memory_bytes)
                 .margin(aterm_capacity::build_cpu::default_memory_reserve());
+                // Its row is owed from its ask, its refusal as an impossible head included.
+                let owed = Owed::of(&self.ledger, &need);
                 // Low-level Waiter polling deliberately does not apply the
                 // high-level admission wrapper's permanent-impossibility check.
                 // Refuse an impossible head before it can block every later job.
-                if let Some(reason) =
-                    aterm_capacity::never(&need, &aterm_capacity::Machine::read(&Live, None))
-                {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput, reason));
+                let entered = match aterm_capacity::never(&need, &machine.read(None)) {
+                    Some(reason) => Err(aterm_capacity::Error::Never(reason)),
+                    None => Waiter::enter_cohort(&self.ledger, machine, need)
+                        .map_err(aterm_capacity::Error::Ledger),
+                };
+                match entered {
+                    Ok(waiter) => MemoryWait { waiter, owed },
+                    Err(error) => return memory_decided(owed, Err(error)).map(drop),
                 }
-                pending.waiter = Some(Waiter::enter_cohort(&self.ledger, &Live, need)?);
             }
-            match pending
-                .waiter
-                .take()
-                .ok_or_else(|| refused("missing memory waiter"))?
-                .poll(&Live)
-            {
-                Polled::Admitted(claim) => pending.claim = Some(claim),
-                Polled::Waiting(waiter, _) => {
-                    pending.waiter = Some(waiter);
-                    return Ok(());
-                }
-                Polled::Gone(error) => return Err(error),
-                Polled::Unqualified(_) => return Err(refused("memory admission unavailable")),
+        };
+        let decided = match wait.waiter.poll(machine) {
+            Polled::Waiting(waiter, _) => {
+                pending.waiter = Some(MemoryWait {
+                    waiter,
+                    owed: wait.owed,
+                });
+                return Ok(());
             }
-        }
+            Polled::Admitted(claim) => Ok(claim),
+            Polled::Gone(error) => Err(aterm_capacity::Error::Ledger(error)),
+            Polled::Unqualified(why) => Err(aterm_capacity::Error::Timing(why)),
+        };
+        pending.claim = Some(memory_decided(wait.owed, decided)?);
         Ok(())
     }
     fn defer_accounted_refusal(&mut self, mut pending: Pending, reason: &str) {
@@ -325,14 +342,25 @@ impl Owner {
         false
     }
 }
-enum Advance {
+/// The memory admission `owed` came to, `decided`: its row written ([`Owed::decided`]), then its
+/// claim, or the error that refuses its request before launch (an impossible head's is
+/// `InvalidInput`).
+fn memory_decided(owed: Owed, decided: Result<Claim, aterm_capacity::Error>) -> io::Result<Claim> {
+    owed.decided(decided.as_ref());
+    decided.map_err(|error| match error {
+        aterm_capacity::Error::Ledger(error) => error,
+        aterm_capacity::Error::Never(reason) => io::Error::new(io::ErrorKind::InvalidInput, reason),
+        _ => refused("memory admission unavailable"),
+    })
+}
+pub(super) enum Advance {
     Wait,
     Retain,
     Launch(Box<Custody>),
 }
 
 impl Owner {
-    fn prepare(&mut self, pending: &mut Pending) -> io::Result<Advance> {
+    pub(super) fn prepare(&mut self, pending: &mut Pending) -> io::Result<Advance> {
         let metadata = recipe::metadata_request(&pending.submission.request);
         let width = if metadata {
             1

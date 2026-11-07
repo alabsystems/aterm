@@ -2323,7 +2323,10 @@ mod tests {
     /// 401's failure and its weekly upsell; Kimi Code's spent quota), where every frame read
     /// `unknown` and every wall was dropped before. A card in the composer's place and Grok
     /// Build's plan approval publish `prompt` with the box's kind (and, for a command, the
-    /// read-only rule's verdict). CONTROL: a shell showing those frames runs no agent.
+    /// read-only rule's verdict; none for a Kimi Code command its box shows only part of, a
+    /// fullscreen panel's body taller than its dock or squeezed under it, one a blank row splits,
+    /// or one under Kimi's own `Dangerous:` row, which backspaces in it can redraw as a read).
+    /// CONTROL: a shell showing those frames runs no agent.
     #[test]
     fn grok_and_kimi_tabs_publish_the_phase_and_walls_their_screens_decide() {
         use aterm_phase::prompt::fixtures::screen;
@@ -2396,6 +2399,63 @@ mod tests {
             ("kimi", kimi::fixtures::BOX_SHELL_240, "bash:read-only"),
             ("kimi", kimi::fixtures::QUESTION_240, "question"),
             ("kimi", kimi::fixtures::BOX_EDIT_252, "edit"),
+            (
+                "kimi",
+                kimi::fixtures::BOX_SHELL_EMPTY_LINE_252,
+                "bash:not-read-only",
+            ),
+            (
+                "kimi",
+                kimi::fixtures::FULLSCREEN_BOX_SHELL_252,
+                "bash:not-read-only",
+            ),
+            (
+                "kimi",
+                kimi::fixtures::FULLSCREEN_BOX_SHELL_OVERFLOW_252,
+                "bash",
+            ),
+            (
+                "kimi",
+                kimi::fixtures::FULLSCREEN_BOX_SHELL_FEEDBACK_WIDE_252,
+                "bash",
+            ),
+            (
+                "kimi",
+                kimi::fixtures::FULLSCREEN_BOX_SHELL_SQUEEZED_252,
+                "bash",
+            ),
+            (
+                "kimi",
+                kimi::fixtures::BOX_SHELL_CARRIAGE_RETURN_252,
+                "bash",
+            ),
+            (
+                "kimi",
+                kimi::fixtures::BOX_SHELL_SPACED_252,
+                "bash:not-read-only",
+            ),
+            ("kimi", kimi::fixtures::BOX_SHELL_BACKSPACED_252, "bash"),
+            (
+                "kimi",
+                kimi::fixtures::BOX_SHELL_LONG_WORD_252,
+                "bash:not-read-only",
+            ),
+            (
+                "kimi",
+                kimi::fixtures::BOX_SHELL_CARRIAGE_RETURN_MID_252,
+                "bash:not-read-only",
+            ),
+            (
+                "kimi",
+                kimi::fixtures::BOX_SHELL_OPTION_SHAPED_252,
+                "bash:not-read-only",
+            ),
+            (
+                "kimi",
+                kimi::fixtures::BOX_SHELL_OPTION_SHAPED_CR_252,
+                "bash",
+            ),
+            ("kimi", kimi::fixtures::BOX_PLAN_FORGED_252, "plan-exit"),
         ] {
             let v = verdict(program, text);
             assert_eq!(detail_of(&v).as_deref(), Some(detail), "{program}: {v:?}");

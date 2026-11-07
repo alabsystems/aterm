@@ -79,7 +79,7 @@ fn an_adopted_accounts_admissions_are_held_to_its_namespaced_ledger() {
         "m101",
         aterm_telemetry::Digest::dir("/facts"),
         &asked,
-        &refused,
+        refused.as_ref(),
         |_| {
             n += 1;
             true
@@ -96,7 +96,7 @@ fn an_adopted_accounts_admissions_are_held_to_its_namespaced_ledger() {
         "m101",
         aterm_telemetry::Digest::dir("/facts"),
         &asked,
-        &refused,
+        refused.as_ref(),
         |_| {
             held_to_source += 1;
             true

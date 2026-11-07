@@ -9578,6 +9578,7 @@ fn a_watched_call_ends_with_its_leaders_status_and_names_the_program_it_ran() {
                 pid: 400,
                 start: start_of(400),
                 end,
+                at_ms: w.at + 7,
             };
             if early {
                 // The kernel's event reached the host while the sweep still listed the wrapper:
@@ -9592,6 +9593,11 @@ fn a_watched_call_ends_with_its_leaders_status_and_names_the_program_it_ran() {
             let _ = w.tick(TICK_MS);
             let call = ended_call(&mut w);
             assert_eq!(call.ended_by, Some(end), "early={early}: {call:?}");
+            assert_eq!(
+                call.leader_exited_ms,
+                Some(exit.at_ms),
+                "its moment, kept with its status: early={early}: {call:?}"
+            );
             assert_eq!(
                 call.ran.as_deref(),
                 Some("sleep"),
@@ -9614,10 +9620,67 @@ fn an_end_of_another_process_given_the_leaders_pid_is_not_the_calls() {
         pid: 400,
         start: Some(1),
         end: ExitOf::Code(0),
+        at_ms: w.at,
     });
     let _ = w.tick(TICK_MS);
     let call = ended_call(&mut w);
     assert_eq!(call.ended_by, None, "a pid taken anew: {call:?}");
+    assert_eq!(call.leader_exited_ms, None, "nor its moment: {call:?}");
+}
+
+/// A WATCHED CALL ENDS AT ITS LEADER'S OWN MOMENT (TM-1 §5): the pass that finds the leader gone
+/// may come long after its exit (a windowless instance reads at its next edge), and the call's
+/// end is still the moment the host's watch stamped, between the passes. NEGATIVE CONTROL: a call
+/// no watch read ends at that pass alone.
+#[test]
+fn a_watched_calls_end_is_its_leaders_moment_not_the_pass_that_finds_it_gone() {
+    use aterm_vitals::jobs::{ExitOf, LeaderExit};
+    for watched in [true, false] {
+        let mut w = World::new();
+        w.call(1, 300, 400, sleeper(401, "sleep"), None);
+        let _ = run_to(&mut w, 4_000, |_, _| {});
+        let exited = w.at + 150;
+        w.exit(401, false);
+        w.exit(400, false);
+        if watched {
+            w.exits.push(LeaderExit {
+                pid: 400,
+                start: start_of(400),
+                end: ExitOf::Code(0),
+                at_ms: exited,
+            });
+        }
+        // The next reading comes a minute on.
+        let _ = w.tick(60_000);
+        let call = ended_call(&mut w);
+        assert_eq!(call.ended_ms, w.at, "the pass that found it gone: {call:?}");
+        assert!(call.opened_ms < exited, "{call:?}");
+        assert_eq!(
+            call.leader_exited_ms,
+            watched.then_some(exited),
+            "watched={watched}: {call:?}"
+        );
+    }
+}
+
+/// A CALL THE JOIN NAMES ENDS WITH THE COMMAND IT NAMED (TM-1 §5): what its telemetry row keys
+/// on (`telemetry_host::agent_call_row`), never its shell wrapper. NEGATIVE CONTROL: a call no
+/// join names ends with none.
+#[test]
+fn a_call_the_join_names_ends_with_the_command_it_named() {
+    for command in [Some("targo test -p aterm-vitals"), None] {
+        let mut w = World::new();
+        let mut h = hint(400, Consumer::AgentFg, None, None);
+        h.command = command.map(str::to_owned);
+        w.call(1, 300, 400, sleeper(401, "targo"), Some(h));
+        let _ = run_to(&mut w, 4_000, |_, _| {});
+        w.exit(401, false);
+        w.exit(400, false);
+        let _ = w.tick(TICK_MS);
+        let call = ended_call(&mut w);
+        assert_eq!(call.command, command.unwrap_or(""), "{call:?}");
+        assert_eq!(call.ran.as_deref(), Some("targo"), "{call:?}");
+    }
 }
 
 #[test]
@@ -9697,6 +9760,7 @@ fn a_call_judged_stuck_ends_stuck_whatever_the_pass_that_finds_it_gone_judges() 
         pid: 400,
         start: start_of(400),
         end: ExitOf::Signal(2),
+        at_ms: w.at,
     });
     w.exit(400, false);
     let _ = w.tick(TICK_MS);

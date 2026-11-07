@@ -1858,9 +1858,13 @@ pub const GROK_ANCHORS: &[Anchor] = &[
 /// the footer and the notice a resume draws over the composer are read as 2.4.0 drew them
 /// ([`crate::kimi::phase`]), and so are the titles of the boxes it draws in the composer's place
 /// (a command's approval, a plan's, a question and the folder-trust prompt, [`crate::kimi::prompt`]).
-/// The approval panel's other titles (a file's write and edits, a task's stop, `Approve <tool>?`
-/// for any other tool) and a multi-select question's `showing a-b of n` row are read from 2.5.1's
-/// and 2.5.2's binaries (`headerFor`, `renderQuestionTab`), where no frame measured them.
+/// The approval panel's key row ends `↵ confirm` as 2.4.0 drew it, and `· ctrl+e preview` over
+/// a file's block as 2.5.2 drew it, and a command its own patterns call dangerous draws a
+/// `Dangerous: <label>` row over its lines, in 2.5.1's and 2.5.2's binaries and 2.5.2's frames.
+/// Its other titles (a file's write and edits, a task's stop,
+/// `Approve <tool>?` for any other tool) and a multi-select question's `showing a-b of n` row are
+/// read from 2.5.1's and 2.5.2's binaries (`headerFor`, `renderQuestionTab`); 2.5.2's frames
+/// measured the write's and edits' titles, and none the others.
 pub const KIMI_ANCHORS: &[Anchor] = &[
     lit("kimi.welcome", "Welcome to Kimi Code!", "2.3.1"),
     lit("kimi.footer.context", "context: ", "2.3.1"),
@@ -1880,6 +1884,9 @@ pub const KIMI_ANCHORS: &[Anchor] = &[
     lit("kimi.box.stop", "Stop this task?", "2.5.1"),
     lit("kimi.box.approve", "Approve ", "2.5.1"),
     lit("kimi.question.showing", "showing ", "2.5.1"),
+    lit("kimi.box.keys.confirm", "\u{21b5} confirm", "2.4.0"),
+    lit("kimi.box.keys.preview", "\u{b7} ctrl+e preview", "2.5.1"),
+    lit("kimi.box.dangerous", "Dangerous: ", "2.5.1"),
     lit("kimi.error", "Error: ", "2.3.1"),
     lit("kimi.auth.llm_not_set", "LLM not set", "2.3.1"),
     lit(

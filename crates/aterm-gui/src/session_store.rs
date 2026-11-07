@@ -688,12 +688,6 @@ pub(crate) struct SessionHandoff {
         skip_serializing_if = "Vec::is_empty",
         deserialize_with = "lenient_rows"
     )]
-    pub fleet_told: Vec<String>,
-    #[serde(
-        default,
-        skip_serializing_if = "Vec::is_empty",
-        deserialize_with = "lenient_rows"
-    )]
     pub mirror_dropped: Vec<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub mirror_served: bool,
@@ -950,7 +944,6 @@ impl SessionHandoff {
             fabric_attached: crate::fabric_launch::handoff_attached(),
             #[cfg(not(unix))]
             fabric_attached: Vec::new(),
-            fleet_told: Vec::new(),
             mirror_dropped: store.mirror.draw_tombstones(),
             mirror_served: store.mirror.served(),
             machine_names: crate::tab_label::machine_names_for_handoff(),
@@ -1578,6 +1571,8 @@ impl SessionStore {
         };
         if let Some((reason, t_ms)) = resolved {
             self.by_id.remove(&closed.sid);
+            #[cfg(not(test))]
+            crate::fabric::forget_direct_mail(&closed.sid);
             let seq = self.record_roster(
                 closed.sid.as_str().to_string(),
                 local_id,

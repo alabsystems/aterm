@@ -448,16 +448,12 @@ fn owned_helper_external_model_moves_require_explicit_current_credits() {
     assert!(cold_resolve_at(&c.seat, &seed, &intent, &facts, &derive).is_ok());
     intent.billing = ColdBilling::UsageCredits;
     assert!(cold_resolve_at(&c.seat, &seed, &intent, &facts, &derive).is_ok());
-    struct Restore(u8);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            LIVE_ACCOUNTS_MODE.store(self.0, Ordering::SeqCst);
-        }
-    }
-    let _restore = Restore(LIVE_ACCOUNTS_MODE.swap(
+    // This body runs alone in its own child process (`test_alone::alone`), so the policy it
+    // sets ends with that process and reaches no other test.
+    LIVE_ACCOUNTS_MODE.store(
         ACCOUNTS_SUPERVISED | ACCOUNTS_WALL | ACCOUNTS_USAGE_CREDITS,
         Ordering::SeqCst,
-    ));
+    );
     assert!(cold_intent_current(&intent));
     LIVE_ACCOUNTS_MODE.store(ACCOUNTS_SUPERVISED | ACCOUNTS_WALL, Ordering::SeqCst);
     assert!(

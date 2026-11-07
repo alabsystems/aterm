@@ -323,7 +323,7 @@ fn the_cold_exec_runs_only_once_a_closed_tabs_holdout_has_its_sigkill() {
     let mut tab = stub_session(1);
     tab.pid = i32::try_from(holdout.id()).expect("pid fits i32");
     tab.shell_identity = aterm_pty::record_spawned_shell(tab.pid);
-    let hold = aterm_pty::hold_reap_kills_for_test();
+    let hold = aterm_pty::hold_reap_kills_for_test(tab.pid);
     drop(tab);
     assert!(
         !aterm_pty::wait_for_reaps(Duration::ZERO),

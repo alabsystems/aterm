@@ -3074,8 +3074,9 @@ fn space_section(c: Ctx<'_>) -> Section<'_> {
 
 /// GB used, last 24 hours: occupancy as space used, so a column's height and its heat both mean
 /// full, as the deck's Disk row does (`docs/DESIGN-stats-deck-units-2026-11-04.md` §7). Each
-/// 10-minute column is the most used of its readings ([`aterm_vitals::history::FreeHistory`] keeps
-/// each bucket's least free), so it draws no tick.
+/// 10-minute column is the space its readings used on average, each weighed by its time, and its
+/// tick the most any used ([`aterm_vitals::history::FreeHistory`] keeps each bucket's free space
+/// as an [`aterm_vitals::Agg`]: its mean and its least).
 fn filling_section(c: Ctx<'_>) -> Section<'_> {
     let snap = c.snap;
     let now = snap.at_unix_ms;
@@ -3086,21 +3087,24 @@ fn filling_section(c: Ctx<'_>) -> Section<'_> {
         .map(|v| v.total)
         .or_else(|| snap.free_history.volume().map(|v| v.total))
         .filter(|&t| t > 0);
-    let used: Vec<Option<u64>> = snap
-        .free_history
-        .window(now)
-        .into_iter()
-        .map(|free| Some(total?.saturating_sub(free?)))
+    let used = |free: f64| total.map(|t| (t as f64 - free.max(0.0)).max(0.0));
+    let buckets = snap.free_history.buckets(now);
+    let mean_used: Vec<Option<f64>> = buckets
+        .iter()
+        .map(|b| b.and_then(|b| used(b.value()?)))
         .collect();
-    let vals: Vec<Option<f64>> = used.iter().map(|u| u.map(|b| b as f64 / 1e9)).collect();
-    let heat: Vec<HeatCell> = used
+    let vals: Vec<Option<f64>> = mean_used.iter().map(|u| u.map(|b| b / 1e9)).collect();
+    let peaks: Vec<Option<f64>> = buckets
+        .iter()
+        .map(|b| b.and_then(|b| used(b.min)).map(|u| u / 1e9))
+        .collect();
+    let heat: Vec<HeatCell> = mean_used
         .iter()
         .map(|u| HeatCell {
-            heat: u.zip(total).map(|(u, t)| (u as f64 / t as f64) as f32),
+            heat: u.zip(total).map(|(u, t)| (u / t as f64) as f32),
             ..HeatCell::default()
         })
         .collect();
-    let peaks = vec![None; vals.len()];
     let n = vals.len() as i64;
     let start_ms = (now.div_euclid(BUCKET_MS) + 1 - n) * BUCKET_MS;
     let freed = watched(snap).and_then(|d| d.freed_today.as_ref());

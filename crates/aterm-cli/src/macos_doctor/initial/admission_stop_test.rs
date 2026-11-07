@@ -140,6 +140,7 @@ impl<'a> InitialSetupAdmissionStopTest<'a> {
         &self,
         expected: &PendingInputAdmission,
         system: impl Fn() -> Box<dyn aterm_machines::port::System>,
+        hooks: SetupHooks,
     ) -> Result<Option<InitialInputPass>, String> {
         let mut host = NativeWorkstationInitial {
             sys: system(),
@@ -149,7 +150,7 @@ impl<'a> InitialSetupAdmissionStopTest<'a> {
             ),
         };
         let _lock = HeldLock::take(self.root)?;
-        input_pass::run_at(&mut host, self.root, expected, SetupHooks::NONE)
+        input_pass::run_at(&mut host, self.root, expected, hooks)
     }
 
     /// A scoped mark using only the supplied inert console and service facts.

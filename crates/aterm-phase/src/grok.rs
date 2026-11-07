@@ -63,7 +63,7 @@ use crate::wall::{Placement, Wall, WallKind};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 17, "0.17");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 18, "0.18");
 
 /// How many of the screen's last worded rows a wall row may stand in ([`live_from`]): the
 /// notice a turn ended on, with room for a composer and key rows under it.
@@ -566,6 +566,7 @@ fn card_prompt(rows: &[String], c: Card) -> PromptV2 {
         gutter: kind == PromptKind::Bash,
         command_rows,
         description_rows: 0,
+        spellings: None,
         command,
         description: match kind {
             PromptKind::Edit => String::new(),
@@ -601,6 +602,7 @@ fn plan_prompt(rows: &[String], top: usize, bottom: usize) -> PromptV2 {
             .unwrap_or_default(),
         command_rows: Vec::new(),
         description_rows: 0,
+        spellings: None,
         gutter: false,
         command: String::new(),
         description: String::new(),

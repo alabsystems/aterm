@@ -114,7 +114,7 @@ impl App {
         let notify = move |key: u64| {
             let _ = proxy.send_event(crate::Wake::NativeDocumentFileChanged(key));
         };
-        match aterm_uds::file_watch::FileWatch::platform(Box::new(notify)) {
+        match aterm_uds::file_watch::FileWatch::platform("aterm-document-watch", Box::new(notify)) {
             Ok(watch) => {
                 for (key, (_, path)) in &host.watched {
                     watch.watch(*key, path.clone());

@@ -2616,19 +2616,9 @@ pub fn register_on_log<T>(ctx: &dyn FabricSession, publish: impl FnOnce() -> T) 
         .log_transition
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    let current = {
-        #[cfg(any(test, debug_assertions))]
-        let section = LINK_SECTION.lock().unwrap_or_else(|p| p.into_inner());
-        #[cfg(any(test, debug_assertions))]
-        let foreign = section.is_some_and(|owner| owner != std::thread::current().id());
-        #[cfg(not(any(test, debug_assertions)))]
-        let foreign = false;
-        if foreign {
-            None
-        } else {
-            *LINK.log.lock().unwrap_or_else(|p| p.into_inner())
-        }
-    };
+    let current =
+        unless_another_link_section(|| *LINK.log.lock().unwrap_or_else(|p| p.into_inner()))
+            .flatten();
     if let Some(clock) = current {
         let mut inbox = ctx.fabric().lock();
         let forget = inbox
@@ -2718,19 +2708,18 @@ fn stale_in() -> Option<std::time::Duration> {
 }
 
 fn note_work_owed() {
-    // Only a connected bridge can owe anything: the gate `bridge_attached`, `link_report` and
-    // `link_evidence` keep too, so a caller with no live bridge cannot move the link's state.
-    if LINK.state.load(Ordering::Relaxed) != FABRIC_CONNECTED {
-        return;
-    }
-    #[cfg(any(test, debug_assertions))]
-    if link_section_is_foreign() {
-        return;
-    }
-    let mut link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
-    if link.owed_since.is_none() {
-        link.owed_since = Some(std::time::Instant::now());
-    }
+    unless_another_link_section(|| {
+        // Only a connected bridge can owe anything: the gate `bridge_attached`, `link_report`
+        // and `link_evidence` keep too, so a caller with no live bridge cannot move the link's
+        // state.
+        if LINK.state.load(Ordering::Relaxed) != FABRIC_CONNECTED {
+            return;
+        }
+        let mut link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
+        if link.owed_since.is_none() {
+            link.owed_since = Some(std::time::Instant::now());
+        }
+    });
 }
 
 fn posts_outstanding(store: &Store) -> bool {
@@ -2745,13 +2734,13 @@ fn posts_outstanding(store: &Store) -> bool {
 }
 
 fn settle_work_owed(store: &Store) {
-    #[cfg(any(test, debug_assertions))]
-    if link_section_is_foreign() {
-        return;
-    }
+    // Read before the link section's turn: it takes each session's fabric lock, which
+    // `note_work_owed`'s callers hold while they take that turn.
     let outstanding = posts_outstanding(store);
-    let mut link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
-    link.owed_since = outstanding.then(std::time::Instant::now);
+    unless_another_link_section(|| {
+        let mut link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
+        link.owed_since = outstanding.then(std::time::Instant::now);
+    });
 }
 
 #[cfg(test)]
@@ -2792,16 +2781,7 @@ pub fn fabric_link_status() -> (&'static str, String, Option<u64>, Option<u64>) 
 
 /// [`fabric_state`] as an App's presence facts read it.
 pub fn fabric_state_seen() -> &'static str {
-    #[cfg(any(test, debug_assertions))]
-    {
-        let section = LINK_SECTION.lock().unwrap_or_else(|p| p.into_inner());
-        if section.is_some_and(|owner| owner != std::thread::current().id()) {
-            return "absent";
-        }
-        fabric_state()
-    }
-    #[cfg(not(any(test, debug_assertions)))]
-    fabric_state()
+    unless_another_link_section(fabric_state).unwrap_or("absent")
 }
 
 /// The link's three reported facts (reason, rtt, ack age), as `fabric status` prints them;
@@ -2871,28 +2851,26 @@ pub fn bridge_attached(generation: BridgeGeneration) {
 
 /// A bridge that never reports its link is read by what it does.
 pub fn link_evidence(generation: Option<BridgeGeneration>) {
-    #[cfg(any(test, debug_assertions))]
-    if link_section_is_foreign() {
-        return;
-    }
-    let owner = LINK.generation.lock().unwrap_or_else(|p| p.into_inner());
-    if !generation.is_some_and(|g| g.0 == *owner) || *owner == 0 {
-        return;
-    }
-    if LINK.state.load(Ordering::Relaxed) != FABRIC_STALLED {
-        return;
-    }
-    let mut link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
-    if link.reported || link.reason != LINK_STARTING {
-        return;
-    }
-    link.up = true;
-    link.reason.clear();
-    link.rtt_ms = None;
-    link.acked_at = Some(std::time::Instant::now());
-    link.stalled_at = None;
-    LINK.state.store(FABRIC_CONNECTED, Ordering::Relaxed);
-    link_moved(FABRIC_CONNECTED, *owner, LinkSaid::Evidence);
+    unless_another_link_section(|| {
+        let owner = LINK.generation.lock().unwrap_or_else(|p| p.into_inner());
+        if !generation.is_some_and(|g| g.0 == *owner) || *owner == 0 {
+            return;
+        }
+        if LINK.state.load(Ordering::Relaxed) != FABRIC_STALLED {
+            return;
+        }
+        let mut link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
+        if link.reported || link.reason != LINK_STARTING {
+            return;
+        }
+        link.up = true;
+        link.reason.clear();
+        link.rtt_ms = None;
+        link.acked_at = Some(std::time::Instant::now());
+        link.stalled_at = None;
+        LINK.state.store(FABRIC_CONNECTED, Ordering::Relaxed);
+        link_moved(FABRIC_CONNECTED, *owner, LinkSaid::Evidence);
+    });
 }
 
 /// The bridge's report of its broker link.
@@ -2960,16 +2938,15 @@ fn wake_presence(store: &Store) {
 /// Whether the owning bridge said in its `hello` that it offers a kept session's unhandled
 /// broadcasts again after a relaunch (`refill=…say`).
 pub fn bridge_refills_broadcasts() -> bool {
-    #[cfg(any(test, debug_assertions))]
-    if link_section_is_foreign() {
-        return false;
-    }
-    LINK.link
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .hello
-        .as_ref()
-        .is_some_and(|h| h.refills_broadcasts)
+    unless_another_link_section(|| {
+        LINK.link
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .hello
+            .as_ref()
+            .is_some_and(|h| h.refills_broadcasts)
+    })
+    .unwrap_or(false)
 }
 
 const HELLO_USAGE: &str =
@@ -3074,16 +3051,15 @@ pub fn with_current_bridge<T>(
 /// Whether the owning bridge asked for the bus mirror in its recorded `hello` (`log=turns`).
 #[must_use]
 pub fn bridge_mirrors_logs() -> bool {
-    #[cfg(any(test, debug_assertions))]
-    if link_section_is_foreign() {
-        return false;
-    }
-    LINK.link
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .hello
-        .as_ref()
-        .is_some_and(|h| h.log == HelloLog::Turns)
+    unless_another_link_section(|| {
+        LINK.link
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .hello
+            .as_ref()
+            .is_some_and(|h| h.log == HelloLog::Turns)
+    })
+    .unwrap_or(false)
 }
 
 /// Whether the node mirrors, as the owning bridge last said it; `None` for an `auto` bridge whose
@@ -3091,20 +3067,19 @@ pub fn bridge_mirrors_logs() -> bool {
 /// the word.
 #[must_use]
 pub fn bridge_mirror_word() -> Option<bool> {
-    #[cfg(any(test, debug_assertions))]
-    if link_section_is_foreign() {
-        return Some(false);
-    }
-    let link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
-    match link.hello.as_ref().map(|h| h.log) {
-        Some(HelloLog::Turns) => Some(true),
-        Some(HelloLog::Auto) => link
-            .mirror
-            .as_ref()
-            .is_some_and(|m| m.state == MirrorState::Unretained)
-            .then_some(false),
-        Some(HelloLog::Off) | None => Some(false),
-    }
+    unless_another_link_section(|| {
+        let link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
+        match link.hello.as_ref().map(|h| h.log) {
+            Some(HelloLog::Turns) => Some(true),
+            Some(HelloLog::Auto) => link
+                .mirror
+                .as_ref()
+                .is_some_and(|m| m.state == MirrorState::Unretained)
+                .then_some(false),
+            Some(HelloLog::Off) | None => Some(false),
+        }
+    })
+    .unwrap_or(Some(false))
 }
 
 /// `fabric status`'s bus-mirror tail.
@@ -3463,16 +3438,14 @@ fn note_given_up(ctx: &dyn FabricSession, gap: GivenUp, scope: GapScope<'_>) -> 
 
 /// The endpoint answered one of `generation`'s bridge-only lines `ERR usage`.
 pub fn note_lane_fault(generation: Option<BridgeGeneration>) {
-    #[cfg(any(test, debug_assertions))]
-    if link_section_is_foreign() {
-        return;
-    }
-    let owner = LINK.generation.lock().unwrap_or_else(|p| p.into_inner());
-    if !generation.is_some_and(|g| g.0 == *owner) || *owner == 0 {
-        return;
-    }
-    let mut link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
-    link.lane_faults = link.lane_faults.saturating_add(1);
+    unless_another_link_section(|| {
+        let owner = LINK.generation.lock().unwrap_or_else(|p| p.into_inner());
+        if !generation.is_some_and(|g| g.0 == *owner) || *owner == 0 {
+            return;
+        }
+        let mut link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
+        link.lane_faults = link.lane_faults.saturating_add(1);
+    });
 }
 
 /// What the attached bridge said of itself and how its lane has gone, as `fabric status` prints it.
@@ -4387,12 +4360,25 @@ fn apply_hold_as(
 #[cfg(any(test, debug_assertions))]
 static LINK_SECTION: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
 
+/// Run `in_turn` unless another thread's [`with_link_reset`] section is open (`None` then),
+/// holding [`LINK_SECTION`] across it. A link read or write from outside a section is a no-op
+/// while one is open; held across the body, not only the check, the lock keeps a section from
+/// opening between them, resetting the link and then taking the write into its own test.
 #[cfg(any(test, debug_assertions))]
-fn link_section_is_foreign() -> bool {
-    LINK_SECTION
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .is_some_and(|owner| owner != std::thread::current().id())
+fn unless_another_link_section<T>(in_turn: impl FnOnce() -> T) -> Option<T> {
+    let section = LINK_SECTION.lock().unwrap_or_else(|p| p.into_inner());
+    if section.is_some_and(|owner| owner != std::thread::current().id()) {
+        return None;
+    }
+    let done = in_turn();
+    drop(section);
+    Some(done)
+}
+
+/// A release build opens no link sections: `in_turn` always runs.
+#[cfg(not(any(test, debug_assertions)))]
+fn unless_another_link_section<T>(in_turn: impl FnOnce() -> T) -> Option<T> {
+    Some(in_turn())
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -9582,6 +9568,20 @@ mod inbox_hold {
             let (state, reason, _, _) = fabric_link_status();
             assert_eq!((state, reason.as_str()), ("disconnected", LINK_BRIDGE_LOST));
         });
+    }
+
+    /// A link read or write from outside every link section holds [`LINK_SECTION`] from its
+    /// check to its end: no section opens between them, resets the link and then takes the
+    /// write into its own test.
+    #[test]
+    fn a_link_write_holds_the_section_lock_from_its_check_to_its_write() {
+        let held =
+            with_link_reset(|| unless_another_link_section(|| LINK_SECTION.try_lock().is_err()));
+        assert_eq!(
+            held,
+            Some(true),
+            "a link write a section can open under between its check and its write"
+        );
     }
 
     #[test]

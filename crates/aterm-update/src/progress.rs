@@ -44,8 +44,25 @@ pub type ProgressNotify = Box<dyn Fn(Progress) + Send + Sync>;
 
 static OBSERVER: OnceLock<ProgressNotify> = OnceLock::new();
 
-#[cfg(any(target_os = "macos", test))]
-static DOWNLOAD_BEGAN: AtomicBool = AtomicBool::new(false);
+/// Whether one check began downloading its release's container. Each check owns its own, so a
+/// check (or a test of the binary) that ends meanwhile cannot take it, and every check reports
+/// its own failure.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Default)]
+pub(crate) struct DownloadBegan(std::cell::Cell<bool>);
+
+#[cfg(target_os = "macos")]
+impl DownloadBegan {
+    /// The check began downloading.
+    pub(crate) fn mark(&self) {
+        self.0.set(true);
+    }
+
+    /// Whether the check began downloading.
+    pub(crate) fn began(&self) -> bool {
+        self.0.get()
+    }
+}
 
 /// Install the process-wide observer.
 pub fn set_progress_observer(observer: ProgressNotify) {
@@ -56,21 +73,12 @@ pub fn set_progress_observer(observer: ProgressNotify) {
 /// host's observer, if installed, gets every step (a terminal session has none).
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn report(p: Progress) {
-    if let Progress::Downloading { .. } = &p {
-        DOWNLOAD_BEGAN.store(true, Ordering::Relaxed);
-    }
     if matches!(p, Progress::Downloading { .. } | Progress::Verifying { .. }) {
         crate::checker_watch::WATCH.beat_progress();
     }
     if let Some(cb) = OBSERVER.get() {
         cb(p);
     }
-}
-
-/// Whether a download was reported since the last [`take_download_began`].
-#[cfg(any(target_os = "macos", test))]
-pub(crate) fn take_download_began() -> bool {
-    DOWNLOAD_BEGAN.swap(false, Ordering::Relaxed)
 }
 
 /// Watch the growing `dest` (the curl sink) at 10 Hz while `url` downloads, reporting
@@ -164,33 +172,9 @@ impl Drop for DownloadWatch {
 mod tests {
     use super::*;
 
-    static GLOBAL_REPORTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[test]
-    fn the_download_flag_is_set_by_a_download_report_and_consumed_once() {
-        let _turn = GLOBAL_REPORTS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _ = take_download_began();
-        report(Progress::Verifying {
-            version: "0.1.0".into(),
-        });
-        assert!(!take_download_began(), "verifying alone is not a download");
-        report(Progress::Downloading {
-            version: "0.1.0".into(),
-            bytes_done: 1,
-            bytes_total: 2,
-        });
-        assert!(take_download_began());
-        assert!(!take_download_began(), "consumed");
-    }
-
     #[test]
     fn a_download_with_no_observer_still_restamps_the_checking_heartbeat() {
         use crate::checker_watch::{CheckerPhase, WATCH};
-        let _turn = GLOBAL_REPORTS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(
             OBSERVER.get().is_none(),
             "PRECONDITION: the session's shape"
@@ -218,7 +202,6 @@ mod tests {
         };
         drop(watch);
         let _ = WATCH.supersede(generation);
-        let _ = take_download_began();
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(
             moved,

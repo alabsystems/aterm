@@ -14437,7 +14437,7 @@ fn clt_install_aliases_are_recognized_by_atpkg_install() {
         let developer = root.join("CommandLineTools");
         std::fs::create_dir_all(&shim).unwrap();
         let cc = shim.join("cc");
-        std::fs::write(&cc, "#!/bin/sh\nif [ -n \"$SDKROOT\" ]; then echo 'build SDK unavailable' >&2; exit 1; fi\n[ \"$1\" = -o ] && printf x > \"$2\"\n").unwrap();
+        std::fs::write(&cc, "#!/bin/sh\nif [ -n \"$SDKROOT\" ]; then echo 'build SDK unavailable' >&2; exit 1; fi\n[ \"$1\" = -o ] && { printf x > \"$2\"; /bin/chmod +x \"$2\"; }\n").unwrap();
         std::fs::set_permissions(&cc, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         let xcrun = shim.join("xcrun");
         std::fs::write(

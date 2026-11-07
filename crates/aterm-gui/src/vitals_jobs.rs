@@ -392,7 +392,8 @@ impl JobsPass {
         let fronts = &mut self.fronts;
         let procs = job_procs(&read, &roots, stand_in, readers.exec, |p| fronts.front(p));
         fronts.keep(&read);
-        let read_ms = read_ms();
+        let clock = &read_ms;
+        let read_ms = clock();
         let mounts = OnceCell::new();
         let ours = OnceCell::new();
         let mut held = held_list(
@@ -411,9 +412,12 @@ impl JobsPass {
         );
         name_tied(&mut held, &self.ties);
         let lanes = self.reader.lanes();
-        // The statuses of watched calls' leaders read since the last pass: read after the sweep,
-        // so a leader it no longer lists has left its event or is waited on briefly for it.
-        let exits = self.calls.read(|pid| sweep.iter().any(|p| p.pid == pid));
+        // The statuses of watched calls' leaders read since the last pass, each at its own moment
+        // on this pass's clock: read after the sweep, so a leader it no longer lists has left its
+        // event or is waited on briefly for it.
+        let exits = self
+            .calls
+            .read(|pid| sweep.iter().any(|p| p.pid == pid), clock);
         let tick = JobTick {
             at_ms,
             read_ms,
@@ -436,7 +440,7 @@ impl JobsPass {
             exits,
         };
         let view = self.jobs.absorb(&tick);
-        crate::telemetry_host::jobs_passed(&mut self.jobs, at_ms);
+        crate::telemetry_host::jobs_passed(&mut self.jobs, at_ms, &self.calls);
         self.calls.watch(&view.rows);
         self.naming_fresh = true;
         self.next_ms = Some(at_ms + next_pass_ms(view.demand));

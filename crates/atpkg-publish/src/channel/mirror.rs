@@ -239,28 +239,70 @@ fn mirror_in(
         ));
     }
     let mut report = MirrorReport::default();
-    for (program, build) in &work_list {
-        let repo = quad
-            .index
-            .programs
-            .get(program)
-            .map(|p| p.repo.clone())
-            .ok_or_else(|| {
-                Error::refused(format!(
-                    "pinned program {program} has no [programs.{program}] repo in the index"
-                ))
-            })?;
-        one(
-            ctx,
-            quad,
-            opts,
-            log,
-            work,
-            &repo,
-            program,
-            *build,
-            &mut report,
-        )?;
+    // Independent public reads share no pack directory. Keep the window small,
+    // join every reader before cleanup, and consume results in pin order: an
+    // error in a later pack must not reorder earlier packs' serial write tail.
+    const PUBLIC_READS: usize = 4;
+    let work_list: Vec<_> = work_list.into_iter().collect();
+    for (window, batch) in work_list.chunks(PUBLIC_READS).enumerate() {
+        let reads = std::thread::scope(|scope| {
+            let readers: Vec<_> = batch
+                .iter()
+                .enumerate()
+                .map(|(offset, (program, build))| {
+                    // Ordinals remain distinct on case-insensitive filesystems
+                    // even when two valid program/tag spellings differ by case.
+                    let read_work = work.join("reads").join((window * PUBLIC_READS + offset).to_string());
+                    std::thread::Builder::new()
+                        .name("atpkg-public-pack-read".into())
+                        .spawn_scoped(scope, move || -> Result<_> {
+                            let repo = quad
+                                .index
+                                .programs
+                                .get(program)
+                                .map(|p| p.repo.clone())
+                                .ok_or_else(|| {
+                                    Error::refused(format!(
+                                        "pinned program {program} has no [programs.{program}] repo in the index"
+                                    ))
+                                })?;
+                            let state = read_public(ctx, quad, &read_work, &repo, program, *build)?;
+                            Ok((repo, state))
+                        })
+                        .map_err(|e| {
+                            Error::cannot_run(format!(
+                                "cannot start public read for {program}/{build}: {e}"
+                            ))
+                        })
+                })
+                .collect();
+            readers
+                .into_iter()
+                .zip(batch)
+                .map(|(reader, (program, build))| {
+                    reader?.join().unwrap_or_else(|_| {
+                        Err(Error::cannot_run(format!(
+                            "public read for {program}/{build} panicked; its state is unknown"
+                        )))
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
+        for ((program, build), read) in batch.iter().zip(reads) {
+            let (repo, state) = read?;
+            one(
+                ctx,
+                quad,
+                opts,
+                log,
+                work,
+                &repo,
+                program,
+                *build,
+                state,
+                &mut report,
+            )?;
+        }
     }
     log.say(format!(
         "every pack atpkg-index-{} pins is {} on {}",
@@ -275,26 +317,27 @@ fn mirror_in(
     Ok(report)
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one pack's walk over the run's shared state"
-)]
-fn one(
+struct PublicState {
+    dir: PathBuf,
+    manifest: bool,
+    signature: bool,
+    manifest_bytes: Option<Vec<u8>>,
+    signature_bytes: Option<Vec<u8>>,
+    complete: bool,
+}
+
+fn read_public(
     ctx: &Ctx,
     quad: &VerifiedQuad,
-    opts: &MirrorOptions,
-    log: &mut Log,
     work: &Path,
     repo: &str,
     program: &str,
     build: u64,
-    report: &mut MirrorReport,
-) -> Result<()> {
+) -> Result<PublicState> {
     let tag = upload::tag(program, build);
     let mf = pkgdoc::manifest_name(program, build);
     let sig = pkgdoc::sig_name(program, build);
     let public = ctx.public_slug(repo);
-    let staging = ctx.staging_slug(repo);
     let channel = &*ctx.hosts.channel;
     let unknown = |what: &str, why: &str| {
         Error::cannot_run(format!(
@@ -346,13 +389,71 @@ fn one(
             }
         }
         if complete {
-            log.say(format!("{public}@{tag} is public and complete — skip"));
-            report.skipped.push(tag);
-            return Ok(());
+            return Ok(PublicState {
+                dir: pub_dir,
+                manifest: true,
+                signature: true,
+                manifest_bytes: None,
+                signature_bytes: None,
+                complete: true,
+            });
         }
         pub_mf_bytes = Some(bytes);
         pub_sig_bytes = Some(sig_bytes);
     }
+
+    Ok(PublicState {
+        dir: pub_dir,
+        manifest: public_mf,
+        signature: public_sig,
+        manifest_bytes: pub_mf_bytes,
+        signature_bytes: pub_sig_bytes,
+        complete: false,
+    })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one pack's walk over the run's shared state"
+)]
+fn one(
+    ctx: &Ctx,
+    quad: &VerifiedQuad,
+    opts: &MirrorOptions,
+    log: &mut Log,
+    work: &Path,
+    repo: &str,
+    program: &str,
+    build: u64,
+    state: PublicState,
+    report: &mut MirrorReport,
+) -> Result<()> {
+    let tag = upload::tag(program, build);
+    let mf = pkgdoc::manifest_name(program, build);
+    let sig = pkgdoc::sig_name(program, build);
+    let public = ctx.public_slug(repo);
+    if state.complete {
+        log.say(format!("{public}@{tag} is public and complete — skip"));
+        report.skipped.push(tag);
+        return Ok(());
+    }
+    let PublicState {
+        dir: pub_dir,
+        manifest: public_mf,
+        signature: public_sig,
+        manifest_bytes: pub_mf_bytes,
+        signature_bytes: pub_sig_bytes,
+        ..
+    } = state;
+    let staging = ctx.staging_slug(repo);
+    let channel = &*ctx.hosts.channel;
+    let unknown = |what: &str, why: &str| {
+        Error::cannot_run(format!(
+            "could not read {} ({why}: DNS, TLS, a timeout or no route) — nothing about {tag} \
+             is known",
+            public.download_url(&tag, what)
+        ))
+    };
 
     log.say(format!("fetching {staging}@{tag}"));
     let staged_release = ctx

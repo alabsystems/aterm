@@ -3631,8 +3631,10 @@ fn a_relaunch_only_lanes_worker_carries_its_own_agents_record_alone() {
 
 #[test]
 fn a_restored_landing_after_the_attach_asks_for_the_next_idle_point() {
+    if !crate::message_inbox::lane_zero_alone() {
+        return;
+    }
     use aterm_agent::harness::relaunch::{AgentRun, AgyRun, MuseRun};
-    let _lane = crate::message_inbox::lane_test_guard();
     let world = Arc::new(World::default());
     let mut h = hooks(&world, parking_body(&world));
     h.acts.snapshot = Arc::new(|_| None);
@@ -40769,7 +40771,9 @@ fn one_restored_tabs_panic_is_that_tabs_alone() {
 
 #[test]
 fn a_restored_end_whose_word_panicked_is_said_all_the_same() {
-    let _lane = crate::message_inbox::lane_test_guard();
+    if !crate::message_inbox::lane_zero_alone() {
+        return;
+    }
     for panics in [true, false] {
         let _ = crate::message_inbox::take_queued();
         let world = Arc::new(World::default());
@@ -41472,7 +41476,9 @@ fn a_carry_that_missed_nothing_says_no_row() {
 
 #[test]
 fn a_carried_restart_that_did_not_land_is_said_as_its_records_agent() {
-    let _lane = crate::message_inbox::lane_test_guard();
+    if !crate::message_inbox::lane_zero_alone() {
+        return;
+    }
     for (agent, who, resume, other) in [
         (
             upgrade::Agent::Codex,

@@ -498,6 +498,51 @@ pub fn observation(setting: Setting, rows: &[&ItemReport]) -> Observation {
     }
 }
 
+/// Project the complete native producer's paid post-apply cohort as current facts.
+/// The caller must supply every part prepared for this setting, including held,
+/// unread and failed parts. This changes no operation outcome or journal record.
+#[must_use]
+pub fn readback_observation(setting: Setting, rows: &[&ItemReport]) -> Observation {
+    let live: Vec<_> = rows
+        .iter()
+        .copied()
+        .filter(|row| row.effect == Effect::Now)
+        .collect();
+    let caps_live = setting == Setting::CapsLock
+        && !live.is_empty()
+        && live.iter().all(|row| {
+            matches!(row.outcome, Outcome::Ok | Outcome::Changed)
+                && row.stood_aside.is_none()
+                && Reading::of(row) != Some(Reading::CapsLock)
+        });
+    let normalized: Vec<_> = rows
+        .iter()
+        .map(|row| {
+            let mut row = (**row).clone();
+            row.outcome = if row.outcome == Outcome::NotApplicable
+                || (row.stood_aside.is_some()
+                    && matches!(row.outcome, Outcome::Ok | Outcome::Changed))
+            {
+                // A held item can have read a real difference. Its operation's exemption
+                // supplies no successful native value for the owning setting.
+                Outcome::Unknown
+            } else if row.outcome == Outcome::Changed {
+                match Reading::of(&row) {
+                    Some(Reading::UntilLogin | Reading::CapsLock) => Outcome::Planned,
+                    _ if matches!(row.effect, Effect::Now | Effect::Relaunch) || caps_live => {
+                        Outcome::Ok
+                    }
+                    _ => row.outcome,
+                }
+            } else {
+                row.outcome
+            };
+            row
+        })
+        .collect();
+    observation(setting, &normalized.iter().collect::<Vec<_>>())
+}
+
 /// The Rust in Spotlight row's note for `count` of the person's project build folders Spotlight
 /// indexes: how to keep one out, asked of no one. aterm never renames them: a program started
 /// from one may still be under macOS's first-exec check.
@@ -847,6 +892,49 @@ mod tests {
             assert!(!live_in_place(Setting::CapsLock, &[&saved, &live, &other]));
         }
         assert!(!live_in_place(Setting::TrackpadScrolling, &[&saved, &live]));
+
+        let mut changed_saved = saved.clone();
+        changed_saved.outcome = Outcome::Changed;
+        let mut changed_live = live.clone();
+        changed_live.outcome = Outcome::Changed;
+        let retained = readback_observation(Setting::CapsLock, &[&changed_saved, &changed_live]);
+        assert_eq!(
+            (retained.standing, retained.now.as_deref()),
+            (Standing::InPlace, Some("Control"))
+        );
+        assert_eq!(changed_saved.outcome, Outcome::Changed);
+        assert_eq!(changed_live.outcome, Outcome::Changed);
+        assert_eq!(
+            readback_observation(Setting::CapsLock, &[&changed_saved]).standing,
+            Standing::AtLogin,
+            "a saved-only write supplies no physical readback"
+        );
+        assert_eq!(
+            readback_observation(Setting::CapsLock, &[&saved]).standing,
+            Standing::InPlace,
+            "a known-empty cohort retains saved-configuration semantics"
+        );
+
+        for outcome in [
+            Outcome::Unknown,
+            Outcome::Planned,
+            Outcome::Blocked,
+            Outcome::Failed,
+            Outcome::NotApplicable,
+        ] {
+            let unread = row(outcome, None, None);
+            let retained =
+                readback_observation(Setting::CapsLock, &[&changed_saved, &changed_live, &unread]);
+            assert!(
+                !matches!(retained.standing, Standing::InPlace | Standing::NotNeeded),
+                "a negative cohort member remains part of the reading: {outcome:?}"
+            );
+            assert_ne!(retained.now.as_deref(), Some("Control"));
+        }
+        let mut held = live.clone();
+        held.stood_aside = Some(StoodAside::Permission("Accessibility".into()));
+        let retained = readback_observation(Setting::CapsLock, &[&saved, &held]);
+        assert_eq!((retained.standing, retained.now), (Standing::Unknown, None));
     }
 
     #[test]

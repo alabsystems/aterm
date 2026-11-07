@@ -615,6 +615,9 @@ fn bounded_harness_acts_reject_expiry_and_stale_proof_without_publication() {
 
 #[test]
 fn leased_standing_faces_wait_for_rest_and_keep_unbounded_compatibility() {
+    if !crate::test_alone::alone() {
+        return;
+    }
     let state = aterm_tempfile::tempdir().expect("scratch state dir");
     crate::test_env::scoped("ATERM_STATE_HOME", state.path(), || {
         use super::control_session::{HarnessActSnapshot, cmd_meta_harness_act_with_clock};
@@ -761,6 +764,9 @@ fn a_harness_act_rechecks_claim_expiry_at_the_timeline_commit() {
 
 #[test]
 fn a_proven_holders_act_is_shown_and_booked_once_and_a_refusal_or_lease_neither() {
+    if !crate::test_alone::alone() {
+        return;
+    }
     let state = aterm_tempfile::tempdir().expect("scratch state dir");
     crate::test_env::scoped("ATERM_STATE_HOME", state.path(), || {
         proven_holder_booking_and_display(state.path());

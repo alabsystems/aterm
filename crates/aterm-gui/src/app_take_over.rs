@@ -197,6 +197,55 @@ fn label_line(t: &str) -> Option<String> {
     Some(crate::session_timeline::sanitize_presentation_line(t, 40)).filter(|t| !t.is_empty())
 }
 
+/// Whether `title` is the one a shell gave its tab for the line `line` it runs (each
+/// `aterm_shell_integration` script, as the line starts): the line without its control
+/// characters, or, where it is longer than 256, a head of it and `…` (zsh, bash and fish cut it at
+/// 255 characters, pwsh at 255 UTF-16 units, and bash and zsh in a C locale at 255 bytes). A line
+/// longer than 256 of any of those is longer than 256 bytes, so a shorter one is never cut; a cut
+/// by bytes can split the last character it keeps, which the terminal stores as U+FFFD. The
+/// terminal drops control and bidi characters from a title it stores, so both are read without
+/// them.
+fn is_title_of_line(title: &str, line: &str) -> bool {
+    let shown = |c: &char| {
+        !c.is_control() && !matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+    };
+    let title = title.trim();
+    let (head, cut) = match title.strip_suffix('\u{2026}') {
+        Some(head) if line.len() > 256 => (head.trim_end_matches('\u{FFFD}'), true),
+        _ => (title, false),
+    };
+    let mut line = line.trim().chars().filter(shown);
+    !head.is_empty()
+        && head.chars().filter(shown).all(|c| line.next() == Some(c))
+        && (cut || line.next().is_none())
+}
+
+/// Whether `t`'s title is its shell's: at a prompt, or once the line it ran has ended, whatever
+/// titled it last (each `aterm_shell_integration` script titles a prompt by its folder), and while
+/// a line runs, the title its shell gave that line ([`is_title_of_line`]). Without shell
+/// integration's marks no title is known to be its shell's.
+pub(crate) fn shell_titled(t: &aterm_core::terminal::Terminal) -> bool {
+    use aterm_core::terminal::BlockState;
+    t.current_block().is_some_and(|block| match block.state {
+        BlockState::Executing => block
+            .commandline
+            .as_deref()
+            .is_some_and(|line| is_title_of_line(t.title(), line)),
+        BlockState::PromptOnly | BlockState::EnteringCommand | BlockState::Complete => true,
+        _ => false,
+    })
+}
+
+/// The agent `ctx`'s session runs, by its product's name (`Claude Code`): the one in front, else
+/// the one its worker's task started; `None` for a program that is no agent, or none.
+fn agent_name(ctx: &crate::SessionCtx) -> Option<&'static str> {
+    let timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+    crate::harness_host::identified_agent(timeline.agent())
+        .or_else(|| timeline.task().and_then(|task| task.agent))
+        .filter(|program| program.agent().is_some())
+        .map(aterm_phase::Program::product)
+}
+
 const CLAUDE_IDLE_MARK: char = '\u{2733}';
 
 /// A program's OSC title as a label names it: trimmed, and without the status glyph and blank
@@ -1180,30 +1229,47 @@ impl App {
 
     /// A session's tab label as every Agents row names it (the Overview, a manager's Workers
     /// rows, `Go to <manager>`, the long-hold entry): the words the person can find on the strip
-    /// (`docs/DESIGN-owner-surfaces-2026-10-16.md` §3, §6).
+    /// (`docs/DESIGN-owner-surfaces-2026-10-16.md` §3, §6). A worker's one chip is the Workers
+    /// chip, which reads this label, so while its shell titles its tab ([`shell_titled`]) the
+    /// agent it runs names it ([`agent_name`]).
     pub(crate) fn tab_label_of_session(&self, session: u64) -> String {
         let clip = |t: &str| label_line(title_without_agent_glyph(t));
         if let Some(label) = self.named_label_of_session(session) {
             return label;
         }
         if let Some(s) = self.pool.get(session) {
+            // The live title, and whether the tab's shell gave it; a busy terminal's, as the strip
+            // last read both.
             let rung = |t: &aterm_core::terminal::Terminal| {
                 use crate::cwd_native::ReportedCwd as _;
                 let cwd = t.native_working_directory();
-                crate::app_tabs::resolved_terminal_title_rung(
+                let title = crate::app_tabs::resolved_terminal_title_rung(
                     None,
                     title_without_agent_glyph(t.title()),
                     cwd.as_deref(),
-                )
+                );
+                (title, shell_titled(t))
             };
-            let live = match s.term.try_lock() {
+            let (live, shell) = match s.term.try_lock() {
                 Ok(t) => rung(&t),
                 Err(std::sync::TryLockError::Poisoned(p)) => rung(&p.into_inner()),
                 Err(std::sync::TryLockError::WouldBlock) => self
                     .windows
                     .values()
-                    .find_map(|ws| ws.tab_title_cache.get(&session).cloned()),
+                    .find_map(|ws| ws.tab_title_cache.get(&session))
+                    .map_or((None, false), |cached| {
+                        (Some(cached.title.clone()), cached.shell)
+                    }),
             };
+            // A shell titles its tab by its folder and by each line it starts, and a worker's
+            // line opens with environment words: the agent names the worker until it titles the
+            // tab itself.
+            if shell
+                && self.session_is_parked(session)
+                && let Some(agent) = agent_name(&s.ctx)
+            {
+                return agent.to_owned();
+            }
             if let Some(label) = live.as_deref().and_then(clip) {
                 return label;
             }
@@ -3108,6 +3174,61 @@ mod tests {
             .unwrap()
             .role = Some("fmt".to_string());
         assert_eq!(app.tab_label_of_session(worker), "fmt");
+    }
+
+    /// A shell's title for the line it runs is that line without its control characters, or its
+    /// first 255 and `…` past 256, cut by characters or, in a C locale, by bytes. CONTROLS: a
+    /// title that is only the line's head with no `…`, a head and `…` of a line no shell cuts, a
+    /// title that runs past the line, and a program's own title are none; a line that ends in `…`
+    /// itself is its own title.
+    #[test]
+    fn a_title_is_its_lines_whole_or_cut_and_nothing_else() {
+        let line = " CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 'claude'";
+        assert!(is_title_of_line(line, line));
+        assert!(
+            is_title_of_line("echo aecho b", "echo a\necho b"),
+            "its newline dropped"
+        );
+        let long: String = std::iter::repeat_n("abc ", 80).collect();
+        let cut: String = long.chars().take(255).chain(['\u{2026}']).collect();
+        assert!(is_title_of_line(&cut, &long), "cut past 256");
+        let wide: String = std::iter::repeat_n('a', 254)
+            .chain("\u{e9}tude".chars())
+            .collect();
+        let bytes: String = String::from_utf8_lossy(&wide.as_bytes()[..255])
+            .chars()
+            .chain(['\u{2026}'])
+            .collect();
+        assert!(
+            is_title_of_line(&bytes, &wide),
+            "cut by bytes through its last character"
+        );
+        assert!(
+            is_title_of_line("echo wait\u{2026}", "echo wait\u{2026}"),
+            "a line that ends in `…` itself"
+        );
+        let head: String = long.chars().take(255).collect();
+        assert!(
+            !is_title_of_line(&head, &long),
+            "CONTROL: a head with no `…`"
+        );
+        assert!(
+            !is_title_of_line("claude\u{2026}", "claude --resume"),
+            "CONTROL: a head and `…` of a line no shell cuts"
+        );
+        assert!(
+            !is_title_of_line("e\u{2026}", "echo hello"),
+            "CONTROL: a head and `…` of a line no shell cuts"
+        );
+        assert!(
+            !is_title_of_line("make test all", "make test"),
+            "CONTROL: past the line"
+        );
+        assert!(
+            !is_title_of_line("\u{2733} Claude Code", line),
+            "CONTROL: the program's own"
+        );
+        assert!(!is_title_of_line("", line), "CONTROL: no title");
     }
 
     #[test]

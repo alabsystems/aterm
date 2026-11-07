@@ -5,6 +5,116 @@
 
 use aterm_search::{BudgetedSearch, SearchDirection, SearchIndex};
 
+#[test]
+#[ignore = "manual before/after dense Unicode offset translation measurement"]
+fn unicode_dense_offset_translation_cost() {
+    const ROWS: usize = 32;
+    const CHARS: usize = 2048;
+    for width in [16, 256] {
+        let query = "A".repeat(width);
+        let mut index = SearchIndex::new();
+        for row in 0..ROWS {
+            index.index_line(row, &format!("İé{}", "a".repeat(CHARS)));
+        }
+        for direction in [SearchDirection::Forward, SearchDirection::Backward] {
+            let allocated = crate::heap::allocated();
+            let before = instructions();
+            let result = index
+                .search_results_opts_direction(&query, false, false, direction)
+                .unwrap();
+            let retired = before.zip(instructions()).map(|(a, b)| b - a);
+            let bytes = crate::heap::allocated() - allocated;
+            let per_row = CHARS - width + 1;
+            assert_eq!(result.matches.len(), ROWS * per_row);
+            for (i, found) in result.matches.iter().enumerate() {
+                let start = 2 + i % per_row;
+                assert_eq!(
+                    (found.line, found.start_col, found.end_col),
+                    (i / per_row, start, start + width)
+                );
+            }
+            eprintln!(
+                "dense_offset_translation width={width} direction={direction:?} rows={ROWS} instructions={retired:?} allocated_bytes={bytes}"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "manual before/after Unicode offset translation measurement"]
+fn unicode_offset_translation_cost() {
+    const ROWS: usize = 256;
+    let query = format!("{}B", "A".repeat(15));
+    for shape in ["ascii", "unicode", "alternating"] {
+        for length in [64, 4096] {
+            for hit in [false, true] {
+                let prefix = match shape {
+                    "ascii" => "x".repeat(length),
+                    "unicode" => format!("é{}", "x".repeat(length)),
+                    _ => "éx".repeat(length / 2),
+                };
+                let text = if hit {
+                    format!("{prefix}{}b", "a".repeat(15))
+                } else {
+                    // Every query trigram exists, but the full query does not.
+                    format!("{prefix}aab{}c", "a".repeat(15))
+                };
+                let start = aterm_search::display_columns(&prefix);
+                let check = |result: &aterm_search::SearchResults| {
+                    assert_eq!(result.matches.len(), if hit { ROWS } else { 0 });
+                    for (row, found) in result.matches.iter().enumerate() {
+                        assert_eq!(
+                            (found.line, found.start_col, found.end_col),
+                            (row, start, start + 16)
+                        );
+                    }
+                };
+                let rows = vec![text.clone(); ROWS];
+                let mut search = BudgetedSearch::new(&query, false, false, 0, ROWS).unwrap();
+                let allocated = crate::heap::allocated();
+                let before = instructions();
+                for row in rows {
+                    search.feed_row_owned(row);
+                }
+                let feed = before.zip(instructions()).map(|(a, b)| b - a);
+                let feed_bytes = crate::heap::allocated() - allocated;
+                let result = search.results();
+                check(&result);
+                let retained = crate::heap::net();
+                let before = instructions();
+                drop(search);
+                let dropped = before.zip(instructions()).map(|(a, b)| b - a);
+                let freed = retained - crate::heap::net();
+                let total = feed.zip(dropped).map(|(a, b)| a + b);
+                eprintln!(
+                    "offset_translation path=budgeted shape={shape} length={length} hit={hit} rows={ROWS} instructions={total:?} allocated_bytes={feed_bytes} state_freed_bytes={freed}"
+                );
+                let mut index = SearchIndex::new();
+                for row in 0..ROWS {
+                    index.index_line(row, &text);
+                }
+                assert_eq!(
+                    index.literal_candidate_bound(&query, false),
+                    Some(ROWS as u64)
+                );
+                for direction in [SearchDirection::Forward, SearchDirection::Backward] {
+                    let allocated = crate::heap::allocated();
+                    let before = instructions();
+                    let result = index
+                        .search_results_opts_direction(&query, false, false, direction)
+                        .unwrap();
+                    let retired = before.zip(instructions()).map(|(a, b)| b - a);
+                    let bytes = crate::heap::allocated() - allocated;
+                    check(&result);
+                    eprintln!(
+                        "offset_translation path=indexed direction={direction:?} shape={shape} length={length} hit={hit} rows={ROWS} instructions={retired:?} allocated_bytes={bytes}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn instructions() -> Option<u64> {
     let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::uninit();

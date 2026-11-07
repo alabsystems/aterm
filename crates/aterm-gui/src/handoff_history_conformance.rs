@@ -191,7 +191,6 @@ impl Real {
                     held: Vec::new(),
                     roster_seq: None,
                     fabric_attached: Vec::new(),
-                    fleet_told: Vec::new(),
                     mirror_dropped: Vec::new(),
                     mirror_served: false,
                     machine_names: Vec::new(),

@@ -308,7 +308,7 @@ fn its_footer_claims_no_other_programs_screen() {
         }
     }
     assert_eq!(
-        footer_only, 8,
+        footer_only, 17,
         "the approval, question and session-picker frames with no composer"
     );
     assert!(unclaimed > 0, "frames with nothing to tell them by stand");
@@ -375,7 +375,28 @@ const PHASES: &[(&str, Phase, bool)] = &[
     ("2.4.0-trust", Phase::Prompt, true),
     ("2.4.1-local-stub-reply", Phase::Idle, true),
     ("2.5.2-box-edit", Phase::Prompt, true),
+    ("2.5.2-box-plan-forged", Phase::Prompt, true),
+    ("2.5.2-box-shell-backspaced", Phase::Prompt, true),
+    ("2.5.2-box-shell-carriage-return", Phase::Prompt, true),
+    ("2.5.2-box-shell-carriage-return-mid", Phase::Prompt, true),
+    ("2.5.2-box-shell-empty-line", Phase::Prompt, true),
+    ("2.5.2-box-shell-long-word", Phase::Prompt, true),
+    ("2.5.2-box-shell-option-shaped", Phase::Prompt, true),
+    ("2.5.2-box-shell-option-shaped-cr", Phase::Prompt, true),
+    ("2.5.2-box-shell-spaced", Phase::Prompt, true),
     ("2.5.2-box-write", Phase::Prompt, true),
+    ("2.5.2-fullscreen-box-plan", Phase::Prompt, true),
+    ("2.5.2-fullscreen-box-shell", Phase::Prompt, true),
+    (
+        "2.5.2-fullscreen-box-shell-feedback-wide",
+        Phase::Prompt,
+        true,
+    ),
+    ("2.5.2-fullscreen-box-shell-overflow", Phase::Prompt, true),
+    ("2.5.2-fullscreen-box-shell-squeezed", Phase::Prompt, true),
+    ("2.5.2-fullscreen-box-write", Phase::Prompt, true),
+    ("2.5.2-fullscreen-box-write-scrolled", Phase::Prompt, true),
+    ("2.5.2-fullscreen-question", Phase::Prompt, true),
 ];
 
 /// The screen of the Kimi Code fixture `name` (`kimi-<name>.txt`).
@@ -385,8 +406,9 @@ fn frame(name: &str) -> Vec<String> {
 }
 
 /// EVERY KIMI CODE FRAME READS THE PHASE ITS OWN ROWS DECIDE (measured on 2.3.1 and 2.4.0 at 110
-/// columns, and 2.5.2's file approvals at 144): a running turn's frames (held before the first byte with a moon phase alone or a
-/// tip, streaming under `Working…`, a draft typed or cleared under it, a message queued under
+/// columns, and 2.5.2's approvals, inline and fullscreen, at 144): a running turn's frames (held
+/// before the first byte with a moon phase alone or a tip, streaming under `Working…`, a draft
+/// typed or cleared under it, a message queued under
 /// it, a 429 being retried) are busy by the spinner row opening the run of rows over the
 /// composer's top border; every frame a turn ended on (a reply, an interrupt, an error, a
 /// resume's notice, a plan mode switched on, a slash menu or the exit hint over the idle
@@ -528,8 +550,8 @@ fn options(p: &PromptV2) -> Vec<(Option<u8>, &str, bool)> {
 }
 
 /// EACH BOX IN THE COMPOSER'S PLACE READS AS THE BOX IT DRAWS (measured on 2.4.0 at 110 columns):
-/// a command's approval is a Bash box whose command is its `$ ` row (the read-only rule reads
-/// it) and whose description is the row under it; a plan's approval names its plans; a question
+/// a command's approval is a Bash box whose command is its `$ ` row and whose description is
+/// the row under it, the read-only rule reading the command with and without it; a plan's approval names its plans; a question
 /// names its question and its options up to their descriptions, and its review step its last
 /// question; all three are picked by their digits. The trust prompt names its folder and its two
 /// unnumbered options, picked by arrows and Enter, its key row the one under its title. No box
@@ -540,7 +562,14 @@ fn each_box_in_the_composers_place_reads_as_the_box_it_draws() {
     assert_eq!(shell.kind, PromptKind::Bash);
     assert_eq!(shell.title, "Run this command?");
     assert_eq!(shell.command, "echo lab-kimi-tool");
-    assert_eq!(shell.readings(), vec!["echo lab-kimi-tool"]);
+    assert_eq!(
+        shell.readings(),
+        vec![
+            "echo lab-kimi-tool",
+            "echo lab-kimi-tool print a lab marker",
+            "echo lab-kimi-toolprint a lab marker"
+        ]
+    );
     assert_eq!(shell.description, "print a lab marker");
     assert_eq!(
         options(&shell),
@@ -696,32 +725,182 @@ fn approval_with(rows: &[&str], described: bool) -> Vec<String> {
 /// AN APPROVAL READS EVERY LINE OF ITS COMMAND (2.5.2's `renderShellDisplayBlock`: the first
 /// line after `$ `, each later one after `· `, a long line wrapping two columns deeper, the
 /// description last at that same depth): a later line is its own row of the reading, so the
-/// read-only rule sees `rm` on a line of its own; a wrap mid-block joins its line; a last row
-/// that may be a wrap is read both with and without it. NEGATIVE CONTROL for the mutant that
-/// reads the `$ ` row alone, which reads `cat README.md` and a read-only verdict for a box that
-/// deletes.
+/// read-only rule sees `rm` on a line of its own; the measured empty line, its `·` alone, is a
+/// line of its own; every wrap joins its line, read with a space and with none (the measured run
+/// of spaces dropped at a wrap under a row with room for its first word, the measured word cut
+/// at the box's edge and the measured line broken at a carriage return within it, each hiding
+/// `;git push --force` behind a read), and a wrap that opens like an option at the unfocused
+/// options' column is the command's, the options being the block over the key row (measured);
+/// the last row at the description's depth is read with and without it, as its last line's
+/// wrap and never as a line of its own (the measured description); a blank row inside the block
+/// (the measured carriage returns, at a line's end or twice in it), a row it holds at no depth of
+/// its own, more than [`MAX_WRAPS`] wraps, or Kimi's `Dangerous:` row over it (the measured
+/// backspaces that draw `cat README.md` over `rm -rf build-output`) leaves the command unread.
+/// NEGATIVE CONTROL for the mutants that read the `$ ` row alone, stop at a bare mark or a blank
+/// row, read a stray row, join a wrap one way only, take an option-shaped wrap for an option,
+/// read past the bound, read under a danger row or read the description as a line of its own,
+/// each of which reads a read-only verdict for a box that pushes or deletes, or no verdict for a
+/// measured `echo`.
 #[test]
 fn an_approval_reads_every_line_of_its_command() {
+    let read = |rows: &[String]| prompt(rows).map(|p| p.command_rows);
     let measured = prompt(&frame("2.4.0-box-shell")).expect("PRECONDITION");
     assert_eq!(
         (measured.description_rows, measured.readings()),
-        (0, vec!["echo lab-kimi-tool".to_string()]),
-        "the measured description fits beside its command: no wrap"
+        (
+            1,
+            vec![
+                "echo lab-kimi-tool".to_string(),
+                "echo lab-kimi-tool print a lab marker".to_string(),
+                "echo lab-kimi-toolprint a lab marker".to_string()
+            ]
+        ),
+        "the measured description, read off and as a wrap both ways"
     );
 
     let lines = approval_with(&["   $ cat README.md", "   · rm -rf build"], true);
     let p = prompt(&lines).expect("the approval");
-    assert_eq!(p.command_rows, vec!["cat README.md", "rm -rf build"]);
+    assert_eq!(
+        p.command_rows,
+        vec!["cat README.md", "rm -rf build", "print a lab marker"]
+    );
     assert_eq!(p.description, "print a lab marker");
+    for reading in [
+        "cat README.md\nrm -rf build",
+        "cat README.md\nrm -rf build print a lab marker",
+    ] {
+        assert!(p.readings().contains(&reading.to_string()), "{reading:?}");
+    }
+    assert_eq!(p.options.len(), 4, "the options stay");
+
+    let empty = prompt(&frame("2.5.2-box-shell-empty-line")).expect("the measured approval");
+    assert_eq!(
+        empty.command_rows,
+        vec![
+            "cat README.md",
+            "",
+            "git push --force",
+            "Read the readme, then push"
+        ]
+    );
+    let readings = empty.readings();
+    assert!(
+        readings.contains(&"cat README.md\n\ngit push --force".to_string())
+            && !readings
+                .iter()
+                .any(|r| r.ends_with("\nRead the readme, then push")),
+        "{readings:?}"
+    );
+
+    let spaced = prompt(&frame("2.5.2-box-shell-spaced")).expect("the measured approval");
+    assert_eq!(
+        (spaced.command_rows.clone(), spaced.description_rows),
+        (
+            vec!["cat README.md".to_string(), ";git push --force".to_string()],
+            1
+        ),
+        "a row at the description's depth under a row with room for its first word"
+    );
+    assert_eq!(
+        spaced.readings(),
+        vec![
+            "cat README.md",
+            "cat README.md ;git push --force",
+            "cat README.md;git push --force"
+        ]
+    );
+
+    // The measured wrap that opens like an option is the command's: the options are the block
+    // over the key row; under the measured blank row of two carriage returns, the command is
+    // unread.
+    let p = prompt(&frame("2.5.2-box-shell-option-shaped")).expect("the measured approval");
+    assert_eq!(
+        (p.command_rows.clone(), options(&p).len()),
+        (
+            vec![
+                "cat README.md".to_string(),
+                "1. ;git push --force".to_string()
+            ],
+            4
+        ),
+        "a wrap shaped like an option"
+    );
     assert!(
         p.readings()
-            .contains(&"cat README.md\nrm -rf build".to_string())
+            .contains(&"cat README.md 1. ;git push --force".to_string())
     );
-    assert_eq!(p.options.len(), 4, "the options stay");
+    let p = prompt(&frame("2.5.2-box-shell-option-shaped-cr")).expect("the measured approval");
+    assert_eq!(
+        (p.command_rows.clone(), options(&p).len()),
+        (Vec::<String>::new(), 4),
+        "a blank row between"
+    );
+
+    let word = "a".repeat(138);
+    let cut = prompt(&frame("2.5.2-box-shell-long-word")).expect("the measured approval");
+    assert_eq!(
+        cut.command_rows,
+        vec![format!("echo {word}"), "#;git push --force".to_string()],
+        "PRECONDITION: a word cut at the box's edge"
+    );
+    assert!(
+        cut.readings()
+            .contains(&format!("echo {word}#;git push --force")),
+        "the cut word read whole: {:?}",
+        cut.readings()
+    );
+    let broken =
+        prompt(&frame("2.5.2-box-shell-carriage-return-mid")).expect("the measured approval");
+    assert_eq!(
+        broken.readings(),
+        vec![
+            "cat README.md",
+            "cat README.md #;git push --force",
+            "cat README.md#;git push --force"
+        ],
+        "a line broken at its carriage return, read with no space too"
+    );
+
+    let returned = frame("2.5.2-box-shell-carriage-return");
+    assert_eq!(
+        read(&returned),
+        Some(Vec::new()),
+        "a blank row inside the block"
+    );
+    let at = returned
+        .iter()
+        .position(|r| r.trim() == "$ cat README.md")
+        .expect("the first line");
+    let mut closed = returned.clone();
+    closed.remove(at + 1);
+    assert_eq!(
+        read(&closed),
+        Some(vec![
+            "cat README.md".to_string(),
+            "git push --force".to_string()
+        ]),
+        "CONTROL: closed up, both lines"
+    );
+
+    let spoofed = frame("2.5.2-box-shell-backspaced");
+    assert_eq!(read(&spoofed), Some(Vec::new()), "under Kimi's danger row");
+    assert_eq!(
+        read(&undangered(&spoofed)),
+        Some(vec!["cat README.md".to_string()]),
+        "CONTROL: without it, the line drawn"
+    );
+
+    let stray = approval_with(&["   $ cat README.md", "   rm -rf build"], true);
+    let p = prompt(&stray).expect("the approval");
+    assert_eq!(
+        (p.command.as_str(), p.readings().len()),
+        ("", 0),
+        "a row at the lines' depth with no mark is no line of the block"
+    );
 
     let long = format!(
         "cat {}",
-        (1..=6)
+        (1..=5)
             .map(|i| format!("lab-notes-{i:02}.txt"))
             .collect::<Vec<_>>()
             .join(" ")
@@ -738,12 +917,15 @@ fn an_approval_reads_every_line_of_its_command() {
     let p = prompt(&wrapped).expect("the approval");
     assert_eq!(
         p.command_rows,
-        vec![format!("{long} && rm -rf /private/tmp/at.H2aa/proj")],
+        vec![
+            format!("{long} && rm -rf /private/tmp/at.H2aa/proj"),
+            "print a lab marker".to_string()
+        ],
         "a deeper row with a row under it is a wrap"
     );
     assert_eq!(
         (p.description.as_str(), p.description_rows),
-        ("print a lab marker", 0)
+        ("print a lab marker", 1)
     );
 
     let full = format!("cat {}", "x".repeat(102 - "cat ".len()));
@@ -751,18 +933,102 @@ fn an_approval_reads_every_line_of_its_command() {
     let unsure = approval_with(&[&edge, "     rm -rf build"], false);
     let p = prompt(&unsure).expect("the approval");
     assert_eq!(
-        p.description_rows, 1,
-        "the last row may be a wrap or the description"
+        p.readings(),
+        vec![
+            full.clone(),
+            format!("{full} rm -rf build"),
+            format!("{full}rm -rf build")
+        ],
+        "the last row read as the wrap and as the description"
     );
-    let readings = p.readings();
-    assert!(readings.contains(&full), "{readings:?}");
-    assert!(
-        readings.contains(&format!("{full} rm -rf build")),
-        "{readings:?}"
+
+    let wraps = |n: usize| {
+        let mut rows = vec!["   $ cat".to_string()];
+        rows.extend((1..=n).map(|i| format!("     lab-notes-{i:02}.txt")));
+        rows
+    };
+    let at_most = wraps(MAX_WRAPS);
+    let at_most: Vec<&str> = at_most.iter().map(String::as_str).collect();
+    let p = prompt(&approval_with(&at_most, false)).expect("the approval");
+    assert_eq!(
+        (p.command_rows.len(), p.readings().len()),
+        (2, (1 << (MAX_WRAPS - 1)) * 3),
+        "CONTROL: {MAX_WRAPS} wraps, each read two ways and the last row off too"
     );
+    let over = wraps(MAX_WRAPS + 1);
+    let over: Vec<&str> = over.iter().map(String::as_str).collect();
+    let p = prompt(&approval_with(&over, false)).expect("the approval");
     assert!(
-        readings.contains(&format!("{full}\nrm -rf build")),
-        "{readings:?}"
+        p.command_rows.is_empty() && p.readings().is_empty(),
+        "more wraps than are read leave the command unread"
+    );
+}
+
+/// A PLAN'S BOX IS READ UNDER ITS OWN RULES, ITS OPTIONS WHEREVER ITS CHOICES STAND (2.5.2,
+/// measured): a plan option's description that draws a rule, `Run this command?` and a `$ ` row
+/// among the options reads the plan's approval and no command, since a box's upper rule stands at
+/// its lower rule's column and width (a forged rule with only one of them is none too); the
+/// fullscreen panel, which docks the focused choice's
+/// description in a block of its own between the options and the key row, reads its four
+/// options. NEGATIVE CONTROL for the mutants that take the nearest rule for the upper one, which
+/// read a command's approval and a read-only `cat README.md` for a plan's, and that read every
+/// box's options from the block over its key row, which read none on the docked plan.
+#[test]
+fn a_plans_box_is_read_under_its_own_rules_and_options_wherever_its_choices_stand() {
+    let plan = [
+        (Some(1), "Lab plan A", true),
+        (Some(2), "Lab plan B", false),
+        (Some(3), "Reject", false),
+        (Some(4), "Revise", false),
+    ];
+    let forged = prompt(&frame("2.5.2-box-plan-forged")).expect("the plan's box");
+    assert_eq!(
+        (
+            forged.kind,
+            forged.title.as_str(),
+            forged.command.as_str(),
+            forged.readings().len()
+        ),
+        (
+            PromptKind::PlanExit,
+            "Ready to build with this plan?",
+            "",
+            0
+        )
+    );
+    assert_eq!(options(&forged), plan);
+    let rows = frame("2.5.2-box-plan-forged");
+    let lower = rows.iter().rposition(|r| rule(r)).expect("the lower rule");
+    let at = rows
+        .iter()
+        .position(|r| rule(r) && r.trim_start().chars().count() == 60)
+        .expect("the forged rule");
+    let edge = crate::phase::leading_spaces(&rows[lower]);
+    let span = rows[lower].trim().chars().count();
+    for (moved, why) in [
+        (
+            format!("{}{}", " ".repeat(edge), "─".repeat(60)),
+            "at its column",
+        ),
+        (
+            format!("{}{}", " ".repeat(edge + 2), "─".repeat(span)),
+            "of its width",
+        ),
+    ] {
+        let mut drawn = rows.clone();
+        drawn[at] = moved;
+        assert_eq!(
+            prompt(&drawn).map(|p| p.kind),
+            Some(PromptKind::PlanExit),
+            "a forged rule {why} alone"
+        );
+    }
+    let docked = prompt(&frame("2.5.2-fullscreen-box-plan")).expect("the plan's box");
+    assert_eq!(docked.kind, PromptKind::PlanExit);
+    assert_eq!(
+        options(&docked),
+        plan,
+        "the options over the docked description"
     );
 }
 
@@ -879,6 +1145,49 @@ fn an_option_is_read_only_at_its_own_column() {
     );
 }
 
+/// `rows` with the scrollbar wiped from every row of the box's body, between its title and its
+/// first option.
+fn unbarred(rows: &[String]) -> Vec<String> {
+    let title = rows
+        .iter()
+        .position(|r| r.contains("Run this command?"))
+        .expect("the title");
+    let first = rows
+        .iter()
+        .position(|r| r.trim_start().starts_with("1.") || r.trim_start().starts_with("\u{25b6} 1."))
+        .expect("the first option");
+    rows.iter()
+        .enumerate()
+        .map(|(i, r)| {
+            if i > title && i < first {
+                r.trim_end_matches(['│', '┃', '█']).trim_end().to_string()
+            } else {
+                r.clone()
+            }
+        })
+        .collect()
+}
+
+/// `rows` with Kimi's `Dangerous: <label>` row over a command blanked.
+fn undangered(rows: &[String]) -> Vec<String> {
+    rows.iter()
+        .map(|r| {
+            if r.trim_start().starts_with("Dangerous: ") {
+                String::new()
+            } else {
+                r.clone()
+            }
+        })
+        .collect()
+}
+
+/// `rows` with one more transcript row over the box, its upper rule off the screen's second row.
+fn lowered(rows: &[String]) -> Vec<String> {
+    let mut rows = rows.to_vec();
+    rows.insert(1, " \u{25cf} a transcript row".to_string());
+    rows
+}
+
 /// The column a measured box's rules start at and the cells they span.
 fn edges(rows: &[String]) -> (usize, usize) {
     let r = rows.iter().find(|r| rule(r)).expect("a rule");
@@ -888,12 +1197,11 @@ fn edges(rows: &[String]) -> (usize, usize) {
     )
 }
 
-/// A FILE'S BOX NAMES ITS FILE ONLY WHEN IT IS DRAWN WHOLE, AND A SCROLLBAR IS NO PART OF A ROW
-/// (2.5.2's `renderBody` and `paintScrollbar`, read in its binary): the measured write with its
-/// path cut at the box's edge by `...` reads that text as its command and no path; the
-/// measured write, edit and command with a fullscreen panel's scrollbar painted at the box's
-/// right edge (`┃`, `│`) read as they do without it. NEGATIVE CONTROL for the mutants that take
-/// the cut text for the path, or the scrollbar's glyph into a path or a command.
+/// A FILE'S BOX NAMES ITS FILE ONLY WHEN IT IS DRAWN WHOLE (2.5.2's `renderBody`, read in its
+/// binary): the measured write with its path cut at the box's edge by `...` reads that text as
+/// its command and no path, and so does one of two-cell glyphs whose cells reach the edge.
+/// NEGATIVE CONTROL for the mutants that take the cut text for the path or count a cut row's
+/// characters for its cells.
 #[test]
 fn a_file_box_names_its_file_only_when_drawn_whole() {
     let path = "/private/tmp/at.H2aa/proj/notes-for-the-lab.txt";
@@ -916,39 +1224,285 @@ fn a_file_box_names_its_file_only_when_drawn_whole() {
     );
     assert_eq!(p.command, format!("{cut}..."), "the box shows what it drew");
 
-    let barred = |rows: &[String], glyph: char| -> Vec<String> {
-        let (edge, width) = edges(rows);
-        let title = rows
-            .iter()
-            .position(|r| r.contains('▶'))
-            .expect("the title");
-        let first = rows
-            .iter()
-            .position(|r| r.trim_start().starts_with("▶ 1."))
-            .expect("the first option");
-        rows.iter()
-            .enumerate()
-            .map(|(i, r)| {
-                if i > title && i < first && !r.trim().is_empty() {
-                    format!("{r:<0$}{glyph}", edge + width - 1)
-                } else {
-                    r.clone()
-                }
-            })
-            .collect()
+    // A path of two-cell glyphs is cut where its cells, not its characters, reach the edge.
+    let mut wide = String::from("/private/tmp/at.H2aa/proj/");
+    for glyph in "日本/".chars().cycle() {
+        if crate::question::cells(&format!("{wide}{glyph}")) > edge + width - lead - 3 {
+            break;
+        }
+        wide.push(glyph);
+    }
+    assert!(
+        lead + wide.chars().count() + 3 + 2 < edge + width,
+        "PRECONDITION: its characters fall short of the edge"
+    );
+    let mut cut_wide = write.clone();
+    cut_wide[at] = format!("{}{wide}...", " ".repeat(lead));
+    let p = prompt(&cut_wide).expect("the write");
+    assert_eq!(
+        (p.path, p.command),
+        (None, format!("{wide}...")),
+        "a path of two-cell glyphs cut at the edge"
+    );
+}
+
+/// A FULLSCREEN PANEL READS ITS COMMAND AND FILE ONLY OFF A BODY PROVEN DRAWN WHOLE (2.5.2 under
+/// `tui_mode = "fullscreen"`, measured): its dock shows at most six body rows and scrolls a body
+/// taller than that under a scrollbar, its focused key row then ending `· shift+↑/↓ scroll`. A
+/// command whose rows all fit reads every line and its description, as inline. The six-line
+/// command whose last two lines (`rm -rf build-output` the last) and description are hidden
+/// below reads no command, so the read-only rule judges none of it rather than the four
+/// read-only lines it shows; so does the first frame of a dock squeezed under its body's rows,
+/// whose key row, judged off the previous layout, still ends `↵ confirm` over `cat README.md`
+/// with `git push --force` hidden, by its scrollbar and by its upper rule on the screen's second
+/// row, each alone; so does the squeezed dock's on its feedback line, whose key row shows
+/// nothing, beside rows of two-cell glyphs (`mv` and `rm` hidden below); and so does a body that
+/// fits under the feedback line's key row, an unfocused panel's, or one cut at the box's edge. A
+/// body row that reaches the scrollbar's column by its cells (a two-cell glyph's too), or ends in
+/// any of a bar's glyphs short of it, is drawn in part. A write whose file block overflows names
+/// no file and reads no command, at the top of its scroll and scrolled to its foot alike. The
+/// question reads as inline: its question, its five options numbered in order, its key row.
+/// NEGATIVE CONTROL: with every mark but one wiped, each shell frame reads the rows it shows,
+/// and a row reaching the rules' last cell is read; they kill the mutants that read past the
+/// hint, the bar or the dock's place, take the feedback line's, an unfocused or a cut key row
+/// for the focused one, judge a row's reach in characters or its glyph only at the bar's column,
+/// or drop one of the bar's glyphs.
+#[test]
+fn a_fullscreen_panel_reads_its_command_and_file_only_off_a_body_drawn_whole() {
+    let read = |rows: &[String]| prompt(rows).map(|p| p.command_rows);
+    let approvals = vec![
+        (Some(1), "Approve once", true),
+        (Some(2), "Approve for this session", false),
+        (Some(3), "Reject", false),
+        (Some(4), "Reject with feedback", false),
+    ];
+    let shell = prompt(&frame("2.5.2-fullscreen-box-shell")).expect("the command");
+    assert_eq!(shell.kind, PromptKind::Bash);
+    assert_eq!(
+        shell.command_rows,
+        [
+            "cat README.md",
+            "git push --force",
+            "Read the readme, then push"
+        ]
+    );
+    assert_eq!(shell.command, "cat README.md git push --force");
+    assert_eq!(shell.description, "Read the readme, then push");
+    assert!(
+        shell
+            .readings()
+            .contains(&"cat README.md\ngit push --force".to_string()),
+        "{:?}",
+        shell.readings()
+    );
+    assert_eq!(options(&shell), approvals);
+    assert_eq!(
+        shell.footer.as_deref(),
+        Some("↑/↓ select · 1/2/3/4 choose · ↵ confirm")
+    );
+
+    let overflow = frame("2.5.2-fullscreen-box-shell-overflow");
+    let over = prompt(&overflow).expect("the overflowing command");
+    assert_eq!(
+        (over.kind, over.title.as_str()),
+        (PromptKind::Bash, "Run this command?")
+    );
+    assert_eq!((over.command.as_str(), over.description.as_str()), ("", ""));
+    assert!(over.command_rows.is_empty() && over.readings().is_empty());
+    assert_eq!(options(&over), approvals);
+    assert_eq!(
+        over.footer.as_deref(),
+        Some("↑/↓ select · 1/2/3/4 choose · ↵ confirm · shift+↑/↓ scroll")
+    );
+    let hint = " \u{b7} shift+\u{2191}/\u{2193} scroll";
+    let focused = "   \u{2191}/\u{2193} select \u{b7} 1/2/3/4 choose \u{b7} \u{21b5} confirm";
+    let unhinted: Vec<String> = overflow.iter().map(|r| r.replace(hint, "")).collect();
+    assert_ne!(
+        unhinted, overflow,
+        "PRECONDITION: the key row offers the scroll"
+    );
+    let lines = [
+        "cat README.md",
+        "ls -la",
+        "git status",
+        "git log --oneline -3",
+    ]
+    .map(String::from)
+    .to_vec();
+    assert_eq!(
+        read(&undangered(&unbarred(&overflow))),
+        Some(Vec::new()),
+        "the hint withholds the command"
+    );
+    assert_eq!(
+        read(&undangered(&unbarred(&unhinted))),
+        Some(lines),
+        "CONTROL: without it, the rows it shows"
+    );
+
+    // The first frame of a dock squeezed under its body's rows: its key row whole, its scrollbar
+    // and its place on the screen's second row withholding the command, each alone.
+    let squeezed = frame("2.5.2-fullscreen-box-shell-squeezed");
+    assert!(
+        squeezed[1].trim_start().starts_with('─')
+            && squeezed
+                .iter()
+                .any(|r| r.trim().ends_with("\u{21b5} confirm"))
+            && squeezed.iter().filter(|r| r.ends_with('┃')).count() == 2,
+        "PRECONDITION: the upper rule on the second row, the key row whole, a thumb alone"
+    );
+    assert_eq!(read(&squeezed), Some(Vec::new()), "the squeezed frame");
+    assert_eq!(
+        read(&unbarred(&squeezed)),
+        Some(Vec::new()),
+        "the dock's place withholds the command"
+    );
+    let low = lowered(&squeezed);
+    assert_eq!(read(&low), Some(Vec::new()), "the scrollbar withholds it");
+    let bare = unbarred(&low);
+    assert_eq!(
+        read(&bare),
+        Some(vec!["cat README.md".to_string()]),
+        "CONTROL: with neither, the rows it shows"
+    );
+
+    // A row reaching the scrollbar's column (the grid drew it wider than Kimi counted, its bar
+    // past the screen's edge) is drawn in part, and so is one ending in a bar's glyph short of it
+    // (drawn narrower); one reaching the rules' last cell is read.
+    let (edge, width) = edges(&bare);
+    let at = bare
+        .iter()
+        .position(|r| r.trim_start().starts_with("$ "))
+        .expect("the first line");
+    let to = |cells: usize, glyph: char| {
+        let mut rows = bare.clone();
+        let pad =
+            cells - crate::question::cells(&glyph.to_string()) - crate::question::cells(&bare[at]);
+        rows[at] = format!("{}{}{glyph}", bare[at], " ".repeat(pad));
+        assert_eq!(crate::question::cells(&rows[at]), cells, "PRECONDITION");
+        rows
     };
-    for (name, glyph) in [("2.5.2-box-write", '┃'), ("2.5.2-box-edit", '│')] {
-        let p = prompt(&barred(&frame(name), glyph)).expect(name);
+    assert_eq!(
+        read(&to(edge + width + 1, 'x')),
+        Some(Vec::new()),
+        "the bar's column"
+    );
+    assert_eq!(
+        read(&to(edge + width + 1, '日')),
+        Some(Vec::new()),
+        "a two-cell glyph reaching the bar's column, its characters short of it"
+    );
+    for glyph in ['│', '┃', '█'] {
         assert_eq!(
-            (p.path.as_deref(), p.command.as_str()),
-            (Some(path), path),
+            read(&to(edge + width - 2, glyph)),
+            Some(Vec::new()),
+            "the bar's {glyph} short of it"
+        );
+    }
+    assert_eq!(
+        read(&to(edge + width, 'x')).map(|r| r.len()),
+        Some(1),
+        "CONTROL: the rules' last cell"
+    );
+
+    // The feedback line's key row shows nothing, over a squeezed dock beside rows of two-cell
+    // glyphs: no command. CONTROL: given the focused key row back, the rows it shows.
+    let wide = frame("2.5.2-fullscreen-box-shell-feedback-wide");
+    let feedback = "Type feedback \u{b7} \u{21b5} submit.";
+    assert!(
+        wide.iter().any(|r| r.trim() == feedback)
+            && wide.iter().filter(|r| r.ends_with('┃')).count() == 2,
+        "PRECONDITION: the feedback line's key row, a thumb alone"
+    );
+    let p = prompt(&wide).expect("the feedback line's box");
+    assert_eq!(
+        (p.kind, p.command.as_str(), p.readings().len()),
+        (PromptKind::Bash, "", 0)
+    );
+    assert_eq!(p.footer.as_deref(), Some(feedback));
+    let mut refocused = unbarred(&lowered(&wide));
+    assert_eq!(
+        read(&refocused),
+        Some(Vec::new()),
+        "the key row withholds it"
+    );
+    let keys = refocused
+        .iter()
+        .position(|r| r.trim() == feedback)
+        .expect("the feedback line's key row");
+    refocused[keys] = focused.to_string();
+    assert_eq!(
+        read(&refocused),
+        Some(
+            ["cat 说明文档.md", "ls 项目目录/"]
+                .map(String::from)
+                .to_vec()
+        ),
+        "CONTROL: the rows it shows"
+    );
+
+    // A body drawn whole is unproven under any key row but the focused one drawn to its end: the
+    // feedback line's, an unfocused panel's, one cut at the box's edge.
+    let fit = frame("2.5.2-fullscreen-box-shell");
+    let at = fit
+        .iter()
+        .position(|r| r.trim_start().starts_with("\u{2191}/\u{2193} select"))
+        .expect("PRECONDITION: the key row");
+    for row in [
+        format!("   {feedback}"),
+        "   esc back to approval".to_string(),
+        "   \u{2191}/\u{2193} select \u{b7} 1/2/3/4 choose \u{b7} \u{21b5} con...".to_string(),
+    ] {
+        let mut rows = fit.clone();
+        rows[at] = row.clone();
+        assert_eq!(read(&rows), Some(Vec::new()), "{row:?}");
+    }
+
+    for (name, path_drawn) in [
+        ("2.5.2-fullscreen-box-write", true),
+        ("2.5.2-fullscreen-box-write-scrolled", false),
+    ] {
+        let rows = frame(name);
+        assert_eq!(
+            rows.iter().any(|r| r
+                .trim_start()
+                .starts_with("/private/tmp/at.HOk4/proj/notes-for-the-lab.txt ")),
+            path_drawn,
+            "PRECONDITION: {name}'s path row"
+        );
+        let write = prompt(&rows).expect(name);
+        assert_eq!(
+            (write.kind, write.path.as_deref(), write.command.as_str()),
+            (PromptKind::Write, None, ""),
+            "{name}"
+        );
+        assert_eq!(options(&write), approvals, "{name}");
+        assert_eq!(
+            write.footer.as_deref(),
+            Some("↑/↓ select · 1/2/3/4 choose · ↵ confirm · ctrl+e preview · shift+↑/↓ scroll"),
             "{name}"
         );
     }
-    let shell = prompt(&barred(&frame("2.4.0-box-shell"), '│')).expect("the command");
+
+    let question = prompt(&frame("2.5.2-fullscreen-question")).expect("the question");
+    assert_eq!(question.kind, PromptKind::Question);
     assert_eq!(
-        (shell.command.as_str(), shell.description.as_str()),
-        ("echo lab-kimi-tool", "print a lab marker")
+        question.description,
+        "Which checks should the lab run before landing?"
     );
-    assert_eq!(shell.readings(), vec!["echo lab-kimi-tool"]);
+    assert_eq!(
+        options(&question),
+        vec![
+            (Some(1), "Format", false),
+            (Some(2), "Lint", false),
+            (Some(3), "Tests", false),
+            (Some(4), "Cells", false),
+            (Some(5), "Other", false),
+        ]
+    );
+    assert_eq!(question.select, Select::Digits);
+    assert_eq!(
+        question.footer.as_deref(),
+        Some("↑↓ select  1-5 / ↵ toggle  ←/→/tab switch  esc cancel")
+    );
 }

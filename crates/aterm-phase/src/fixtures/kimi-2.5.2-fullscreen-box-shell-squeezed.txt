@@ -1,0 +1,15 @@
+# kimi 2.5.2 · MEASURED 2026-11-06, `aterm ctl text` of an `aterm-lab kimi` instance (a private headless aterm, 144x14 by `LAB_LINES=14`, aterm 0.161.0, a debug build of this branch before its reader proved a body whole by its scrollbar and its dock's place) running the real Kimi Code, launched by path with a scratch `HOME` and `KIMI_CODE_HOME` whose `config.toml` names one `openai`-type provider at `http://127.0.0.1:<port>/v1` with a fake key (a local stub of the Chat Completions API, crates/aterm-lab), no login, in a project folder that is no git work tree, and whose `tui.toml` says `tui_mode = "fullscreen"`, so the panel docks over the transcript in the composer's place with no `context: N%` footer under it · the stub's `tool` mode asks for `Bash` `{command: "cat README.md\ngit push --force"}`: the short screen squeezes the docked panel one row under its body's three (cwd and two lines): the root keeps the transcript one row (its `● Running a command` row) and the panel's upper rule stands on the screen's second row; on this, the panel's first frame, its body shows the cwd and `$ cat README.md` rows under a scrollbar that is a thumb alone (`┃` on both rows in the screen's last column), `· git push --force` hidden, while its key row, judged off the previous layout, still ends `↵ confirm` with no `shift+↑/↓ scroll` hint; that build published `agent_detail=bash:read-only` · the lab's random project dir is spelled /private/tmp/at.ncJJ here
+ ● Running a command · $ cat README.md…
+ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   ▶ Run this command?
+
+   cwd: /private/tmp/at.ncJJ/proj                                                                                                              ┃
+   $ cat README.md                                                                                                                             ┃
+
+   ▶ 1. Approve once
+     2. Approve for this session
+     3. Reject
+     4. Reject with feedback
+
+   ↑/↓ select · 1/2/3/4 choose · ↵ confirm
+ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────

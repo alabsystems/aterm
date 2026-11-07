@@ -612,7 +612,8 @@ fn every_view_answers_in_both_shapes_and_the_json_keeps_the_contract() {
                 let j = render_json(&query(view, true), &c);
                 let v = contract_violations(&j);
                 assert!(v.is_empty(), "{view:?}: {v:?}\n{}", j.to_text());
-                assert_eq!(j.get("schema"), Some(&Jv::Int(1)));
+                let schema = if view == View::Disk { 2 } else { 1 };
+                assert_eq!(j.get("schema"), Some(&Jv::Int(schema)), "{view:?}");
                 assert_eq!(j.get("kind"), Some(&Jv::s(format!("sys.{}", view.word()))));
                 assert!(j.get("as_of").is_some());
                 assert!(matches!(j.get("events"), Some(Jv::Arr(e)) if e.len() == 1));
@@ -1281,6 +1282,7 @@ fn sys_disk_prints_what_the_walker_measured_through_the_seam() {
             entries: 120_000,
             root: Some(1),
         }],
+        ..DiskTotals::default()
     });
     let c = ctx(&w, Some(&s), true, true);
     let text = all_text(&render_text(&query(View::Disk, false), &c));
@@ -1347,6 +1349,120 @@ fn sys_disk_prints_what_the_walker_measured_through_the_seam() {
     );
     let tj = render_json(&query(View::Tab, true), &c);
     assert!(contract_violations(&tj).is_empty(), "{}", tj.to_text());
+}
+
+/// SYS DISK WITHHOLDS OTHER TABS' PANES AND PATHS FROM A TAB CALLER: a caller that is not of
+/// owner class reads its own tab's panes and `withheld=N`; a caller in a session of either class
+/// reads another tab's folders as `under=`. Negative control: an owner caller reads every pane.
+#[test]
+fn sys_disk_withholds_other_tabs_panes_and_paths_from_a_tab_caller() {
+    use crate::sys::{DiskTotals, PaneLine, ScopeBytes, ScopeLine};
+    let s = snapshot();
+    let mut w = world();
+    let pane = |key: u64, tab: usize, live: &str, why: Option<&'static str>| PaneLine {
+        key,
+        tab: Some(tab),
+        tab_name: None,
+        pane: 1,
+        from: Some("shell"),
+        exe: Some("zsh".into()),
+        host: None,
+        live: Some(live.into()),
+        project: Some(live.into()),
+        member: why.is_none(),
+        why,
+    };
+    w.disk = Some(DiskTotals {
+        scopes: vec![
+            ScopeLine::Global {
+                pool: Some("container:disk3".into()),
+                used: Some(620_000_000_000),
+                total: Some(1_000_000_000_000),
+            },
+            ScopeLine::Bytes(ScopeBytes {
+                name: "aterm",
+                pool: Some("container:disk3".into()),
+                bytes: 9_000,
+                drawn: true,
+                complete: true,
+                roots: 2,
+                counted: 2,
+                oldest_walk_s: Some(34),
+                ..ScopeBytes::default()
+            }),
+            ScopeLine::Bytes(ScopeBytes {
+                name: "tab",
+                tab: Some(1),
+                keys: vec![7],
+                pool: Some("container:disk3".into()),
+                why: Some("walking"),
+                roots: 1,
+                ..ScopeBytes::default()
+            }),
+        ],
+        panes: vec![
+            pane(7, 1, "/Users//a/my proj", None),
+            pane(8, 2, "/Users//a/secret", None),
+            pane(9, 3, "/Users//a", Some("too_broad")),
+        ],
+        ..DiskTotals::default()
+    });
+    let tab_caller = ctx(&w, Some(&s), false, true);
+    let text = all_text(&render_text(&query(View::Disk, false), &tab_caller));
+    assert!(
+        text.contains("scope name=global pool=container:disk3 used_bytes=620000000000 total_bytes=1000000000000"),
+        "{text}"
+    );
+    assert!(
+        text.contains("scope name=aterm pool=container:disk3 bytes=9000 drawn=yes complete=yes roots=2 counted=2 oldest_walk_s=34 clamped=no"),
+        "{text}"
+    );
+    assert!(
+        text.contains("scope name=tab tab=1 pool=container:disk3 bytes=0 drawn=no why=walking complete=no roots=1 counted=0 oldest_walk_s=unavailable(not_sampled) clamped=no"),
+        "{text}"
+    );
+    assert!(
+        text.contains("pane tab=1 pane=1 from=shell exe=zsh live=/Users//a/my%20proj project=/Users//a/my%20proj member=yes"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("pane tab=2") && !text.contains("secret"),
+        "{text}"
+    );
+    assert!(
+        text.contains("withheld=2 (pane rows outside this tab"),
+        "{text}"
+    );
+    let j = render_json(&query(View::Disk, true), &tab_caller);
+    assert!(contract_violations(&j).is_empty(), "{}", j.to_text());
+    assert_eq!(j.get("schema"), Some(&Jv::Int(2)));
+    let d = j.get("disk").expect("disk");
+    let Some(Jv::Arr(panes)) = d.get("panes") else {
+        panic!("{}", j.to_text());
+    };
+    assert_eq!(panes.len(), 1);
+    assert_eq!(d.get("panes_withheld"), Some(&Jv::u(2)));
+    let Some(Jv::Arr(scopes)) = d.get("scopes") else {
+        panic!("{}", j.to_text());
+    };
+    assert_eq!(scopes[2].get("why_not"), Some(&Jv::s("walking")));
+    // An owner caller in another tab reads every pane, its paths outside its tab as `under=`.
+    let owner_elsewhere = ctx(&w, Some(&s), true, false);
+    let text = all_text(&render_text(&query(View::Disk, false), &owner_elsewhere));
+    assert!(
+        text.contains("pane tab=2 pane=1 from=shell exe=zsh under=home member=yes"),
+        "{text}"
+    );
+    assert!(
+        text.contains("pane tab=3 pane=1 from=shell exe=zsh under=home member=no why=too_broad"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("withheld=") && !text.contains("secret"),
+        "{text}"
+    );
+    let j = render_json(&query(View::Disk, true), &owner_elsewhere);
+    assert!(contract_violations(&j).is_empty(), "{}", j.to_text());
 }
 
 /// A tab whose only folder no walk measures (a scratch HOME is too broad) reads its size as

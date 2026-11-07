@@ -9,6 +9,7 @@
 //! hairlines (a wall, a rim, a seam) cost the most and a form fits its column at every scale
 //! above. The tiles inside each form, and their paint, are A1's steps R5 and R6.
 
+use aterm_vitals::Snapshot;
 use aterm_vitals::units::DISK_UNITS;
 
 /// The scale the planner measures forms at: 1×, where hairlines cost the most (A1 §2.4).
@@ -74,6 +75,79 @@ pub(crate) struct UnitFacts<'a> {
     /// reading draws, as a wall keeps its space (A1 §4.0), and a front-tab change moves no
     /// column (A1 §2.4).
     pub(crate) disk: bool,
+}
+
+/// What the host's reading gives the units' widths, owned so a deck keeps it beside its plan
+/// ([`Self::facts`] lends the [`UnitFacts`] the planner reads): the cores per cluster in the
+/// reading's cluster order (`hw.perflevel0` first) or, with no cluster read, every core in one;
+/// the GPU's core count, and the Neural Engine tile where its reader's self-check held
+/// (`Snapshot::ane` read, A2 §3.1); memory's total; and whether this platform's block reader
+/// reads devices (macOS and Linux, A1 §4.4). Each changes seldom or never: none is a reading the
+/// units draw. A1's step R5 plans both deck forms from these facts in its laws; step R6 plans the
+/// painted deck with them as it paints the units.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "A1 step R6 plans the painted deck with the host's facts"
+    )
+)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HostFacts {
+    clusters: Vec<usize>,
+    gpu: Option<Gpu>,
+    memory: Option<u64>,
+    disk: bool,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "A1 step R6 plans the painted deck with the host's facts"
+    )
+)]
+impl HostFacts {
+    /// What `snap` reads of the machine.
+    pub(crate) fn of(snap: &Snapshot) -> Self {
+        let clusters = snap
+            .cpu
+            .as_ref()
+            .map(|cpu| {
+                cpu.clusters
+                    .iter()
+                    .map(|c| c.cores.len())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|counts| counts.iter().any(|&n| n > 0))
+            .or_else(|| snap.total_cores().map(|n| vec![n]))
+            .unwrap_or_default();
+        Self {
+            clusters,
+            gpu: snap.gpu.as_ref().map(|gpu| Gpu {
+                cores: gpu.cores.map(u32::from),
+                neural_engine: matches!(snap.ane, Some(Ok(_))),
+            }),
+            memory: snap
+                .mem
+                .as_ref()
+                .map(|mem| mem.sample.total)
+                .filter(|&total| total > 0),
+            // The block reader's platforms (`aterm_sysprobe::blockio`): elsewhere the Disk row
+            // draws no units.
+            disk: cfg!(any(target_os = "macos", target_os = "linux")),
+        }
+    }
+
+    /// The facts the planner reads.
+    pub(crate) fn facts(&self) -> UnitFacts<'_> {
+        UnitFacts {
+            clusters: &self.clusters,
+            gpu: self.gpu,
+            memory: self.memory,
+            disk: self.disk,
+        }
+    }
 }
 
 /// The GPU's facts.
@@ -526,5 +600,67 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The host's reading supplies every fact the units plan reads (A1 step R5): the deck's
+    /// three-reading snapshot of this Mac reads its 4 + 6 cores, its 10-core GPU and 32 GiB,
+    /// the Neural Engine tile only once its reader reads, and the disk row on macOS and Linux;
+    /// planned from them, both deck forms lay the units column the laws plan for this Mac at
+    /// 1039 pt. A machine with no cluster read draws every core in one, and an empty snapshot
+    /// gives the planner nothing to draw.
+    #[test]
+    fn the_hosts_reading_supplies_the_facts_the_units_plan_reads() {
+        use crate::stats_plan::{plan_folded_with, plan_full_with};
+        let mut snap = crate::stats_deck::tests::snapshot();
+        let disk = cfg!(any(target_os = "macos", target_os = "linux"));
+        let read = HostFacts::of(&snap);
+        let want = UnitFacts {
+            gpu: Some(Gpu {
+                cores: Some(10),
+                neural_engine: false,
+            }),
+            disk,
+            ..this_mac()
+        };
+        assert_eq!(read.facts(), want);
+        snap.ane = Some(Ok(aterm_vitals::AneSample {
+            cores: 16,
+            powered: false,
+        }));
+        let read = HostFacts::of(&snap);
+        assert_eq!(read.facts(), UnitFacts { disk, ..this_mac() });
+
+        let m = crate::deck_face::FaceMetrics::helvetica_neue();
+        let folded = plan_folded_with(1039.0, &m, &read.facts()).blocks[0].units;
+        let full = plan_full_with(1039.0, &m, &read.facts()).units;
+        assert_eq!(folded.map(|u| u.at.w), Some(46.0));
+        let column = Some(Form::Column);
+        assert_eq!(
+            full.map(|u| u.forms),
+            Some([column, column, column, disk.then_some(Form::Column)]),
+            "{full:?}"
+        );
+
+        if let Some(cpu) = snap.cpu.as_mut() {
+            cpu.clusters.clear();
+        }
+        assert_eq!(HostFacts::of(&snap).facts().clusters, &[10]);
+        let empty = HostFacts::of(&Snapshot::default());
+        assert_eq!(
+            empty.facts(),
+            UnitFacts {
+                disk,
+                ..UnitFacts::NONE
+            }
+        );
+        let disk_alone = empty.facts().draw_any(CELL);
+        assert_eq!(disk_alone, disk);
+        assert!(
+            !UnitFacts {
+                disk: false,
+                ..empty.facts()
+            }
+            .draw_any(CELL)
+        );
     }
 }

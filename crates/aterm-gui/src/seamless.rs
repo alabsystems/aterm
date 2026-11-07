@@ -3699,8 +3699,6 @@ pub(crate) struct IncomingHandoff {
     pub status_seen: Vec<(String, String)>,
     /// Each adopted session's Autopilot end and its task's work, by sid ([`crate::session_store::SessionRecord::autopilot_end`], read by [`end_carry_of`]): the successor's `App::end_carry` as it is, spent at each adopted session's first publication (`App::adopt_end_carry`), never a reason to refuse.
     pub end_carry: std::collections::HashMap<String, crate::harness_end_carry::EndCarry>,
-    /// The fleet needs the outgoing herald had told ([`crate::session_store::SessionHandoff::fleet_told`]), as the manifest carried them: read at this process's first fresh fleet read (`App::herald_fleet`), never a reason to refuse.
-    pub fleet_told: Vec<String>,
     /// Where the outgoing process will name, at its Commit, how long ago a person last keyed each carried session ([`person_stamps_path`] of the manifest this process read), for the Commit to take (`App::take_carried_person_stamps`).
     #[cfg(unix)]
     pub person_stamps: Option<std::path::PathBuf>,
@@ -6043,7 +6041,6 @@ fn take_incoming_from_as(env: &mut HandoffEnv, shape: ReceiverShape) -> Incoming
         refusal: None,
         roster_seq: manifest.roster_seq,
         fabric_attached: manifest.fabric_attached,
-        fleet_told: manifest.fleet_told,
         status_seen: manifest
             .sessions
             .iter()

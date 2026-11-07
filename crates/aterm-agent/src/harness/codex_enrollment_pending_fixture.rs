@@ -131,9 +131,10 @@ impl PendingCustodyFixture {
             }
             Ok(Vec::new())
         })?;
-        let turn = super::super::native_enrollment_admission::NativeBrowserTurn::acquire(
-            &store, &request, &row, env.now,
-        )?;
+        let turn =
+            super::super::native_enrollment_admission::NativeBrowserTurn::acquire_isolated_fixture(
+                &store, &request, &row, env.now,
+            )?;
         let callback = turn
             .callback()?
             .local_addr()

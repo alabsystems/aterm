@@ -3027,6 +3027,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_vault_a_process_reads_follows_where_its_state_root_resolved() {
+        if !crate::test_alone::alone() {
+            return;
+        }
         let home = aterm_tempfile::tempdir().unwrap();
         let vault = aterm_secrets::client::Paths::for_home(home.path());
         let found = || Ok(vault.clone());
@@ -3082,6 +3085,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_windows_grants_admit_only_beside_the_vault_its_fleet_was_taken_under() {
+        if !crate::test_alone::alone() {
+            return;
+        }
         let root = aterm_tempfile::tempdir().unwrap();
         let state = root.path().join("state");
         aterm_secrets::fsx::ensure_private_dir(&state).unwrap();

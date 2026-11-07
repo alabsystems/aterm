@@ -238,6 +238,7 @@ fn led_as(sid: &str, tab: bool, leader: Option<u32>) -> Request {
                 key: 7,
                 window: 1,
                 tab: 2,
+                tab_id: None,
             })
             .into_iter()
             .collect(),

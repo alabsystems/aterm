@@ -1,0 +1,15 @@
+# kimi 2.5.2 · MEASURED 2026-11-06, `aterm ctl text` of an `aterm-lab kimi` instance (a private headless aterm, 144x14 by `LAB_LINES=14`, aterm 0.161.0, a debug build of this branch) running the real Kimi Code, launched by path with a scratch `HOME` and `KIMI_CODE_HOME` whose `config.toml` names one `openai`-type provider at `http://127.0.0.1:<port>/v1` with a fake key (a local stub of the Chat Completions API, crates/aterm-lab), no login, in a project folder that is no git work tree, and whose `tui.toml` says `tui_mode = "fullscreen"` · the stub's `tool` mode asks for `Bash` `{command: "cat 说明文档.md\nls 项目目录/\nwc -l 数据集.csv\nmv 旧目录 新目录\nrm -rf build-output", description: "Look around, then tidy the folders"}`: the short screen squeezes the approval panel's docked body to two rows of its eight (cwd, `Dangerous: recursive delete`, five lines, description), so its scrollbar is a thumb alone (`┃` on both rows, `thumbHeight` at least two); after two `shift+↓` the rows show `$ cat 说明文档.md` and `· ls 项目目录/`, each holding four wide characters (the row text carries one character per two-cell glyph, so each row is 140 characters to its bar in the screen's last column); then `4` opened the feedback line, `▶ 4. Reject with feedback` focused and the key row `Type feedback · ↵ submit.`, which carries no `shift+↑/↓ scroll` hint · the lab's random project dir is spelled /private/tmp/at.kfRy here
+ ● Running a command · $ cat 说明文档.md…
+ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   ▶ Run this command?
+
+   $ cat 说明文档.md                                                                                                                           ┃
+   · ls 项目目录/                                                                                                                              ┃
+
+     1. Approve once
+     2. Approve for this session
+     3. Reject
+   ▶ 4. Reject with feedback
+
+   Type feedback · ↵ submit.
+ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────

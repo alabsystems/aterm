@@ -1244,6 +1244,12 @@ impl Admitted {
 /// interrupt ends the run there ([`Checks::interrupted`]).
 /// With no ledger (no home) or one that cannot be written, a check starts unclaimed and says
 /// so.
+///
+/// Each claim asked writes one `kind=admission` row (Continuum TM-1, [`aterm_capacity::telemetry`])
+/// where its ledger is this user's own: at the look that admits it, or at the end that leaves it
+/// unclaimed (its ledger unusable, its claim file gone, its timing unqualified), never one a look.
+/// A check given up while it waits (the run interrupted, [`Self::stopped`], or the gate dropped)
+/// writes one too, `outcome=fail`.
 pub struct Admission<'m> {
     ledger: Option<aterm_capacity::Ledger>,
     machine: &'m dyn aterm_capacity::Machine,
@@ -1259,6 +1265,9 @@ pub struct Admission<'m> {
 struct Head {
     name: String,
     waiter: aterm_capacity::Waiter,
+    /// Its admission's row, owed from its entry to its decision; given up undecided, it writes
+    /// that of a wait stopped.
+    owed: aterm_capacity::telemetry::Owed,
     /// How it is taken, decided as it entered.
     taken: Taken,
     /// When it entered, on the slots' clock ([`Checks::now`]).
@@ -1321,7 +1330,7 @@ impl<'m> Admission<'m> {
         now: Duration,
         say: &mut dyn FnMut(&str),
     ) -> Option<Admitted> {
-        use aterm_capacity::{Admit, Polled, Short, span};
+        use aterm_capacity::{Admit, Error, Polled, Short, span};
         if job.need == 0 {
             return Some(Admitted::unclaimed());
         }
@@ -1332,6 +1341,8 @@ impl<'m> Admission<'m> {
             ));
             return Some(Admitted::unclaimed());
         };
+        // Another check at the gate gives up the one that waited there, whose row says so as it
+        // goes ([`aterm_capacity::telemetry::Owed`]).
         if self.head.as_ref().is_some_and(|h| h.name != job.name) {
             self.head = None;
         }
@@ -1368,23 +1379,28 @@ impl<'m> Admission<'m> {
         };
         let mut head = match self.head.take() {
             Some(head) => head,
-            None => match aterm_capacity::Waiter::enter(ledger, self.machine, need) {
-                Ok(waiter) => Head {
-                    name: job.name.clone(),
-                    waiter,
-                    taken,
-                    entered: now,
-                    looked: None,
-                    said: None,
-                    short: None,
-                },
-                Err(e) => {
-                    say(&format!(
-                        "capacity: {what} starts unclaimed: the capacity ledger could not be used: {e}"
-                    ));
-                    return Some(Admitted::unclaimed());
+            None => {
+                let owed = aterm_capacity::telemetry::Owed::of(ledger, &need);
+                match aterm_capacity::Waiter::enter(ledger, self.machine, need) {
+                    Ok(waiter) => Head {
+                        name: job.name.clone(),
+                        waiter,
+                        owed,
+                        taken,
+                        entered: now,
+                        looked: None,
+                        said: None,
+                        short: None,
+                    },
+                    Err(e) => {
+                        say(&format!(
+                            "capacity: {what} starts unclaimed: the capacity ledger could not be used: {e}"
+                        ));
+                        owed.decided(Err(&Error::Ledger(e)));
+                        return Some(Admitted::unclaimed());
+                    }
                 }
-            },
+            }
         };
         if head
             .looked
@@ -1397,6 +1413,7 @@ impl<'m> Admission<'m> {
         if head.taken != Taken::Fits {
             return match head.waiter.force(self.machine) {
                 Ok(aterm_capacity::Forced::Admitted(claim, would)) => {
+                    head.owed.decided(Ok(&claim));
                     if head.said.is_some() {
                         say(&format!("capacity: {what} admitted after {}", span(waited)));
                     }
@@ -1432,6 +1449,7 @@ impl<'m> Admission<'m> {
                 }
                 Err(e) => {
                     say(&format!("capacity: {what} starts unclaimed: {e}"));
+                    head.owed.decided(Err(&Error::Ledger(e)));
                     Some(Admitted::unclaimed())
                 }
             };
@@ -1445,13 +1463,17 @@ impl<'m> Admission<'m> {
                     "capacity: {what} starts unclaimed after waiting {} at the launch gate: {e}",
                     span(waited)
                 ));
+                head.owed.decided(Err(&Error::Ledger(e)));
                 Some(Admitted::unclaimed())
             }
+            // It has left the queue: the next pass enters it again, a new admission.
             Polled::Unqualified(why) => {
                 say(&format!("capacity: {what} timing admission refused: {why}"));
+                head.owed.decided(Err(&Error::Timing(why)));
                 None
             }
             Polled::Admitted(claim) => {
+                head.owed.decided(Ok(&claim));
                 if head.said.is_some() {
                     say(&format!("capacity: {what} admitted after {}", span(waited)));
                 }
@@ -1492,6 +1514,16 @@ impl Admission<'_> {
     #[must_use]
     pub fn waiting(&self) -> Option<String> {
         self.head.as_ref().and_then(|h| h.short.clone())
+    }
+
+    /// The run stopped, by `signal` where one interrupted it, while the check at the head of the
+    /// queue may wait: that wait ends, its claim leaving the queue, and its admission row says
+    /// so ([`aterm_capacity::telemetry::Owed::stopped`]). With no check waiting, nothing.
+    pub fn stopped(&mut self, signal: Option<i32>) {
+        if let Some(Head { waiter, owed, .. }) = self.head.take() {
+            drop(waiter);
+            owed.stopped(signal);
+        }
     }
 }
 
@@ -1989,6 +2021,10 @@ impl Bench for Machine {
             out: Box::new(&mut *out),
         };
         let ran = run_slots(jobs, slots, cfg.budget, &mut real, done);
+        // Only an interrupt ends a run while a check waits at the gate.
+        if matches!(ran, Err(Stopped::Interrupted(_))) {
+            real.admission.stopped(crate::interrupt::caught());
+        }
         let locks = std::mem::take(&mut real.locks);
         drop(real);
         drop(keeper);
@@ -8186,6 +8222,204 @@ c	100	100	{GIB}	2026-11-01T00:00:00Z		failed
         assert_eq!(r, Err(Stopped::Interrupted(None)));
         assert_eq!(starts, [("beside".to_owned(), Duration::ZERO)]);
         assert_eq!(left, 0, "its place left the queue with the gate");
+    }
+
+    /// A claim of `gib` GiB another holder keeps in `l`, admitted at its one look.
+    fn held_by_another(
+        l: &aterm_capacity::Ledger,
+        m: &aterm_capacity::Fixed,
+        gib: u64,
+    ) -> aterm_capacity::Claim {
+        match aterm_capacity::Waiter::enter(l, m, aterm_capacity::Need::new("hold").mem_gib(gib))
+            .expect("the holder entered")
+            .poll(m)
+        {
+            aterm_capacity::Polled::Admitted(c) => c,
+            other => panic!("the holder is not admitted: {other:?}"),
+        }
+    }
+
+    /// The `kind`, `outcome`, `stop`, `sig` and `meter` of `row`.
+    fn admission_words(
+        row: &aterm_telemetry::Row,
+    ) -> (
+        aterm_telemetry::Kind,
+        aterm_telemetry::Outcome,
+        aterm_telemetry::Stop,
+        Option<i32>,
+        aterm_telemetry::Meter,
+    ) {
+        (row.kind.clone(), row.outcome, row.stop, row.sig, row.meter)
+    }
+
+    /// A CHECK'S ADMISSION AT THE GATE WRITES ONE ROW, WHERE IT IS DECIDED (TM-1 review): the
+    /// gate drives a waiter of its own across passes of the slots, not `admit_with`, so its
+    /// `kind=admission` row is written at the look that decides, however many looks waited.
+    /// Three looks short of memory beside a held claim write none, and the look after that claim
+    /// is let go writes one, admitted, with the wait its record's stamps say (the one its check's
+    /// build rows read). Under `--admit now`, three looks that met another admission holding the
+    /// ledger's lock write none, and the look in its turn writes one. NEGATIVE CONTROLS (by hand):
+    /// the gate writing no row, as before: none at either decision; a row each look: three for
+    /// the looks that waited.
+    #[test]
+    fn a_checks_admission_at_the_gate_writes_one_row_where_it_is_decided() {
+        use aterm_capacity::telemetry::{capture, wait};
+        use aterm_telemetry::{Kind, Meter, Outcome, Stop};
+        let (_d, l) = ledger();
+        let m = aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(48, 40, 14));
+        let at = |n: u64| Duration::from_secs(2 * n);
+        let admitted_row = (Kind::Admission, Outcome::Ok, Stop::Exit, None, Meter::Exact);
+
+        let hold = held_by_another(&l, &m, 30);
+        let mut g = gate(&l, &m, aterm_capacity::Admit::Wait);
+        let check = needing("a", 20);
+        let ((), rows) = capture(l.clone(), || {
+            for n in 0..3 {
+                assert!(
+                    g.admit(&check, at(n), &mut |_| {}).is_none(),
+                    "20 GiB beside 30 waits at look {n}"
+                );
+            }
+        });
+        assert!(rows.is_empty(), "no row a look: {rows:?}");
+        drop(hold);
+        let (admitted, rows) = capture(l.clone(), || g.admit(&check, at(3), &mut |_| {}));
+        let admitted = admitted.expect("admitted at the look after the holder let go");
+        let claim = admitted._claim.as_ref().expect("its claim");
+        assert_eq!(rows.len(), 1, "one row however many looks: {rows:?}");
+        assert_eq!(admission_words(&rows[0]), admitted_row);
+        assert_eq!(
+            rows[0].wait_ms,
+            wait(claim.asked_ms(), claim.record().held.map(|h| h.admitted_ms)),
+            "the wait its record's stamps say"
+        );
+        drop(admitted);
+        let ((), rows) = capture(l.clone(), || drop(g));
+        assert!(rows.is_empty(), "a gate with none waiting: {rows:?}");
+
+        let mut g = gate(&l, &m, aterm_capacity::Admit::Now);
+        let check = needing("b", 4);
+        let turn = l.hold_turn().expect("the ledger's lock").expect("free");
+        let ((), rows) = capture(l.clone(), || {
+            for n in 0..3 {
+                assert!(
+                    g.admit(&check, at(n), &mut |_| {}).is_none(),
+                    "not in its turn at look {n}"
+                );
+            }
+        });
+        assert!(rows.is_empty(), "no row a look: {rows:?}");
+        drop(turn);
+        let (admitted, rows) = capture(l.clone(), || g.admit(&check, at(3), &mut |_| {}));
+        assert!(admitted.is_some(), "admitted in its turn");
+        assert_eq!(rows.len(), 1, "one row however many looks: {rows:?}");
+        assert_eq!(admission_words(&rows[0]), admitted_row);
+        drop((admitted, g));
+        assert!(l.list().expect("the ledger").is_empty());
+    }
+
+    /// A CHECK GIVEN UP WHILE IT WAITS AT THE GATE WRITES ONE ROW (TM-1 review): its admission
+    /// was asked, so its row is owed however its wait ends. A run stopped by a signal while the
+    /// check waits ends that wait, its row `outcome=fail` with the signal ([`Admission::stopped`]),
+    /// and neither a second stop nor the gate's drop after writes another. A run interrupted
+    /// through the slots, its gate dropped with the check waiting, writes one with no signal; so
+    /// does a check the gate gave up for another, and that other as the gate drops. A check whose
+    /// claim file was removed while it waited (it starts unclaimed) writes one, its ledger's
+    /// failure. NEGATIVE CONTROL (by hand: a wait given up writing no row, as before): none for
+    /// each but the last.
+    #[cfg(unix)]
+    #[test]
+    fn a_check_given_up_at_the_gate_writes_one_row() {
+        use aterm_capacity::telemetry::capture;
+        use aterm_telemetry::{Kind, Meter, Outcome, Stop};
+        let (_d, l) = ledger();
+        let m = aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(48, 40, 14));
+        let given_up = (
+            Kind::Admission,
+            Outcome::Fail,
+            Stop::Exit,
+            None,
+            Meter::Stamped,
+        );
+        let waits = |g: &mut Admission<'_>, name: &str, n: u64| {
+            assert!(
+                g.admit(&needing(name, 20), Duration::from_secs(2 * n), &mut |_| {})
+                    .is_none(),
+                "{name}'s 20 GiB beside 30 waits"
+            );
+        };
+        let hold = held_by_another(&l, &m, 30);
+
+        let mut g = gate(&l, &m, aterm_capacity::Admit::Wait);
+        let ((), rows) = capture(l.clone(), || {
+            waits(&mut g, "a", 0);
+            g.stopped(Some(15));
+            g.stopped(Some(15));
+            drop(g);
+        });
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(
+            admission_words(&rows[0]),
+            (
+                Kind::Admission,
+                Outcome::Fail,
+                Stop::Signal,
+                Some(15),
+                Meter::Stamped
+            )
+        );
+        assert_eq!(l.list().expect("the ledger").len(), 1, "its wait left");
+
+        let mut f = fake(&[("a", 5)]);
+        f.gate = Some(gate(&l, &m, aterm_capacity::Admit::Wait));
+        f.interrupt_at = Some(Duration::from_secs(30));
+        let ((), rows) = capture(l.clone(), || {
+            let (r, _) = slots(&mut f, vec![needing("a", 20)], 1, 100);
+            assert!(matches!(r, Err(Stopped::Interrupted(Some(_)))), "{r:?}");
+            f.gate = None;
+        });
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(admission_words(&rows[0]), given_up);
+
+        let mut g = gate(&l, &m, aterm_capacity::Admit::Wait);
+        let ((), rows) = capture(l.clone(), || {
+            waits(&mut g, "a", 0);
+            waits(&mut g, "b", 1);
+        });
+        assert_eq!(rows.len(), 1, "a, given up for b: {rows:?}");
+        assert_eq!(admission_words(&rows[0]), given_up);
+        let ((), rows) = capture(l.clone(), || drop(g));
+        assert_eq!(rows.len(), 1, "b, as the gate drops: {rows:?}");
+        assert_eq!(admission_words(&rows[0]), given_up);
+
+        let mut g = gate(&l, &m, aterm_capacity::Admit::Wait);
+        let ((), rows) = capture(l.clone(), || {
+            waits(&mut g, "a", 0);
+            for e in l.dir().read_dir().expect("the ledger").flatten() {
+                if e.file_name().to_string_lossy().ends_with(".wait") {
+                    fs::remove_file(e.path()).expect("a's file removed");
+                }
+            }
+            assert!(
+                g.admit(&needing("a", 20), Duration::from_secs(2), &mut |_| {})
+                    .is_some_and(|a| a.cover().is_none()),
+                "it starts unclaimed"
+            );
+            drop(g);
+        });
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(
+            admission_words(&rows[0]),
+            (
+                Kind::Admission,
+                Outcome::Fail,
+                Stop::Unknown,
+                None,
+                Meter::Stamped
+            )
+        );
+        drop(hold);
+        assert!(l.list().expect("the ledger").is_empty());
     }
 
     /// A check claims its recorded peak and a fifth more, at least 1 GiB more; with no peak

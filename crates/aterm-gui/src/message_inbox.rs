@@ -230,32 +230,19 @@ thread_local! {
     static LANE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Every test that uses the inbox holds this shared ([`own_lane_for_test`],
-/// [`lane_test_guard`]); the one that poisons the inbox holds it alone
-/// ([`whole_inbox_for_test`]).
-#[cfg(test)]
-static INBOX_TESTS: std::sync::RwLock<()> = std::sync::RwLock::new(());
-
 /// Assign the calling test thread a dedicated inbox lane for isolated testing.
 #[cfg(test)]
 pub(crate) fn own_lane_for_test() -> OwnLane {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    let shared = INBOX_TESTS
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let lane = NEXT.fetch_add(1, Ordering::Relaxed);
     LANE.with(|at| at.set(lane));
-    OwnLane {
-        lane,
-        _shared: shared,
-    }
+    OwnLane { lane }
 }
 
 /// RAII guard resetting the thread's test inbox lane on drop.
 #[cfg(test)]
 pub(crate) struct OwnLane {
     lane: u64,
-    _shared: std::sync::RwLockReadGuard<'static, ()>,
 }
 
 #[cfg(test)]
@@ -277,12 +264,14 @@ impl Drop for OwnLane {
     }
 }
 
-/// Acquire exclusive access to all inbox lanes for poison-recovery tests.
+/// Empty every lane, for the test that poisons the inbox, which runs alone in a child of the
+/// test binary ([`crate::test_alone::alone`]): the inbox and its poison are the whole process's.
 #[cfg(test)]
-pub(crate) fn whole_inbox_for_test() -> std::sync::RwLockWriteGuard<'static, ()> {
-    let whole = INBOX_TESTS
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+pub(crate) fn whole_inbox_for_test() {
+    assert!(
+        crate::test_alone::in_child(),
+        "the whole inbox is every test's: a test that takes it runs alone"
+    );
     let mut q = INBOX
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -294,27 +283,17 @@ pub(crate) fn whole_inbox_for_test() -> std::sync::RwLockWriteGuard<'static, ()>
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clear();
     EXCEPTIONS_PENDING.store(false, Ordering::Relaxed);
-    whole
 }
 
-/// Serialize tests that operate on the default inbox lane `0`.
+/// Run the calling test alone in a child of the test binary ([`crate::test_alone::alone`]):
+/// `true` in the child, which runs the body on lane `0` with no other test's message in it.
+/// Lane `0` is the lane of every thread no test gave one of its own, a test's workers included,
+/// so in the lib-test process any test's message can land in it; a test that reads lane `0`
+/// starts with `if !lane_zero_alone() { return; }`.
 #[cfg(test)]
-pub(crate) fn lane_test_guard() -> LaneZero {
-    static LANE_TEST: Mutex<()> = Mutex::new(());
-    let shared = INBOX_TESTS
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    LaneZero {
-        _alone: LANE_TEST.lock().unwrap_or_else(|p| p.into_inner()),
-        _shared: shared,
-    }
-}
-
-/// RAII guard holding exclusive test access to inbox lane `0`.
-#[cfg(test)]
-pub(crate) struct LaneZero {
-    _alone: std::sync::MutexGuard<'static, ()>,
-    _shared: std::sync::RwLockReadGuard<'static, ()>,
+#[track_caller]
+pub(crate) fn lane_zero_alone() -> bool {
+    crate::test_alone::alone()
 }
 
 #[cfg(test)]
@@ -330,7 +309,10 @@ mod tests {
     /// holding the lock, a queue is refused and a drain answers empty, never a second panic.
     #[test]
     fn the_pre_app_inbox_is_poison_tolerant_and_bounded() {
-        let _whole = whole_inbox_for_test();
+        if !crate::test_alone::alone() {
+            return;
+        }
+        whole_inbox_for_test();
         assert!(!INBOX_PENDING.load(Ordering::Acquire));
         for i in 0..(INBOX_CAP + 8) {
             queue_message(msg(&format!("warning {i}")));
@@ -383,6 +365,23 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["before the poison", "after the poison"],
             "what the poison stranded comes out ahead of what followed it"
+        );
+    }
+
+    /// A test that reads lane `0` runs where no other test queued into it: a message another
+    /// test of the lib-test process queued on lane `0` meanwhile is not in its drain.
+    #[test]
+    fn a_lane_zero_test_drains_no_message_another_test_queued() {
+        const STRAY: &str = "another test's message on lane 0";
+        if !crate::test_alone::in_child() {
+            queue_message(msg(STRAY));
+        }
+        if !lane_zero_alone() {
+            return;
+        }
+        assert!(
+            take_queued().iter().all(|m| m.message.title != STRAY),
+            "a lane 0 drain took another test's message"
         );
     }
 

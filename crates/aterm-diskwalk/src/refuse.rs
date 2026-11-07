@@ -294,6 +294,19 @@ pub fn within(path: &Path, root: &Path, fold: bool) -> bool {
         .any(|p| roots.iter().any(|r| under(p, r, fold)))
 }
 
+/// `path` relative to `root` where it lies at or under it in some spelling ([`within`]): the
+/// components of `path` past `root`'s, spelled as `path` spells them (empty for `root` itself).
+#[must_use]
+pub fn rel_within(path: &Path, root: &Path, fold: bool) -> Option<PathBuf> {
+    let roots = forms(root, fold);
+    forms(path, fold).into_iter().find_map(|p| {
+        roots
+            .iter()
+            .find(|r| under(&p, r, fold))
+            .map(|r| p.components().skip(r.components().count()).collect())
+    })
+}
+
 /// Whether `dir` is a mount point of `mounts`, in any spelling.
 #[must_use]
 pub fn is_mount_point(dir: &Path, mounts: &Table, fold: bool) -> bool {

@@ -291,6 +291,35 @@ pub fn publish_initial_setup_status(status: SetupStatus) {
     });
 }
 
+/// The setup worker's already-owned observations and current stage, read without
+/// consulting setup records, native services, or the network.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SetupReadings {
+    /// The current typed readings, with at most one per subject.
+    pub observed: Vec<aterm_types::macos_setup::Observation>,
+    /// Change notification for the readings, independent of stage activity.
+    pub observed_generation: u64,
+    /// The source described by the vault and repository readings.
+    pub observed_vault_url: Option<String>,
+    /// The settings whose stage is running now.
+    pub running: Vec<Setting>,
+}
+
+impl SetupReadings {
+    fn overlay(self, status: &mut SetupStatus) {
+        status.observed = self.observed;
+        status.observed_generation = self.observed_generation;
+        status.observed_vault_url = self.observed_vault_url;
+        status.running = self.running;
+    }
+}
+
+/// Publish already-owned readings. The pure callback is invoked when delivered,
+/// so a queued wake cannot reinstall an earlier observation or stage state.
+pub fn publish_initial_setup_readings(read: fn() -> SetupReadings) {
+    crate::workstation_setup::send_setup_wake(Wake::InitialSetupReadings(read));
+}
+
 /// The dev seam that shows System State a fixed scenario in place of the
 /// setup worker (`crate::system_state::fixture_status`): its actions are inert.
 const FIXTURE_SEAM: &str = "ATERM_DEV_SYSTEM_STATE_FIXTURE";
@@ -446,6 +475,9 @@ pub(crate) struct Host {
     observed_access_revision: Option<u64>,
     action_refusal: Option<SetupStatusRow>,
     latest_status: SetupStatus,
+    /// Read the worker's current owned facts at delivery. No observation or
+    /// admission is retained here, and full status replies keep their other fields.
+    readings: Option<fn() -> SetupReadings>,
     /// The access step last published with the status.
     access_step: Option<Access>,
     /// The permission walk's page last published with the status (the card's `Step 1 of 3`).
@@ -845,7 +877,7 @@ impl App {
     pub(crate) fn receive_system_state_status(
         &mut self,
         generation: Option<u64>,
-        status: SetupStatus,
+        mut status: SetupStatus,
     ) {
         let Some(generation) = generation else {
             self.system_state_host.generation = self.system_state_host.generation.wrapping_add(1);
@@ -887,7 +919,25 @@ impl App {
         if !changing {
             self.observe_initial_setup_permissions(status.permissions);
         }
+        if let Some(read) = self.system_state_host.readings {
+            read().overlay(&mut status);
+        }
         self.publish_system_state(status);
+    }
+
+    /// Refresh only the already-owned observation fields. This does not invoke
+    /// the full status publisher's repair, tool-install or polling paths.
+    pub(crate) fn receive_system_state_readings(&mut self, read: fn() -> SetupReadings) {
+        self.system_state_host.readings = Some(read);
+        read().overlay(&mut self.system_state_host.latest_status);
+        let (status, _) =
+            self.project_system_state_status(self.system_state_host.latest_status.clone());
+        let changed = self.native_runtime.publish_system_state(status);
+        self.refresh_system_state_menu_line();
+        self.refresh_system_state_tab_indicators();
+        if changed {
+            self.request_redraw_system_state_windows();
+        }
     }
 
     pub(crate) fn offer_system_state(&mut self, request: Request) {

@@ -58,9 +58,9 @@ pub const RING_WASH: f32 = 0.14;
 #[must_use]
 #[inline]
 pub const fn ring_ink(key: &RingKey) -> u32 {
-    let (g, f) = (key.ground, key.fg);
+    let (g, f) = (key.ground & 0x00FF_FFFF, key.fg & 0x00FF_FFFF);
     let ink = match key.hue {
-        RingHue::Rule(rule) => rule,
+        RingHue::Rule(rule) => rule & 0x00FF_FFFF,
         RingHue::Neutral => mix(g, f, 0.30),
     };
     floor_contrast_keeping_hue(ink, g, RING_CONTRAST)

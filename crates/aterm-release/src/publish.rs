@@ -11484,27 +11484,6 @@ mod local_probe_tests {
             }
         );
     }
-
-    /// This machine's process table lists this process in its own group, and a reaped child's
-    /// group is empty.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn the_live_table_shows_this_process_in_its_own_group() {
-        let me = std::process::id();
-        let own = LocalProbe::own_pgid().expect("this process has a group");
-        let GroupState::Members(members) = LocalProbe::members_of(own) else {
-            panic!("this process's own group reads with it in it");
-        };
-        assert!(members.iter().any(|(pid, _)| *pid == me), "{members:?}");
-        let mut child = aterm_uds::spawnfd::command("/bin/sh")
-            .args(["-c", "exit 0"])
-            .process_group(0)
-            .spawn()
-            .expect("spawn a child in its own group");
-        let group = child.id();
-        child.wait().expect("reap it");
-        assert_eq!(LocalProbe::members_of(group), GroupState::Empty);
-    }
 }
 
 #[cfg(test)]

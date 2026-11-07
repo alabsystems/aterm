@@ -788,6 +788,8 @@ pub(crate) mod imp {
     /// Open `path` one component at a time from `/`, each with `O_NOFOLLOW` relative to its parent,
     /// and never look a name up in a cloud placeholder on the way: the lookup would download it.
     fn open_chain(path: &Path) -> Result<OwnedFd, Refusal> {
+        #[cfg(any(test, debug_assertions))]
+        crate::touched::note(path);
         let mut fd = open_slash()?;
         for c in path.components() {
             match c {

@@ -1,0 +1,51 @@
+# kimi 2.5.2 · MEASURED 2026-11-06, `aterm ctl text` of an `aterm-lab kimi` instance (a private headless aterm, 144x50, aterm 0.161.0, a debug build of main) running the real Kimi Code, launched by path with a scratch `HOME` and `KIMI_CODE_HOME` whose `config.toml` names one `openai`-type provider at `http://127.0.0.1:<port>/v1` with a fake key (a local stub of the Chat Completions API, crates/aterm-lab), no login, in a project folder that is no git work tree (so Kimi asks before writing), and whose `tui.toml` says `tui_mode = "fullscreen"`, so the panel docks over the transcript in the composer's place with no `context: N%` footer under it and caps its body at six rows (`maxBodyRows`), scrolling one taller under a scrollbar in the screen's last column, one past the rules (`│` its track, `┃` its thumb), and ending its focused key row `· shift+↑/↓ scroll` · that write after six `shift+↓`: the dock scrolled to the block's foot, its path row gone above the six rows shown (lines 6 to 10 and the hidden-lines row), the thumb on the last three rows · the lab's random project dir is spelled /private/tmp/at.HOk4 here
+ │  Directory: /private/tmp/at.HOk4/proj                                                                                                      │
+ │  Session:   session_e8fc3198-7953-4295-bb3c-1540b43b345b                                                                                   │
+ │  Model:     lab-model                                                                                                                      │
+ │  Version:   2.5.2                                                                                                                          │
+ │                                                                                                                                            │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+   No session yet — one will be created on your first message.
+
+ ❯ toolstart bash
+
+ ✗ Ran a command · $ cat README.md…
+   Tool "Bash" was not run because the user rejected the approval request.
+
+   Rejected: Running: cat README.md
+ rm -rf build-output
+
+ ● Tool call done. Result: Wall time: 0.000 seconds <system>ERROR: Tool execution failed.</system> Tool "Bash" was not run because the user
+   rejected the approval request.
+
+ ❯ toolstart write
+
+ ● Using Write (/private/tmp/at.HOk4/proj/notes-for-the-lab.txt)
+     31  line 31 of the notes the lab wrote to fill the box
+     32  line 32 of the notes the lab wrote to fill the box
+     33  line 33 of the notes the lab wrote to fill the box
+     34  line 34 of the notes the lab wrote to fill the box
+     35  line 35 of the notes the lab wrote to fill the box
+     36  line 36 of the notes the lab wrote to fill the box
+     37  line 37 of the notes the lab wrote to fill the box
+     38  line 38 of the notes the lab wrote to fill the box
+     39  line 39 of the notes the lab wrote to fill the box
+     40  line 40 of the notes the lab wrote to fill the box
+ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   ▶ Write this file?
+
+      6  line 06 of the notes the lab wrote to fill the box                                                                                    │
+      7  line 07 of the notes the lab wrote to fill the box                                                                                    │
+      8  line 08 of the notes the lab wrote to fill the box                                                                                    │
+      9  line 09 of the notes the lab wrote to fill the box                                                                                    ┃
+     10  line 10 of the notes the lab wrote to fill the box                                                                                    ┃
+        … 30 more lines hidden (ctrl+e to preview)                                                                                             ┃
+
+   ▶ 1. Approve once
+     2. Approve for this session
+     3. Reject
+     4. Reject with feedback
+
+   ↑/↓ select · 1/2/3/4 choose · ↵ confirm · ctrl+e preview · shift+↑/↓ scroll
+ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────

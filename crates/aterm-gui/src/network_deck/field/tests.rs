@@ -51,7 +51,6 @@ fn need(sid: &str, word: NeedWord) -> FleetNeed {
         what: None,
         claim: None,
         carries_on: false,
-        ids: Vec::new(),
     }
 }
 

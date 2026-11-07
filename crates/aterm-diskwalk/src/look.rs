@@ -82,6 +82,8 @@ pub fn markers_at<const N: usize>(
         let fd = crate::walk::imp::open_checked(&canon)?;
         let mut out = [None; N];
         for (slot, name) in out.iter_mut().zip(names) {
+            #[cfg(any(test, debug_assertions))]
+            crate::touched::note(&canon.join(name));
             let e = crate::list::portable::stat_at(fd.as_fd(), name.as_bytes());
             *slot = match e.error {
                 Some(libc::ENOENT) => None,
@@ -119,6 +121,8 @@ pub fn link_target(dir: &Path, name: &str, policy: &Policy) -> Result<Option<Pat
         use std::os::fd::AsRawFd as _;
         use std::os::unix::ffi::OsStrExt as _;
         let fd = crate::walk::imp::open_checked(&canon)?;
+        #[cfg(any(test, debug_assertions))]
+        crate::touched::note(&canon.join(name));
         let Ok(cname) = std::ffi::CString::new(name) else {
             return Ok(None);
         };

@@ -94,6 +94,11 @@ impl Key {
     fn capability(&self, binding: &Binding) -> Digest {
         self.digest(b"capability\0", binding.capability.as_bytes())
     }
+
+    fn legacy_prepare(&self, prepare: &Prepare) -> Option<Digest> {
+        let text = Request::prepare(prepare.clone()).encode_legacy_cold()?;
+        Some(self.digest(b"prepare\0", text.as_bytes()))
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1233,12 +1238,16 @@ fn observe_phase_at(
         return Ok(None);
     };
     let expected = receipt(&key, prepare, binding)?;
+    let legacy = key.legacy_prepare(prepare);
     let epoch = key.digest(b"epoch\0", prepare.host_epoch.as_bytes());
     Ok(view
         .entries
         .get(&expected.operation)
         .filter(|entry| {
-            entry.receipt == expected
+            entry.receipt.operation == expected.operation
+                && entry.receipt.capability == expected.capability
+                && (entry.receipt.prepare == expected.prepare
+                    || Some(entry.receipt.prepare) == legacy)
                 && entry.epoch == Some(epoch)
                 && entry.state == IssuerState::NoExec
         })
@@ -1385,13 +1394,14 @@ fn observe_prepare_at(paths: &Paths, prepare: &Prepare) -> io::Result<Option<Obs
         return Ok(None);
     };
     let digest = key.prepare(prepare)?;
+    let legacy = key.legacy_prepare(prepare);
     Ok(view
         .entries
         .get(&key.operation(&prepare.id))
         .filter(|entry| {
             entry.state == IssuerState::NoExec
                 && entry.account.is_none()
-                && entry.receipt.prepare == digest
+                && (entry.receipt.prepare == digest || Some(entry.receipt.prepare) == legacy)
         })
         .map(|entry| entry.observed))
 }

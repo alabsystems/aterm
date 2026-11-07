@@ -30,7 +30,7 @@ use crate::wall::{Placement, Wall, WallKind};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 15, "0.15");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 16, "0.16");
 
 /// The usage limit is spent: the server's quota words 2.3.3's patterns matched, and its code
 /// (lowercase).
@@ -289,8 +289,11 @@ fn titled(row: &str) -> &str {
 /// full-width rules ([`rule`]) holds it, the lower one the last drawn row (the trust prompt,
 /// which draws no footer) or standing right over the footer's two rows, the screen's last drawn
 /// ones, its `context: N%` row the second ([`footer_used`]), and the first drawn row under the
-/// upper rule is one of the titles (`TITLES`, [`approval_of`]). The session picker stands on the
-/// same rules under its own title and is none.
+/// upper rule is one of the titles (`TITLES`, [`approval_of`]). The upper rule is the nearest
+/// one over the lower at its column and of its width: the panel draws both at its own column
+/// (`renderHead`, `renderFoot`) and every row between them further in, so a rule a row of the
+/// panel draws (a plan option's description, a command's line) is none and the box is read under
+/// its own title. The session picker stands on the same rules under its own title and is none.
 fn card(rows: &[String]) -> Option<Card> {
     if composer_rows(rows).is_some() {
         return None;
@@ -304,7 +307,13 @@ fn card(rows: &[String]) -> Option<Card> {
     if !footed {
         return None;
     }
-    let upper = rows[..lower].iter().rposition(|r| rule(r))?;
+    let edge = crate::phase::leading_spaces(&rows[lower]);
+    let span = crate::text::trim(&rows[lower]).chars().count();
+    let upper = rows[..lower].iter().rposition(|r| {
+        rule(r)
+            && crate::phase::leading_spaces(r) == edge
+            && crate::text::trim(r).chars().count() == span
+    })?;
     let title = (upper + 1..lower).find(|&i| !crate::text::blank(&rows[i]))?;
     let named = titled(&rows[title]);
     let kind = TITLES
@@ -348,6 +357,25 @@ fn choice(row: &str, edge: usize) -> Option<(Option<u8>, bool, &str)> {
         .map(|(n, label)| (Some(n), false, label))
 }
 
+/// The rows a command's or a file's approval draws its options on, over its key row `keys` and
+/// below `from`: the run of drawn rows over the blank row above the key row, up to the blank row
+/// over it. Kimi Code opens and closes that run with a blank row (`renderFoot`, read in 2.5.2's
+/// binary; measured on every 2.4.0 and 2.5.2 approval), and those approvals' choices carry no
+/// description (`DEFAULT_APPROVAL_CHOICES`) that could draw a row of its own between them, so
+/// the run holds them all, and a row above it shaped like an option (a command's wrap, drawn at
+/// an unfocused option's column) is none and stays in the body it belongs to.
+fn option_block(rows: &[String], from: usize, keys: usize) -> std::ops::Range<usize> {
+    let end = (from..keys)
+        .rev()
+        .find(|&i| !crate::text::blank(&rows[i]))
+        .map_or(from, |i| i + 1);
+    let start = (from..end)
+        .rev()
+        .find(|&i| crate::text::blank(&rows[i]))
+        .map_or(from, |i| i + 1);
+    start..end
+}
+
 /// A numbered option's number and label: `1. Approve once`, `[1] Red (Recommended)`.
 fn numbered(text: &str) -> Option<(u8, &str)> {
     let (digits, label) = match text.strip_prefix('[') {
@@ -373,35 +401,67 @@ fn first_shown(rows: &[String], from: usize, to: usize) -> u8 {
         .unwrap_or(1)
 }
 
-/// How many cells `text` may take on the screen: two for each character past ASCII, so a wide
-/// character is never counted short.
-fn cells(text: &str) -> usize {
-    text.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
+/// Whether an approval panel's key row `row` shows its body drawn whole: the focused panel's own
+/// key row drawn to its end, `… · ↵ confirm`, past a file block's `· ctrl+e preview`
+/// (`renderFoot`, read in 2.5.1's and 2.5.2's binaries; measured on 2.4.0 and 2.5.2). A
+/// fullscreen panel docks its body in at most six rows (`maxBodyRows`, fewer on a short screen)
+/// and scrolls a taller one, and then its focused key row ends `· shift+↑/↓ scroll`
+/// (`bodyOverflows`); the panel draws that hint on no other row, so the feedback line's key row
+/// (`Type feedback · ↵ submit.`) and an unfocused panel's (`esc back to approval`) show nothing,
+/// and neither does one cut at the box's edge (`...`) or clipped at the screen's (its last cell
+/// holds the last glyph written). No column is counted, so no width the grid and the panel
+/// disagree on matters.
+fn keys_show_whole(row: &str) -> bool {
+    let row = crate::text::trim(row);
+    row.ends_with(crate::anchor!("kimi.box.keys.confirm"))
+        || row.ends_with(crate::anchor!("kimi.box.keys.preview"))
 }
 
-/// A body row's words in a box whose rules start `edge` columns in and span `width` cells, short
-/// of the scrollbar a fullscreen panel paints at the box's right edge over a body taller than it
-/// (`│` its track, `┃` its thumb, `█` while it is dragged: `paintScrollbar`, read in 2.5.2's
-/// binary; unmeasured): the glyph is the row's last, after a space, at the edge.
-fn body_words(row: &str, edge: usize, width: usize) -> &str {
-    let text = crate::text::trim(row);
-    let end = crate::phase::leading_spaces(row) + text.chars().count();
-    match text.strip_suffix(['│', '┃', '█']) {
-        Some(rest) if end + 1 >= edge + width && rest.ends_with(' ') => crate::text::trim_end(rest),
-        _ => text,
-    }
+/// Whether a box whose rules start `edge` columns in and span `width` cells, its upper rule on
+/// screen row `upper` and its key row `keys`, shows its body rows `body` drawn whole. Its key row
+/// says so ([`keys_show_whole`]), but its scroll hint is judged off the previous layout
+/// (`bodyOverflows` reads `bodyScroll.canScroll`, which the layout sets only after measuring the
+/// foot, and nothing renders again), so the first frame of a dock squeezed below its body's rows
+/// shows the key row whole over a body drawn in part: measured on 2.5.2, a fourteen-row screen's
+/// panel for `cat README.md` and `git push --force` showing its `cwd` and `$` rows over
+/// `↵ confirm`. Two marks the same frame draws off the current layout disprove it:
+/// - the scrollbar, painted after the layout (`getScrollbarGeometry`) in the screen's last
+///   column, one past the rules, where the panel draws no text of its own: a body row that ends
+///   in its track `│` or its thumb `┃` (`█` under the pointer), or reaches that column (a row the
+///   grid draws wider than Kimi counts, its bar pushed past the screen), is drawn in part;
+/// - the dock's place: the fullscreen root gives the transcript at least one row
+///   (`minSize: 1`) and the dock the rest, so a squeezed dock stands on the screen's second row,
+///   and a box whose upper rule stands there or higher is unproven (an inline box that fills the
+///   screen too). While a box waits the dock hides its activity, queue and side question, and a
+///   squeeze takes a notice's row (`minSize: 0`) before the box's, so a squeezed box tops the
+///   dock; a survey (`shrink: 0`) is the one row kept over it, which moves it lower and leaves
+///   the scrollbar the one mark.
+fn drawn_whole(
+    rows: &[String],
+    upper: usize,
+    body: std::ops::Range<usize>,
+    keys: usize,
+    edge: usize,
+    width: usize,
+) -> bool {
+    keys_show_whole(&rows[keys])
+        && upper >= 2
+        && rows[body].iter().all(|row| {
+            let drawn = row.trim_end();
+            !drawn.ends_with(['│', '┃', '█']) && crate::question::cells(drawn) <= edge + width
+        })
 }
 
 /// Whether a body row's `words` were cut at the box's edge: the panel ends every body row too
 /// wide for it with `...` at its last cells (`truncateToWidth`, read in 2.5.2's binary).
 fn cut(row: &str, words: &str, edge: usize, width: usize) -> bool {
-    let end = crate::phase::leading_spaces(row) + words.chars().count();
+    let end = crate::phase::leading_spaces(row) + crate::question::cells(words);
     words.ends_with("...") && end + 2 >= edge + width
 }
 
 /// The file a file's approval names, in a box whose rules start `edge` columns in and span
-/// `width` cells: its block's first row on `rows` `from..to`, two columns in from the rules, and
-/// whether that row shows it whole. A file written whole draws its path there over its numbered
+/// `width` cells: its block's first row on `rows` `from..to` (a body drawn whole, [`prompt`]),
+/// two columns in from the rules, and whether that row shows it whole. A file written whole draws its path there over its numbered
 /// content; a file's edits draw a diff headed by the counts it adds and removes before the path
 /// (`+1 -1 <path>`, `renderDiffLinesClustered`, read in 2.5.2's binary). Measured on 2.5.2's
 /// write and edit frames; a path cut at the box's edge ([`cut`]) names no file.
@@ -416,7 +476,7 @@ fn file_of(
     if crate::phase::leading_spaces(&rows[row]) != edge + 2 {
         return None;
     }
-    let words = body_words(&rows[row], edge, width);
+    let words = crate::text::trim(&rows[row]);
     let mut text = words;
     for sign in ['+', '-'] {
         let count = text
@@ -432,70 +492,144 @@ fn file_of(
     (!text.is_empty()).then(|| (text, !cut(&rows[row], words, edge, width)))
 }
 
-/// A command's approval ([`prompt`]): its lines, its description, and whether the row read as
-/// its description may instead end its last line.
+/// A command's approval ([`prompt`]): each line's rows, the words its mark opens and then each
+/// row it wraps onto, and whether the block's last row is a wrap, which may be the description.
 #[derive(Debug, Default)]
 struct Shell {
-    lines: Vec<String>,
-    description: String,
-    unsure: bool,
+    lines: Vec<Vec<String>>,
+    described: bool,
 }
 
-/// The command a box whose rules start `edge` columns in and span `width` cells shows on its
-/// rows `from..to` (read in 2.5.2's `renderShellDisplayBlock`, whose shape 2.4.0's approval
-/// frame shows). Its first line follows `$ ` and every later one `· `, both two columns in from
-/// the rules, a line too long for the box wrapping onto rows two columns further in; the
-/// description, when the tool gave one, is the block's last row, at that same depth, never
-/// wrapped. That last row is read as the description when the row over it had room for its
-/// first word, so it cannot be a wrap; otherwise it may be either, and it is kept for both
-/// readings (`unsure`).
-fn shell(rows: &[String], from: usize, to: usize, edge: usize, width: usize) -> Option<Shell> {
-    let at_line = |i: usize| crate::phase::leading_spaces(&rows[i]) == edge + 2;
-    let start =
-        (from..to).find(|&i| at_line(i) && crate::text::trim(&rows[i]).starts_with("$ "))?;
-    let wrap = width.saturating_sub(4);
-    let mut lines: Vec<String> = Vec::new();
-    let mut prev_cells = 0;
-    let mut tail: Option<(String, bool)> = None;
-    for row in &rows[start..to] {
-        let text = body_words(row, edge, width);
+/// The most wraps a command's approval is read across: each is read two ways
+/// ([`Shell::spellings`]), so a command drawn on more is left unread.
+const MAX_WRAPS: usize = 6;
+
+impl Shell {
+    /// The block's last row when it may be the description.
+    fn tail(&self) -> Option<&str> {
+        self.described
+            .then(|| self.lines.last()?.last().map(String::as_str))
+            .flatten()
+    }
+
+    /// The command's lines as drawn, its rows joined by a space, the description left off.
+    fn lines_drawn(&self) -> Vec<String> {
+        let mut lines: Vec<Vec<String>> = self.lines.clone();
+        if self.described
+            && let Some(line) = lines.last_mut()
+        {
+            line.pop();
+        }
+        lines.iter().map(|line| line.join(" ")).collect()
+    }
+
+    /// Every command the block may stand for: its lines joined by a newline, each wrap joined by
+    /// a space (a run of spaces dropped there) and by none (a word cut there, or broken at a
+    /// carriage return), the description's row read off and on.
+    fn spellings(&self) -> Vec<String> {
+        fn spell(lines: &[Vec<String>], tail: bool) -> Vec<String> {
+            let mut out = vec![String::new()];
+            let rows = lines.len();
+            for (n, line) in lines.iter().enumerate() {
+                let kept = if tail || n + 1 < rows {
+                    line.len()
+                } else {
+                    line.len() - 1
+                };
+                for (k, row) in line.iter().take(kept).enumerate() {
+                    let joins: &[&str] = match (n, k) {
+                        (0, 0) => &[""],
+                        (_, 0) => &["\n"],
+                        _ => &[" ", ""],
+                    };
+                    out = out
+                        .iter()
+                        .flat_map(|head| joins.iter().map(move |join| format!("{head}{join}{row}")))
+                        .collect();
+                }
+            }
+            out
+        }
+        if self.lines.is_empty() {
+            return Vec::new();
+        }
+        let mut out = if self.described {
+            spell(&self.lines, false)
+        } else {
+            Vec::new()
+        };
+        out.extend(spell(&self.lines, true));
+        out
+    }
+}
+
+/// The command a box whose rules start `edge` columns in shows on its rows `from..to` (read in
+/// 2.5.2's `renderShellDisplayBlock`, whose shape 2.4.0's approval frame shows). Its first line
+/// follows `$ ` and every later one `· `, both two columns in from the rules (an empty line is
+/// its mark alone), a line too long for the box wrapping onto rows two columns further in; the
+/// description, when the tool gave one, is the block's last row, at that same depth. The block
+/// ends at a blank row, and every row after it up to `to` is blank: a carriage return at a line's
+/// end draws a blank row inside the block (`wrapTextWithAnsi` breaks there; measured on 2.5.2,
+/// `cat README.md` and `git push --force` split by one), and that, a row the block holds at no
+/// depth of its own, more than [`MAX_WRAPS`] wraps, or a `Dangerous: <label>` row over it leaves
+/// the command unread (`None`), never read short. Kimi draws that row when its own patterns match the command
+/// (`detectDanger`, read off the command itself), and the drawn lines may not be the command:
+/// Kimi passes its control characters through raw, and one that moves the cursor draws later
+/// words over earlier ones (measured on 2.5.2, `rm -rf build-output`, nineteen backspaces and
+/// `cat README.md` drawn as `$ cat README.md` under `Dangerous: recursive delete`); an escape
+/// sequence can redraw any row, that one too (measured: a command ending `ESC[1A ESC[2K` blanked
+/// the row over its own). Only Kimi's own patterns draw that row, so a command they miss
+/// (`git push`, `mv`, a write) can be redrawn as a read with none, which no reading of the
+/// screen sees: the verdict is on the command as drawn. No wrap shows what it stood on ([`Shell::spellings`]): a
+/// run of spaces that reaches it is dropped there whole (`wrapSingleLine`), so the row over it
+/// may have had room for the next word (measured on 2.5.2, `cat README.md`, 130 spaces and
+/// `;git push --force`); a word wider than the box is cut with none (`breakLongWord`; measured,
+/// `echo`, a word of 138 `a` and `#;git push --force` drawn as three rows), and so is a line at a
+/// carriage return within it (measured, `cat README.md`, a carriage return and
+/// `#;git push --force` drawn as two). The block's last row at the wrap's depth is that or the
+/// description ([`Shell::described`]), and no width tells them apart.
+fn shell(rows: &[String], from: usize, to: usize, edge: usize) -> Option<Shell> {
+    fn marked<'a>(text: &'a str, mark: &str) -> Option<&'a str> {
+        text.strip_prefix(mark)
+            .filter(|rest| rest.is_empty() || rest.starts_with(' '))
+    }
+    let start = (from..to).find(|&i| {
+        crate::phase::leading_spaces(&rows[i]) == edge + 2
+            && marked(crate::text::trim(&rows[i]), "$").is_some()
+    })?;
+    let flagged = rows[from..start]
+        .iter()
+        .any(|r| crate::text::trim(r).starts_with(crate::anchor!("kimi.box.dangerous")));
+    if flagged {
+        return None;
+    }
+    let mut lines: Vec<Vec<String>> = Vec::new();
+    let mut described = false;
+    let mut end = to;
+    for (i, row) in rows.iter().enumerate().take(to).skip(start) {
+        let text = crate::text::trim(row);
         if text.is_empty() {
+            end = i;
             break;
         }
         let lead = crate::phase::leading_spaces(row);
         let opened = if lead == edge + 2 {
-            text.strip_prefix(if lines.is_empty() { "$ " } else { "· " })
+            marked(text, if lines.is_empty() { "$" } else { "·" })
         } else {
             None
         };
-        if opened.is_none() && lead != edge + 4 {
-            break;
+        match (opened, lines.last_mut()) {
+            (Some(line), _) => lines.push(vec![crate::text::trim(line).to_string()]),
+            (None, Some(line)) if lead == edge + 4 => line.push(text.to_string()),
+            _ => return None,
         }
-        // A deeper row with a row of the block under it is a wrap: only the last can describe.
-        if let (Some((held, _)), Some(last)) = (tail.take(), lines.last_mut()) {
-            last.push(' ');
-            last.push_str(&held);
-        }
-        if let Some(line) = opened {
-            let line = crate::text::trim(line);
-            prev_cells = cells(line);
-            lines.push(line.to_string());
-        } else {
-            let first_word = text.split_whitespace().next().map_or(0, cells);
-            let may_wrap = prev_cells + 1 + first_word > wrap;
-            prev_cells = cells(text);
-            tail = Some((text.to_string(), may_wrap));
-        }
+        described = opened.is_none();
     }
-    let (description, unsure) = match tail {
-        Some((text, may_wrap)) => (text, may_wrap),
-        None => (String::new(), false),
-    };
-    Some(Shell {
-        lines,
-        description,
-        unsure,
-    })
+    let wraps: usize = lines.iter().map(|line| line.len() - 1).sum();
+    if wraps > MAX_WRAPS || rows[end..to].iter().any(|r| !crate::text::blank(r)) {
+        return None;
+    }
+    Some(Shell { lines, described })
 }
 
 /// The box that waits on the person in the composer's place on `rows` ([`card`]), for display:
@@ -504,15 +638,23 @@ fn shell(rows: &[String], from: usize, to: usize, edge: usize, width: usize) -> 
 /// an open box is unmeasured, so none is read as cancelling it.
 ///
 /// A command's approval reads its command's lines and description ([`shell`]): its rows are the
-/// lines, joined by a newline for the read-only rule's reading ([`PromptV2::readings`]), and a
-/// last row that may be either a wrap or the description is kept as both
-/// ([`PromptV2::description_rows`]), so the rule reads the command with and without it. A file's
-/// write or edits names its file ([`file_of`]): its command is the file as drawn and its path
-/// the file only when drawn whole. Any other tool's approval is read by its title alone: its
-/// blocks are unmeasured. A question's text is its `? ` row; its review step's
+/// lines, and its last row at the description's depth, the description or the last line's wrap,
+/// is kept as both ([`PromptV2::description_rows`]); the read-only rule reads every command the
+/// rows may stand for ([`PromptV2::spellings`]). A file's write or edits
+/// names its file ([`file_of`]): its command is the file as drawn and its path the file only
+/// when drawn whole. Either is read only off a body proven drawn whole ([`drawn_whole`]): a
+/// fullscreen panel's body taller than its dock is drawn in part, its command's hidden lines
+/// unjudged and its file's head row first only at the top of its scroll, and a key row that
+/// shows nothing (the feedback line's, an unfocused panel's, a cut one) leaves the body
+/// unproven. Any other tool's approval is read by its title alone: its blocks are unmeasured.
+/// A question's text is its `? ` row; its review step's
 /// is the last row over its options. The trust prompt's command is the folder it names, and its
 /// two options are the unnumbered rows over its lower rule, picked by arrows and Enter. Every
-/// other box's options stand at the columns [`choice`] reads and a digit picks one, or toggles
+/// other box's options stand at the columns [`choice`] reads, a command's or a file's approval's
+/// only in the block over its key row ([`option_block`]), whose body is read; another box's
+/// choices may carry descriptions, drawn among them or, docked, under them in a block of their
+/// own, so its options are read wherever they stand in it, and its body for nothing. A digit
+/// picks one, or toggles
 /// one on a multi-select question, whose options are numbered in order from the first it shows
 /// ([`first_shown`]) and whose focus and ticks are not read. Its key row is the last row in the
 /// box, the trust prompt's the row under its title.
@@ -551,10 +693,17 @@ pub fn prompt(rows: &[String]) -> Option<PromptV2> {
             })
             .collect()
     } else {
-        let mut unnumbered = first_shown(rows, c.title + 1, c.lower);
-        drawn
-            .iter()
-            .filter_map(|&i| {
+        let block = match c.kind {
+            PromptKind::Bash | PromptKind::Write | PromptKind::Edit => {
+                drawn.last().map_or(c.lower..c.lower, |&keys| {
+                    option_block(rows, c.title + 1, keys)
+                })
+            }
+            _ => c.title + 1..c.lower,
+        };
+        let mut unnumbered = first_shown(rows, block.start, block.end);
+        block
+            .filter_map(|i| {
                 let (n, focused, label) = choice(&rows[i], edge)?;
                 let n = n.or_else(|| {
                     let n = unnumbered;
@@ -574,15 +723,24 @@ pub fn prompt(rows: &[String]) -> Option<PromptV2> {
     };
     let first_option = options.first().map_or(c.lower, |o| o.row);
     let width = crate::text::trim(&rows[c.upper]).chars().count();
+    let keys = if trust {
+        drawn.first().copied()
+    } else {
+        drawn.last().copied()
+    };
+    let whole =
+        keys.is_some_and(|i| drawn_whole(rows, c.upper, c.title + 1..first_option, i, edge, width));
     let shown = match c.kind {
-        PromptKind::Bash => shell(rows, c.title + 1, first_option, edge, width).unwrap_or_default(),
+        PromptKind::Bash if whole => {
+            shell(rows, c.title + 1, first_option, edge).unwrap_or_default()
+        }
         _ => Shell::default(),
     };
-    let command = shown.lines.join(" ");
-    let mut command_rows = shown.lines;
-    if shown.unsure {
-        command_rows.push(shown.description.clone());
-    }
+    let mut command_rows = shown.lines_drawn();
+    let command = command_rows.join(" ");
+    let tail = shown.tail().map(str::to_string);
+    let description_rows = usize::from(tail.is_some());
+    command_rows.extend(tail.iter().cloned());
     let asked = match c.kind {
         PromptKind::Question => drawn
             .iter()
@@ -597,17 +755,12 @@ pub fn prompt(rows: &[String]) -> Option<PromptV2> {
             .map(|&i| words(i))
             .find(|t| t.starts_with('/') || t.starts_with('~'))
             .map(|path| (path, true)),
-        PromptKind::Write | PromptKind::Edit => {
+        PromptKind::Write | PromptKind::Edit if whole => {
             file_of(rows, c.title + 1, first_option, edge, width)
         }
         _ => None,
     };
     let path = named.and_then(|(path, whole)| whole.then(|| path.to_string()));
-    let keys = if trust {
-        drawn.first().copied()
-    } else {
-        drawn.last().copied()
-    };
     let command = match c.kind {
         PromptKind::Bash => command,
         PromptKind::Trust | PromptKind::Write | PromptKind::Edit => named
@@ -619,11 +772,12 @@ pub fn prompt(rows: &[String]) -> Option<PromptV2> {
         kind: c.kind,
         title: titled(&rows[c.title]).to_string(),
         command_rows,
-        description_rows: usize::from(shown.unsure),
+        description_rows,
+        spellings: (c.kind == PromptKind::Bash).then(|| shown.spellings()),
         gutter: c.kind == PromptKind::Bash,
         command,
         description: match c.kind {
-            PromptKind::Bash => shown.description,
+            PromptKind::Bash => tail.unwrap_or_default(),
             PromptKind::Question => asked
                 .map(|i| {
                     let text = words(i);
@@ -764,6 +918,58 @@ pub mod fixtures {
     pub const QUESTION_240: &str = include_str!("fixtures/kimi-2.4.0-question.txt");
     /// Kimi Code 2.5.2 asking to apply a file's edits, its diff in the approval panel (MEASURED).
     pub const BOX_EDIT_252: &str = include_str!("fixtures/kimi-2.5.2-box-edit.txt");
+    /// Kimi Code 2.5.2 asking to run `cat README.md`, an empty line (its `·` alone) and
+    /// `git push --force` (MEASURED).
+    pub const BOX_SHELL_EMPTY_LINE_252: &str =
+        include_str!("fixtures/kimi-2.5.2-box-shell-empty-line.txt");
+    /// Kimi Code 2.5.2 asking to run `cat README.md` ended by a carriage return, then
+    /// `git push --force`: a blank row inside the block (MEASURED).
+    pub const BOX_SHELL_CARRIAGE_RETURN_252: &str =
+        include_str!("fixtures/kimi-2.5.2-box-shell-carriage-return.txt");
+    /// Kimi Code 2.5.2 asking to run `cat README.md`, 130 spaces and `;git push --force` on one
+    /// line: the wrap drawn under a row with room for its first word (MEASURED).
+    pub const BOX_SHELL_SPACED_252: &str = include_str!("fixtures/kimi-2.5.2-box-shell-spaced.txt");
+    /// Kimi Code 2.5.2 asking to run `echo`, a word of 138 `a` and `#;git push --force` with no
+    /// space between: the word cut at the box's edge with none (MEASURED).
+    pub const BOX_SHELL_LONG_WORD_252: &str =
+        include_str!("fixtures/kimi-2.5.2-box-shell-long-word.txt");
+    /// Kimi Code 2.5.2 asking to approve a plan whose second option's description draws a rule,
+    /// `Run this command?` and `$ cat README.md` among the options (MEASURED).
+    pub const BOX_PLAN_FORGED_252: &str = include_str!("fixtures/kimi-2.5.2-box-plan-forged.txt");
+    /// Kimi Code 2.5.2 asking to run `cat README.md`, 130 spaces and `1. ;git push --force`: the
+    /// wrap opening like an option at the unfocused options' column (MEASURED).
+    pub const BOX_SHELL_OPTION_SHAPED_252: &str =
+        include_str!("fixtures/kimi-2.5.2-box-shell-option-shaped.txt");
+    /// Kimi Code 2.5.2 asking to run `cat README.md`, two carriage returns and
+    /// `1. ;git push --force`: that row under a blank one (MEASURED).
+    pub const BOX_SHELL_OPTION_SHAPED_CR_252: &str =
+        include_str!("fixtures/kimi-2.5.2-box-shell-option-shaped-cr.txt");
+    /// Kimi Code 2.5.2 asking to run `cat README.md`, a carriage return and
+    /// `#;git push --force` on one line: the line broken there with no space (MEASURED).
+    pub const BOX_SHELL_CARRIAGE_RETURN_MID_252: &str =
+        include_str!("fixtures/kimi-2.5.2-box-shell-carriage-return-mid.txt");
+    /// Kimi Code 2.5.2 asking to run `rm -rf build-output` redrawn by backspaces as
+    /// `cat README.md` under its `Dangerous: recursive delete` row (MEASURED).
+    pub const BOX_SHELL_BACKSPACED_252: &str =
+        include_str!("fixtures/kimi-2.5.2-box-shell-backspaced.txt");
+    /// Kimi Code 2.5.2 under `tui_mode = "fullscreen"` asking to run a two-line command, with a
+    /// description, whose body fits the panel's dock (MEASURED).
+    pub const FULLSCREEN_BOX_SHELL_252: &str =
+        include_str!("fixtures/kimi-2.5.2-fullscreen-box-shell.txt");
+    /// A fourteen-row screen's dock squeezed under that command's body, on its first frame: a
+    /// scrollbar over the cwd and `$` rows, `· git push --force` hidden, and the key row still
+    /// `↵ confirm` (MEASURED).
+    pub const FULLSCREEN_BOX_SHELL_SQUEEZED_252: &str =
+        include_str!("fixtures/kimi-2.5.2-fullscreen-box-shell-squeezed.txt");
+    /// The same panel asking to run six lines, the last two (`rm -rf build-output` the last)
+    /// and the description hidden below the six rows its dock shows (MEASURED).
+    pub const FULLSCREEN_BOX_SHELL_OVERFLOW_252: &str =
+        include_str!("fixtures/kimi-2.5.2-fullscreen-box-shell-overflow.txt");
+    /// A fourteen-row screen's dock squeezed to two body rows, on its feedback line: no scroll
+    /// hint on its key row, a thumb alone for its bar, and two lines of two-cell glyphs over
+    /// hidden `mv` and `rm -rf` lines (MEASURED).
+    pub const FULLSCREEN_BOX_SHELL_FEEDBACK_WIDE_252: &str =
+        include_str!("fixtures/kimi-2.5.2-fullscreen-box-shell-feedback-wide.txt");
     /// Kimi Code 2.4.0 holding a turn before its first byte: one moon phase over the composer
     /// (MEASURED).
     pub const BUSY_HELD_240: &str = include_str!("fixtures/kimi-2.4.0-busy-held.txt");

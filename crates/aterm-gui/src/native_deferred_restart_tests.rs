@@ -295,9 +295,32 @@ fn deferred_resolution_keeps_the_prepare_and_requires_its_selected_identity_at_e
             .unwrap()
             .insert(600, process(600, 400, 600, 400, 20));
         kernel.base.foreground.store(600, Ordering::SeqCst);
-        assert!(matches!(Reply::parse(&kernel.serve(ctx,
-            Request::Attach(binding.clone(), ImagePhase::Forward), helper.clone())),
+        let attached = kernel.serve(
+            ctx,
+            Request::Attach(binding.clone(), ImagePhase::Forward),
+            helper.clone(),
+        );
+        assert!(matches!(Reply::parse(&attached),
             Some(Reply::NeedEnvironment { deadline_us, .. }) if deadline_us == original.deadline_us));
+        let encoded_intent = attached
+            .split_ascii_whitespace()
+            .find_map(|word| word.strip_prefix("intent="))
+            .unwrap();
+        let intent_json =
+            String::from_utf8(aterm_codec::hex::decode_vec(encoded_intent.as_bytes()).unwrap())
+                .unwrap();
+        let old_reader: aterm_json::Value = aterm_json::from_str(&intent_json).unwrap();
+        assert_eq!(
+            old_reader
+                .get("stored_login")
+                .and_then(aterm_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            old_reader.get("route").is_none(),
+            "the captured older launcher cannot read route"
+        );
+        assert_eq!(ColdIntent::parse(&intent_json), Some(intent.clone()));
         assert_eq!(
             kernel.serve(
                 ctx,

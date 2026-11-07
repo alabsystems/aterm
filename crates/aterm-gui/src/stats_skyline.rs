@@ -7,8 +7,9 @@
 //! A box is a plate in `track`. A heat column rises from its foot to the box's mean, in the heat
 //! of the mean; a one-pixel peak tick stands at its largest reading, in the heat of that, where it
 //! clears the column by a pixel or more; and an over cap, outside the plate above it, is as long
-//! as the share of the box's readings that were over. A box with no reading is `hollow`. A box's
-//! value is its height, so a strip reads without colour.
+//! as the share of the box's read time that was over, each reading weighed by the time it stands
+//! for. A box with no reading is `hollow`. A box's value is its height, so a strip reads without
+//! colour.
 
 use aterm_vitals::ink::{Rgb, VitalsInks};
 
@@ -22,7 +23,7 @@ pub(crate) struct BoxValue {
     pub(crate) mean: Option<f32>,
     /// Its largest reading, the peak tick.
     pub(crate) max: Option<f32>,
-    /// The share of its readings that were over the resource's maximum, `0..=1`, the over cap.
+    /// The share of its read time that was over the resource's maximum, `0..=1`, the over cap.
     pub(crate) over: f32,
 }
 

@@ -1027,6 +1027,9 @@ fn rollout_line(kind: &str, payload: &str) -> String {
 /// a reopen the fence refused likewise made at the next sweep.
 #[test]
 fn a_proven_self_claims_landing_marks_its_workers_task_done_with_its_rollout_report() {
+    if !crate::test_alone::alone() {
+        return;
+    }
     use crate::task_record::{TaskMark, TaskState, mark_session_task};
     let state = aterm_tempfile::Builder::new()
         .prefix("aterm-codex-landing")

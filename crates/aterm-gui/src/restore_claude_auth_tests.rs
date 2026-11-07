@@ -248,6 +248,7 @@ fn every_shipped_producers_claude_auth_reads_as_the_route_it_recorded() {
     let root = aterm_tempfile::manifest_dir().join("tests/fixtures/handoff");
     let mut read = 0;
     let mut stored_at_155 = 0;
+    let mut by_route = 0;
     for release in std::fs::read_dir(&root).unwrap() {
         let release = release.unwrap().path();
         let Ok(carried) = std::fs::read_dir(release.join("carried-state")) else {
@@ -261,13 +262,21 @@ fn every_shipped_producers_claude_auth_reads_as_the_route_it_recorded() {
             for table in shipped_claude_auths(&std::fs::read_to_string(&file).unwrap()) {
                 let auth: ClaudeAuthRestore = aterm_toml::from_str(&table)
                     .unwrap_or_else(|e| panic!("{}: {table}: {e}", file.display()));
-                let recorded = if table.contains("stored_login = true") {
-                    AuthRoute::Stored
-                } else {
-                    AuthRoute::Outside
+                // The route in the record's own words: `route` since v0.158.0, else the older
+                // `stored_login`. A spelling this test does not name (a token route) fails here
+                // rather than reading as outside.
+                let words = |key: &str| table.lines().find_map(|l| l.strip_prefix(key));
+                let recorded = match (words("route = "), words("stored_login = ")) {
+                    (Some("\"stored\""), _) | (None, Some("true")) => AuthRoute::Stored,
+                    (Some("\"outside\""), _) | (None, Some("false") | None) => AuthRoute::Outside,
+                    other => panic!(
+                        "{}: a route this test does not name: {other:?}",
+                        file.display()
+                    ),
                 };
                 assert_eq!(auth.route(), recorded, "{}: {table}", file.display());
                 read += 1;
+                by_route += usize::from(words("route = ").is_some());
                 if release.ends_with("v0.155.0") && recorded == AuthRoute::Stored {
                     stored_at_155 += 1;
                 }
@@ -278,5 +287,9 @@ fn every_shipped_producers_claude_auth_reads_as_the_route_it_recorded() {
     assert!(
         stored_at_155 > 0,
         "v0.155.0's desk records a stored login as `stored_login = true`"
+    );
+    assert!(
+        by_route > 0,
+        "a shipped producer records its route as `route`"
     );
 }

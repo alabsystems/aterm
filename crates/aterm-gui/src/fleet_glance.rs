@@ -18,8 +18,6 @@ pub(crate) const QUIET_MAX: Duration = Duration::from_secs(30 * 60);
 pub(crate) const MENU_FRESH: Duration = Duration::from_secs(15);
 /// A fleet need counts on the badge only from a read this young.
 pub(crate) const COUNT_FRESH: Duration = Duration::from_secs(300);
-/// The most told fleet needs a seamless update carries (`SessionHandoff::fleet_told`).
-pub(crate) const FLEET_TOLD_MAX: usize = 512;
 /// One read's whole bound: the child's own deadline is 3 s a peer, so this is the kill, never a wait it is expected to reach.
 pub(crate) const READ_CAP: Duration = Duration::from_secs(10);
 /// The most fleet peers one snapshot keeps (`aterm_net`'s book is bounded
@@ -45,8 +43,6 @@ pub(crate) struct FleetNeed {
     pub(crate) claim: Option<&'static str>,
     /// The row says the need is a harness's `NEEDS YOU:` report its agent carries on past (`needs_by=harness`): Needs you lists it after the needs that stopped their agents ([`crate::status_item::NeedRow::carries_on`]).
     pub(crate) carries_on: bool,
-    /// An ask's needs as the peer's own herald reads them, each its id and how it was read (`need_ids=`, a content row's, [`crate::status_item::need_ids_row`]), so this herald tells each of them once ([`escalation`]); empty for another need, a facts row and an older peer's, which keep one notice per appearance of the need.
-    pub(crate) ids: Vec<(u64, crate::status_item::NeedRead)>,
 }
 
 /// One session on a fleet peer that this Mac holds over the fleet.
@@ -537,12 +533,7 @@ impl Reach {
 }
 
 impl FleetMac {
-    /// Who it is across reads: its node id, else the name the book knows it by — never the address that answered, which DHCP moves.
-    pub(crate) fn ident(&self) -> &str {
-        self.node.as_deref().unwrap_or(&self.dial)
-    }
-
-    /// Whether its needs are this Mac's to count and tell, and its sessions its to hold and hand back.
+    /// Whether its needs are this Mac's to count, and its sessions its to hold and hand back.
     pub(crate) const fn counts(&self) -> bool {
         !self.older && !self.unproven
     }
@@ -915,10 +906,6 @@ fn mac_of(
                 .or_else(|| content.then(|| content_what(need, row)).flatten()),
             claim,
             carries_on: field(row, "needs_by") == Some("harness"),
-            ids: field(row, "need_ids")
-                .filter(|_| content && need == NeedWord::Ask)
-                .map(crate::status_item::parse_need_ids)
-                .unwrap_or_default(),
         });
     }
     mac.activity = (!older).then_some(tally);
@@ -1304,7 +1291,7 @@ impl FleetRunner for CopyRunner {
         )
         .map_err(|e| e.to_string())?;
         // Before its node read the standings a view holds this Mac's seat alone; without its
-        // needs rows every up seat would read as having none, and the herald would retire what
+        // needs rows every up seat would read as having none, and Needs you would lose what
         // they still need. Either is a read that failed, which keeps the last good one.
         if !view.standings {
             return Err("the node has not read the lab's membership standings yet".to_owned());
@@ -1450,7 +1437,6 @@ pub(crate) fn snapshot_of(
                         what: None,
                         claim: None,
                         carries_on: need.harness,
-                        ids: Vec::new(),
                         sid,
                     })
                 })
@@ -1899,76 +1885,6 @@ pub(crate) fn quiet_line(quiet: Quiet, away: bool) -> String {
     }
 }
 
-/// The herald's key for a fleet need.
-pub(crate) fn herald_key(mac: &str, sid: &str) -> u64 {
-    aterm_hash::fnv1a_64(format!("{mac}\u{1f}{sid}").as_bytes()) | (1 << 63)
-}
-
-/// Whether `key` is a fleet need's ([`herald_key`]).
-pub(crate) const fn is_herald_key(key: u64) -> bool {
-    key & (1 << 63) != 0
-}
-
-/// A fleet need's transition key within its slot: its word's hash — a facts
-/// row carries no verdict rev, so one notice per (Mac, session, word).
-const fn need_key(word: NeedWord) -> u64 {
-    aterm_hash::fnv1a_64(word.word().as_bytes())
-}
-
-/// A fleet need as the herald reads it: an ask the peer names by its needs ([`FleetNeed::ids`]) stands for each of them, read as the peer read it and named by the row's words, so a need this herald told is told once (design §14.18) whatever the peer's set does around it; one it does not name keeps one notice per appearance of its word.
-pub(crate) fn escalation(mac: &FleetMac, need: &FleetNeed) -> crate::status_item::Escalation {
-    let what = need
-        .what
-        .as_deref()
-        .unwrap_or_else(|| crate::status_item::need_words(need.word));
-    let body = crate::needs::fold_clip(&format!("{} \u{b7} {}: {what}", mac.name, need.who), 120);
-    crate::status_item::Escalation {
-        session: herald_key(mac.ident(), &need.sid),
-        kind: crate::status_item::EscalationKind::of(need.word),
-        word: need.word,
-        key: need_key(need.word),
-        label: format!("{} \u{b7} {} \u{2014} {what}", mac.name, need.who),
-        needs: need
-            .ids
-            .iter()
-            .map(|&(id, read)| crate::status_item::NeedId {
-                id,
-                read,
-                body: body.clone(),
-            })
-            .collect(),
-        body,
-        headline: crate::status_item::headline(need.word),
-        report: None,
-        owner_turn: 0,
-    }
-}
-
-/// One told fleet need as the park writes it (`SessionHandoff::fleet_told`): its herald key in hex and its word.
-#[cfg(any(unix, test))]
-pub(crate) fn told_row(key: u64, word: NeedWord) -> String {
-    format!("{key:016x}={}", word.word())
-}
-
-/// The told fleet needs a seamless update carried ([`told_row`]'s rows),
-/// by herald key; a row that does not read — no fleet key, no word this
-/// build knows — is dropped, and at most [`FLEET_TOLD_MAX`] are read.
-pub(crate) fn parse_told(rows: &[String]) -> std::collections::HashMap<u64, NeedWord> {
-    rows.iter()
-        .filter_map(|row| {
-            let (key, word) = row.split_once('=')?;
-            if !key.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return None;
-            }
-            let key = u64::from_str_radix(key, 16)
-                .ok()
-                .filter(|k| is_herald_key(*k))?;
-            Some((key, NeedWord::parse(word)?))
-        })
-        .take(FLEET_TOLD_MAX)
-        .collect()
-}
-
 impl crate::App {
     /// START THE FLEET GLANCE with the status item (the first OS window's attach).
     pub(crate) fn start_fleet_glance(&mut self) {
@@ -2059,103 +1975,6 @@ impl crate::App {
             self.network_next_poll = None;
         }
         self.mark_status_dirty();
-        self.herald_fleet();
-    }
-
-    /// THE FLEET'S NOTICES: one per fleet need's transition, through the herald's rate limits, from rows no older than [`COUNT_FRESH`] only.
-    pub(crate) fn herald_fleet(&mut self) {
-        if self.headless {
-            return;
-        }
-        let snapshot = self.fleet_glance.as_ref().and_then(|f| {
-            let slot = f.copy();
-            slot.book.in_fleet.then(|| slot.snapshot.clone()).flatten()
-        });
-        let now_ms = aterm_time::unix_millis().unwrap_or(0);
-        let Some(snap) = snapshot.filter(|s| s.fresh(now_ms)) else {
-            let keys: Vec<u64> = self.fleet_heralded.keys().copied().collect();
-            for key in keys {
-                self.presence.herald.forgo(key);
-            }
-            return;
-        };
-        let mut current: Vec<(crate::status_item::Escalation, String, NeedWord)> = Vec::new();
-        for mac in snap.macs.iter().filter(|m| m.counts() && m.fresh(now_ms)) {
-            for need in &mac.needs {
-                current.push((escalation(mac, need), mac.dial.clone(), need.word));
-            }
-        }
-        let answered: std::collections::HashSet<&str> = snap
-            .macs
-            .iter()
-            .filter(|m| !m.carried)
-            .map(|m| m.dial.as_str())
-            .collect();
-        let silent: std::collections::HashSet<&str> =
-            snap.unanswered.iter().map(|u| u.dial.as_str()).collect();
-        let mut gone: Vec<u64> = Vec::new();
-        let mut quiet: Vec<u64> = Vec::new();
-        for (key, (dial, _)) in &self.fleet_heralded {
-            if current.iter().any(|(e, _, _)| e.session == *key) {
-                continue;
-            }
-            if silent.contains(dial.as_str()) && !answered.contains(dial.as_str()) {
-                quiet.push(*key);
-            } else {
-                gone.push(*key);
-            }
-        }
-        for key in gone {
-            self.herald_deliver(key, None, false);
-            self.presence.herald.retire(key);
-            self.fleet_heralded.remove(&key);
-        }
-        for key in quiet {
-            self.presence.herald.forgo(key);
-        }
-        if let Some(told) = self.fleet_adopt.take() {
-            let now_unix = i64::try_from(now_ms / 1000).unwrap_or(i64::MAX);
-            for (esc, _, word) in &current {
-                if told.get(&esc.session) != Some(word) {
-                    continue;
-                }
-                self.presence.herald.adopt(
-                    esc.session,
-                    crate::status_item::StatusCarry {
-                        need: Some((*word, now_unix)),
-                        told: true,
-                        ..crate::status_item::StatusCarry::default()
-                    },
-                    now_unix,
-                    std::time::Instant::now(),
-                );
-            }
-        }
-        for (esc, dial, word) in &current {
-            self.fleet_heralded
-                .insert(esc.session, (dial.clone(), *word));
-            self.herald_deliver(esc.session, Some(esc), false);
-        }
-    }
-
-    /// THE FLEET NEEDS THIS HERALD HAS TOLD, as a seamless update's park stamps them (`SessionHandoff::fleet_told`).
-    #[cfg(unix)]
-    pub(crate) fn fleet_told_rows(&self) -> Vec<String> {
-        let mut rows: Vec<String> = self
-            .fleet_heralded
-            .iter()
-            .filter(|(key, (_, word))| {
-                self.presence.herald.told(
-                    **key,
-                    crate::status_item::EscalationKind::of(*word),
-                    need_key(*word),
-                )
-            })
-            .map(|(key, (_, word))| told_row(*key, *word))
-            .collect();
-        rows.sort();
-        rows.truncate(FLEET_TOLD_MAX);
-        rows
     }
 
     /// A fleet row's act on the Mac the book knows as `dial`, shown as `name` (and its session `sid`).

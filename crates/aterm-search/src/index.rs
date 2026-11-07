@@ -21,8 +21,8 @@ use super::types::SearchResult;
 use super::types::{DirectedFind, LineFrame, SearchDirection, SearchMatch, SearchResults};
 use crate::cells::LineCells;
 use crate::grapheme::{
-    ColumnMap, LowerByteMap, LowerNeed, MapSource, lower_fold, lower_fold_char, lower_fold_into,
-    lower_need,
+    ColumnMap, LowerByteCursors, LowerNeed, MapSource, lower_fold, lower_fold_char,
+    lower_fold_into, lower_need,
 };
 
 /// Default maximum number of lines kept in the search index cache before oldest-quarter eviction.
@@ -157,11 +157,11 @@ pub(crate) struct MatchVisit {
     pub(crate) had_occurrence: bool,
 }
 
-fn visit_occurrences(
+fn visit_occurrences<const REV: bool>(
     line_num: usize,
     query_len: usize,
     col_map: &ColumnMap,
-    byte_map: Option<&LowerByteMap>,
+    mut byte_map: Option<&mut LowerByteCursors<'_, REV>>,
     positions: impl Iterator<Item = usize>,
     mut visit: impl FnMut(SearchMatch) -> bool,
 ) -> MatchVisit {
@@ -174,8 +174,10 @@ fn visit_occurrences(
         CASE_INSENSITIVE_MATCH_VISITS.with(|count| count.set(count.get() + 1));
         result.had_occurrence = true;
         let match_end = abs_pos.saturating_add(query_len);
-        let orig_start = byte_map.map_or(abs_pos, |map| map.map_to_original(abs_pos));
-        let orig_end = byte_map.map_or(match_end, |map| map.map_to_original(match_end));
+        // Starts and ends each stay monotone, even when overlapping spans interleave.
+        let (orig_start, orig_end) = byte_map
+            .as_mut()
+            .map_or((abs_pos, match_end), |map| map.span(abs_pos, match_end));
         let (start_col, end_col) = col_map.span(orig_start, orig_end);
         if start_col != end_col && !visit(SearchMatch::new(line_num, start_col, end_col)) {
             result.completed = false;
@@ -249,7 +251,7 @@ impl CaseInsensitiveMatcher {
                 })
                 .unwrap_or(0..text.len());
             let offset = window.start;
-            return visit_occurrences(
+            return visit_occurrences::<REV>(
                 line_num,
                 self.lower_query.len(),
                 col_map,
@@ -267,13 +269,13 @@ impl CaseInsensitiveMatcher {
         self.lower_buf.clear();
         self.lower_buf
             .extend(text.chars().flat_map(lower_fold_char));
-        let byte_map = LowerByteMap::new(text);
+        let mut byte_map = LowerByteCursors::new(text, self.lower_buf.len());
         let searcher = self.lower_query.searcher();
-        visit_occurrences(
+        visit_occurrences::<REV>(
             line_num,
             self.lower_query.len(),
             col_map,
-            Some(&byte_map),
+            Some(&mut byte_map),
             searcher.matches_in::<REV>(self.lower_buf.as_bytes()),
             visit,
         )

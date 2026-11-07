@@ -1083,6 +1083,83 @@ fn an_ended_builds_claim_goes_before_its_peak_is_kept() {
     );
 }
 
+/// AN ENDED BUILD WRITES ITS ROW AFTER ITS PEAK BOOK (TM-1 §5): `keep` hands the row its run,
+/// stage, end and peak once the book holds the peak, so the row's lock wait never holds up the
+/// peak a next claim of the key reads; a failed build whose peak was not kept, and a book that
+/// could not be written, still write their row. NEGATIVE CONTROL: the book read before `keep`
+/// lacks the peak.
+#[test]
+fn an_ended_build_writes_its_row_after_its_peak_book() {
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let m = machine();
+    let s = seat(dir.path(), &m, std::process::id().wrapping_add(43));
+    let b = test_build();
+    let claimed = || match admit(&b, dir.path(), &s, &mut |_| {}) {
+        Admission::Claimed(h) => h,
+        other => panic!("expected a claim, got {other:?}"),
+    };
+    let book = dir.path().join("targo-memory.json");
+    let k = key(&b, dir.path());
+    // The peaks the book keeps of the build's key, as a reader of the file finds them.
+    let kept_in_book = || {
+        Records::load(&book)
+            .rows()
+            .iter()
+            .find(|row| row.key == k)
+            .map_or(0, |row| row.peaks.len())
+    };
+    assert_eq!(kept_in_book(), 0, "nothing kept yet");
+    let mut rows = Vec::new();
+    let kept = claimed().let_go().keep_then(
+        BuildEnd::Success(true),
+        5 * GIB,
+        &mut |_| {},
+        |_, stage, end, peak| rows.push((stage.to_owned(), *end, peak, kept_in_book())),
+    );
+    assert_eq!(kept, Some(5 * GIB));
+    assert_eq!(
+        rows,
+        [(b.stage.clone(), BuildEnd::Success(true), 5 * GIB, 1)],
+        "one row, written once the book held its peak"
+    );
+    rows.clear();
+    let kept = claimed().let_go().keep_then(
+        BuildEnd::Success(false),
+        GIB,
+        &mut |_| {},
+        |_, stage, end, peak| rows.push((stage.to_owned(), *end, peak, kept_in_book())),
+    );
+    assert_eq!(kept, None, "a failure below its claim keeps nothing");
+    assert_eq!(
+        rows,
+        [(b.stage.clone(), BuildEnd::Success(false), GIB, 1)],
+        "and writes its row all the same"
+    );
+
+    let file = dir.path().join("a-file");
+    std::fs::write(&file, "").expect("a file");
+    let Held { claim, key, .. } = *claimed();
+    let held = Held {
+        claim,
+        key,
+        own: Some(file.join("targo-memory.json")),
+        #[cfg(unix)]
+        cohort: false,
+    };
+    let mut written = 0;
+    let mut said = Vec::new();
+    assert_eq!(
+        held.let_go().keep_then(
+            BuildEnd::Success(true),
+            5 * GIB,
+            &mut |line| said.push(line.to_owned()),
+            |_, _, _, _| written += 1,
+        ),
+        None
+    );
+    assert_eq!((said.len(), written), (1, 1), "an unwritten book: {said:?}");
+}
+
 /// A fresh build that compiled nothing keeps no peak while its key's heavy one is young, so
 /// eight of them after a 10 GiB compile leave its next claim at 12 GiB, not a fresh run's 1 GiB
 /// and a little. NEGATIVE CONTROL: the 3 GiB run, a quarter of the heavy one or more, is kept.
@@ -1370,26 +1447,24 @@ fn a_front_holds_its_claim_until_a_deaf_leftover_is_drained() {
     let spawn_front = |grace_ms: &str| {
         use std::io::BufRead as _;
         let dir = aterm_tempfile::tempdir().expect("scratch");
-        let turn = crate::platform::FORWARDING_TURN
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut front = aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"))
-            .args([
-                "--exact",
-                "build_admit::tests::standin_front_supervises_a_cat",
-                "--test-threads=1",
-                "--nocapture",
-            ])
-            .env(FORWARD_STANDIN, dir.path())
-            .env(FORWARD_BUILD, DEAF)
-            .env(TREE_END_GRACE_ENV, grace_ms)
-            .setsid(true)
-            .stdin(aterm_uds::spawnfd::Stdio::piped())
-            .stdout(aterm_uds::spawnfd::Stdio::piped())
-            .stderr(aterm_uds::spawnfd::Stdio::null())
-            .spawn()
-            .expect("the stand-in front");
-        drop(turn);
+        let mut front = crate::platform::spawn_outside_a_stand_aside(|| {
+            aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "build_admit::tests::standin_front_supervises_a_cat",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(FORWARD_STANDIN, dir.path())
+                .env(FORWARD_BUILD, DEAF)
+                .env(TREE_END_GRACE_ENV, grace_ms)
+                .setsid(true)
+                .stdin(aterm_uds::spawnfd::Stdio::piped())
+                .stdout(aterm_uds::spawnfd::Stdio::piped())
+                .stderr(aterm_uds::spawnfd::Stdio::null())
+                .spawn()
+                .expect("the stand-in front")
+        });
         let out = front.stdout.take().expect("its stdout");
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -1482,27 +1557,24 @@ fn a_front_passes_on(sig: libc::c_int, build: &str) {
     use std::io::BufRead as _;
     use std::os::unix::process::ExitStatusExt as _;
     let dir = aterm_tempfile::tempdir().expect("scratch");
-    // Spawned in this process's forwarding turn: a lease test of this binary that stands aside
-    // ignores SIGINT meanwhile, and a front that inherits an ignored signal keeps it ignored.
-    let turn = crate::platform::FORWARDING_TURN
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut front = aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"))
-        .args([
-            "--exact",
-            "build_admit::tests::standin_front_supervises_a_cat",
-            "--test-threads=1",
-            "--nocapture",
-        ])
-        .env(FORWARD_STANDIN, dir.path())
-        .env(FORWARD_BUILD, build)
-        .setsid(true)
-        .stdin(aterm_uds::spawnfd::Stdio::piped())
-        .stdout(aterm_uds::spawnfd::Stdio::piped())
-        .stderr(aterm_uds::spawnfd::Stdio::null())
-        .spawn()
-        .expect("the stand-in front");
-    drop(turn);
+    // A front that inherits an ignored signal keeps it ignored.
+    let mut front = crate::platform::spawn_outside_a_stand_aside(|| {
+        aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "build_admit::tests::standin_front_supervises_a_cat",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(FORWARD_STANDIN, dir.path())
+            .env(FORWARD_BUILD, build)
+            .setsid(true)
+            .stdin(aterm_uds::spawnfd::Stdio::piped())
+            .stdout(aterm_uds::spawnfd::Stdio::piped())
+            .stderr(aterm_uds::spawnfd::Stdio::null())
+            .spawn()
+            .expect("the stand-in front")
+    });
     let out = front.stdout.take().expect("its stdout");
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {

@@ -4,7 +4,7 @@
 //! macOS workstation profile, checks, and `defaults` recovery journal.
 
 use aterm_json::{Value, json};
-use aterm_machines::init::{Hold, Workstation, WorkstationGroup};
+use aterm_machines::init::{Hold, Workstation, WorkstationGroup, WorkstationRun};
 use aterm_machines::port::{Cmd, System};
 use aterm_machines::{model::PValue, plist};
 use aterm_types::macos_setup::{
@@ -22,26 +22,26 @@ pub use initial::{
     BackgroundVaultAuthorization, BroughtForward, InitialInputPass, InitialSetupAdmission,
     InitialSetupAuthorization, InitialSetupObservation, InitialSetupObserved, InitialSetupParkMark,
     InitialSetupRestart, InitialSetupSnapshot, InitialSetupSnapshotError, InitialSetupUpgrade,
-    InputServiceSet, InputSetupScope, ObservationRead, ParkWatch, PendingInputAdmission,
-    PermissionSteps, SETUP_BUSY, SetAside, SetupHooks, SetupNext, SetupUpgrade, StageEvent,
-    VAULT_SETTINGS_UNREAD, Watches, activate_input_attachments, alab_mac, apply_initial_setup,
-    apply_initial_setup_observed, automatic_plan, automatic_vault_bootstrap_allowed,
-    bring_forward_restored_setup, bring_forward_restored_setup_observing,
-    check_background_workstation, check_initial_setup, check_initial_setup_observed,
-    forget_set_aside_setup, initial_setup_access_revision, initial_setup_admission,
-    initial_setup_finished, initial_setup_holds, initial_setup_input_park_mark,
-    initial_setup_keeps_vault_sync, initial_setup_observation, initial_setup_owes_secrets_stage,
-    initial_setup_park_mark, initial_setup_pending_inputs, initial_setup_pending_repositories,
-    initial_setup_pending_workstation_revision, initial_setup_review_revision,
-    initial_setup_revision, initial_setup_snapshot, initial_setup_snapshot_read_only,
-    input_setup_scope, look_for_the_vault_again, note_person_asked_for_access,
-    note_setup_interrupted, observe_initial_setup, provisional_setup_widened,
-    provisional_setup_widens, put_back_held_initial_setup, request_initial_setup_stop,
-    restart_initial_setup, restart_initial_setup_observed, retry_parked_setup_stages,
-    run_initial_input_pass, run_initial_setup_pass, set_aside_unreadable_setup,
-    set_aside_unreadable_setup_observing, setup_is_newer, setup_ledger_environment,
-    setup_records_held, take_back_setup_interrupted, validate_initial_setup_plan,
-    vault_config_unread, with_initial_setup_vault_sync,
+    InputServiceSet, InputSetupScope, ObservationBatch, ObservationRead, ParkWatch,
+    PendingInputAdmission, PermissionSteps, SETUP_BUSY, SetAside, SetupHooks, SetupNext,
+    SetupUpgrade, StageEvent, VAULT_SETTINGS_UNREAD, Watches, activate_input_attachments, alab_mac,
+    apply_initial_setup, apply_initial_setup_observed, automatic_plan,
+    automatic_vault_bootstrap_allowed, bring_forward_restored_setup,
+    bring_forward_restored_setup_observing, check_background_workstation, check_initial_setup,
+    check_initial_setup_observed, forget_set_aside_setup, initial_setup_access_revision,
+    initial_setup_admission, initial_setup_finished, initial_setup_holds,
+    initial_setup_input_park_mark, initial_setup_keeps_vault_sync, initial_setup_observation,
+    initial_setup_owes_secrets_stage, initial_setup_park_mark, initial_setup_pending_inputs,
+    initial_setup_pending_repositories, initial_setup_pending_workstation_revision,
+    initial_setup_review_revision, initial_setup_revision, initial_setup_snapshot,
+    initial_setup_snapshot_read_only, input_setup_scope, look_for_the_vault_again,
+    note_person_asked_for_access, note_setup_interrupted, observe_initial_setup,
+    provisional_setup_widened, provisional_setup_widens, put_back_held_initial_setup,
+    request_initial_setup_stop, restart_initial_setup, restart_initial_setup_observed,
+    retry_parked_setup_stages, run_initial_input_pass, run_initial_setup_pass,
+    set_aside_unreadable_setup, set_aside_unreadable_setup_observing, setup_is_newer,
+    setup_ledger_environment, setup_records_held, take_back_setup_interrupted,
+    validate_initial_setup_plan, vault_config_unread, with_initial_setup_vault_sync,
 };
 #[cfg(any(test, debug_assertions))]
 pub use initial::{
@@ -186,6 +186,109 @@ pub struct PassPage {
     pub outcome: PassOutcome,
     /// The pass's other rows, about no one setting's keys, which the page shows as they are.
     pub rows: Vec<Row>,
+    /// Native facts already read by this pass; never serialized with operation rows.
+    pub readback: WorkstationReadback,
+}
+
+/// An owned native readback, independent of journal outcomes or setup completion.
+/// Only the native workstation producer constructs nonempty values.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct WorkstationReadback(Vec<aterm_types::macos_setup::Observation>);
+
+impl std::fmt::Debug for WorkstationReadback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WorkstationReadback(..)")
+    }
+}
+
+impl WorkstationReadback {
+    /// No owned native facts were supplied.
+    pub const EMPTY: Self = Self(Vec::new());
+
+    /// Current facts as the native producer observed them, without another read.
+    #[must_use]
+    pub fn observations(&self) -> &[aterm_types::macos_setup::Observation] {
+        &self.0
+    }
+
+    /// Whether no native facts are available for this pass.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Transfer custody without cloning its facts.
+    #[must_use]
+    pub fn take(&mut self) -> Self {
+        std::mem::take(self)
+    }
+
+    /// Keep only the settings the owning stage can publish.
+    pub fn retain(&mut self, selected: Selection) {
+        self.0.retain(|observation| match observation.subject {
+            Subject::Setting(setting) => selected.contains(setting),
+            _ => false,
+        });
+    }
+
+    /// Merge a later complete setting readback, replacing its earlier value.
+    pub fn append(&mut self, later: Self) {
+        for observation in later.0 {
+            match self
+                .0
+                .iter_mut()
+                .find(|old| old.subject == observation.subject)
+            {
+                Some(old) => *old = observation,
+                None => self.0.push(observation),
+            }
+        }
+    }
+}
+
+/// Run one already-prepared native pass and retain its complete post-apply facts
+/// before converting operation rows for display. Its canonical preparation must
+/// match `group`; attachment-only, deferred-container and manual passes prove no
+/// whole setting.
+///
+/// # Errors
+/// The native pass cannot resolve its journal or execute its prepared items.
+pub fn run_workstation_readback(
+    prepared: Workstation,
+    sys: &dyn System,
+    group: WorkstationGroup,
+    mode: aterm_machines::model::Mode,
+) -> Result<(WorkstationRun, WorkstationReadback), String> {
+    let selected = prepared
+        .prepared_scope()
+        .and_then(|(prepared_group, selected)| {
+            (mode == aterm_machines::model::Mode::Apply
+                && prepared_group == group
+                && matches!(group, WorkstationGroup::All | WorkstationGroup::Preferences))
+            .then_some(selected)
+        });
+    let run = prepared.run_recording(sys, mode)?;
+    let readback = if let Some(selected) = selected {
+        let tagged = run.tagged();
+        WorkstationReadback(
+            Setting::ALL
+                .into_iter()
+                .filter(|setting| selected.contains(*setting))
+                .filter_map(|setting| {
+                    let rows: Vec<_> = tagged
+                        .iter()
+                        .filter(|(member, _)| *member == setting)
+                        .map(|(_, row)| *row)
+                        .collect();
+                    (!rows.is_empty())
+                        .then(|| aterm_machines::init_observe::readback_observation(setting, &rows))
+                })
+                .collect(),
+        )
+    } else {
+        WorkstationReadback::EMPTY
+    };
+    Ok((run, readback))
 }
 
 impl PassPage {
@@ -193,6 +296,7 @@ impl PassPage {
     pub fn merge(&mut self, later: Self) {
         self.outcome.merge(later.outcome);
         self.rows.extend(later.rows);
+        self.readback.append(later.readback);
     }
 
     /// Say that `setting`'s step failed for `reason`, the page's words its step decided
@@ -2002,6 +2106,10 @@ trait Host {
     fn verified_settings(&mut self) -> Selection {
         Selection::none()
     }
+    /// Native facts paid for by the last workstation pass, transferred once to its report.
+    fn take_readback(&mut self) -> WorkstationReadback {
+        WorkstationReadback::EMPTY
+    }
     /// The System State row the item `item` was built for.
     fn item_setting(&self, item: &str) -> Option<Setting> {
         aterm_machines::init_preferences::setting_of(item)
@@ -2073,6 +2181,7 @@ struct NativeHost {
     tagged: Vec<(String, Setting)>,
     /// Complete preference cohorts verified by this pass, independent of other settings.
     verified: Selection,
+    readback: WorkstationReadback,
 }
 
 impl NativeHost {
@@ -2117,6 +2226,7 @@ impl NativeHost {
             readings: Vec::new(),
             tagged: Vec::new(),
             verified: Selection::none(),
+            readback: WorkstationReadback::EMPTY,
         }
     }
 
@@ -2190,6 +2300,9 @@ impl Host for NativeHost {
     }
     fn verified_settings(&mut self) -> Selection {
         std::mem::replace(&mut self.verified, Selection::none())
+    }
+    fn take_readback(&mut self) -> WorkstationReadback {
+        self.readback.take()
     }
     fn item_setting(&self, item: &str) -> Option<Setting> {
         self.tagged
@@ -2309,13 +2422,16 @@ impl Host for NativeHost {
         apply: bool,
     ) -> Result<Vec<(Option<Setting>, Row)>, String> {
         use aterm_machines::model::{Mode, Outcome};
+        self.readback = WorkstationReadback::EMPTY;
         let mode = if apply { Mode::Apply } else { Mode::Plan };
         let prepared = match self.prepared.take() {
             Some((prepared_group, prepared)) if prepared_group == group => prepared,
             _ => self.prepare(group)?,
         };
         self.domains.clear();
-        let result = prepared.run_recording(self.sys.as_ref(), mode)?;
+        let (result, readback) =
+            run_workstation_readback(prepared, self.sys.as_ref(), group, mode)?;
+        self.readback = readback;
         let settings: Vec<(String, Setting)> = result
             .tagged()
             .into_iter()
@@ -2825,6 +2941,10 @@ fn append_workstation(
             covers,
         ),
     }
+    let readback = host.take_readback();
+    if !readback.is_empty() {
+        page(report).readback.append(readback);
+    }
     clock.lap(&mut report.rows);
 }
 
@@ -2861,6 +2981,7 @@ fn as_step(report: &mut Report, row: Row, settings: Selection) {
 fn step_page(row: &Row, subjects: impl IntoIterator<Item = Subject>) -> PassPage {
     PassPage {
         outcome: PassOutcome::default(),
+        readback: WorkstationReadback::EMPTY,
         rows: subjects
             .into_iter()
             .map(|subject| Row {
@@ -3100,6 +3221,9 @@ fn apply_preferences(
     // The rollback's `restored` row, by its place in the report, and the keys it names.
     let mut restored_row: Option<(usize, Vec<String>)> = None;
     if !rollback.is_empty() {
+        // Restoring any preference can invalidate the earlier native cohort. The
+        // ordinary observer must read the state left by rollback before publication.
+        page(report).readback = WorkstationReadback::EMPTY;
         let mut errors = Vec::new();
         if full_profile {
             let mut record = reload.clone();
@@ -3182,6 +3306,9 @@ fn apply_preferences(
     clock.lap(&mut report.rows);
     let relaunched = report.rows.len();
     let unread = refresh(host, &reload.iter().collect::<Vec<_>>(), report);
+    if !unread.is_empty() {
+        page(report).readback = WorkstationReadback::EMPTY;
+    }
     clock.lap(&mut report.rows);
     journal |= report.rows[relaunched..]
         .iter()
@@ -3193,6 +3320,7 @@ fn apply_preferences(
     // as back.
     let lost = not_retained(host, &put_back);
     if !lost.is_empty() {
+        page(report).readback = WorkstationReadback::EMPTY;
         if let Some((at, restored)) = restored_row {
             let kept: Vec<String> = restored
                 .into_iter()

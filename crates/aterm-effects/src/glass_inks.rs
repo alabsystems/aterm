@@ -205,6 +205,12 @@ impl GlassInks {
     /// The tokens solved for `key`, with no cache.
     #[must_use]
     pub fn solve(key: GlassKey) -> Self {
+        let key = GlassKey {
+            palette: key.palette,
+            ground: key.ground & 0x00FF_FFFF,
+            ink: key.ink & 0x00FF_FFFF,
+            rule: key.rule & 0x00FF_FFFF,
+        };
         let GlassKey {
             palette,
             ground,

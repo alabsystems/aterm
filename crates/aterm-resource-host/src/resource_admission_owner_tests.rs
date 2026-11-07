@@ -581,6 +581,151 @@ fn impossible_memory_head_refuses_before_arm_and_next_job_runs() {
     world.assert_settled(&next, &memory, pid);
 }
 
+/// `world`'s queued sleep, its fixture's claim let go before it armed, so that its memory is
+/// admitted by the queue's own look ([`Owner::poll_memory`]); and the stream its events go to.
+fn unclaimed_sleep(world: &mut World, attempt: [u8; 16]) -> (Pending, CtlStream) {
+    let (_, _, client) = world.queue_sleep_attempt(HANG, attempt);
+    let mut pending = world.owner.pending.pop_back().unwrap();
+    drop(pending.claim.take());
+    (pending, client)
+}
+
+/// The `kind`, `outcome`, `stop`, `sig` and `meter` of `row`.
+fn admission_words(
+    row: &aterm_telemetry::Row,
+) -> (
+    aterm_telemetry::Kind,
+    aterm_telemetry::Outcome,
+    aterm_telemetry::Stop,
+    Option<i32>,
+    aterm_telemetry::Meter,
+) {
+    (row.kind.clone(), row.outcome, row.stop, row.sig, row.meter)
+}
+
+/// A RETAINED RUN'S MEMORY ADMISSION WRITES ONE ROW, WHERE IT IS DECIDED (TM-1 review): the
+/// queue drives a waiter of its own in this user's ledger across its ticks, not `admit_with`,
+/// so its `kind=admission` row is written at the look that decides, however many looks waited:
+/// three looks that met another admission holding the ledger's lock write none, and the look in
+/// its turn writes one, admitted, with the wait its record's stamps say; a look once it holds its
+/// claim writes none. NEGATIVE CONTROLS (by hand): the queue writing no row, as before: none at
+/// the decision; a row each look: three for the looks that waited.
+#[test]
+fn a_retained_runs_memory_admission_writes_one_row_where_it_is_decided() {
+    use aterm_capacity::telemetry::{capture, wait};
+    use aterm_telemetry::{Kind, Meter, Outcome, Stop};
+    let mut world = World::new();
+    let machine = Fixed::new(Reading::of_gib(64, 60, 2));
+    let user = world.owner.ledger.clone();
+    let (mut pending, client) = unclaimed_sleep(&mut world, [7; 16]);
+    let turn = world
+        .owner
+        .ledger
+        .hold_turn()
+        .expect("the ledger's lock")
+        .expect("free");
+    let ((), rows) = capture(user.clone(), || {
+        for look in 0..3 {
+            world.owner.poll_memory(&mut pending, &machine).unwrap();
+            assert!(
+                pending.claim.is_none() && pending.waiter.is_some(),
+                "look {look} met the ledger's lock"
+            );
+        }
+    });
+    assert!(rows.is_empty(), "no row a look: {rows:?}");
+    drop(turn);
+    let ((), rows) = capture(user.clone(), || {
+        world.owner.poll_memory(&mut pending, &machine).unwrap();
+    });
+    let claim = pending.claim.as_ref().expect("admitted in its turn");
+    assert_eq!(rows.len(), 1, "one row however many looks: {rows:?}");
+    assert_eq!(
+        admission_words(&rows[0]),
+        (Kind::Admission, Outcome::Ok, Stop::Exit, None, Meter::Exact)
+    );
+    assert_eq!(
+        rows[0].wait_ms,
+        wait(claim.asked_ms(), claim.record().held.map(|h| h.admitted_ms)),
+        "the wait its record's stamps say"
+    );
+    let ((), rows) = capture(user, || {
+        world.owner.poll_memory(&mut pending, &machine).unwrap();
+    });
+    assert!(rows.is_empty(), "a look once it holds its claim: {rows:?}");
+    pending.cancelled = true;
+    world.owner.pending.push_back(pending);
+    world.settle();
+    assert!(world.owner.ledger.list().unwrap().is_empty());
+    drop(client);
+}
+
+/// A RETAINED RUN'S MEMORY WAIT GIVEN UP, OR REFUSED, WRITES ONE ROW (TM-1 review): a request
+/// cancelled while its memory waits leaves the queue with its row, `outcome=fail`, written as
+/// its wait drops; an impossible head is refused before it enters the wait, and its row says
+/// `outcome=refused`. NEGATIVE CONTROLS (by hand): a wait given up writing no row, as before:
+/// none for the first; the refusal written before its ask is taken: none for the second.
+#[test]
+fn a_retained_runs_memory_wait_given_up_or_refused_writes_one_row() {
+    use aterm_capacity::telemetry::capture;
+    use aterm_telemetry::{Kind, Meter, Outcome, Stop};
+    let mut world = World::new();
+    let machine = Fixed::new(Reading::of_gib(64, 60, 2));
+    let user = world.owner.ledger.clone();
+    let (mut pending, client) = unclaimed_sleep(&mut world, [7; 16]);
+    let turn = world
+        .owner
+        .ledger
+        .hold_turn()
+        .expect("the ledger's lock")
+        .expect("free");
+    let ((), rows) = capture(user.clone(), || {
+        world.owner.poll_memory(&mut pending, &machine).unwrap();
+        assert!(pending.waiter.is_some(), "it waits for its turn");
+        pending.cancelled = true;
+        world.owner.pending.push_back(pending);
+        world.owner.tick_queue();
+    });
+    assert!(world.owner.pending.is_empty(), "the cancelled request left");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        admission_words(&rows[0]),
+        (
+            Kind::Admission,
+            Outcome::Fail,
+            Stop::Exit,
+            None,
+            Meter::Stamped
+        )
+    );
+    drop(turn);
+
+    let (mut pending, impossible) = unclaimed_sleep(&mut world, [8; 16]);
+    pending.submission.request.memory_bytes = u64::MAX;
+    let (refused, rows) = capture(user, || world.owner.poll_memory(&mut pending, &machine));
+    assert_eq!(
+        refused.expect_err("it can never fit").kind(),
+        io::ErrorKind::InvalidInput
+    );
+    assert!(pending.waiter.is_none(), "it never entered the wait");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        admission_words(&rows[0]),
+        (
+            Kind::Admission,
+            Outcome::Refused,
+            Stop::Exit,
+            None,
+            Meter::Stamped
+        )
+    );
+    pending.cancelled = true;
+    world.owner.pending.push_back(pending);
+    world.settle();
+    assert!(world.owner.ledger.list().unwrap().is_empty());
+    drop((client, impossible));
+}
+
 #[cfg(target_os = "macos")]
 #[path = "resource_admission_owner_tests/context_rpc.rs"]
 mod context_rpc;
@@ -590,15 +735,21 @@ fn cancelled_paid_metadata_preparation_joins_before_native_release_and_settlemen
     for fault_owner in [false, true] {
         let mut world = World::new();
         let (binding, memory, client) = world.queue_sleep(HANG);
-        let pending = world.owner.pending.back_mut().unwrap();
+        let mut pending = world.owner.pending.pop_back().unwrap();
         pending.submission.request.argv = vec![
             b"/unselected/targo".to_vec(),
             b"--resource-metadata-v1".to_vec(),
         ];
+        // This test starts at paid preparation. Native ancestry admission is
+        // covered separately; its observation deadline is not a cancellation precondition.
+        let queue::Advance::Launch(custody) = world.owner.prepare(&mut pending).unwrap() else {
+            panic!("private preparation did not acquire original custody")
+        };
+        pending.admitted = Some(*custody);
         pending.recipe = None;
         let (probe, release) = recipe::Probe::paused();
         pending.probe = Some(probe);
-        world.owner.tick_queue();
+        world.owner.pending.push_back(pending);
         assert!(world.owner.pending.front().unwrap().admitted.is_some());
         assert_eq!(
             world.owner.debt.reserved().unwrap(),

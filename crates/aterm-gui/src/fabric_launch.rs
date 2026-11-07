@@ -831,6 +831,9 @@ mod tests {
 
     #[test]
     fn the_fabric_is_off_unless_it_is_configured() {
+        if !crate::test_alone::alone() {
+            return;
+        }
         crate::test_env::scoped_unset(FABRIC_COMMAND_ENV, || {
             assert_eq!(configured_command(&Config::default()), None);
             assert_eq!(configured_command(&with_command(None)), None);
@@ -844,6 +847,9 @@ mod tests {
 
     #[test]
     fn the_argv_form_keeps_a_spaced_program_whole_and_the_line_still_splits() {
+        if !crate::test_alone::alone() {
+            return;
+        }
         crate::test_env::scoped_unset(FABRIC_COMMAND_ENV, || {
             let program = "/Users//u/Applications/aterm (dev).app/Contents/MacOS/aterm";
             let argv = parsed(&format!(
@@ -907,6 +913,9 @@ mod tests {
 
     #[test]
     fn a_metacharacter_is_an_argument_and_not_a_second_command() {
+        if !crate::test_alone::alone() {
+            return;
+        }
         let cfg = Config::default();
         crate::test_env::scoped(FABRIC_COMMAND_ENV, "bridge ; rm -rf /", || {
             assert_eq!(
@@ -1446,6 +1455,9 @@ mod tests {
 
     #[test]
     fn the_startup_path_records_the_configured_command_and_arms_through_the_one_seam() {
+        if !crate::test_alone::alone() {
+            return;
+        }
         crate::test_env::scoped_unset(FABRIC_COMMAND_ENV, || {
             crate::fabric::with_link_reset(|| {
                 assert!(!spawn_supervisor(&Config::default()));
@@ -1491,6 +1503,9 @@ mod tests {
 
     #[test]
     fn a_runtime_attached_bridge_is_armed_again_after_an_update() {
+        if !crate::test_alone::alone() {
+            return;
+        }
         use crate::session_store::{SessionHandoff, SessionStore};
         crate::test_env::scoped_unset(FABRIC_COMMAND_ENV, || {
             let argv = vec![true_program(), "serve".to_string(), "--fleet".to_string()];

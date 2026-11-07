@@ -152,7 +152,7 @@ pub(crate) struct SessionRow {
     pub id: u64,
     /// The session's global sid (a task's `from=` names it).
     pub sid: String,
-    /// The tab's label as every Agents surface names it (`App::tab_label_of_session`): its role, else its title pin, else the strip's own rungs (the live OSC title without the status glyph an agent leads it with, then the cwd), else the tab's position, else the short sid.
+    /// The tab's label as every Agents surface names it (`App::tab_label_of_session`): its role, else its title pin, else the strip's own rungs (the live OSC title without the status glyph an agent leads it with, a worker's agent instead while its shell titles its tab, then the cwd), else the tab's position, else the short sid.
     pub title: String,
     /// What the session needs of its owner now, as published.
     pub need: Option<crate::needs::Need>,
@@ -373,7 +373,7 @@ pub(crate) const fn headline(word: NeedWord) -> &'static str {
 /// One session's escalation: its published need, as the menu row and the herald read it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Escalation {
-    /// Process-local session id, or a fleet need's key (`fleet_glance::herald_key`, which no local id reaches).
+    /// Process-local session id.
     pub session: u64,
     /// What it is about.
     pub kind: EscalationKind,
@@ -390,9 +390,9 @@ pub(crate) struct Escalation {
     /// The engine's sequence of the program's own `blocked` report a program-claim need stands
     /// on ([`crate::needs::Need::report`]): the box [`crate::box_banner`] keeps to one banner.
     pub report: Option<u64>,
-    /// Each need an ask stands for, by its own words ([`need_ids`], or a fleet peer's `need_ids=`, `fleet_glance::escalation`); empty for every other kind and for a fleet need its peer names no needs for, which keep one notice per transition.
+    /// Each need an ask stands for, by its own words ([`need_ids`]); empty for every other kind, which keeps one notice per transition.
     pub needs: Vec<NeedId>,
-    /// The owner's turn in the tab as the row read it ([`SessionRow::owner_turn`]); `0` for a fleet need.
+    /// The owner's turn in the tab as the row read it ([`SessionRow::owner_turn`]).
     pub owner_turn: u64,
 }
 
@@ -688,37 +688,6 @@ pub(crate) fn parse_told_ids(row: &str) -> Vec<u64> {
     ids[ids.len().saturating_sub(TOLD_MAX)..].to_vec()
 }
 
-/// The most needs a survey row publishes for one ask ([`need_ids_row`]) and a reader reads ([`parse_need_ids`]): the needs one session's told memory can keep, and the key of a count past them.
-pub(crate) const NEED_IDS_MAX: usize = TOLD_MAX + 1;
-
-/// THE NEEDS A PEER'S HERALD TELLS ONCE (design §14.18): a content survey row's `need_ids=` for `need`, each need [`need_ids`] reads, in its order, at most [`NEED_IDS_MAX`], comma-separated, each as this herald read it ([`NeedRead`]): `<id>` read whole, `<id>/<entry>` read whole beside an entry that cuts it to the words whose id is `<entry>`, `/<id>` read from the entry alone; ids in hex as [`told_ids_row`] spells them. So a fleet peer's herald (`fleet_glance::escalation`) names each need as this one does, and a first need read from the entry alone before its told set came is the same need read whole after. `None` for any need but an ask.
-#[must_use]
-pub(crate) fn need_ids_row(need: &crate::needs::Need) -> Option<String> {
-    let ids: Vec<String> = need_ids("", need, "")
-        .into_iter()
-        .take(NEED_IDS_MAX)
-        .map(|need| match need.read {
-            NeedRead::Whole => format!("{:016x}", need.id),
-            NeedRead::Cut(entry) => format!("{:016x}/{entry:016x}", need.id),
-            NeedRead::Entry => format!("/{:016x}", need.id),
-        })
-        .collect();
-    (!ids.is_empty()).then(|| ids.join(","))
-}
-
-/// A survey row's `need_ids=` ([`need_ids_row`]) read back: each need's id and how the peer read it, in its order, at most [`NEED_IDS_MAX`]; a part that does not read ([`hex_id`]) is dropped.
-#[must_use]
-pub(crate) fn parse_need_ids(row: &str) -> Vec<(u64, NeedRead)> {
-    row.split(',')
-        .filter_map(|part| match part.split_once('/') {
-            None => Some((hex_id(part)?, NeedRead::Whole)),
-            Some(("", entry)) => Some((hex_id(entry)?, NeedRead::Entry)),
-            Some((whole, entry)) => Some((hex_id(whole)?, NeedRead::Cut(hex_id(entry)?))),
-        })
-        .take(NEED_IDS_MAX)
-        .collect()
-}
-
 /// What a told escalation marks ([`Told::mark`]): each need it stands for ([`NeedId::marks`]), and its key.
 fn told_ids(esc: &Escalation) -> impl Iterator<Item = u64> + '_ {
     esc.needs
@@ -772,7 +741,7 @@ fn told_off_seam() -> bool {
     })
 }
 
-/// How long a seamless successor takes what its outgoing process had told the owner as already told ([`Herald::adopt`], and `App::herald_fleet`'s first fresh read): room for every standing need to be published again — the stall watch's re-detection (`input_backlog::STALL_AFTER`, stretched under load, then `input_stall::RECHECK`) and an issuer's first fleet read (`fleet_glance::POLL_EVERY` and its timeout).
+/// How long a seamless successor takes what its outgoing process had told the owner as already told ([`Herald::adopt`]): room for every standing need to be published again, which the stall watch's re-detection (`input_backlog::STALL_AFTER`, stretched under load, then `input_stall::RECHECK`) bounds.
 pub(crate) const ADOPT_SETTLE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// What the status item knew of one session, carried across a seamless update as one row (`SessionRecord::status_seen`): the published need and since when it stood, whether the herald had told it (posted, or spent it on a looking owner or alerts off: nothing owed), the ids its told-once memory holds, the hold and since when, and the done the owner looked at, by when its task entered it. A quit's restore leaf carries the told ids alone (`TerminalLeafRestore::told`), read back as a carry with nothing else.
@@ -1411,13 +1380,6 @@ impl Herald {
     /// Why the last [`Self::note_spent`] posted nothing, when it had a transition or a re-read to judge; `None` after a post or a cleared escalation.
     pub(crate) const fn last_quiet(&self) -> Option<HeraldQuiet> {
         self.last_quiet
-    }
-
-    /// `session` cannot be told of now — a fleet need whose Mac did not answer, or whose last read stopped counting (`App::herald_fleet`): a notice it owes is dropped, since no read can pay it and the App's timer ([`Self::due`]) would ask again at once, and what it shows is kept, so the same need read again is no new transition.
-    pub(crate) fn forgo(&mut self, session: u64) {
-        if let Some(slot) = self.slots.get_mut(&session) {
-            slot.suppress_desktop_notice();
-        }
     }
 
     /// Forget a retired session.
@@ -7002,7 +6964,6 @@ mod tests {
                     what: None,
                     claim: None,
                     carries_on: false,
-                    ids: Vec::new(),
                 })
                 .collect(),
             ..crate::fleet_glance::FleetMac::default()
@@ -7465,7 +7426,6 @@ mod tests {
                 what: None,
                 claim: None,
                 carries_on,
-                ids: Vec::new(),
             }
         };
         let slot = fleet_slot(

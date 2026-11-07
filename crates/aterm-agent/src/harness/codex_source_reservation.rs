@@ -13,6 +13,10 @@ mod origin;
 pub(crate) mod seal;
 pub use seal::SourceSeal;
 
+#[path = "codex_source_reservation_census.rs"]
+mod census;
+pub use census::{CensusCursor, CensusPage};
+
 const MAX_ACTIVE_USES: usize = 512;
 const MAX_MEMBER_USES: usize = 32;
 const RECENT_USES: usize = 8;
@@ -99,6 +103,22 @@ struct ActiveUse {
     gate: super::super::codex_source_gate::SourceGateIdentity,
     _scope: super::super::account_work::Scope,
 }
+struct EndingUse {
+    registration: String,
+    capability: Option<String>,
+    source: Arc<slot::SourceHandle>,
+    gate: SourceGateIdentity,
+    retirement: super::super::account_work::Cancellation,
+}
+impl EndingUse {
+    fn matches(&self, registration: Option<&str>, capability: Option<&str>) -> bool {
+        registration.is_none_or(|value| value == self.registration)
+            && capability.is_none_or(|value| self.capability.as_deref() == Some(value))
+    }
+    fn settled(&self) -> bool {
+        self.retirement.retired()
+    }
+}
 struct EndedUse {
     counter: u64,
     registration: String,
@@ -109,6 +129,7 @@ pub(super) struct Uses {
     highwater: u64,
     active: BTreeMap<u64, ActiveUse>,
     pending: BTreeMap<u64, PendingBegin>,
+    ending: BTreeMap<u64, EndingUse>,
     recent: std::collections::VecDeque<EndedUse>,
 }
 
@@ -234,6 +255,16 @@ fn cleanup_state(
     if uses.prefix != nonce.prefix {
         return Err(Error::Stale);
     }
+    if let Some(ending) = uses.ending.get(&nonce.counter) {
+        if !ending.matches(registration, capability) {
+            return Err(Error::Stale);
+        }
+        return if ending.settled() {
+            Ok(CleanupState::Closed)
+        } else {
+            Ok(CleanupState::FenceNeeded)
+        };
+    }
     if let Some(active) = uses.active.get(&nonce.counter) {
         if registration.is_some_and(|value| value != active.registration)
             || capability.is_some_and(|value| value != active.capability)
@@ -254,19 +285,14 @@ fn cleanup_state(
         .find(|ended| ended.counter == nonce.counter)
     {
         if registration.is_some_and(|value| value != ended.registration)
-            || capability.is_some_and(|value| {
-                ended
-                    .capability
-                    .as_deref()
-                    .is_some_and(|accepted| value != accepted)
-            })
+            || capability.is_some_and(|value| ended.capability.as_deref() != Some(value))
         {
             return Err(Error::Stale);
         }
         return Ok(CleanupState::Closed);
     }
     if nonce.counter <= uses.highwater {
-        return Ok(CleanupState::Closed);
+        return Err(Error::Stale);
     }
     if registration.is_some() {
         Ok(CleanupState::FenceNeeded)
@@ -392,7 +418,7 @@ fn replay_use(
     request: &UseRequest<'_>,
 ) -> Result<Option<UseProgress>, Error> {
     if !retained_member(state, caller, process, request.member)? {
-        return Ok(Some(UseProgress::Closed));
+        return Err(Error::Stale);
     }
     let key = member_key(caller, request.member)?;
     let Some(uses) = state.uses.get(&key) else {
@@ -400,6 +426,16 @@ fn replay_use(
     };
     if uses.prefix != request.nonce.prefix {
         return Err(Error::Stale);
+    }
+    if let Some(ending) = uses.ending.get(&request.nonce.counter) {
+        if !ending.matches(Some(request.registration), None) {
+            return Err(Error::Stale);
+        }
+        return if ending.settled() {
+            Ok(Some(UseProgress::Closed))
+        } else {
+            Err(Error::Busy)
+        };
     }
     if let Some(active) = uses.active.get(&request.nonce.counter) {
         if active.registration != request.registration {
@@ -452,13 +488,27 @@ fn begin_candidate(
         && (state
             .uses
             .values()
-            .map(|uses| uses.active.len() + uses.pending.len())
+            .map(|uses| {
+                uses.active.len()
+                    + uses.pending.len()
+                    + uses
+                        .ending
+                        .values()
+                        .filter(|ending| !ending.settled())
+                        .count()
+            })
             .sum::<usize>()
             >= MAX_ACTIVE_USES
-            || state
-                .uses
-                .get(&key)
-                .is_some_and(|uses| uses.active.len() + uses.pending.len() >= MAX_MEMBER_USES))
+            || state.uses.get(&key).is_some_and(|uses| {
+                uses.active.len()
+                    + uses.pending.len()
+                    + uses
+                        .ending
+                        .values()
+                        .filter(|ending| !ending.settled())
+                        .count()
+                    >= MAX_MEMBER_USES
+            }))
     {
         return Err(Error::Busy);
     }
@@ -654,27 +704,38 @@ impl Registry {
 
     pub fn settle_use_cleanup(&self, cleanup: Box<OwnedUseCleanup>) -> Result<UseProgress, Error> {
         self.check_cleanup(&cleanup.identity)?;
-        match &cleanup.body {
+        let OwnedUseCleanup { identity, body } = *cleanup;
+        let RegisteredMemberCleanup {
+            caller,
+            process,
+            member,
+            _custody,
+            ..
+        } = identity;
+        // The cleanup envelope must not itself keep the original operation
+        // alive while asking whether all credential captures have retired.
+        let _release = match _custody {
+            CleanupCustody::Original { _scope } => {
+                drop(_scope);
+                None
+            }
+            CleanupCustody::Release { _turn } => Some(_turn),
+        };
+        match body {
             CleanupBody::End { nonce, capability } => {
-                self.end_checked(
-                    &cleanup.identity.caller,
-                    &cleanup.identity.process,
-                    &cleanup.identity.member,
-                    *nonce,
-                    capability,
-                )?;
+                self.end_checked(&caller, &process, &member, nonce, &capability)?;
                 Ok(UseProgress::Closed)
             }
             CleanupBody::Close {
                 nonce,
                 registration,
             } => self.close_checked(
-                &cleanup.identity.caller,
-                &cleanup.identity.process,
+                &caller,
+                &process,
                 UseRequest {
-                    member: &cleanup.identity.member,
-                    nonce: *nonce,
-                    registration,
+                    member: &member,
+                    nonce,
+                    registration: &registration,
                 },
             ),
         }
@@ -970,6 +1031,7 @@ impl Registry {
             highwater: 0,
             active: BTreeMap::new(),
             pending: BTreeMap::new(),
+            ending: BTreeMap::new(),
             recent: std::collections::VecDeque::new(),
         });
         uses.highwater = work.nonce.counter;
@@ -1112,17 +1174,28 @@ impl Registry {
         let key = member_key(caller, request.member)?;
         let mut state = lock(&self.state)?;
         if !retained_member(&state, caller, process, request.member)? {
-            return Ok(UseProgress::Closed);
+            return Err(Error::Stale);
         }
         let uses = state.uses.entry(key).or_insert_with(|| Uses {
             prefix: request.nonce.prefix,
             highwater: 0,
             active: BTreeMap::new(),
             pending: BTreeMap::new(),
+            ending: BTreeMap::new(),
             recent: std::collections::VecDeque::new(),
         });
         if uses.prefix != request.nonce.prefix {
             return Err(Error::Stale);
+        }
+        if let Some(ending) = uses.ending.get(&request.nonce.counter) {
+            if !ending.matches(Some(request.registration), None) {
+                return Err(Error::Stale);
+            }
+            return if ending.settled() {
+                Ok(UseProgress::Closed)
+            } else {
+                Err(Error::Busy)
+            };
         }
         if let Some(active) = uses.active.get(&request.nonce.counter) {
             if active.registration != request.registration {
@@ -1140,17 +1213,27 @@ impl Registry {
                 .pending
                 .remove(&request.nonce.counter)
                 .ok_or(Error::Stale)?;
-            uses.recent.push_back(EndedUse {
-                counter: request.nonce.counter,
-                registration: pending.registration.clone(),
-                capability: None,
-            });
-            while uses.recent.len() > RECENT_USES {
-                uses.recent.pop_front();
-            }
+            let retirement = pending.scope.cancellation();
+            retirement.cancel();
+            uses.ending.insert(
+                request.nonce.counter,
+                EndingUse {
+                    registration: pending.registration.clone(),
+                    capability: None,
+                    source: pending.source.clone(),
+                    gate: pending.gate.clone(),
+                    retirement,
+                },
+            );
             drop(state);
             drop(pending);
-            return Ok(UseProgress::Closed);
+            return self.ending_progress(
+                caller,
+                request.member,
+                request.nonce,
+                Some(request.registration),
+                None,
+            );
         }
         if let Some(ended) = uses
             .recent
@@ -1164,7 +1247,7 @@ impl Registry {
             };
         }
         if request.nonce.counter <= uses.highwater {
-            return Ok(UseProgress::Closed);
+            return Err(Error::Stale);
         }
         uses.highwater = request.nonce.counter;
         uses.recent.push_back(EndedUse {
@@ -1321,6 +1404,7 @@ impl Registry {
                 highwater: 0,
                 active: BTreeMap::new(),
                 pending: BTreeMap::new(),
+                ending: BTreeMap::new(),
                 recent: std::collections::VecDeque::new(),
             });
         uses.highwater = uses.highwater.max(request.nonce.counter);
@@ -1385,6 +1469,30 @@ impl Registry {
         self.end_checked(&peer.caller, &peer.process, member, nonce, capability)
     }
 
+    fn ending_progress(
+        &self,
+        caller: &slot::Caller,
+        member: &str,
+        nonce: UseNonce,
+        registration: Option<&str>,
+        capability: Option<&str>,
+    ) -> Result<UseProgress, Error> {
+        let state = lock(&self.state)?;
+        let uses = state
+            .uses
+            .get(&member_key(caller, member)?)
+            .ok_or(Error::Stale)?;
+        let ending = uses.ending.get(&nonce.counter).ok_or(Error::Stale)?;
+        if uses.prefix != nonce.prefix || !ending.matches(registration, capability) {
+            return Err(Error::Stale);
+        }
+        if ending.settled() {
+            Ok(UseProgress::Closed)
+        } else {
+            Err(Error::Busy)
+        }
+    }
+
     fn end_checked(
         &self,
         caller: &slot::Caller,
@@ -1399,58 +1507,111 @@ impl Registry {
         let key = member_key(caller, member)?;
         let mut state = lock(&self.state)?;
         if !retained_member(&state, caller, process, member)? {
-            return Ok(());
+            return Err(Error::Stale);
         }
         let uses = state.uses.get_mut(&key).ok_or(Error::Stale)?;
         if uses.prefix != nonce.prefix || nonce.counter > uses.highwater {
             return Err(Error::Stale);
         }
+        if let Some(ending) = uses.ending.get(&nonce.counter) {
+            if !ending.matches(None, Some(capability)) {
+                return Err(Error::Stale);
+            }
+            return if ending.settled() {
+                Ok(())
+            } else {
+                Err(Error::Busy)
+            };
+        }
         if uses.pending.contains_key(&nonce.counter) {
             return Err(Error::Stale);
         }
-        if let Some(active) = uses.active.get(&nonce.counter) {
-            if active.capability != capability {
-                return Err(Error::Stale);
-            }
-        } else {
-            return if uses
-                .recent
-                .iter()
-                .find(|ended| ended.counter == nonce.counter)
-                .is_none_or(|ended| {
-                    ended
-                        .capability
-                        .as_deref()
-                        .is_none_or(|accepted| accepted == capability)
-                }) {
+        let Some(active) = uses.active.get(&nonce.counter) else {
+            return if uses.recent.iter().any(|ended| {
+                ended.counter == nonce.counter && ended.capability.as_deref() == Some(capability)
+            }) {
                 Ok(())
             } else {
                 Err(Error::Stale)
             };
+        };
+        if active.capability != capability {
+            return Err(Error::Stale);
         }
         let active = uses.active.remove(&nonce.counter).ok_or(Error::Stale)?;
-        uses.recent.push_back(EndedUse {
-            counter: nonce.counter,
-            registration: active.registration,
-            capability: Some(active.capability),
-        });
-        while uses.recent.len() > RECENT_USES {
-            uses.recent.pop_front();
-        }
+        let retirement = active._scope.cancellation();
+        retirement.cancel();
+        uses.ending.insert(
+            nonce.counter,
+            EndingUse {
+                registration: active.registration,
+                capability: Some(active.capability),
+                source: active.source,
+                gate: active.gate,
+                retirement,
+            },
+        );
         drop(state);
         drop(active._scope);
-        Ok(())
+        self.ending_progress(caller, member, nonce, None, Some(capability))
+            .map(|_| ())
     }
+}
+
+/// Kernel-proven caller departure ends SDK work, but native credential captures
+/// still own the real operation. The caller drops returned scopes outside State.
+pub(super) fn retire_gone_uses(
+    state: &mut State,
+    keys: &[String],
+) -> Vec<super::super::account_work::Scope> {
+    let mut scopes = Vec::new();
+    for key in keys {
+        let Some(uses) = state.uses.get_mut(key) else {
+            continue;
+        };
+        for (counter, active) in std::mem::take(&mut uses.active) {
+            let retirement = active._scope.cancellation();
+            retirement.cancel();
+            uses.ending.insert(
+                counter,
+                EndingUse {
+                    registration: active.registration,
+                    capability: Some(active.capability),
+                    source: active.source,
+                    gate: active.gate,
+                    retirement,
+                },
+            );
+            scopes.push(active._scope);
+        }
+        for (counter, pending) in std::mem::take(&mut uses.pending) {
+            let retirement = pending.scope.cancellation();
+            retirement.cancel();
+            uses.ending.insert(
+                counter,
+                EndingUse {
+                    registration: pending.registration,
+                    capability: None,
+                    source: pending.source,
+                    gate: pending.gate,
+                    retirement,
+                },
+            );
+            scopes.push(pending.scope);
+        }
+    }
+    scopes
 }
 
 pub(super) fn has_active_uses(state: &State, key: &str) -> bool {
     state.preloads.contains_key(key) || has_credential_uses(state, key)
 }
 pub(super) fn has_credential_uses(state: &State, key: &str) -> bool {
-    state
-        .uses
-        .get(key)
-        .is_some_and(|uses| !uses.active.is_empty() || !uses.pending.is_empty())
+    state.uses.get(key).is_some_and(|uses| {
+        !uses.active.is_empty()
+            || !uses.pending.is_empty()
+            || uses.ending.values().any(|ending| !ending.settled())
+    })
 }
 
 pub(super) fn admit_derived(

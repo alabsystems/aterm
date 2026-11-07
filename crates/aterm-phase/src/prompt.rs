@@ -443,6 +443,11 @@ pub struct PromptV2 {
     pub command_rows: Vec<String>,
     /// Number of trailing [`Self::command_rows`] attributed to [`Self::description`].
     pub description_rows: usize,
+    /// Every command the box's drawing may stand for, when its reader names them all: then
+    /// [`Self::readings`] is these alone. A reader sets it where no join of the rows is sure, as
+    /// Kimi Code's, whose wraps may have dropped a run of spaces or cut a word with none
+    /// ([`crate::kimi::prompt`]).
+    pub spellings: Option<Vec<String>>,
     /// Whether the command block was rendered with `│` gutter bars.
     pub gutter: bool,
     /// Display command string (`command_rows` excluding `description_rows`), path, or folder.
@@ -493,16 +498,24 @@ impl PromptV2 {
             .find(|o| o.role == Role::Answer && o.recommended())
     }
 
-    /// Returns all candidate command strings that must be classified before approving.
+    /// Returns all candidate command strings that must be classified before approving: the
+    /// [`Self::spellings`] when the reader named them, else the rows with and without the
+    /// [`Self::description_rows`], joined as one wrapped line and, on a [`Self::gutter`], as
+    /// lines.
     #[must_use]
     pub fn readings(&self) -> Vec<String> {
         let rows = &self.command_rows;
         let head = &rows[..rows.len().saturating_sub(self.description_rows)];
-        let mut out = vec![head.join(" "), rows.join(" ")];
-        if self.gutter {
-            out.push(head.join("\n"));
-            out.push(rows.join("\n"));
-        }
+        let out = match &self.spellings {
+            Some(spellings) => spellings.clone(),
+            None if self.gutter => vec![
+                head.join(" "),
+                rows.join(" "),
+                head.join("\n"),
+                rows.join("\n"),
+            ],
+            None => vec![head.join(" "), rows.join(" ")],
+        };
         let mut seen: Vec<String> = Vec::new();
         for r in out {
             if !r.is_empty() && !seen.contains(&r) {
@@ -935,6 +948,7 @@ fn parse(rows: &[String]) -> Option<(Prompt, PromptV2)> {
         title: title.to_string(),
         command_rows: Vec::new(),
         description_rows: 0,
+        spellings: None,
         gutter: false,
         command: String::new(),
         description: String::new(),

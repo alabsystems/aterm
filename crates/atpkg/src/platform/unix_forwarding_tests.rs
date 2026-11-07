@@ -84,3 +84,13 @@ fn two_overlapping_waits_leave_sigint_as_they_found_it() {
     }
     assert_eq!(sigint_now(), before, "SIGINT as the waits found it");
 }
+
+/// A test's child spawned through [`super::spawn_outside_a_stand_aside`] is spawned inside this
+/// process's forwarding turn, which every wait that stands aside holds while it ignores SIGINT.
+#[test]
+fn a_child_spawned_outside_a_stand_aside_is_spawned_in_the_forwarding_turn() {
+    assert!(
+        super::spawn_outside_a_stand_aside(|| super::FORWARDING_TURN.try_lock().is_err()),
+        "a child spawned while another test's wait may be ignoring SIGINT"
+    );
+}

@@ -132,7 +132,9 @@ fn native_centers_share_one_confirmation_incarnation() {
 
 #[test]
 fn the_pre_app_inbox_drains_into_the_center_with_its_own_stamp() {
-    let _lane = crate::message_inbox::lane_test_guard();
+    if !crate::message_inbox::lane_zero_alone() {
+        return;
+    }
     let _ = crate::message_inbox::take_queued();
     let mut app = App::headless_for_test();
     crate::message_inbox::queue_message(warn("queued before App"));
@@ -157,8 +159,10 @@ fn the_pre_app_inbox_drains_into_the_center_with_its_own_stamp() {
 
 #[test]
 fn torn_fabric_state_set_aside_is_one_exceptions_entry_at_the_next_park() {
+    if !crate::message_inbox::lane_zero_alone() {
+        return;
+    }
     use crate::fabric::Registry as _;
-    let _lane = crate::message_inbox::lane_test_guard();
     let _ = crate::message_inbox::take_queued();
     let _ = crate::message_inbox::take_queued_exceptions();
     let mut app = App::headless_for_test();
@@ -201,7 +205,9 @@ fn torn_fabric_state_set_aside_is_one_exceptions_entry_at_the_next_park() {
 
 #[test]
 fn torn_fabric_state_ends_once_the_quarantine_holds_none_of_it() {
-    let _lane = crate::message_inbox::lane_test_guard();
+    if !crate::message_inbox::lane_zero_alone() {
+        return;
+    }
     let _ = crate::message_inbox::take_queued();
     let _ = crate::message_inbox::take_queued_exceptions();
     let key = crate::message_reporters::torn_state_key();
@@ -301,8 +307,10 @@ fn fell_back(dir: &str, fault: crate::spawn_folder::Fault) {
 
 #[test]
 fn folders_that_were_not_found_fold_into_one_row_while_it_is_up() {
+    if !crate::message_inbox::lane_zero_alone() {
+        return;
+    }
     use crate::spawn_folder::Fault;
-    let _lane = crate::message_inbox::lane_test_guard();
     let _ = crate::message_inbox::take_queued();
     let _ = crate::spawn_folder::take_noted();
     let mut app = App::headless_for_test();
@@ -347,8 +355,10 @@ fn folders_that_were_not_found_fold_into_one_row_while_it_is_up() {
 
 #[test]
 fn a_carried_folder_row_keeps_its_folders_when_the_next_one_joins() {
+    if !crate::message_inbox::lane_zero_alone() {
+        return;
+    }
     use crate::spawn_folder::{Fault, Named};
-    let _lane = crate::message_inbox::lane_test_guard();
     let _ = crate::message_inbox::take_queued();
     let _ = crate::spawn_folder::take_noted();
     let key = crate::message_reporters::KEY_FOLDER_NOT_FOUND;

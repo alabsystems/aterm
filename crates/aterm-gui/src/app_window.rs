@@ -2888,6 +2888,7 @@ impl App {
                     .windows
                     .get(&id)
                     .and_then(|state| state.tab_title_cache.get(&session_id))
+                    .map(|cached| cached.title.as_str())
                     .filter(|title| !title.is_empty())
                 {
                     Some(cached) => {
@@ -4283,7 +4284,13 @@ mod tests {
             .get_mut(&wid)
             .expect("window 0")
             .tab_title_cache
-            .insert(0, "~/cached-worktree".to_string());
+            .insert(
+                0,
+                crate::app_tabs::CapturedTitle {
+                    title: "~/cached-worktree".to_string(),
+                    shell: false,
+                },
+            );
         let term = app.pool.get(0).expect("session 0").term.clone();
         let _parser_guard = term.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut slot = String::new();

@@ -3435,7 +3435,7 @@ fn admit_waiting(
 ) -> Result<Claim, Error> {
     let asked = crate::telemetry::Asked::of(&need);
     let decided = admit_deciding(ledger, machine, need, mode, pace, relief, say, stopped);
-    crate::telemetry::decided(ledger, &asked, &decided);
+    crate::telemetry::decided(ledger, &asked, decided.as_ref());
     decided
 }
 

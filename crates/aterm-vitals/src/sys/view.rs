@@ -1868,6 +1868,27 @@ fn mem_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
     }
 }
 
+/// The pane lines a caller may read, and how many outside its tab were withheld from a caller
+/// that is not the owner (as [`disk_writers`]).
+fn disk_panes<'a>(ctx: &Ctx<'_>, t: &'a disk::DiskTotals) -> (Vec<&'a disk::PaneLine>, usize) {
+    let keys = scope_keys(ctx, ScopeArg::Tab);
+    let mut withheld = 0usize;
+    let shown = t
+        .panes
+        .iter()
+        .filter(|p| {
+            let own = keys.contains(&p.key);
+            if own || ctx.owner_class {
+                true
+            } else {
+                withheld += 1;
+                false
+            }
+        })
+        .collect();
+    (shown, withheld)
+}
+
 fn disk_writers<'a>(ctx: &Ctx<'_>, s: &'a Snapshot, scope: ScopeArg) -> (Vec<&'a ProcView>, usize) {
     let keys = scope_keys(ctx, ScopeArg::Tab);
     let mut withheld = 0usize;
@@ -1988,6 +2009,30 @@ fn disk_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
             format!("space {}", words::disk_space_line(&volume)),
         ));
     }
+    if let Some(t) = ctx.disk {
+        for sc in &t.scopes {
+            let key = match sc {
+                disk::ScopeLine::Global { .. } => "scope global".to_owned(),
+                disk::ScopeLine::Bytes(b) => format!("scope {}", b.name),
+            };
+            lines.push(line(key, sc.text(&|t| pct(t), &unavailable)));
+        }
+        let (panes, withheld) = disk_panes(ctx, t);
+        for p in panes {
+            lines.push(line(
+                format!("pane {}", p.key),
+                p.text(ctx.path_ok(&[p.key]), ctx.home, &|t| pct(t), &|e| {
+                    exe_word(e).to_owned()
+                }),
+            ));
+        }
+        if withheld > 0 {
+            lines.push(note(
+                "panes withheld",
+                format!("withheld={withheld} (pane rows outside this tab are the owner's)"),
+            ));
+        }
+    }
     lines.push(line(
         "disk",
         format!(
@@ -2051,6 +2096,12 @@ fn disk_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
         }
         if let Some(t) = r.counted_in {
             rec.push_str(&format!(" counted_in=tab{t}"));
+        }
+        if !r.scopes.is_empty() {
+            rec.push_str(&format!(" scopes={}", r.scopes.join(",")));
+        }
+        if let Some(pool) = r.pool {
+            rec.push_str(&format!(" pool={pool}"));
         }
         lines.push(line(format!("root {n}"), rec));
         for (rank, d) in r
@@ -2764,7 +2815,9 @@ fn split_json(s: &Snapshot, tab: &Fig) -> Jv {
 pub fn render_json(q: &SysQuery, ctx: &Ctx<'_>) -> Jv {
     let scope = q.effective_scope();
     let mut o = Jv::obj([
-        ("schema", Jv::Int(1)),
+        // `sys.disk` replies carry its scope and pane arrays (flow record §7.12); every other
+        // kind keeps 1.
+        ("schema", Jv::Int(if q.view == View::Disk { 2 } else { 1 })),
         ("kind", Jv::s(format!("sys.{}", q.view.word()))),
     ]);
     if let Some(sc) = q.view.default_scope().and(scope) {
@@ -3676,6 +3729,13 @@ fn disk_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
             if let Some(t) = r.counted_in {
                 o.set("counted_in_tab", Jv::u(t as u64));
             }
+            o.set(
+                "scopes",
+                Jv::Arr(r.scopes.iter().map(|s| Jv::s(s.clone())).collect()),
+            );
+            if let Some(pool) = r.pool {
+                o.set("pool", Jv::s(pool));
+            }
             let dirs: Vec<Jv> = r
                 .dirs
                 .iter()
@@ -3741,6 +3801,25 @@ fn disk_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
         },
     );
     let mut o = Jv::obj([("roots", Jv::Arr(roots))]);
+    if let Some(t) = ctx.disk {
+        o.set(
+            "scopes",
+            Jv::Arr(t.scopes.iter().map(disk::ScopeLine::json).collect()),
+        );
+        let (panes, withheld) = disk_panes(ctx, t);
+        o.set(
+            "panes",
+            Jv::Arr(
+                panes
+                    .iter()
+                    .map(|p| p.json(ctx.path_ok(&[p.key]), ctx.home, &|e| exe_word(e).to_owned()))
+                    .collect(),
+            ),
+        );
+        if withheld > 0 {
+            o.set("panes_withheld", Jv::u(withheld as u64));
+        }
+    }
     disk::totals_json(ctx.disk, &mut o);
     o.set(
         "walking",

@@ -10,6 +10,57 @@ use aterm_types::land_trailer::KEYS;
 use std::cell::RefCell;
 use std::path::PathBuf;
 
+#[test]
+fn resource_admission_cannot_replace_the_landing_check_scope() {
+    let args = |values: &[&str]| {
+        values
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(admission(&[]), Some(aterm_capacity::Admit::Wait));
+    assert_eq!(
+        admission(&args(&["--admit", "now"])),
+        Some(aterm_capacity::Admit::Now)
+    );
+    assert_eq!(
+        admission(&args(&["--admit=wait"])),
+        Some(aterm_capacity::Admit::Wait)
+    );
+    for flags in [
+        &["--admit"][..],
+        &["--admit", "other"],
+        &["--checks", "fmt"],
+        &["-p", "one"],
+        &["--base", "HEAD"],
+        &["--admit", "now", "--all"],
+    ] {
+        assert_eq!(admission(&args(flags)), None);
+    }
+    let cmd = judgment_command(
+        Path::new("/targo"),
+        Path::new("/checkout"),
+        "main-sha",
+        Path::new("/events"),
+        aterm_capacity::Admit::Now,
+    );
+    assert_eq!(
+        cmd.get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+        [
+            "--unverified",
+            "verify",
+            "--base",
+            "main-sha",
+            "--events",
+            "/events",
+            "--admit",
+            "now"
+        ]
+    );
+}
+
 fn git_cmd(dir: &Path) -> Command {
     let mut cmd = aterm_uds::fixture_git::git();
     cmd.current_dir(dir)

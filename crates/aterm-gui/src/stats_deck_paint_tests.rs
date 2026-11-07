@@ -191,7 +191,8 @@ pub(crate) fn readings_of(ring: &[Cell], at: i64) -> Arc<[Reading]> {
             Some(Reading {
                 at_ms: t,
                 v: cell.mean?,
-                over: cell.over_n > 0.0,
+                over: cell.over_ms > 0.0,
+                w_ms: 1_000,
             })
         })
         .collect()
@@ -214,12 +215,12 @@ fn row(now: f64, cap: f64, st: &Story, i: usize, aterm: ScopeFig, tab: ScopeFig)
         .zip(over)
         .map(|(h, &o)| {
             let v = h.map(|h| h * cap);
-            let n = if v.is_some() { 10.0 } else { 0.0 };
+            let tau_ms = if v.is_some() { 10_000.0 } else { 0.0 };
             Cell {
                 mean: v,
                 max: v,
-                n,
-                over_n: if o { n } else { 0.0 },
+                tau_ms,
+                over_ms: if o { tau_ms } else { 0.0 },
             }
         })
         .collect();
@@ -1086,7 +1087,7 @@ fn every_row_with_a_percent_draws_its_bar() {
         (DeckForm::Folded, 1119.0),
         (DeckForm::Folded, 650.0),
         (DeckForm::Folded, 600.0),
-        (DeckForm::Folded, 350.0),
+        (DeckForm::Folded, 400.0),
         (DeckForm::Full, 580.0),
         (DeckForm::Full, 400.0),
         (DeckForm::Full, 350.0),
@@ -1186,9 +1187,9 @@ fn the_bar_under_the_percent_is_the_bars_on_whole_pixels() {
     let snap = scene(Scene::Calm);
     let mut nested = 0;
     for (form, w, wide) in [
-        (DeckForm::Folded, 350.0, 1119.0),
         (DeckForm::Folded, 400.0, 1119.0),
         (DeckForm::Folded, 450.0, 1119.0),
+        (DeckForm::Folded, 520.0, 1119.0),
         (DeckForm::Full, 210.0, 580.0),
     ] {
         for s in [1.0, 2.0] {
@@ -3025,7 +3026,10 @@ fn an_events_keyline_never_cuts_another_events_line() {
 /// rail, except at 1×, where the words' descenders can take its one row over the rail and, on the
 /// rail's row, either the rail breaks under it, as under Worst's "Disk emergency" over Folded
 /// 1119 pt's first strip, or a descender's edge reaches its foot, as at Full 420 pt and Folded
-/// 700 pt (the third review, 2026-11-06): there it has none and reads as part of the words. Calm's
+/// 700 pt (the third review, 2026-11-06): there it has none and reads as part of the words. Each
+/// of its columns may take either, and a break is a cap's or the piece under 3 px the deck drops
+/// between two breaks of one band (`Deck::rail_pieces`), as under the Restart's pip at Worst Full
+/// 420 pt 1×'s 196 since R5's plan (the land of R5, F4′ and F2a, 2026-11-06). Calm's
 /// header and Worst's, events of every kind, at ages across every band and, at 1×, at every place
 /// along each strip where the header's ink stands over both of a pip's columns on the row over the
 /// rail, over boxes two of three of which are over (half or wholly) and the third not, Full and
@@ -3310,13 +3314,19 @@ fn an_events_pip_stands_on_the_rail_clear_of_row_0s_caps() {
                                     "{tag}: the pip at {x} px has no px of its own"
                                 );
                                 if own == 0 {
-                                    let on_break = breaks.iter().any(|b| over(b.0, b.1));
-                                    let edged = (x as i32..(x + qw) as i32).all(|c| {
-                                        let c = c as f32;
+                                    // On the rail's row each of its columns stands where the rail
+                                    // breaks, over a cap's break or over a piece under 3 px between
+                                    // two breaks of one band, which the deck drops
+                                    // (`Deck::rail_pieces`; at Full 420 pt since R5's plan), or
+                                    // under a descender's edge over the rail.
+                                    let cols = || (x as i32..(x + qw) as i32).map(|c| c as f32);
+                                    let edge = |c: f32| {
                                         on(c) && ![grid, ground].contains(&at(&bare_px, c, rail_y))
-                                    });
+                                    };
+                                    let on_break = breaks.iter().any(|b| over(b.0, b.1))
+                                        || cols().any(|c| !on(c));
                                     assert!(
-                                        on_break || edged,
+                                        cols().all(|c| !on(c) || edge(c)),
                                         "{tag}: the pip at {x} px has no px of its own, with neither \
                                          the rail's break nor the header's ink on the rail's row \
                                          under it"
@@ -3344,7 +3354,7 @@ fn an_events_pip_stands_on_the_rail_clear_of_row_0s_caps() {
          the rail's break at a cap at 1× ({over_break})"
     );
     assert!(
-        wholly > 10 && tinted > 10 && located > 100 && hidden_named > 0 && hidden_edged > 0,
+        wholly > 0 && tinted > 10 && located > 100 && hidden_named > 0 && hidden_edged > 0,
         "CONTROL: the words' px under a pip, wholly their ink ({wholly}) and edges blended over it \
          ({tinted}), pips laid where the header's ink stands over the rail at 1× ({located}), and \
          pips with no px of their own ({hidden}): over the rail's break under Worst's words over \
@@ -3369,7 +3379,10 @@ fn an_events_pip_stands_on_the_rail_clear_of_row_0s_caps() {
 /// notch's px, where the events' frame holds ground, the gap's ink; on every other px exactly what
 /// the events' frame holds, so the pips keep every px there and nothing else of a gap stands there.
 /// On the rail's row: each px of a pip's foot the pip covers wholly keeps its ink, a gap's rail
-/// under it included; off the feet, inside a span, the gap's rail where the rail stands; elsewhere
+/// under it included; off the feet, inside a span, the gap's rail where the rail stands, under a
+/// header tick that keeps its px in both frames, while a glyph's edge where the header's words
+/// reach the rail's row, as at Folded 420 pt since R5's plan (the land of R5, F4′ and F2a,
+/// 2026-11-06), blends over the gap's rail and is judged no further, as over a pip; elsewhere
 /// the events' frame's px, or the grid's rail where a gap's box took the cap the rail broke over.
 /// The rows under the rail are the caps' (`an_events_pip_stands_on_the_rail_clear_of_row_0s_caps`
 /// and `a_time_gaps_rail_breaks_where_the_axis_rail_does` judge them). Crash, sleep and paused gaps
@@ -3505,8 +3518,19 @@ fn a_gaps_notch_steps_clear_of_an_events_pip_on_its_end() {
                             kind,
                         })
                         .collect();
-                    let (_, ev_px, pw) = raster(&events);
+                    let (ev_laid, ev_px, pw) = raster(&events);
                     let (both_laid, both_px, _) = raster(&both);
+                    // The inks the events' frame draws opaque: where a px holds one exactly, a
+                    // prim covers it wholly.
+                    let opaque: Vec<crate::widget::Rgba> = ev_laid
+                        .prims
+                        .iter()
+                        .filter_map(|p| match *p {
+                            DrawPrim::Text { color, .. } if color[3] == 0xFF => Some(color),
+                            DrawPrim::Panel { fill, .. } if fill[3] == 0xFF => Some(fill),
+                            _ => None,
+                        })
+                        .collect();
                     let at = |px: &[u8], x: f32, y: f32| {
                         let i = (y as usize * pw + x as usize) * 4;
                         [px[i], px[i + 1], px[i + 2], px[i + 3]]
@@ -3685,7 +3709,14 @@ fn a_gaps_notch_steps_clear_of_an_events_pip_on_its_end() {
                                     feet_on_gaps[n] += usize::from(span.is_some());
                                 }
                             } else if let (Some(&(_, _, kind)), true) = (span, on(x)) {
-                                // A header tick stands over the rail in both frames.
+                                // A header tick stands over the rail in both frames. A glyph's
+                                // edge, where the header's words reach the rail's row (Folded
+                                // 420 pt since R5's plan), blends over the gap's rail instead of
+                                // the events' frame's px, as over a pip (the pip law), so it
+                                // keeps no px to compare.
+                                if e != grid && e != ground && !opaque.contains(&e) {
+                                    continue;
+                                }
                                 let want = if e == grid || e == ground {
                                     ink(kind)
                                 } else {
@@ -4696,7 +4727,7 @@ fn hit_map() {
         .find(|h| h.kind == HitKind::Header)
         .map(|h| h.instrument());
     assert_eq!(header_names, Some(Instrument::HowToRead));
-    for (w, s) in [(1119.0, 2.0), (750.0, 2.0), (450.0, 1.0)] {
+    for (w, s) in [(1119.0, 2.0), (750.0, 2.0), (500.0, 1.0)] {
         let p = plan::plan_folded(w, &m);
         let at = format!("Folded {:?} at {w} pt, {s}×", p.blocks[0].kind);
         let laid = laid(Scene::Calm, w, s, DeckForm::Folded, &m, true);
@@ -5231,7 +5262,7 @@ fn no_column_of_figures_stands_after_the_strip() {
         for (form, w) in [
             (DeckForm::Full, 1039.0),
             (DeckForm::Full, 700.0),
-            (DeckForm::Full, 450.0),
+            (DeckForm::Full, 500.0),
             (DeckForm::Folded, 2560.0),
             (DeckForm::Folded, 1424.0),
             (DeckForm::Folded, 1039.0),

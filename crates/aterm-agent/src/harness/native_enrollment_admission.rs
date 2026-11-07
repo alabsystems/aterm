@@ -200,6 +200,7 @@ pub struct NativeBrowserTurn {
     directory: File,
     claim: browser_window::ProfileLock,
     callback: TcpListener,
+    callback_port: u16,
     source_home: std::sync::OnceLock<PathBuf>,
     exchange: Mutex<Option<CodeExchangeLease>>,
     publication: Mutex<Option<PublicationTurn>>,
@@ -318,6 +319,27 @@ impl NativeBrowserTurn {
         row: &accounts::Row,
         now: i64,
     ) -> Result<Arc<Self>, String> {
+        Self::acquire_on(store, request, row, now, &codex_app_login::LOOPBACK_PORTS)
+    }
+
+    /// Private-world fixtures must not reserve a person's real sign-in ports.
+    #[cfg(all(unix, any(test, debug_assertions)))]
+    pub(super) fn acquire_isolated_fixture(
+        store: &accounts::Store,
+        request: &codex_enrollment::Request,
+        row: &accounts::Row,
+        now: i64,
+    ) -> Result<Arc<Self>, String> {
+        Self::acquire_on(store, request, row, now, &[0])
+    }
+
+    fn acquire_on(
+        store: &accounts::Store,
+        request: &codex_enrollment::Request,
+        row: &accounts::Row,
+        now: i64,
+        ports: &[u16],
+    ) -> Result<Arc<Self>, String> {
         platform::require_available()?;
         let (logins, warning) = store
             .load_logins(now)
@@ -347,10 +369,14 @@ impl NativeBrowserTurn {
         let claim = browser_window::ProfileLock::claim(&profile)
             .map_err(|_| "native browser profile is in use")?;
         let callback = codex_app_login::bind_callback_listener(
-            &codex_app_login::LOOPBACK_PORTS,
+            ports,
             super::wake_deadline::WakeDeadline::after(super::login_drive::HANG),
         )
         .map_err(|_| "registered native callback ports are in use")?;
+        let callback_port = callback
+            .local_addr()
+            .map_err(|_| "native callback unavailable")?
+            .port();
         let result = Arc::new(Self {
             request: request.clone(),
             shared_dir,
@@ -359,6 +385,7 @@ impl NativeBrowserTurn {
             directory,
             claim,
             callback,
+            callback_port,
             source_home: std::sync::OnceLock::new(),
             exchange: Mutex::new(None),
             publication: Mutex::new(None),
@@ -403,9 +430,7 @@ impl NativeBrowserTurn {
             .callback
             .local_addr()
             .map_err(|_| "native callback unavailable")?;
-        if address.ip() != std::net::Ipv4Addr::LOCALHOST
-            || !codex_app_login::LOOPBACK_PORTS.contains(&address.port())
-        {
+        if address.ip() != std::net::Ipv4Addr::LOCALHOST || address.port() != self.callback_port {
             return Err("native callback changed".into());
         }
         Ok(address.port())

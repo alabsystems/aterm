@@ -1,0 +1,51 @@
+# kimi 2.5.2 · MEASURED 2026-11-06, `aterm ctl text` of an `aterm-lab kimi` instance (a private headless aterm, 144x50, aterm 0.161.0, a debug build of main) running the real Kimi Code, launched by path with a scratch `HOME` and `KIMI_CODE_HOME` whose `config.toml` names one `openai`-type provider at `http://127.0.0.1:<port>/v1` with a fake key (a local stub of the Chat Completions API, crates/aterm-lab), no login, in a project folder that is no git work tree (so Kimi asks before writing), and whose `tui.toml` says `tui_mode = "fullscreen"`, so the panel docks over the transcript in the composer's place with no `context: N%` footer under it and caps its body at six rows (`maxBodyRows`), scrolling one taller under a scrollbar in the screen's last column, one past the rules (`│` its track, `┃` its thumb), and ending its focused key row `· shift+↑/↓ scroll` · the stub asks for `Bash` with six lines (`cat README.md`, `ls -la`, `git status`, `git log --oneline -3`, `wc -l README.md`, `rm -rf build-output`) and a description: its nine body rows (cwd, danger, six lines, description) overflow the six the dock shows, so the cwd and danger rows and the first four lines stand over a scrollbar (thumb on the first four rows) and the last two lines and the description are hidden below; the key row adds `shift+↑/↓ scroll` · the lab's random project dir is spelled /private/tmp/at.HOk4 here
+ ✗ Ran a command · $ cat README.md…
+   Tool "Bash" was not run because the user rejected the approval request.
+
+   Rejected: Running: cat README.md
+ rm -rf build-output
+
+ ● Tool call done. Result: Wall time: 0.000 seconds <system>ERROR: Tool execution failed.</system> Tool "Bash" was not run because the user
+   rejected the approval request.
+
+ ❯ toolstart write
+
+ ✗ Used Write (/private/tmp/at.HOk4/proj/notes-for-the-lab.txt) · 40 lines
+      1  line 01 of the notes the lab wrote to fill the box
+      2  line 02 of the notes the lab wrote to fill the box
+      3  line 03 of the notes the lab wrote to fill the box
+      4  line 04 of the notes the lab wrote to fill the box
+      5  line 05 of the notes the lab wrote to fill the box
+      6  line 06 of the notes the lab wrote to fill the box
+      7  line 07 of the notes the lab wrote to fill the box
+      8  line 08 of the notes the lab wrote to fill the box
+      9  line 09 of the notes the lab wrote to fill the box
+     10  line 10 of the notes the lab wrote to fill the box
+   … (30 more lines, 40 total, ctrl+o to expand)
+   Tool "Write" was not run because the user rejected the approval request.
+
+   Rejected: Writing /private/tmp/at.HOk4/proj/notes-for-the-lab.txt
+
+ ● Tool call done. Result: <system>ERROR: Tool execution failed.</system> Tool "Write" was not run because the user rejected the approval
+   request.
+
+ ❯ toolstart six lines
+
+ ● Running a command · $ cat README.md…
+ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   ▶ Run this command?
+
+   cwd: /private/tmp/at.HOk4/proj                                                                                                              ┃
+   Dangerous: recursive delete                                                                                                                 ┃
+   $ cat README.md                                                                                                                             ┃
+   · ls -la                                                                                                                                    ┃
+   · git status                                                                                                                                │
+   · git log --oneline -3                                                                                                                      │
+
+   ▶ 1. Approve once
+     2. Approve for this session
+     3. Reject
+     4. Reject with feedback
+
+   ↑/↓ select · 1/2/3/4 choose · ↵ confirm · shift+↑/↓ scroll
+ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────

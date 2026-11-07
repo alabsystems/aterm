@@ -149,10 +149,10 @@ fn set_soak(row: &mut ResourceView, soak: f32) {
     let n = cells.len();
     for (i, cell) in cells.iter_mut().enumerate() {
         if i + over >= n {
-            cell.n = cell.n.max(1.0);
-            cell.over_n = cell.n;
+            cell.tau_ms = cell.tau_ms.max(aterm_vitals::ring::BUCKET_MS as f64);
+            cell.over_ms = cell.tau_ms;
         } else {
-            cell.over_n = 0.0;
+            cell.over_ms = 0.0;
         }
     }
     row.ring = cells.into();

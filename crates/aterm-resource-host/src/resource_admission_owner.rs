@@ -93,7 +93,7 @@ struct Pending {
     recipe: Option<recipe::Recipe>,
     probe: Option<recipe::Probe>,
     sdk: Option<trust_resource_controller::SdkCustody>,
-    waiter: Option<Waiter>,
+    waiter: Option<MemoryWait>,
     claim: Option<Claim>,
     recovery: Option<PreparedRecovery>,
     admitted: Option<Custody>,
@@ -101,6 +101,15 @@ struct Pending {
     scope_reference: Option<aterm_capacity::CohortClosureRef>,
     cancelled: bool,
     resolver: Option<resolver_root::Preparation>,
+}
+/// A request's memory wait in this user's ledger, and the `kind=admission` row its admission owes
+/// ([`aterm_capacity::telemetry::Owed`], Continuum TM-1): written at the look that decides it,
+/// or, given up undecided (the request cancelled, or refused for another reason before its
+/// claim), as it drops, after its waiter has left the queue. The owner's thread lives as long as
+/// the host's process, so a wait still open when the process ends writes none.
+struct MemoryWait {
+    waiter: Waiter,
+    owed: aterm_capacity::telemetry::Owed,
 }
 enum Custody {
     Fixed(RetainedCohort),

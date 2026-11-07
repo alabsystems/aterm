@@ -1497,7 +1497,9 @@ mod tests {
     #[cfg(a11y_tree)]
     #[test]
     fn an_accessibility_backend_panic_leaves_no_crash_evidence_for_the_next_launch() {
-        let _lane = crate::message_inbox::lane_test_guard();
+        if !crate::message_inbox::lane_zero_alone() {
+            return;
+        }
         let _ = crate::message_inbox::take_queued();
         let dir = std::env::temp_dir().join(format!("aterm-log-a11y-{}", std::process::id()));
         ensure_private_dir(&dir).unwrap();

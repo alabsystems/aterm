@@ -4539,14 +4539,10 @@ pub const VERBS: &[VerbSpec] = &[
          (`goal=` the agent's active goal, as `status` reads it), `needs=ask` selects the ask \
          excerpt and \
          `by=harness` turns are skipped in `prompt=`): `user_title= title= cwd= branch= prompt= \
-         said= cmd= rows= need_ids= step=` (`step=`: a worker's step, its last topic post where \
+         said= cmd= rows= step=` (`step=`: a worker's step, its last topic post where \
          newer than its words, `-` with no task; <= 400 B per excerpt, credentials/fleet codes \
          redacted, fleet replies capped at 256 KiB; `rows=-` on an unfinished DEC 2026 frame, \
          never waited for). \
-         `need_ids=` names each need of an ask as the herald tells them once (at most 33, \
-         comma-separated, ids in hex: `<id>` read whole, `<id>/<entry>` read whole beside the \
-         entry's cut of it, `/<id>` read from the entry alone; `-` for any other need), so a fleet \
-         peer's herald tells each of them once too. \
          A codex-alab row, whose screen names no state, takes `agent=` from what codex-alab says of \
          itself in OSC 7501 (`working` is `busy`; `blocked` is `prompt`, `question` or \
          `wall:auth`; at rest, `idle`; nothing said, `unknown`) and `model= effort= ctx_left_pct= \

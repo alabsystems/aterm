@@ -691,6 +691,9 @@ fn prove_self_claim(ctx: &crate::SessionCtx, home: &std::path::Path, thread: &st
 /// the record stays `working`.
 #[test]
 fn a_self_claims_short_landing_its_fence_refused_is_marked_at_the_successor() {
+    if !crate::test_alone::alone() {
+        return;
+    }
     use crate::task_record::{TaskMark, TaskState, mark_session_task};
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
     let state = aterm_tempfile::Builder::new()
@@ -845,6 +848,9 @@ fn a_self_claims_short_landing_its_fence_refused_is_marked_at_the_successor() {
 /// claims hold.
 #[test]
 fn a_self_claims_face_that_moves_after_the_park_stands_the_commit_down() {
+    if !crate::test_alone::alone() {
+        return;
+    }
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
     let state = aterm_tempfile::Builder::new()
         .prefix("aterm-codex-face-commit")
@@ -915,6 +921,9 @@ fn a_self_claims_face_that_moves_after_the_park_stands_the_commit_down() {
 /// successor reads keeps them. Negative control: a mark after the park stands the Commit down.
 #[test]
 fn a_task_record_that_stands_still_holds_the_commit() {
+    if !crate::test_alone::alone() {
+        return;
+    }
     use crate::task_record::{TaskMark, TaskState, mark_session_task};
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
     let state = aterm_tempfile::Builder::new()
@@ -1040,6 +1049,9 @@ fn a_carried_self_claim_face_crosses_a_second_update_before_the_claim_returns() 
 /// before it, is drawn known free and carries no face.
 #[test]
 fn a_self_claims_reexec_gap_is_drawn_owed_with_its_face() {
+    if !crate::test_alone::alone() {
+        return;
+    }
     let state = aterm_tempfile::Builder::new()
         .prefix("aterm-codex-reexec-gap")
         .tempdir()
@@ -1116,6 +1128,9 @@ fn a_self_claims_reexec_gap_is_drawn_owed_with_its_face() {
 /// reopens the record `working`.
 #[test]
 fn only_a_shown_or_carried_open_face_reopens_a_landed_task() {
+    if !crate::test_alone::alone() {
+        return;
+    }
     use crate::task_record::{TaskMark, TaskState, WHY_LANDED, mark_session_task};
     let state = aterm_tempfile::Builder::new()
         .prefix("aterm-codex-reopen")

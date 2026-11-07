@@ -749,7 +749,8 @@ fn native_owning_waits_restore_a_real_terminals_foreground_group() {
         let reader = std::thread::spawn(move || {
             let _ = std::io::copy(&mut terminal_output, &mut std::io::sink());
         });
-        let mut actor = OwnedChild(
+        // The "signal" mode's actor and its cat keep the SIGINT they inherit: ^C must end them.
+        let mut actor = OwnedChild(crate::platform::spawn_outside_a_stand_aside(|| {
             spawnfd::command(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -764,8 +765,8 @@ fn native_owning_waits_restore_a_real_terminals_foreground_group() {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
-                .unwrap(),
-        );
+                .unwrap()
+        }));
         let mut last = String::new();
         aterm_spec::wait::until_within(
             aterm_spec::wait::MUST_HAPPEN,

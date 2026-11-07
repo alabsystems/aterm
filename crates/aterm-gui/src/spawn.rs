@@ -3151,6 +3151,9 @@ mod agent_prime_tests {
 
     #[test]
     fn an_uncommitted_candidate_writes_no_agents_file() {
+        if !crate::test_alone::alone() {
+            return;
+        }
         let scratch = aterm_tempfile::tempdir().expect("scratch");
         let home = scratch.path();
         std::fs::create_dir_all(home.join(".codex")).expect("detect codex");
@@ -3281,6 +3284,9 @@ mod agent_prime_tests {
 
     #[test]
     fn a_pass_reports_exactly_what_it_did() {
+        if !crate::test_alone::alone() {
+            return;
+        }
         assert_eq!(
             run_agent_prime(false, false, None),
             AgentPrimeOutcome::Disabled
@@ -9812,6 +9818,9 @@ mod reroute_path_env_tests {
     #[test]
     #[cfg(windows)]
     fn login_shell_path_asks_no_shell_on_windows() {
+        if !crate::test_alone::alone() {
+            return;
+        }
         let asks = || super::LOGIN_SHELL_ASKS.with(std::cell::Cell::get);
         let git_bash = [
             r"C:\Program Files\Git\usr\bin\bash",

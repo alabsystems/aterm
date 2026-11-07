@@ -113,12 +113,12 @@ fn view(now: f64, cap: f64, cells: &[Bucket], aterm: ScopeFig, tab: ScopeFig) ->
         .iter()
         .map(|&(h, over)| {
             let v = h.map(|h| h * cap);
-            let n = if v.is_some() { 10.0 } else { 0.0 };
+            let tau_ms = if v.is_some() { 10_000.0 } else { 0.0 };
             Cell {
                 mean: v,
                 max: v,
-                n,
-                over_n: if over { n } else { 0.0 },
+                tau_ms,
+                over_ms: if over { tau_ms } else { 0.0 },
             }
         })
         .collect();
@@ -143,12 +143,12 @@ fn series(now: f64, cap: f64, cells: &[Bucket], binds: bool) -> Series {
         .iter()
         .map(|&(h, over)| {
             let v = h.map(|h| h * cap);
-            let n = if v.is_some() { 10.0 } else { 0.0 };
+            let tau_ms = if v.is_some() { 10_000.0 } else { 0.0 };
             Cell {
                 mean: v,
                 max: v,
-                n,
-                over_n: if over { n } else { 0.0 },
+                tau_ms,
+                over_ms: if over { tau_ms } else { 0.0 },
             }
         })
         .collect();
@@ -948,7 +948,8 @@ fn the_run_says_the_machines_reading_where_it_fits() {
     );
 }
 
-/// The gauge sits at the Folded deck's top left wherever two slim blocks fit beside it, inside
+/// The gauge sits at the Folded deck's top left wherever two slim blocks fit beside it with their
+/// % (each strip six minutes or more beside it, A1 step R5: from 461 pt on Helvetica Neue), inside
 /// its slot at every tier: 4 pt inside the band, left of its divider, the rows right of it, and
 /// its bloom clipped to the slot. Below that (the narrowest tier) the deck draws none, and
 /// nothing else moves into its place.
@@ -964,7 +965,7 @@ fn the_folded_gauge_sits_top_left_inside_its_slot() {
     let (mut drawn, mut bare) = (0, 0);
     for s in [1.0, 2.0] {
         for w in [
-            1424.0, 1119.0, OWNER_W, 750.0, 550.0, 450.0, 419.0, 418.0, 350.0,
+            1424.0, 1119.0, OWNER_W, 750.0, 550.0, 461.0, 460.0, 450.0, 350.0,
         ] {
             let plan = plan::plan_folded(w, &m);
             let laid = lay(
@@ -981,7 +982,7 @@ fn the_folded_gauge_sits_top_left_inside_its_slot() {
                 .map(|b| b.r)
                 .collect();
             let Some(g) = plan.gauge else {
-                assert!(w < 419.0, "{w} pt has room for the gauge");
+                assert!(w < 461.0, "{w} pt has room for the gauge");
                 assert!(dials.is_empty(), "{w} pt draws no gauge: {dials:?}");
                 bare += 1;
                 continue;
@@ -1025,7 +1026,7 @@ fn the_folded_gauge_sits_top_left_inside_its_slot() {
     }
     assert_eq!(
         (drawn, bare),
-        (14, 4),
+        (12, 6),
         "CONTROL: both sides of the gauge's floor"
     );
 }
@@ -1514,7 +1515,7 @@ fn every_scope_shows_its_own_ink_in_the_bar_under_the_percent() {
         let snap = owner_scene(o);
         for (form, w) in [
             (DeckForm::Folded, 450.0),
-            (DeckForm::Folded, 350.0),
+            (DeckForm::Folded, 400.0),
             (DeckForm::Full, 210.0),
         ] {
             for s in [1.0, 2.0] {

@@ -13049,8 +13049,9 @@ struct Needs {
     answered: Vec<String>,
     /// The lines the go-ahead decided at this point answers, not yet submitted.
     answering: Vec<String>,
-    /// The last reply read named needs, and no go-ahead was submitted since.
-    named: bool,
+    /// The needs the last reply read named, while no go-ahead was submitted since: every line
+    /// standing after a report, only the turn's own after one a wall cut ([`Self::join`]).
+    named: Vec<String>,
     /// The needs standing less the lines answered or being answered: what the menu bar shows.
     shown: Vec<String>,
     /// The key of `shown` ([`needs::needs_key`]).
@@ -13073,15 +13074,44 @@ impl Needs {
         self.shown_key = needs::needs_key(&self.shown);
     }
 
-    /// A JUDGMENT OF THE REPLY LAST READ, where it names needs ([`Self::named`]): of the lines
-    /// answered before, only those its own park answers (`parks`, [`go_ahead::Park::needs`]) stay
+    /// A JUDGMENT OF THE REPLY LAST READ: of the lines answered before that it names
+    /// ([`Self::named`]), only those its own park answers (`parks`, [`go_ahead::Park::needs`]) stay
     /// off the menu bar. The hidden set is matched by cleaned words, so a later reply's need that
     /// cleans to a line an earlier go-ahead answered, and that this reply's park does not answer
     /// (a person's need opening with the same words), shows (2026-10-30 review 9, second pass).
     fn keep_answered(&mut self, parks: &[String]) {
-        if self.named {
-            self.answered.retain(|line| parks.contains(line));
+        let named = &self.named;
+        self.answered
+            .retain(|line| parks.contains(line) || !named.contains(line));
+    }
+
+    /// The lines answered that the reply last read does not name ([`Self::named`]): off the menu
+    /// bar whatever a decision on it is ([`Self::keep_answered`]).
+    fn answered_unnamed(&self) -> Vec<String> {
+        self.answered
+            .iter()
+            .filter(|line| !self.named.contains(line))
+            .cloned()
+            .collect()
+    }
+
+    /// A TURN A WALL CUT NAMED `named` ([`TurnEndState::observe`]): those not standing join the
+    /// set after the needs standing, in the turn's order, and none is taken down, for the report
+    /// that would have named every need again never came. The lines answered stay answered, and
+    /// only those it names again are the last reply's ([`Self::named`]), so a decision on it
+    /// other than the go-ahead's puts up only those, as it would on a reply that named them.
+    fn join(&mut self, named: Vec<String>) {
+        if named.is_empty() {
+            return;
         }
+        for line in &named {
+            if !self.standing.contains(line) {
+                self.standing.push(line.clone());
+            }
+        }
+        self.key = needs::needs_key(&self.standing);
+        self.named = named;
+        self.reshow();
     }
 
     /// The standing needs a word of the agent's took back ([`needs::retracted_in`]) are no
@@ -13093,6 +13123,7 @@ impl Needs {
         self.standing.retain(|n| !lines.contains(n));
         self.answered.retain(|n| !lines.contains(n));
         self.answering.retain(|n| !lines.contains(n));
+        self.named.retain(|n| !lines.contains(n));
         if self.standing.is_empty() {
             *self = Self::default();
             return;
@@ -13110,7 +13141,7 @@ impl Needs {
                 self.answered.push(line);
             }
         }
-        self.named = false;
+        self.named.clear();
         self.reshow();
     }
 }
@@ -14438,7 +14469,8 @@ impl TurnEndState {
         if !(worked || first_point || compared) || matches!(r.phase, Phase::Busy | Phase::Prompt) {
             return false;
         }
-        let folds_needs = r.wall.is_none() && !r.pending_input;
+        // A turn a wall cut folds its needs too ([`Self::observe`]), so it is read whole for them.
+        let folds_needs = !r.pending_input;
         let keeps_landing =
             r.finished_record == Some(true) && (self.landed() || self.landed_seed.is_some());
         folds_needs || keeps_landing
@@ -15256,12 +15288,8 @@ impl TurnEndState {
     /// menu bar ([`GoAheadVerdict::Other`]) are not the set last acked.
     #[must_use]
     pub fn needs_ack_owed(&self) -> bool {
-        let held: &[String] = if self.needs.named {
-            &[]
-        } else {
-            &self.needs.answered
-        };
-        self.ack_owed_of(&self.needs.less(&[held]))
+        let held = self.needs.answered_unnamed();
+        self.ack_owed_of(&self.needs.less(&[held.as_slice()]))
     }
 
     /// Whether `shown` is a set of needs not acked.
@@ -18760,23 +18788,30 @@ impl TurnEndState {
             } else {
                 0
             };
-            if reading.wall.is_none() && !reading.pending_input {
+            if !reading.pending_input {
+                let walled = reading.wall.is_some();
                 // Someone else's turn on someone's prompt (`prompted`): the
                 // person answered what stood. A turn nobody asked — Claude
                 // Code's own wake, the vendor's continuation of a limit —
-                // answered nothing.
-                if awaited.is_none() && reading.worked.is_some() && prompted {
+                // answered nothing. A turn a wall cut takes nothing down.
+                if !walled && awaited.is_none() && reading.worked.is_some() && prompted {
                     self.needs = Needs::default();
                 }
                 let act = self.act_words.clone().filter(|_| reading.opens_cut);
+                // A TURN A WALL CUT ONLY ADDS ([`Needs::join`]): the resume the wall gets opens
+                // a turn of its own, whose point reads none of these words again, so its needs go
+                // up here, and its report, which would have named every need again, never came.
                 self.fold_turn_needs(
                     reading.lines_before(),
                     lines_of(tail, reading.said_lines.as_deref()),
                     act.as_deref(),
+                    walled,
                 );
                 // THE GO-AHEAD'S COUNT ([`GoAheads`]) stands while the replies park, on any word,
                 // and no new key of the person's came.
-                self.go_ahead_read(reading.go_ahead_past(act.as_deref()).is_some());
+                if !walled {
+                    self.go_ahead_read(reading.go_ahead_past(act.as_deref()).is_some());
+                }
             }
         }
         // A turn of real work, or one a wall cut, starts the go-ahead's span again
@@ -19407,34 +19442,43 @@ impl TurnEndState {
         opens_cut: bool,
     ) {
         let act = self.act_words.clone().filter(|_| opens_cut);
-        self.fold_turn_needs(before, tail, act.as_deref());
+        self.fold_turn_needs(before, tail, act.as_deref(), false);
     }
 
     /// Fold the needs a turn's words name: its earlier messages `before`, the typed `act`'s own
-    /// rows cut from their opening ([`without_act_rows`]), then its last `tail`.
+    /// rows cut from their opening ([`without_act_rows`]), then its last `tail`. Under `add_only`
+    /// (a turn a wall cut) they join the set standing ([`Needs::join`]) and take none down.
     fn fold_turn_needs(
         &mut self,
         before: Option<needs::Before<'_>>,
         tail: Option<&str>,
         act: Option<&str>,
+        add_only: bool,
     ) {
         let opening = |t: &str| without_act_rows(t, act).to_string();
         // THE AGENT'S WORD ON NEEDS ([`needs::standing_before`]): its last message's own none
         // retracts every need the turn named and every need an earlier point raised; an earlier
         // message's own none retracts only the needs named before it in that message, here as
         // in the turn's words ([`needs::retracted_in`]); a none anywhere else, quoted, fenced or
-        // in a message of its own, takes no need down.
+        // in a message of its own, takes no need down. In a turn a wall cut the agent's word
+        // retracts only what the turn itself named: the needs it took back are not added, and
+        // those an earlier point raised stand.
         let last = tail.unwrap_or_default();
         let retracted = tail.is_some_and(needs::retracts);
-        if let Some(before) = before.filter(|_| !retracted) {
+        if let Some(before) = before.filter(|_| !retracted && !add_only) {
             self.needs.retract(&needs::retracted_in(before));
         }
-        match needs::standing_before(before, last) {
-            Some(before) => {
-                self.fold_needs(Some(&format!("{}\n\n{last}", opening(&before))), retracted)
+        let words = match needs::standing_before(before, last) {
+            Some(before) => Some(format!("{}\n\n{last}", opening(&before))),
+            None => tail.map(opening),
+        };
+        if add_only {
+            if let Some(words) = words {
+                self.needs.join(needs::needs_you(&words));
             }
-            None => self.fold_needs(tail.map(opening).as_deref(), retracted),
+            return;
         }
+        self.fold_needs(words.as_deref(), retracted);
     }
 
     fn fold_needs(&mut self, tail: Option<&str>, retracted: bool) {
@@ -19457,10 +19501,10 @@ impl TurnEndState {
             // A line the go-ahead answered stays answered only while a reply names it.
             self.needs.answered.retain(|line| named.contains(line));
             self.needs.answering.retain(|line| named.contains(line));
-            self.needs.standing = named;
+            self.needs.standing.clone_from(&named);
             self.needs.key = key;
         }
-        self.needs.named = true;
+        self.needs.named = named;
         self.needs.reshow();
     }
 

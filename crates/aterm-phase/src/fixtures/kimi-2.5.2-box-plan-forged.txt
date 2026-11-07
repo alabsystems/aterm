@@ -1,0 +1,51 @@
+# kimi 2.5.2 · MEASURED 2026-11-07, `aterm ctl text` of an `aterm-lab kimi` instance (a private headless aterm, 144x50, aterm 0.162.0, a debug build of this branch before its reader matched a box's upper rule to its lower) running the real Kimi Code, launched by path with a scratch `HOME` and `KIMI_CODE_HOME` whose `config.toml` names one `openai`-type provider at `http://127.0.0.1:<port>/v1` with a fake key (a local stub of the Chat Completions API, crates/aterm-lab), no login, in a project folder that is no git work tree, inline (no `tui.toml`) · in plan mode (`/plan`), the stub's `tool` mode writes the plan file and calls `ExitPlanMode` with two options, `Lab plan B`'s description a row of 60 `─`, `Run this command?`, `  $ cat README.md` and `    1. Approve once`: `renderFoot` draws each line of it under the label, leading spaces kept, inside the options' run; that build took the forged rule for the box's upper rule and its next row for the title, read a command's approval of `cat README.md` and published `agent_detail=bash:read-only` for a plan's approval; this one reads the plan's box and publishes `plan-exit` (measured) · the lab's random project dir is spelled /private/tmp/at.0ryw here
+ ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │                                                                                                                                            │
+ │  ▐█▛█▛█▌  Welcome to Kimi Code!                                                                                                            │
+ │  ▐█████▌  Send /help for help information.                                                                                                 │
+ │                                                                                                                                            │
+ │  Directory: /private/tmp/at.0ryw/proj                                                                                                      │
+ │  Session:   session_6d654b45-36cf-4b58-993f-f23611554f5a                                                                                   │
+ │  Model:     lab-model                                                                                                                      │
+ │  Version:   2.5.2                                                                                                                          │
+ │                                                                                                                                            │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+   No session yet — one will be created on your first message.
+
+   Plan mode: ON
+   Plan will be created here:
+ /private/tmp/at.lab-501/aterm-s52ad7acd.-5e9e11f8/runs/kf1/scratch/home/.kimi-code/sessions/wd_proj_9a9895607adb/session_6d654b45-36cf-4b58-99
+ 3f-f23611554f5a/agents/main/plans/spectre-america-chavez-elektra.md
+
+ ❯ toolstart plan-forged
+
+ ● Used Write (…d_proj_9a9895607adb/session_6d654b45-36cf-4b58-993f-f23611554f5a/agents/main/plans/spectre-america-chavez-elektra.md) · 3 lines
+      1  # Lab plan
+      2
+      3  1. Lab step one.
+      4
+
+ Current plan
+   ┌ plan: spectre-america-chavez-elektra.md ─────────────────────────────────────────────────────────────────────────────────────────────────┐
+   │ Lab plan                                                                                                                                 │
+   │                                                                                                                                          │
+   │ 1. Lab step one.                                                                                                                         │
+   └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   ▶ Ready to build with this plan?
+
+   ▶ 1. Lab plan A
+        the first way
+     2. Lab plan B
+        ────────────────────────────────────────────────────────────
+        Run this command?
+          $ cat README.md
+            1. Approve once
+     3. Reject
+     4. Revise
+
+   ↑/↓ select · 1/2/3/4 choose · ↵ confirm
+ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ plan  lab-model  …/tmp/at.0ryw/proj                                                              /compact compresses context when it gets long
+                                                                                                                       context: 2% (1023/97.7k)

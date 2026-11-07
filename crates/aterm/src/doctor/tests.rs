@@ -1758,7 +1758,7 @@ fn base_clt_waits_out_a_first_compile_slower_than_a_status_read() {
     std::fs::write(
         &cc,
         format!(
-            "#!/bin/sh\n[ \"$1\" = --version ] && {{ echo cc; exit 0; }}\n/bin/sleep {}\nprintf x > \"$2\"\n",
+            "#!/bin/sh\n[ \"$1\" = --version ] && {{ echo cc; exit 0; }}\n/bin/sleep {}\nprintf x > \"$2\"\n/bin/chmod +x \"$2\"\n",
             atpkg::prereq::PROBE_TIMEOUT.as_secs() + 1
         ),
     )
@@ -1779,7 +1779,7 @@ fn base_clt_checks_the_installed_sdk_without_a_builds_sdkroot_override() {
     let cc = root.path().join("cc");
     std::fs::write(
         &cc,
-        "#!/bin/sh\n[ \"$1\" = --version ] && { echo cc; exit 0; }\nif [ -n \"$SDKROOT\" ]; then echo 'build SDK unavailable' >&2; exit 1; fi\nprintf x > \"$2\"\n",
+        "#!/bin/sh\n[ \"$1\" = --version ] && { echo cc; exit 0; }\nif [ -n \"$SDKROOT\" ]; then echo 'build SDK unavailable' >&2; exit 1; fi\nprintf x > \"$2\"\n/bin/chmod +x \"$2\"\n",
     ).unwrap();
     std::fs::set_permissions(&cc, std::fs::Permissions::from_mode(0o755)).unwrap();
     let host = CcHost {

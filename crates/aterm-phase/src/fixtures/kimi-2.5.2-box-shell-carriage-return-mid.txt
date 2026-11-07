@@ -1,0 +1,51 @@
+# kimi 2.5.2 · MEASURED 2026-11-07, `aterm ctl text` of an `aterm-lab kimi` instance (a private headless aterm, 144x50, aterm 0.162.0, a debug build of this branch before its reader read a wrap joined with no space) running the real Kimi Code, launched by path with a scratch `HOME` and `KIMI_CODE_HOME` whose `config.toml` names one `openai`-type provider at `http://127.0.0.1:<port>/v1` with a fake key (a local stub of the Chat Completions API, crates/aterm-lab), no login, in a project folder that is no git work tree, inline (no `tui.toml`) · the stub's `tool` mode asks for `Bash` `{command: "cat README.md\r#;git push --force"}`: no description; `wrapTextWithAnsi` breaks the line at its carriage return, so `#;git push --force` stands two columns deeper under `$ cat README.md` with no blank row between; bash reads `README.md<CR>#` as one word and runs `git push --force`, while that build read the row as a wrap joined by a space (`#` a comment) and published `agent_detail=bash:read-only` · the lab's random project dir is spelled /private/tmp/at.4jKW here
+
+ ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │                                                                                                                                            │
+ │  ▐█▛█▛█▌  Welcome to Kimi Code!                                                                                                            │
+ │  ▐█████▌  Send /help for help information.                                                                                                 │
+ │                                                                                                                                            │
+ │  Directory: /private/tmp/at.4jKW/proj                                                                                                      │
+ │  Session:   session_4f679d3f-0566-4cb5-a741-d2291130d607                                                                                   │
+ │  Model:     lab-model                                                                                                                      │
+ │  Version:   2.5.2                                                                                                                          │
+ │                                                                                                                                            │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+   No session yet — one will be created on your first message.
+
+ ❯ toolstart long-word
+
+ ✗ Ran a command · $ echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa…
+   Tool "Bash" was not run because the user rejected the approval request.
+
+   Rejected: Running: echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa…
+
+ ● Tool call done. Result: Wall time: 0.000 seconds <system>ERROR: Tool execution failed.</system> Tool "Bash" was not run because the user
+   rejected the approval request.
+
+ ❯ toolstart cr-mid
+
+#;git push --forcend · $ cat README.md
+ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   ▶ Run this command?
+
+   cwd: /private/tmp/at.4jKW/proj
+   $ cat README.md
+     #;git push --force
+
+   ▶ 1. Approve once
+     2. Approve for this session
+     3. Reject
+     4. Reject with feedback
+
+   ↑/↓ select · 1/2/3/4 choose · ↵ confirm
+ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ lab-model  …/tmp/at.4jKW/proj                          ctrl+o expand | /goal next to queue follow-up work while the current goal keeps running
+                                                                                                                        context: 1% (202/97.7k)
+
+
+
+
+
+

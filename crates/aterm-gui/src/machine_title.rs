@@ -158,9 +158,12 @@ enum Heard {
 fn watch(state: &Path, vault: Option<&Paths>) -> io::Result<(FileWatch, mpsc::Receiver<()>)> {
     aterm_uds::private_file::ensure_private_dir(state)?;
     let (tell, changes) = mpsc::channel();
-    let watch = FileWatch::platform(Box::new(move |_| {
-        let _ = tell.send(());
-    }))?;
+    let watch = FileWatch::platform(
+        "aterm-machine-name-watch",
+        Box::new(move |_| {
+            let _ = tell.send(());
+        }),
+    )?;
     watch.watch(0, state.join(aterm_agent::machine_name::file::FILE));
     watch.watch(1, state.join(aterm_net::fleet::KEY_FILE));
     for (key, file) in (2..).zip(vault.into_iter().flat_map(Paths::standing_files)) {

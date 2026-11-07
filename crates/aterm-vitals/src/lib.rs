@@ -35,14 +35,15 @@ pub use model::{
     CommitSample, CoreView, CpuView, DiskFacts, DiskLevel, GpuSample, GpuView, HeatCell, HeatSlot,
     Hog, LinkKind, LinkRates, LinkSample, LinkView, MemCounters, MemRates, MemSample, MemView,
     NetState, NetView, NoFigure, PlaceValue, PlaceView, PlanFact, Pressure, ProcSample, ProcState,
-    ProcView, Resource, ResourceView, RowFacts, RowScope, Sample, SavedStrip, ScopeFig, ScopeView,
-    Series, Snapshot, Split, State, StripEvent, StripEventKind, TabRoot, TabTokens, TabView,
-    TaskRoom, TcpCounts, Thermal, Throttle, Ticks, Vitals, VolumeSample, Writer,
+    ProcView, Resource, ResourceView, RowFacts, RowScope, STRIP_RINGS, Sample, SavedStrip,
+    ScopeFig, ScopeView, Series, Snapshot, Split, State, StripEvent, StripEventKind, StripLine,
+    TabRoot, TabTokens, TabView, TaskRoom, TcpCounts, Thermal, Throttle, Ticks, Vitals,
+    VolumeSample, Writer,
 };
 pub use peaks::{DailyMax, DiskPeaks, PeakRow, Peaks};
 pub use ring::{
-    Bucket, BucketRing, Cell, GapKind, MultiScaleSpec, ProgSlot, Reading, SavedBucket,
-    SavedReading, SavedRing, ScaleBand, ScaleCell, SlotGrid, Tiers, TimeGap,
+    Agg, BucketRing, Cell, GapKind, Lands, MultiScaleSpec, ProgSlot, Reading, SavedBucket,
+    SavedReading, SavedRing, ScaleBand, ScaleCell, SlotGrid, Taken, Tiers, TimeGap, lands,
 };
 pub use starts::{StartCount, TaskFlow};
 pub use strain::Strain;

@@ -435,13 +435,20 @@ impl Namespace {
 /// an absent leaf retain its spelling beneath the nearest actual canonical ancestor; a
 /// hidden namespace must not become v1 merely because its offered path used an alias.
 fn canonical_candidate(path: &Path) -> io::Result<PathBuf> {
+    canonical_candidate_with(path, |probe| probe.canonicalize())
+}
+
+fn canonical_candidate_with(
+    path: &Path,
+    mut canonicalize: impl FnMut(&Path) -> io::Result<PathBuf>,
+) -> io::Result<PathBuf> {
     if path.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err(refused("ledger spelling contains parent traversal"));
     }
     let mut suffix = Vec::new();
     let mut probe = path;
     for _ in 0..128 {
-        match probe.canonicalize() {
+        match canonicalize(probe) {
             Ok(mut root) => {
                 for part in suffix.iter().rev() {
                     root.push(part)
@@ -450,6 +457,9 @@ fn canonical_candidate(path: &Path) -> io::Result<PathBuf> {
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 match std::fs::symlink_metadata(probe) {
+                    // First admission can create the directory between these two reads.
+                    // Resolve it again, within the same bound, before classifying its namespace.
+                    Ok(meta) if meta.file_type().is_dir() => continue,
                     Ok(_) => {
                         return Err(refused(
                             "an existing ledger candidate has an unresolved physical spelling",
@@ -618,6 +628,65 @@ fn empty(directory: &File) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_directory_created_during_resolution_is_canonicalized_again() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        for nested in [false, true] {
+            let parent = scratch.path().join(if nested { "nested" } else { "leaf" });
+            let path = if nested {
+                parent.join("ledger")
+            } else {
+                parent.clone()
+            };
+            let mut created = false;
+            let actual = canonical_candidate_with(&path, |probe| {
+                if !created && probe == parent {
+                    created = true;
+                    std::fs::create_dir(&parent).unwrap();
+                    return Err(io::ErrorKind::NotFound.into());
+                }
+                probe.canonicalize()
+            })
+            .unwrap();
+            assert!(created);
+            let expected = if nested {
+                parent.canonicalize().unwrap().join("ledger")
+            } else {
+                parent.canonicalize().unwrap()
+            };
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn an_unresolved_entry_never_becomes_an_absent_ledger() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let path = scratch.path().join("ledger");
+        let mut created = false;
+        assert!(
+            canonical_candidate_with(&path, |probe| {
+                assert!(!created);
+                created = true;
+                std::os::unix::fs::symlink(scratch.path().join("absent"), &path).unwrap();
+                assert_eq!(probe, path);
+                Err(io::ErrorKind::NotFound.into())
+            })
+            .is_err()
+        );
+        assert!(created);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let mut reads = 0;
+        assert!(
+            canonical_candidate_with(&path, |_| {
+                reads += 1;
+                Err(io::ErrorKind::NotFound.into())
+            })
+            .is_err()
+        );
+        assert_eq!(reads, 128, "directory churn must stay bounded");
+    }
 
     fn prepare() -> (aterm_tempfile::TempDir, Namespace) {
         let scratch = aterm_tempfile::tempdir().unwrap();

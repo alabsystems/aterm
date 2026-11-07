@@ -1845,7 +1845,7 @@ fn relaunch_held(
         }
     }
     let old = st.pid;
-    if !st.native_prepare.is_empty() {
+    if st.native.is_some() || !st.native_prepare.is_empty() {
         let tab = st.tab.clone();
         match super::native_restart::recover(opts, session, c, &tab, st) {
             Ok(super::native_restart::Recovery::Completed) => {
@@ -2841,8 +2841,10 @@ fn await_held(
             relaunch_held(opts, r, st, c, hand, session, k)
         }
         None if ended => {
+            // Retirement now persists the record before its request. Include the
+            // observed end, which was temporarily taken out for this polling pass.
+            st.found_gone = found_gone;
             if st.native.is_some() && !super::native_restart::retire(opts, session, c, &tab, st) {
-                st.found_gone = found_gone;
                 save(opts, session, st);
                 if st.native_retired_unissued {
                     return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);

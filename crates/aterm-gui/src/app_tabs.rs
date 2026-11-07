@@ -141,18 +141,35 @@ pub(crate) fn resolved_terminal_title_rung(
         .or_else(|| live_cwd.filter(|cwd| !cwd.is_empty()).map(home_abbreviated))
 }
 
+/// A tab's title as the strip last read it, kept for a reader that finds its terminal busy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CapturedTitle {
+    /// The terminal's rungs of its label ([`resolved_terminal_title_rung`]).
+    pub(crate) title: String,
+    /// Its shell gave the title ([`crate::app_take_over::shell_titled`]), read in the same
+    /// snapshot.
+    pub(crate) shell: bool,
+}
+
 /// Make the keep-stale tab-title cache agree with the exact snapshot that caused an effective chrome refresh.
 pub(crate) fn synchronize_captured_title_cache(
-    cache: &mut std::collections::HashMap<u64, String>,
+    cache: &mut std::collections::HashMap<u64, CapturedTitle>,
     session: u64,
     resolved_rung: Option<&str>,
+    shell: bool,
     needs_refresh: bool,
 ) {
     if !needs_refresh {
         return;
     }
     if let Some(title) = resolved_rung {
-        cache.insert(session, title.to_owned());
+        cache.insert(
+            session,
+            CapturedTitle {
+                title: title.to_owned(),
+                shell,
+            },
+        );
     } else {
         cache.remove(&session);
     }
@@ -270,15 +287,19 @@ mod background_title_tests {
 
     #[test]
     fn captured_drift_snapshot_wins_a_contended_refresh_read() {
-        let mut cache = std::collections::HashMap::from([(7, "stale".to_owned())]);
+        let captured = |title: &str, shell: bool| super::CapturedTitle {
+            title: title.to_owned(),
+            shell,
+        };
+        let mut cache = std::collections::HashMap::from([(7, captured("stale", false))]);
 
-        synchronize_captured_title_cache(&mut cache, 7, Some("fresh"), true);
-        assert_eq!(cache.get(&7).map(String::as_str), Some("fresh"));
+        synchronize_captured_title_cache(&mut cache, 7, Some("fresh"), true, true);
+        assert_eq!(cache.get(&7), Some(&captured("fresh", true)));
 
-        synchronize_captured_title_cache(&mut cache, 7, Some("⠙ fresh"), false);
-        assert_eq!(cache.get(&7).map(String::as_str), Some("fresh"));
+        synchronize_captured_title_cache(&mut cache, 7, Some("⠙ fresh"), false, false);
+        assert_eq!(cache.get(&7), Some(&captured("fresh", true)));
 
-        synchronize_captured_title_cache(&mut cache, 7, None, true);
+        synchronize_captured_title_cache(&mut cache, 7, None, false, true);
         assert!(!cache.contains_key(&7));
     }
 }
@@ -1472,13 +1493,20 @@ impl App {
                     .unwrap_or_else(|p| p.into_inner())
                     .presentation_value("title");
                 if user_title.is_some() {
-                    return (fallback, Some(view.session), user_title);
+                    let pinned = user_title.map(|title| CapturedTitle {
+                        title,
+                        shell: false,
+                    });
+                    return (fallback, Some(view.session), pinned);
                 }
                 let term_label = |t: &aterm_core::terminal::Terminal| {
                     use crate::cwd_native::ReportedCwd as _;
                     let cwd = t.native_working_directory();
-                    resolved_terminal_title_rung(None, t.title(), cwd.as_deref())
-                        .unwrap_or_default()
+                    CapturedTitle {
+                        title: resolved_terminal_title_rung(None, t.title(), cwd.as_deref())
+                            .unwrap_or_default(),
+                        shell: crate::app_take_over::shell_titled(t),
+                    }
                 };
                 let fresh = match s.term.try_lock() {
                     Ok(t) => Some(term_label(&t)),
@@ -1502,19 +1530,20 @@ impl App {
                 };
                 let raw = match fresh {
                     Some(label) => {
-                        if label.is_empty() {
+                        if label.title.is_empty() {
                             ws.tab_title_cache.remove(&sid);
                             fallback
                         } else {
-                            ws.tab_title_cache.insert(sid, label.clone());
-                            label
+                            let title = label.title.clone();
+                            ws.tab_title_cache.insert(sid, label);
+                            title
                         }
                     }
                     None => ws
                         .tab_title_cache
                         .get(&sid)
+                        .map(|cached| cached.title.clone())
                         .filter(|cached| !cached.is_empty())
-                        .cloned()
                         .unwrap_or(fallback),
                 };
                 chrome_labels.present(
@@ -2947,12 +2976,6 @@ impl App {
 
     /// Fold one session's PUBLISHED need into the herald ([`crate::status_item::Herald`], §9 S4: the herald is fed by the need): remember since when its need and hold stand (the glance's ages, headless too), dirty the menu-bar item where what it shows of the session moved, and post the one native notification a transition earns.
     pub(crate) fn herald_session(&mut self, session: u64) {
-        // A fleet need's key (the herald's timer re-heralds an owed one):
-        // the fleet's notices are re-read from the last fleet read.
-        if crate::fleet_glance::is_herald_key(session) {
-            self.herald_fleet();
-            return;
-        }
         let handle = self
             .store
             .read()
@@ -3222,19 +3245,8 @@ impl App {
             .collect()
     }
 
-    /// The herald's decision for `session` (a local id or a fleet need's key) at `current`, and what it posts.
-    pub(crate) fn herald_deliver(
-        &mut self,
-        session: u64,
-        current: Option<&crate::status_item::Escalation>,
-        looking: bool,
-    ) {
-        let spent = looking.then_some(crate::status_item::Spent::Looking);
-        let _ = self.herald_deliver_spent(session, current, spent);
-    }
-
-    /// [`Self::herald_deliver`] where the owner already heard of the need (`spent`): whether a
-    /// notice was queued.
+    /// The herald's decision for the local session `session` at `current`, where the owner may
+    /// already have heard of the need (`spent`), and what it posts: whether a notice was queued.
     fn herald_deliver_spent(
         &mut self,
         session: u64,

@@ -181,11 +181,11 @@ pub fn hour_of(snap: &Snapshot) -> impl Iterator<Item = Flags> + '_ {
     })
 }
 
-/// Whether at least half of a bucket's readings were over: the soak scores a bucket whole, so
+/// Whether at least half of a bucket's read time was over: the soak scores a bucket whole, so
 /// it counts one over when it mostly was. The strip draws the share itself
 /// (`Cell::over_share`, A1 §3).
 fn over_half(c: &Cell) -> bool {
-    c.n > 0.0 && c.over_share() * 2.0 >= 1.0
+    c.tau_ms > 0.0 && c.over_share() * 2.0 >= 1.0
 }
 
 /// The bucket key of a row's oldest cell.
@@ -619,8 +619,8 @@ mod tests {
                 .map(|k| Cell {
                     mean: Some(1.0),
                     max: Some(1.0),
-                    n: 1.0,
-                    over_n: if over(k) { 1.0 } else { 0.0 },
+                    tau_ms: 10_000.0,
+                    over_ms: if over(k) { 10_000.0 } else { 0.0 },
                 })
                 .collect(),
             ring_k: last,

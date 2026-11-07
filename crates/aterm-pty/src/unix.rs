@@ -835,13 +835,13 @@ enum ExecStatusCarrier {
     RacyPipe,
 }
 
-static RACY_EXEC_STATUS_CARRIERS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+/// Whether this process has said that a spawn fell back to the racy carrier: it says so once.
+static RACY_EXEC_STATUS_CARRIER_TOLD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 fn note_racy_exec_status_carrier(why: &io::Error) {
     use std::sync::atomic::Ordering;
-    let prior = RACY_EXEC_STATUS_CARRIERS.fetch_add(1, Ordering::Relaxed);
-    if prior == 0 {
+    if !RACY_EXEC_STATUS_CARRIER_TOLD.swap(true, Ordering::Relaxed) {
         {
             use std::io::Write as _;
             #[cfg(target_os = "macos")]
@@ -1200,6 +1200,27 @@ pub(crate) mod exec_wait_seen {
     }
 }
 
+/// The exec-status carrier of the kit a spawn on this thread last used (tests): the spawn's own,
+/// told by the kit it took wherever that kit was opened, and never another thread's, whose spawns
+/// run at once with this one's.
+#[cfg(test)]
+mod exec_carrier_seen {
+    use std::cell::Cell;
+
+    std::thread_local! {
+        static LAST: Cell<Option<super::ExecStatusCarrier>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn note(carrier: super::ExecStatusCarrier) {
+        LAST.with(|last| last.set(Some(carrier)));
+    }
+
+    /// The carrier noted last on this thread; none is noted after it.
+    pub(super) fn take() -> Option<super::ExecStatusCarrier> {
+        LAST.with(Cell::take)
+    }
+}
+
 fn wait_for_exec_status(rd: libc::c_int, budget: std::time::Duration) -> ExecStatus {
     #[cfg(test)]
     exec_wait_seen::note(budget);
@@ -1223,6 +1244,9 @@ struct SpawnKit {
     slave: libc::c_int,
     status_rd: libc::c_int,
     status_wr: libc::c_int,
+    /// What carries its exec status, which the spawn that uses it tells ([`exec_carrier_seen`]).
+    #[cfg(test)]
+    carrier: ExecStatusCarrier,
 }
 
 impl SpawnKit {
@@ -1235,6 +1259,8 @@ impl SpawnKit {
                 slave,
                 status_rd,
                 status_wr,
+                #[cfg(test)]
+                carrier: _carrier,
             }),
             Err(err) => {
                 // SAFETY: closing the two channel ends opened above after pty open failed.
@@ -1254,7 +1280,10 @@ impl SpawnKit {
         }
     }
 
+    /// The kit's four descriptors, for the spawn that uses it.
     fn into_raw(self) -> (libc::c_int, libc::c_int, libc::c_int, libc::c_int) {
+        #[cfg(test)]
+        exec_carrier_seen::note(self.carrier);
         let kit = std::mem::ManuallyDrop::new(self);
         (kit.master, kit.slave, kit.status_rd, kit.status_wr)
     }
@@ -3106,7 +3135,7 @@ fn reap_shell_draining(
         }
         #[cfg(any(test, debug_assertions))]
         if Some(tick) == kill_at {
-            while HOLD_REAP_KILLS.held() {
+            while HOLD_REAP_KILLS.held(pid) {
                 if let Some(held) = held.as_ref() {
                     held.tend();
                 }
@@ -3208,46 +3237,55 @@ pub fn wait_for_reaps(bound: std::time::Duration) -> bool {
 }
 
 #[cfg(any(test, debug_assertions))]
-static HOLD_REAP_KILLS: ReapKillHolds = ReapKillHolds::new();
+use aterm_types::MutexExt as _;
 
 #[cfg(any(test, debug_assertions))]
-struct ReapKillHolds(std::sync::atomic::AtomicUsize);
+static HOLD_REAP_KILLS: ReapKillHolds = ReapKillHolds::new();
+
+/// The shells whose reaps are held at their kill tick: one entry per live guard, keyed by the pid
+/// of the shell it holds. The tests of a binary run at once, so a hold keeps its own shell's reap
+/// and no other test's, and two holds on one shell last until both drop.
+#[cfg(any(test, debug_assertions))]
+struct ReapKillHolds(std::sync::Mutex<Vec<libc::pid_t>>);
 
 #[cfg(any(test, debug_assertions))]
 impl ReapKillHolds {
     const fn new() -> Self {
-        Self(std::sync::atomic::AtomicUsize::new(0))
+        Self(std::sync::Mutex::new(Vec::new()))
     }
 
-    fn hold(&self) -> ReapKillHold<'_> {
-        self.0.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        ReapKillHold { holds: self }
+    fn hold(&self, pid: libc::pid_t) -> ReapKillHold<'_> {
+        self.0.lock_or_recover().push(pid);
+        ReapKillHold { holds: self, pid }
     }
 
-    fn held(&self) -> bool {
-        self.0.load(std::sync::atomic::Ordering::Acquire) != 0
+    fn held(&self, pid: libc::pid_t) -> bool {
+        self.0.lock_or_recover().contains(&pid)
     }
 }
 
-/// Test seam holding every [`reap_shell`] in its grace window until every guard drops.
+/// Test seam holding the reap of the shell `pid` in its grace window, at its kill tick, until
+/// every guard on that shell drops. Take it before the reap starts.
 #[cfg(any(test, debug_assertions))]
 #[must_use]
-pub fn hold_reap_kills_for_test() -> ReapKillHold<'static> {
-    HOLD_REAP_KILLS.hold()
+pub fn hold_reap_kills_for_test(pid: libc::pid_t) -> ReapKillHold<'static> {
+    HOLD_REAP_KILLS.hold(pid)
 }
 
-/// [`hold_reap_kills_for_test`]'s guard: dropping the last guard lets the held reaps go on.
+/// [`hold_reap_kills_for_test`]'s guard: dropping the last guard on its shell lets that reap go on.
 #[cfg(any(test, debug_assertions))]
 pub struct ReapKillHold<'a> {
     holds: &'a ReapKillHolds,
+    pid: libc::pid_t,
 }
 
 #[cfg(any(test, debug_assertions))]
 impl Drop for ReapKillHold<'_> {
     fn drop(&mut self) {
-        self.holds
-            .0
-            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        let mut holds = self.holds.0.lock_or_recover();
+        if let Some(at) = holds.iter().position(|&pid| pid == self.pid) {
+            holds.swap_remove(at);
+        }
     }
 }
 

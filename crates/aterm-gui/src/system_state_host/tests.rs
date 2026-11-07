@@ -4999,7 +4999,16 @@ fn admitted_here(app: &mut App) -> SetupStatus {
 /// did, so the window still holds its own admission when the next read comes.
 #[test]
 fn a_read_that_met_a_write_keeps_the_page_and_the_windows_own_admission() {
+    use aterm_types::macos_setup::{Observation, Standing, Subject};
+    thread_local! {
+        static READINGS: RefCell<SetupReadings> = RefCell::new(SetupReadings::default());
+    }
+    fn readings() -> SetupReadings {
+        note("owned readings".into());
+        READINGS.with(|readings| readings.borrow().clone())
+    }
     let mut app = App::headless_for_test();
+    let (wid, _, _) = page(&mut app);
     let admitted = admitted_here(&mut app);
     // The poll's read is in flight, as the status thread's reply finds it.
     app.system_state_host.status_in_flight = true;
@@ -5016,12 +5025,110 @@ fn a_read_that_met_a_write_keeps_the_page_and_the_windows_own_admission() {
         .expect("read again once the write is over");
     assert!(asked + CHANGING_REREAD <= next && next <= replied + CHANGING_REREAD);
     assert!(app.system_state_host.deadline(replied, true) <= Some(next));
-    fresh(&mut app, admitted);
+    fresh(&mut app, admitted.clone());
     assert!(
         app.permission_steps_admitted(),
         "still the window's own admission"
     );
     assert_eq!(app.access_revision(), Some(5));
+
+    // An observation wake carries a pure reader, rather than an earlier payload.
+    // The in-flight full status still owns its legitimate plan and approval answer.
+    app.set_system_state_handlers_for_test(InitialSetupHandlers {
+        status: || panic!("an owned-reading wake must not start a full status read"),
+        ..InitialSetupHandlers::inert_for_test()
+    });
+    calls();
+    let queued = Wake::InitialSetupReadings(readings);
+    let owned = SetupReadings {
+        observed: vec![Observation {
+            subject: Subject::Setting(Setting::CapsLock),
+            standing: Standing::InPlace,
+            now: Some("Control".into()),
+            after_login: None,
+            wanted: "Control".into(),
+            note: None,
+            detail: None,
+        }],
+        observed_generation: 41,
+        observed_vault_url: admitted.plan.as_ref().map(|plan| plan.vault_url.clone()),
+        running: vec![Setting::CapsLock],
+    };
+    READINGS.with(|readings| *readings.borrow_mut() = owned.clone());
+    assert!(calls().is_empty(), "the queued wake has not read anything");
+    let generation = app.system_state_host.generation;
+    app.system_state_host.status_in_flight = true;
+    app.system_state_host.next_status = None;
+    let Wake::InitialSetupReadings(read) = queued else {
+        unreachable!()
+    };
+    app.receive_system_state_readings(read);
+    assert_eq!(calls(), ["owned readings"]);
+    let mut patched = admitted.clone();
+    owned.clone().overlay(&mut patched);
+    assert_eq!(app.system_state_host.latest_status(), &patched);
+    assert_eq!(app.system_state_host.generation, generation);
+    assert!(app.system_state_host.status_in_flight);
+    assert_eq!(app.system_state_host.next_status, None);
+    assert!(app.permission_steps_admitted());
+    assert_eq!(app.access_revision(), Some(5));
+    // Stage activity can end without a new observation generation.
+    READINGS.with(|readings| readings.borrow_mut().running.clear());
+    app.receive_system_state_readings(readings);
+    assert_eq!(calls(), ["owned readings"]);
+    assert!(app.system_state_host.latest_status.running.is_empty());
+    assert_eq!(app.system_state_host.latest_status.observed_generation, 41);
+    assert_eq!(app.system_state_host.generation, generation);
+    assert!(app.system_state_host.status_in_flight);
+    assert!(
+        app.compiled_native_ui(wid)
+            .unwrap()
+            .semantic(&UiKey::new("system-state/row/caps-lock/info"))
+            .is_some_and(|node| node.label.contains("Control")),
+        "the cached native model receives the already-owned Caps reading"
+    );
+
+    // A matching full response has older readings but a newer real plan/run. Its
+    // non-observation fields land, while delivery overlays current owned readings.
+    let mut newer = admitted;
+    newer
+        .plan
+        .as_mut()
+        .unwrap()
+        .selection
+        .set(Setting::Dock, false);
+    newer.permissions = Some(crate::InitialSetupPermissionPolicy {
+        revision: 6,
+        allowed: true,
+    });
+    newer.run = Some(crate::InitialSetupRunPolicy {
+        revision: 6,
+        allowed: true,
+    });
+    newer.observed = vec![Observation::unknown(Subject::Setting(Setting::CapsLock))];
+    newer.observed_generation = 1;
+    newer.running = vec![Setting::CapsLock];
+    let mut expected = newer.clone();
+    READINGS.with(|readings| readings.borrow().clone().overlay(&mut expected));
+    app.receive_system_state_status(Some(generation), newer);
+    assert_eq!(calls(), ["owned readings"]);
+    assert_eq!(app.system_state_host.latest_status(), &expected);
+    assert!(!app.system_state_host.status_in_flight);
+    assert_eq!(
+        app.system_state_host
+            .latest_status
+            .permissions
+            .unwrap()
+            .revision,
+        6
+    );
+    assert_eq!(app.system_state_host.latest_status.run.unwrap().revision, 6);
+    app.receive_system_state_status(Some(generation.wrapping_sub(1)), SetupStatus::default());
+    assert_eq!(app.system_state_host.latest_status(), &expected);
+    assert!(
+        calls().is_empty(),
+        "a superseded full poll does not read or publish"
+    );
 }
 
 /// Records that keep changing show as such: after a run of reads that each met a write, the page

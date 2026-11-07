@@ -123,6 +123,8 @@ pub(super) fn revision_at(root: &Path) -> Result<Option<u64>, String> {
 /// Activate only newly attached services under their original accepted Caps setting. The
 /// profile lock orders the operation against choices and Restore, while both the durable and
 /// this process's immediate Stop are checked before each whole item.
+/// `invalidate` retires an earlier whole-Caps reading before a mutation or on uncertain
+/// attachment coverage; this path never supplies a positive whole-Caps observation.
 ///
 /// # Errors
 /// Setup authority, console identity, input facts or live activation cannot be read safely.
@@ -130,30 +132,57 @@ pub fn activate_input_attachments(
     expected: u64,
     registries: &[u64],
     stopped: impl Fn(u64) -> bool,
+    invalidate: &dyn Fn(),
 ) -> Result<Option<bool>, String> {
-    ensure_person_scope()?;
-    let root = state_root()?;
-    activate_at(&root, expected, &stopped, |kept, continues| {
-        aterm_machines::init::activate_keyboard_attachments(
-            &aterm_machines::port::Live::new(),
-            registries,
-            &|item| kept.keeps(item),
-            continues,
+    let invalidated = std::cell::Cell::new(false);
+    let invalidate_once = || {
+        if !invalidated.replace(true) {
+            invalidate();
+        }
+    };
+    let result = (|| {
+        ensure_person_scope()?;
+        let root = state_root()?;
+        activate_at(
+            &root,
+            expected,
+            &stopped,
+            &invalidate_once,
+            |kept, continues| {
+                aterm_machines::init::activate_keyboard_attachments(
+                    &aterm_machines::port::Live::new(),
+                    registries,
+                    &|item| kept.keeps(item),
+                    continues,
+                    &invalidate_once,
+                )
+            },
         )
-    })
+    })();
+    if matches!(result, Err(_) | Ok(Some(false))) {
+        invalidate_once();
+    }
+    result
 }
 
 fn activate_at(
     root: &Path,
     expected: u64,
     stopped: &dyn Fn(u64) -> bool,
+    invalidate: &dyn Fn(),
     work: impl FnOnce(&kept::Kept, &dyn Fn() -> bool) -> Result<bool, String>,
 ) -> Result<Option<bool>, String> {
     let Some(_lock) = HeldLock::try_take(root)? else {
         return Ok(None);
     };
-    let continues =
-        || !stopped(expected) && revision_at(root).is_ok_and(|now| now == Some(expected));
+    let continues = || {
+        let current =
+            !stopped(expected) && revision_at(root).is_ok_and(|now| now == Some(expected));
+        if !current {
+            invalidate();
+        }
+        current
+    };
     if !continues() {
         return Ok(None);
     }
@@ -215,11 +244,17 @@ mod tests {
             "an unrelated pending preference must not suspend accepted keyboard attachments"
         );
         assert_eq!(
-            activate_at(root, current, &|_| false, |_, continues| Ok(continues())).unwrap(),
+            activate_at(root, current, &|_| false, &|| {}, |_, continues| Ok(
+                continues()
+            ))
+            .unwrap(),
             Some(true)
         );
         assert_eq!(
-            activate_at(root, original, &|_| false, |_, _| panic!("old revision")).unwrap(),
+            activate_at(root, original, &|_| false, &|| {}, |_, _| panic!(
+                "old revision"
+            ))
+            .unwrap(),
             None
         );
         assert_eq!(observation_at(root).unwrap(), before);
@@ -228,20 +263,24 @@ mod tests {
     #[test]
     fn a_first_caps_pass_enrolls_attachments_while_an_unrelated_preference_stays_pending() {
         use crate::macos_doctor::NativeHost;
-        use aterm_machines::items::keyboard::{Model, caps_to_control};
+        use aterm_machines::items::keyboard::{CAPS_LOCK, LEFT_CONTROL, Model, caps_to_control};
         use aterm_machines::model::{PValue, User};
         use aterm_machines::port::{Fake, Ran, Stat};
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         enum Caps {
+            Attached,
+            Partial,
             Applied,
             Failed,
             Unread,
             Unobserved,
         }
         for (caps, legacy, dock_pending) in [
+            (Caps::Attached, false, true),
+            (Caps::Partial, false, true),
             (Caps::Applied, false, true),
             (Caps::Failed, false, true),
             (Caps::Unread, false, true),
@@ -269,10 +308,10 @@ mod tests {
             };
             let mut sys = Fake::root();
             sys.euid = user.uid;
-            sys.keyboard_services = Some(Ok(if caps == Caps::Unobserved {
-                vec![41]
-            } else {
-                Vec::new()
+            sys.keyboard_services = Some(Ok(match caps {
+                Caps::Partial => vec![41, 42],
+                Caps::Attached | Caps::Unobserved => vec![41],
+                _ => Vec::new(),
             }));
             sys.logged_in(&user);
             sys.stat_of(
@@ -286,9 +325,32 @@ mod tests {
                     len: 0,
                 },
             );
+            let census = if matches!(caps, Caps::Attached | Caps::Partial) {
+                let mut census = format!(
+                    "Services:\n{:<12}{:<12}{:<16}{:<24}Built-In\n{:<12}{:<12}{:<16}{:<24}0\n",
+                    "VendorID",
+                    "ProductID",
+                    "RegistryID",
+                    "Product",
+                    "0x0",
+                    "0x0",
+                    "0x29",
+                    "Fixture keyboard"
+                );
+                if caps == Caps::Partial {
+                    census.push_str(&format!(
+                        "{:<12}{:<12}{:<16}{:<24}0\n",
+                        "0x0", "0x0", "0x2a", "Unread fixture keyboard"
+                    ));
+                }
+                census.push_str("\nDevices:\n");
+                census
+            } else {
+                "Services:\n\nDevices:\n".into()
+            };
             sys.on(
                 &aterm_machines::facts::hidutil_keyboards().display(),
-                Ran::ok("Services:\n\nDevices:\n"),
+                Ran::ok(&census),
             );
             sys.on(
                 "/usr/bin/defaults export /Library/Preferences/com.apple.keyboardtype -",
@@ -296,13 +358,47 @@ mod tests {
             );
             let mapped = Arc::new(AtomicBool::new(false));
             let reading = Arc::clone(&mapped);
+            let hid_reads = Arc::new(AtomicUsize::new(0));
+            let reads = Arc::clone(&hid_reads);
             let key = Model {
                 vendor: 0,
                 product: 0,
             }
             .key();
             sys.simulate(move |_, cmd| {
-                if cmd.display() == "alice$ /usr/bin/defaults -currentHost export -g -" {
+                if cmd.program.file_name().is_some_and(|name| name == "hidutil") {
+                    reads.fetch_add(1, Ordering::SeqCst);
+                    if !matches!(caps, Caps::Attached | Caps::Partial) {
+                        return None;
+                    }
+                    if cmd.args.first().is_some_and(|word| word == "property") {
+                        return Some(Ran::ok(&format!("RegistryID Key Value\n29 UserKeyMapping ( {{ HIDKeyboardModifierMappingSrc = {CAPS_LOCK}; HIDKeyboardModifierMappingDst = {LEFT_CONTROL}; }} )\n")));
+                    }
+                    if cmd.args.first().is_some_and(|word| word == "dump") {
+                        let plugin = PValue::Dict(vec![
+                            ("Class".into(), PValue::Str("IOHIDKeyboardFilter".into())),
+                            ("HIDKeyboardModifierMappingPairs".into(), PValue::Array(Vec::new())),
+                            ("UserKeyMapping".into(), PValue::Array(vec![PValue::Dict(vec![
+                                ("Src".into(), PValue::Int(CAPS_LOCK)),
+                                ("Dst".into(), PValue::Int(LEFT_CONTROL)),
+                            ])])),
+                            ("FnFunctionUsageMap".into(), PValue::Array(Vec::new())),
+                            ("FnKeyMode".into(), PValue::Int(0)),
+                            ("UnifiedKeyMapping".into(), PValue::Bool(false)),
+                            ("LegacyKeyMaps".into(), PValue::Array(Vec::new())),
+                            ("UnifiedKeyMaps".into(), PValue::Array(Vec::new())),
+                            ("NumLockKeyboardUsageMap".into(), PValue::Array(Vec::new())),
+                        ]);
+                        let service = PValue::Dict(vec![
+                            ("IORegistryEntryID".into(), PValue::Int(41)),
+                            ("PrimaryUsagePage".into(), PValue::Int(1)),
+                            ("PrimaryUsage".into(), PValue::Int(6)),
+                            ("ServiceFilterDebug".into(), PValue::Array(vec![PValue::Dict(vec![("plugin".into(), plugin)])])),
+                        ]);
+                        return Some(Ran::ok(&aterm_machines::plist::document(&PValue::Dict(vec![("ServiceRecords".into(), PValue::Array(vec![service]))]))));
+                    }
+                    None
+                } else if cmd.display() == "alice$ /usr/bin/defaults -currentHost export -g -" {
                     if caps == Caps::Unread {
                         return Some(Ran::exit(1, "inert unread preference domain"));
                     }
@@ -350,8 +446,59 @@ mod tests {
                     .unwrap()
                     .unwrap()
             };
-            let applied = caps == Caps::Applied;
-            assert_eq!(mapped.load(Ordering::SeqCst), applied, "{caps:?}");
+            let applied = matches!(caps, Caps::Applied | Caps::Attached);
+            assert_eq!(
+                mapped.load(Ordering::SeqCst),
+                applied || caps == Caps::Partial,
+                "{caps:?}"
+            );
+            if caps == Caps::Attached {
+                let paid_reads = hid_reads.load(Ordering::SeqCst);
+                assert!(
+                    paid_reads > 0,
+                    "the ordinary native producer read the attached cohort"
+                );
+                let readback = &report
+                    .page
+                    .as_ref()
+                    .expect("the pass keeps its page")
+                    .readback;
+                let observed = readback
+                    .observations()
+                    .iter()
+                    .find(|row| row.subject == Subject::Setting(Setting::CapsLock));
+                assert_eq!(
+                    observed.map(|row| (row.standing, row.now.as_deref())),
+                    Some((aterm_types::macos_setup::Standing::InPlace, Some("Control"))),
+                    "the pass must retain its already-read effective native Caps facts"
+                );
+                let _ = readback.clone().take();
+                assert_eq!(
+                    hid_reads.load(Ordering::SeqCst),
+                    paid_reads,
+                    "retaining and taking readback starts no HID query"
+                );
+            }
+            if caps == Caps::Partial {
+                let paid_reads = hid_reads.load(Ordering::SeqCst);
+                let observed = report.page.as_ref().and_then(|page| {
+                    page.readback
+                        .observations()
+                        .iter()
+                        .find(|row| row.subject == Subject::Setting(Setting::CapsLock))
+                });
+                assert!(
+                    observed.is_none_or(|row| {
+                        !matches!(
+                            row.standing,
+                            aterm_types::macos_setup::Standing::InPlace
+                                | aterm_types::macos_setup::Standing::NotNeeded
+                        ) && row.now.as_deref() != Some("Control")
+                    }),
+                    "a paid but partial native cohort must not claim physical Control"
+                );
+                assert_eq!(hid_reads.load(Ordering::SeqCst), paid_reads);
+            }
             assert_eq!(
                 report.complete(),
                 !dock_pending,
@@ -376,20 +523,26 @@ mod tests {
                 "{caps:?}: Caps completion cannot be borrowed from the unfinished Dock"
             );
             assert_eq!(
-                activate_at(root, current, &|_| false, |_, continues| Ok(continues())).unwrap(),
+                activate_at(root, current, &|_| false, &|| {}, |_, continues| Ok(
+                    continues()
+                ))
+                .unwrap(),
                 enrolled.then_some(true)
             );
             if enrolled {
                 let before = observation_at(root).unwrap();
                 assert_eq!(
-                    activate_at(root, current + 1, &|_| false, |_, _| panic!(
+                    activate_at(root, current + 1, &|_| false, &|| {}, |_, _| panic!(
                         "other revision"
                     ))
                     .unwrap(),
                     None
                 );
                 assert_eq!(
-                    activate_at(root, current, &|_| true, |_, _| panic!("immediate Stop")).unwrap(),
+                    activate_at(root, current, &|_| true, &|| {}, |_, _| panic!(
+                        "immediate Stop"
+                    ))
+                    .unwrap(),
                     None
                 );
                 assert_eq!(observation_at(root).unwrap(), before);
@@ -490,7 +643,10 @@ mod tests {
             );
             assert_eq!(revision_at(root).unwrap(), None);
             assert_eq!(
-                activate_at(root, current, &|_| false, |_, _| panic!("Caps is restored")).unwrap(),
+                activate_at(root, current, &|_| false, &|| {}, |_, _| panic!(
+                    "Caps is restored"
+                ))
+                .unwrap(),
                 None
             );
             assert_eq!(observation_at(root).unwrap(), before);
@@ -508,7 +664,10 @@ mod tests {
         let current = choose(root, &plan);
         assert_eq!(revision_at(root).unwrap(), Some(current));
         assert_eq!(
-            activate_at(root, current, &|_| true, |_, _| panic!("immediate Stop")).unwrap(),
+            activate_at(root, current, &|_| true, &|| {}, |_, _| panic!(
+                "immediate Stop"
+            ))
+            .unwrap(),
             None
         );
         request_stop_at(root, current).unwrap();
@@ -555,7 +714,7 @@ mod tests {
                 "attachment authority belongs to this setting, not the unfinished stage"
             );
             assert_eq!(
-                activate_at(root, current, &|_| false, |_, continues| {
+                activate_at(root, current, &|_| false, &|| {}, |_, continues| {
                     assert_eq!(applied, Setting::CapsLock, "new Caps has not applied");
                     Ok(continues())
                 })
@@ -563,7 +722,7 @@ mod tests {
                 (applied == Setting::CapsLock).then_some(true)
             );
             assert_eq!(
-                activate_at(root, original.revision, &|_| false, |_, _| panic!(
+                activate_at(root, original.revision, &|_| false, &|| {}, |_, _| panic!(
                     "the old partial revision grants nothing"
                 ))
                 .unwrap(),
@@ -617,7 +776,7 @@ mod tests {
         assert!(scope::upgrade_of(&before.records, || true).is_none());
         assert_eq!(revision_at(root).unwrap(), Some(0));
         assert_eq!(
-            activate_at(root, 0, &|_| false, |_, go| {
+            activate_at(root, 0, &|_| false, &|| {}, |_, go| {
                 assert!(HeldLock::try_take(root)?.is_none());
                 Ok(go())
             })
@@ -633,7 +792,7 @@ mod tests {
         let (plan, mut progress) = ready(root);
         assert_ne!(revision_at(root).unwrap(), Some(0));
         assert_eq!(
-            activate_at(root, 0, &|_| false, |_, _| panic!(
+            activate_at(root, 0, &|_| false, &|| {}, |_, _| panic!(
                 "superseded legacy setting"
             ))
             .unwrap(),
@@ -668,7 +827,10 @@ mod tests {
         older(root, selected, "applied", false);
         assert_eq!(revision_at(root).unwrap(), Some(0));
         assert_eq!(
-            activate_at(root, 0, &|_| true, |_, _| panic!("immediate legacy Stop")).unwrap(),
+            activate_at(root, 0, &|_| true, &|| {}, |_, _| panic!(
+                "immediate legacy Stop"
+            ))
+            .unwrap(),
             None
         );
         request_stop_at(root, 0).unwrap();
@@ -686,15 +848,15 @@ mod tests {
         let (mut plan, mut progress) = ready(root);
         assert_eq!(revision_at(root).unwrap(), Some(7));
         assert_eq!(
-            activate_at(root, 7, &|_| false, |_, go| Ok(go())).unwrap(),
+            activate_at(root, 7, &|_| false, &|| {}, |_, go| Ok(go())).unwrap(),
             Some(true)
         );
         assert_eq!(
-            activate_at(root, 8, &|_| false, |_, _| panic!("stale revision")).unwrap(),
+            activate_at(root, 8, &|_| false, &|| {}, |_, _| panic!("stale revision")).unwrap(),
             None
         );
         assert_eq!(
-            activate_at(root, 7, &|_| true, |_, _| panic!("immediate Stop")).unwrap(),
+            activate_at(root, 7, &|_| true, &|| {}, |_, _| panic!("immediate Stop")).unwrap(),
             None
         );
         progress.admitted = false;
@@ -714,7 +876,7 @@ mod tests {
         request_stop_at(root, 7).unwrap();
         assert_eq!(revision_at(root).unwrap(), None);
         assert_eq!(
-            activate_at(root, 7, &|_| false, |_, _| panic!("durable Stop")).unwrap(),
+            activate_at(root, 7, &|_| false, &|| {}, |_, _| panic!("durable Stop")).unwrap(),
             None
         );
         let restored = aterm_tempfile::tempdir().unwrap();
@@ -734,8 +896,24 @@ mod tests {
         let dir = aterm_tempfile::tempdir().unwrap();
         let root = dir.path();
         ready(root);
+        let invalidated = std::cell::Cell::new(0);
+        let invalidate = || invalidated.set(invalidated.get() + 1);
+        let held = HeldLock::try_take(root).unwrap().unwrap();
         assert_eq!(
-            activate_at(root, 7, &|_| false, |_, go| {
+            activate_at(root, 7, &|_| false, &invalidate, |_, _| panic!(
+                "a busy profile does not admit a read"
+            ))
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            invalidated.get(),
+            0,
+            "busy admission preserves an owned reading"
+        );
+        drop(held);
+        assert_eq!(
+            activate_at(root, 7, &|_| false, &invalidate, |_, go| {
                 assert!(HeldLock::try_take(root)?.is_none());
                 assert!(go());
                 request_stop_at(root, 7)?;
@@ -744,6 +922,7 @@ mod tests {
             .unwrap(),
             Some(false)
         );
+        assert_eq!(invalidated.get(), 1, "an observed Stop retires the reading");
         assert!(HeldLock::try_take(root).unwrap().is_some());
     }
 }

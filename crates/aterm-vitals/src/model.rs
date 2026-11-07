@@ -7,10 +7,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::history::{self, Filling, FreeHistory, Rates};
-use crate::peaks::{DailyMax, NET_LEARN_S, Peaks, TOKENS_LEARN_S};
+use crate::peaks::{DailyMax, NET_LEARN_S, PROC_LEARN_S, Peaks, TOKENS_LEARN_S};
 use crate::ring::{
-    BUCKET_MS, BucketRing, Cell, GapKind, MultiScaleSpec, NOW_WINDOW_MS, ProgSlot, Reading, Recent,
-    SLOT_GUARD_MS, SLOT_MS, ScaleCell, SlotGrid, Tiers, TimeGap, columns_of, multi_scale_cells,
+    Agg, BUCKET_MS, BucketRing, Cell, GapKind, MultiScaleSpec, NOW_WINDOW_MS, ProgSlot, Reading,
+    Recent, ScaleCell, SlotGrid, Taken, Tiers, TimeGap, columns_of, multi_scale_cells,
 };
 use crate::trend::{History, Trend, TrendView};
 
@@ -1049,8 +1049,13 @@ pub struct Sample {
     pub at_unix_ms: i64,
     /// Monotonic timestamp of the sample in ms (pauses during system sleep).
     pub mono_ms: u64,
-    /// Active sampling cadence in ms.
+    /// Active sampling cadence in ms: the gap rule's ([`GAP_CADENCES`]), and on the deck's own
+    /// readings the slot each stands for in the rings ([`Self::period_ms`]).
     pub cadence_ms: u32,
+    /// A control worker's pull (`sys` and the like), taken between the deck's own readings: it
+    /// stands for an instant in the rings, so the deck's reading after it keeps its whole slot,
+    /// and its cadence serves the gap rule alone (A1 §9, F4′).
+    pub pull: bool,
     /// True when only machine counters were sampled (process sweep omitted).
     pub machine_only: bool,
     /// The 1-minute load average.
@@ -1109,6 +1114,16 @@ pub struct Sample {
     /// The physical devices home's volume and the front tab's are stored on, home's first, and
     /// their I/O counters ([`crate::units::BlockSample`]).
     pub block: Vec<crate::units::BlockSample>,
+}
+
+impl Sample {
+    /// The slot this reading stands for in the rings, ms ([`crate::ring::Taken`]): its cadence,
+    /// or 0, an instant, for a pull ([`Self::pull`]).
+    #[inline]
+    #[must_use]
+    pub const fn period_ms(&self) -> u32 {
+        if self.pull { 0 } else { self.cadence_ms }
+    }
 }
 
 /// One core's load.
@@ -1756,20 +1771,20 @@ impl ScopeFig {
         let run = (first..=run_k)
             .map(|k| {
                 let mut cell = Cell::default();
-                // The panes read at the same times: the tab's bucket holds as many readings as
-                // its fullest pane's, and as many over as its most over pane's.
+                // The panes read at the same times: the tab's bucket holds as much read time as
+                // its fullest pane's, and as much over as its most over pane's.
                 for c in read.iter().filter_map(|f| f.run_cell(k)) {
                     cell.mean = add(cell.mean, c.mean);
                     cell.max = add(cell.max, c.max);
-                    cell.n = cell.n.max(c.n);
-                    cell.over_n = cell.over_n.max(c.over_n);
+                    cell.tau_ms = cell.tau_ms.max(c.tau_ms);
+                    cell.over_ms = cell.over_ms.max(c.over_ms);
                 }
                 let all = within.run_cell(k);
                 Cell {
                     mean: held(cell.mean, all.and_then(|c| c.mean)),
                     max: held(cell.max, all.and_then(|c| c.max)),
-                    n: cell.n,
-                    over_n: cell.over_n.min(cell.n),
+                    tau_ms: cell.tau_ms,
+                    over_ms: cell.over_ms.min(cell.tau_ms),
                 }
             })
             .collect();
@@ -1848,7 +1863,7 @@ pub struct ResourceView {
     pub tabs: Vec<(u64, ScopeFig)>,
     /// What the capacity is.
     pub basis: CapBasis,
-    /// Secondary series for two-series rows (Network TX or per-user Processes).
+    /// Secondary series for a two-series row: Network's sending (Processes has one since F4′).
     pub second: Option<Series>,
 }
 
@@ -1859,7 +1874,7 @@ pub struct HeatCell {
     pub heat: Option<f32>,
     /// Its largest reading as a share of capacity now: the box's peak tick.
     pub max: Option<f32>,
-    /// The share of its readings over the resource's maximum, `0..=1`: the over cap's length
+    /// The share of its read time over the resource's maximum, `0..=1`: the over cap's length
     /// (`docs/DESIGN-stats-deck-units-2026-11-04.md` §3); 0 where none was.
     pub over: f32,
     /// Discontinuity kind when this cell spans a sleep, crash, or pause gap.
@@ -2042,8 +2057,9 @@ impl ResourceView {
     /// The live box's peak tick and over cap (`docs/DESIGN-stats-deck-units-2026-11-04.md` §3,
     /// "Live box"): the largest reading of the trailing [`NOW_WINDOW_MS`] as a share of capacity
     /// now, the larger series' on a two-series row as [`Self::heat_now`] takes, and the share of
-    /// those readings over the resource's maximum. Its column is [`Self::heat_now`], the 10 s
-    /// mean.
+    /// those readings' read time over the resource's maximum, each reading weighed by the time it
+    /// stands for ([`Reading::w_ms`]) as every other box's over share is. Its column is
+    /// [`Self::heat_now`], the 10 s mean, weighed the same way.
     #[must_use]
     pub fn live_box(&self, now_unix_ms: i64) -> (Option<f32>, f32) {
         let ceiling = self.basis.heat_ceiling();
@@ -2055,12 +2071,19 @@ impl ResourceView {
                     .filter(|r| i128::from(r.at_ms) > cutoff && r.at_ms <= now_unix_ms)
                     .filter(|r| r.v.is_finite())
             };
-            let n = inside().count();
+            let read: u64 = inside().map(|r| u64::from(r.w_ms.max(1))).sum();
             let peak = inside().map(|r| r.v).reduce(f64::max);
-            let over = inside().filter(|r| r.over).count();
+            let over: u64 = inside()
+                .filter(|r| r.over)
+                .map(|r| u64::from(r.w_ms.max(1)))
+                .sum();
             (
                 heat_of(peak, cap).map(|h| h.min(ceiling)),
-                if n > 0 { over as f32 / n as f32 } else { 0.0 },
+                if read > 0 {
+                    (over as f64 / read as f64) as f32
+                } else {
+                    0.0
+                },
             )
         };
         let (peak, over) = of(&self.recent, self.capacity);
@@ -2216,6 +2239,8 @@ pub struct RowFacts {
     /// ([`crate::starts::TaskFlow`]); `None` where no start counter read at both ends, or no
     /// rate spans the interval.
     pub flow: Option<crate::starts::TaskFlow>,
+    /// Processes: seconds of readings toward learning its start peak ([`PROC_LEARN_S`]).
+    pub proc_read_s: u32,
 }
 
 /// Validated build-slot occupancy from the host's slot reader.
@@ -2321,9 +2346,8 @@ pub struct Snapshot {
     pub machine_only: bool,
     /// The sample's wall clock, unix ms.
     pub at_unix_ms: i64,
-    /// Where a strip drawn reading by reading puts its slots: a second each, their edges between
-    /// the recent readings ([`SlotGrid::clear_of`]), so each reading a second stands alone in
-    /// its own slot.
+    /// Where a strip drawn reading by reading puts its slots: the wall clock's seconds
+    /// ([`SlotGrid::SECONDS`]), since readings land on the half-slot, each in its own second.
     pub slot_grid: SlotGrid,
     /// The deck's rows, in [`Resource::ALL`] order.
     pub resources: [ResourceView; 7],
@@ -2895,8 +2919,14 @@ struct Rows {
     rings: [BucketRing; 7],
     /// Network's send direction.
     net_tx: BucketRing,
-    /// Processes run by this user.
-    yours: BucketRing,
+    /// How many processes run, beside the starts `rings[Processes]` holds where a start counter
+    /// reads (record §8.2).
+    proc_count: BucketRing,
+    /// What `rings[Processes]` and the scopes' Processes rings hold: starts a second (`true`),
+    /// the count against its limit (`false`), or nothing yet ([`Rows::proc_meaning`]).
+    proc_starts: Option<bool>,
+    /// Whether a reading of this run carried a start counter.
+    starts_read: bool,
     /// Memory pressure's rank ([`Pressure::rank`]), pushed beside Memory's ring: a bucket's
     /// largest reading is the worst level read in it.
     pressure: BucketRing,
@@ -2950,12 +2980,12 @@ struct Rows {
 struct ScopeRings([Option<BucketRing>; 7]);
 
 impl ScopeRings {
-    fn push(&mut self, now: i64, vals: [Option<f64>; 7]) {
+    fn push(&mut self, t: Taken, vals: [Option<f64>; 7]) {
         for (ring, v) in self.0.iter_mut().zip(vals) {
             if let Some(v) = v {
                 let _ = ring
                     .get_or_insert_with(BucketRing::default)
-                    .push(now, Some(v), false);
+                    .push(t, Some(v), false);
             }
         }
     }
@@ -2995,10 +3025,6 @@ pub struct Vitals {
     tabs: HashMap<u64, ScopeState>,
     detector: crate::events::Detector,
     why: crate::explain::WhyState,
-    /// The last [`SLOT_TIMES`] readings' wall clocks, unix ms, oldest first.
-    slot_times: VecDeque<i64>,
-    /// Where the strips' reading slots stand ([`Snapshot::slot_grid`]).
-    slot_grid: SlotGrid,
     last_stamp: Option<Stamp>,
     restored_wall_ms: i64,
     last_pressure: Pressure,
@@ -3006,21 +3032,30 @@ pub struct Vitals {
     last_gpu_resets: u64,
     time_gaps: VecDeque<TimeGap>,
     strip_events: VecDeque<StripEvent>,
+    /// How many times the strip's held buckets changed other than by a bucket closing
+    /// ([`Self::strip_rewrites`]).
+    strip_rewrites: u64,
 }
 
-/// The readings [`Vitals`] places its slot grid's edges between: eight seconds at the focused
-/// cadence, four at the lens's.
-const SLOT_TIMES: usize = 8;
-const STRIP_HISTORY_CAP: usize = 128;
+/// The most gaps, and the most events, a strip keeps.
+pub const STRIP_HISTORY_CAP: usize = 128;
 /// How far back the strip's gaps and events are kept, ms: the Full deck's six hours.
 pub const STRIP_HORIZON_MS: i64 = 6 * 3_600_000;
 
-/// Persisted strip state across restarts and crashes (`vitals-strip.json`): an hour of 10 s
-/// buckets and six of ten-minute ones.
-#[derive(Clone, Debug, Default, PartialEq)]
+/// How many rings a strip checkpoint holds, by slot ([`SavedStrip::ring_mut`]): the seven rows',
+/// Network's send direction, memory pressure, aterm's seven and the process count.
+pub const STRIP_RINGS: usize = 17;
+
+/// Persisted strip state across restarts and crashes (the strip folder's base, schema 2): an
+/// hour of 10 s buckets and seven of ten-minute ones, replayed forward by the tail's
+/// [`StripLine`]s.
+#[derive(Clone, Debug, PartialEq)]
 pub struct SavedStrip {
     /// Wall-clock timestamp (Unix ms) of the newest absorbed sample, or `0` when empty.
     pub last_wall_ms: i64,
+    /// The newest ten-second epoch it holds closed: a tail line replays only past it
+    /// ([`Self::replay`]). `i64::MIN` for a strip that has closed none.
+    pub through_k: i64,
     /// True when written during a graceful probe-thread shutdown; false on periodic live checkpoints.
     pub clean_stop: bool,
     /// Fixed capacities learned for each [`Resource`] row.
@@ -3029,15 +3064,119 @@ pub struct SavedStrip {
     pub rings: [crate::ring::SavedRing; 7],
     /// Network transmit multi-scale ring (1-hour 10 s and 6-hour 10-minute).
     pub net_tx: crate::ring::SavedRing,
-    /// User-owned process count multi-scale ring (1-hour 10 s and 6-hour 10-minute).
-    pub yours: crate::ring::SavedRing,
+    /// How many processes ran (1-hour 10 s and 7-hour 10-minute), beside the starts
+    /// `rings[Processes]` holds where a start counter reads.
+    pub proc_count: crate::ring::SavedRing,
     /// Memory pressure rank multi-scale ring (1-hour 10 s and 6-hour 10-minute).
     pub pressure: crate::ring::SavedRing,
     /// aterm-scope multi-scale rings (1-hour 10 s and 6-hour 10-minute) in [`Resource::ALL`] order.
     pub aterm: [crate::ring::SavedRing; 7],
+    /// What the Processes rings hold: starts a second (`true`), the process count (`false`), or
+    /// nothing yet.
+    pub proc_starts: Option<bool>,
     /// Discontinuous wall-clock intervals in the last six hours ([`STRIP_HORIZON_MS`]).
     pub time_gaps: Vec<TimeGap>,
     /// Vertical event markers in the last six hours ([`STRIP_HORIZON_MS`]).
+    pub strip_events: Vec<StripEvent>,
+}
+
+impl Default for SavedStrip {
+    fn default() -> Self {
+        Self {
+            last_wall_ms: 0,
+            through_k: i64::MIN,
+            clean_stop: false,
+            caps: [None; 7],
+            rings: std::array::from_fn(|_| crate::ring::SavedRing::default()),
+            net_tx: crate::ring::SavedRing::default(),
+            proc_count: crate::ring::SavedRing::default(),
+            pressure: crate::ring::SavedRing::default(),
+            aterm: std::array::from_fn(|_| crate::ring::SavedRing::default()),
+            proc_starts: None,
+            time_gaps: Vec::new(),
+            strip_events: Vec::new(),
+        }
+    }
+}
+
+impl SavedStrip {
+    /// The ring in slot `slot` (`0..`[`STRIP_RINGS`]): the rows' in [`Resource::ALL`] order,
+    /// then Network's send direction, memory pressure, aterm's in row order and the process
+    /// count. `None` past the last.
+    pub fn ring_mut(&mut self, slot: usize) -> Option<&mut crate::ring::SavedRing> {
+        match slot {
+            0..7 => self.rings.get_mut(slot),
+            7 => Some(&mut self.net_tx),
+            8 => Some(&mut self.pressure),
+            9..16 => self.aterm.get_mut(slot - 9),
+            16 => Some(&mut self.proc_count),
+            _ => None,
+        }
+    }
+
+    /// The ring in slot `slot`, as [`Self::ring_mut`] numbers them.
+    #[must_use]
+    pub fn ring(&self, slot: usize) -> Option<&crate::ring::SavedRing> {
+        match slot {
+            0..7 => self.rings.get(slot),
+            7 => Some(&self.net_tx),
+            8 => Some(&self.pressure),
+            9..16 => self.aterm.get(slot - 9),
+            16 => Some(&self.proc_count),
+            _ => None,
+        }
+    }
+
+    /// Replay `line`, a tail line written after this base: each ring takes its closed bucket
+    /// ([`crate::ring::SavedRing::put_closed`]), the capacities it read and the gaps and events
+    /// it opened, and the strip's newest wall clock moves to the line's. A line at or before
+    /// [`Self::through_k`] holds nothing the base does not, and changes nothing; the result says
+    /// whether it was replayed.
+    pub fn replay(&mut self, line: StripLine) -> bool {
+        if line.k <= self.through_k {
+            return false;
+        }
+        for (slot, agg) in line.rings {
+            if let Some(r) = self.ring_mut(usize::from(slot)) {
+                r.put_closed(line.k, agg);
+            }
+        }
+        for (cap, read) in self.caps.iter_mut().zip(line.caps) {
+            if let Some(c) = read.filter(|c| c.is_finite() && *c > 0.0) {
+                *cap = Some(c);
+            }
+        }
+        if line.proc_starts.is_some() {
+            self.proc_starts = line.proc_starts;
+        }
+        self.time_gaps.extend(line.time_gaps);
+        self.strip_events.extend(line.strip_events);
+        self.last_wall_ms = self.last_wall_ms.max(line.wall_ms);
+        self.through_k = line.k;
+        true
+    }
+}
+
+/// One closed ten-second epoch of every strip ring: a line of the checkpoint's append-only tail
+/// (record §9), written at the first reading past the epoch's end ([`Vitals::strip_line`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StripLine {
+    /// The epoch: unix seconds `[10 k, 10 k + 10)`.
+    pub k: i64,
+    /// The newest reading's wall clock when it was written, unix ms: a restore's
+    /// [`SavedStrip::last_wall_ms`].
+    pub wall_ms: i64,
+    /// The capacities known when it was written.
+    pub caps: [Option<f64>; 7],
+    /// Each ring's bucket for the epoch, where it read anything, by slot
+    /// ([`SavedStrip::ring_mut`]).
+    pub rings: Vec<(u8, Agg)>,
+    /// What the Processes rings held when it was written ([`SavedStrip::proc_starts`]): a base
+    /// written before the run's first reading knows none.
+    pub proc_starts: Option<bool>,
+    /// Gaps opened or changed since the previous line.
+    pub time_gaps: Vec<TimeGap>,
+    /// Events marked since the previous line.
     pub strip_events: Vec<StripEvent>,
 }
 
@@ -3196,6 +3335,7 @@ impl Vitals {
     pub fn saved_strip(&self, clean_stop: bool) -> SavedStrip {
         SavedStrip {
             last_wall_ms: self.last_stamp.map_or(self.restored_wall_ms, |s| s.wall_ms),
+            through_k: self.strip_open_k().map_or(i64::MIN, |k| k - 1),
             clean_stop,
             caps: self
                 .rows
@@ -3203,13 +3343,14 @@ impl Vitals {
                 .map(|c| c.filter(|x| x.is_finite() && *x > 0.0)),
             rings: std::array::from_fn(|i| self.rows.rings[i].saved()),
             net_tx: self.rows.net_tx.saved(),
-            yours: self.rows.yours.saved(),
+            proc_count: self.rows.proc_count.saved(),
             pressure: self.rows.pressure.saved(),
             aterm: std::array::from_fn(|i| {
                 self.rows.aterm.0[i]
                     .as_ref()
                     .map_or_else(crate::ring::SavedRing::default, BucketRing::saved)
             }),
+            proc_starts: self.rows.proc_starts,
             time_gaps: self.time_gaps.iter().copied().collect(),
             strip_events: self.strip_events.iter().cloned().collect(),
         }
@@ -3237,8 +3378,10 @@ impl Vitals {
                 (!ar.is_empty() || !saved.aterm[i].recent.is_empty()).then_some(ar);
         }
         self.rows.net_tx = BucketRing::restored(&saved.net_tx, now_unix_ms);
-        self.rows.yours = BucketRing::restored(&saved.yours, now_unix_ms);
+        self.rows.proc_count = BucketRing::restored(&saved.proc_count, now_unix_ms);
         self.rows.pressure = BucketRing::restored(&saved.pressure, now_unix_ms);
+        self.rows.proc_starts = saved.proc_starts;
+        self.strip_rewrites += 1;
 
         let cutoff = now_unix_ms.saturating_sub(STRIP_HORIZON_MS);
         for mut gap in saved.time_gaps {
@@ -3282,20 +3425,74 @@ impl Vitals {
         self.trim_strip_history(now_unix_ms);
     }
 
-    /// The slot grid with a reading at `at_ms` in it: the one before while that reading stands
-    /// clear of its slot's edges, else the grid clear of the last [`SLOT_TIMES`] readings. Its
-    /// edges then move only when the readings' place in the second has drifted near one, and
-    /// move to the middle of the widest gap between them, so a strip keeps each reading in a
-    /// slot of its own.
-    fn slot_grid(&mut self, at_ms: i64) -> SlotGrid {
-        self.slot_times.push_back(at_ms);
-        while self.slot_times.len() > SLOT_TIMES {
-            self.slot_times.pop_front();
+    /// The strip's open ten-second epoch: the newest any row's ring holds. `None` before a
+    /// reading.
+    #[must_use]
+    pub fn strip_open_k(&self) -> Option<i64> {
+        self.rows.rings.iter().filter_map(BucketRing::open_k).max()
+    }
+
+    /// How many times the strip's held buckets changed other than by an epoch closing: a
+    /// restore, a backward clock step that re-keyed any strip ring (aterm's re-key a reading
+    /// after the rows' where the step left them no rate to read), or a Processes row whose
+    /// meaning changed. An append-only checkpoint writes a whole base when it moves, since its
+    /// tail can carry only closed epochs.
+    #[must_use]
+    pub fn strip_rewrites(&self) -> u64 {
+        self.strip_rewrites
+    }
+
+    /// Every strip ring's open bucket, by slot ([`SavedStrip::ring`]).
+    fn strip_opens(&self) -> [Option<i64>; STRIP_RINGS] {
+        std::array::from_fn(|slot| self.strip_ring(slot).and_then(BucketRing::open_k))
+    }
+
+    fn strip_ring(&self, slot: usize) -> Option<&BucketRing> {
+        match slot {
+            0..7 => self.rows.rings.get(slot),
+            7 => Some(&self.rows.net_tx),
+            8 => Some(&self.rows.pressure),
+            9..16 => self.rows.aterm.0.get(slot - 9).and_then(Option::as_ref),
+            16 => Some(&self.rows.proc_count),
+            _ => None,
         }
-        if !self.slot_grid.clear(at_ms, SLOT_GUARD_MS) {
-            self.slot_grid = SlotGrid::clear_of(self.slot_times.make_contiguous(), SLOT_MS);
+    }
+
+    /// Epoch `k` of every strip ring that read anything in it, for the checkpoint's tail; `None`
+    /// when none did, or while `k` is still open ([`Self::strip_open_k`]). Its gaps and events
+    /// are left for the writer, which knows what it wrote before ([`Self::strip_marks`]).
+    #[must_use]
+    pub fn strip_line(&self, k: i64) -> Option<StripLine> {
+        if self.strip_open_k().is_none_or(|open| k >= open) {
+            return None;
         }
-        self.slot_grid
+        let rings: Vec<(u8, Agg)> = (0..STRIP_RINGS)
+            .filter_map(|slot| {
+                let agg = *self.strip_ring(slot)?.bucket(k)?;
+                (agg.is_sound()).then(|| (u8::try_from(slot).unwrap_or(u8::MAX), agg))
+            })
+            .collect();
+        (!rings.is_empty()).then(|| StripLine {
+            k,
+            wall_ms: self.last_stamp.map_or(self.restored_wall_ms, |s| s.wall_ms),
+            caps: self
+                .rows
+                .caps
+                .map(|c| c.filter(|x| x.is_finite() && *x > 0.0)),
+            rings,
+            proc_starts: self.rows.proc_starts,
+            time_gaps: Vec::new(),
+            strip_events: Vec::new(),
+        })
+    }
+
+    /// The strip's gaps and events, oldest first, as [`Self::saved_strip`] would keep them.
+    #[must_use]
+    pub fn strip_marks(&self) -> (Vec<TimeGap>, Vec<StripEvent>) {
+        (
+            self.time_gaps.iter().copied().collect(),
+            self.strip_events.iter().cloned().collect(),
+        )
     }
 
     /// The peaks learned so far, for the host to persist.
@@ -3553,10 +3750,22 @@ impl Vitals {
             });
         let busy = core_fracs.as_ref().map(|f| f.iter().sum::<f64>());
         let figs = pass.figs.as_ref().filter(|_| !s.machine_only);
+        let opens_before = self.strip_opens();
+        let meaning_before = self.rows.proc_starts;
         let (resources, facts, net) = self.rows.absorb(s, stamp, busy, figs, sweep_dt);
+        // Any strip ring re-keyed back, not only the rows': aterm's, which read nothing at a step
+        // a rate cannot cross, re-key at the reading after it.
+        let rekeyed = opens_before
+            .iter()
+            .zip(self.strip_opens())
+            .any(|(b, a)| b.zip(a).is_some_and(|(b, a)| a < b));
+        if rekeyed || meaning_before.is_some_and(|m| self.rows.proc_starts != Some(m)) {
+            self.strip_rewrites += 1;
+        }
         let units = self.rows.units.absorb(
             &crate::units::UnitReading {
                 now: s.at_unix_ms,
+                period_ms: s.period_ms(),
                 at_ns: s.at_ns,
                 cores: core_fracs.as_deref(),
                 n_cores: s.cores.as_ref().map(Vec::len).filter(|&n| n > 0),
@@ -3636,7 +3845,7 @@ impl Vitals {
             delegated: pass.delegated,
             machine_only: s.machine_only,
             at_unix_ms: s.at_unix_ms,
-            slot_grid: self.slot_grid(s.at_unix_ms),
+            slot_grid: SlotGrid::SECONDS,
             resources,
             free_history: self.rows.free.clone(),
             facts,
@@ -4182,6 +4391,7 @@ impl Rows {
     ) -> ([ResourceView; 7], RowFacts, Option<NetView>) {
         use Resource::{Cpu, Disk, Gpu, Memory, Network, Processes, Tokens};
         let now = s.at_unix_ms;
+        let t = Taken::at(now, s.period_ms());
         if let Some(brand) = s.cpu_brand.as_ref().filter(|b| !b.is_empty()) {
             self.cpu_brand = Some(brand.clone());
         }
@@ -4200,7 +4410,7 @@ impl Rows {
             self.caps[Cpu.index()] = Some(n as f64);
         }
         let cpu_over = crate::units::cpu_over(busy, n_cores, s.load1);
-        self.rings[Cpu.index()].push(now, busy, cpu_over);
+        self.rings[Cpu.index()].push(t, busy, cpu_over);
 
         let gpu_pct = s
             .gpu
@@ -4208,7 +4418,7 @@ impl Rows {
             .and_then(|g| g.device_pct)
             .map(|p| f64::from(p.min(100)));
         self.caps[Gpu.index()] = Some(100.0);
-        self.rings[Gpu.index()].push(now, gpu_pct, false);
+        self.rings[Gpu.index()].push(t, gpu_pct, false);
         if let Some(r) = s.gpu.as_ref().and_then(|g| g.recoveries) {
             let first = *self.gpu_recoveries.get_or_insert(r);
             if r > first {
@@ -4229,16 +4439,16 @@ impl Rows {
             self.swap = Some((stamp, kib));
         }
         let mem_over = facts.swap_rate.is_some_and(|r| r >= SWAP_OVER_BPS);
-        self.rings[Memory.index()].push(now, mem.map(|m| m.used() as f64), mem_over);
+        self.rings[Memory.index()].push(t, mem.map(|m| m.used() as f64), mem_over);
         let pressure = mem.and_then(|m| m.pressure.rank()).map(f64::from);
-        self.pressure.push(now, pressure, false);
+        self.pressure.push(t, pressure, false);
 
         let vol = s.volume.as_ref().filter(|v| v.total > 0);
         if let Some(v) = vol {
             self.caps[Disk.index()] = Some(v.total as f64);
-            self.free.note_on(&v.mount, v.total, now, v.available);
+            self.free.note_on(&v.mount, v.total, t, v.available);
         }
-        self.rings[Disk.index()].push(now, vol.map(|v| v.used() as f64), false);
+        self.rings[Disk.index()].push(t, vol.map(|v| v.used() as f64), false);
         if let Some(v) = vol {
             facts.disk_rates = history::rates(&self.rings[Disk.index()]);
             match facts.disk_rates.rate60 {
@@ -4256,8 +4466,8 @@ impl Rows {
         }
 
         let (rx, tx, net) = self.absorb_links(s, stamp, &mut facts);
-        let closed_rx = self.rings[Network.index()].push(now, rx, false);
-        let closed_tx = self.net_tx.push(now, tx, false);
+        let closed_rx = self.rings[Network.index()].push(t, rx, false);
+        let closed_tx = self.net_tx.push(t, tx, false);
         note_peak(
             &self.rings[Network.index()],
             closed_rx,
@@ -4266,7 +4476,7 @@ impl Rows {
         note_peak(&self.net_tx, closed_tx, &mut self.peaks.net_tx);
 
         let tokens = self.absorb_tokens(&s.tokens, stamp);
-        let closed = self.rings[Tokens.index()].push(now, tokens.out, false);
+        let closed = self.rings[Tokens.index()].push(t, tokens.out, false);
         note_peak(&self.rings[Tokens.index()], closed, &mut self.peaks.tokens);
         if let Some(input) = tokens.input {
             self.tokens_in.push(now, input);
@@ -4274,9 +4484,6 @@ impl Rows {
         facts.tokens_in = self.tokens_in.mean(now, TOKENS_WINDOW_MS);
         facts.agents = tokens.agents;
 
-        self.rings[Processes.index()].push(now, s.room.procs.map(|n| n as f64), false);
-        self.yours
-            .push(now, s.room.user_procs.map(|n| n as f64), false);
         facts.flow = match s.starts.as_ref() {
             Some(count) => {
                 let flow = self.starts.as_ref().and_then(|(then, before)| {
@@ -4289,6 +4496,33 @@ impl Rows {
             None => {
                 self.starts = None;
                 None
+            }
+        };
+        let starts = self.proc_meaning(s.starts.is_some());
+        let proc_v = if starts {
+            facts.flow.as_ref().map(|f| f.starts_ps)
+        } else {
+            s.room.procs.map(|n| n as f64)
+        };
+        let closed = self.rings[Processes.index()].push(t, proc_v, false);
+        if starts {
+            note_peak(
+                &self.rings[Processes.index()],
+                closed,
+                &mut self.peaks.proc_starts,
+            );
+        }
+        let _ = self
+            .proc_count
+            .push(t, s.room.procs.map(|n| n as f64), false);
+        facts.proc_read_s = self.peaks.proc_starts.read_s;
+        // aterm's figure is its starts where the row is starts (its own coalition's); a tab's
+        // share of them is F14's estimate, so a tab reads none until then.
+        let aterm_procs = |acc: &ScopeAcc| {
+            if starts {
+                facts.flow.as_ref().and_then(|f| f.aterm_starts_ps)
+            } else {
+                Some(f64::from(acc.procs))
             }
         };
 
@@ -4304,6 +4538,13 @@ impl Rows {
             (CapBasis::Peak, self.peaks.tokens.peak(today))
         } else {
             (CapBasis::Learning, None)
+        };
+        let (proc_basis, proc_cap) = match () {
+            () if !starts => (CapBasis::Fixed, s.room.procs_max.map(|n| n as f64)),
+            () if self.peaks.proc_starts.learned(PROC_LEARN_S) => {
+                (CapBasis::Peak, self.peaks.proc_starts.peak(today))
+            }
+            () => (CapBasis::Learning, None),
         };
         facts.tokens_read_s = self.peaks.tokens.read_s;
 
@@ -4325,26 +4566,29 @@ impl Rows {
         facts.writes_covered_s = self.write_hour.covered_s();
         if let Some(f) = figs {
             let kappa = self.gpu_clients.kappa().unwrap_or(1.0);
-            let vals =
-                |acc: &ScopeAcc, tokens: Option<f64>, sockets: Option<u32>| -> [Option<f64>; 7] {
-                    let mut v = [None; 7];
-                    v[Cpu.index()] = sweep_dt.map(|_| f64::from(acc.cores));
-                    // The scope's client time times κ, its share of the device's busy time over
-                    // the client window (`gpu_clients::kappa`), held at this reading's device
-                    // busy so each 10 s cell keeps tab <= all tabs <= Mac.
-                    v[Gpu.index()] = acc.gpu.map(|g| {
-                        let share = f64::from(g * kappa) * 100.0;
-                        gpu_pct.map_or(share, |mac| share.min(mac))
-                    });
-                    v[Memory.index()] = acc.footprint.map(|b| b as f64);
-                    v[Disk.index()] = sweep_dt.and(acc.writes);
-                    v[Network.index()] = sockets.map(f64::from);
-                    v[Tokens.index()] = tokens;
-                    v[Processes.index()] = Some(f64::from(acc.procs));
-                    v
-                };
-            self.aterm
-                .push(now, vals(&f.aterm, tokens.out, s.aterm_sockets));
+            let vals = |acc: &ScopeAcc,
+                        tokens: Option<f64>,
+                        sockets: Option<u32>,
+                        procs: Option<f64>|
+             -> [Option<f64>; 7] {
+                let mut v = [None; 7];
+                v[Cpu.index()] = sweep_dt.map(|_| f64::from(acc.cores));
+                // The scope's client time times κ, its share of the device's busy time over
+                // the client window (`gpu_clients::kappa`), held at this reading's device
+                // busy so each 10 s cell keeps tab <= all tabs <= Mac.
+                v[Gpu.index()] = acc.gpu.map(|g| {
+                    let share = f64::from(g * kappa) * 100.0;
+                    gpu_pct.map_or(share, |mac| share.min(mac))
+                });
+                v[Memory.index()] = acc.footprint.map(|b| b as f64);
+                v[Disk.index()] = sweep_dt.and(acc.writes);
+                v[Network.index()] = sockets.map(f64::from);
+                v[Tokens.index()] = tokens;
+                v[Processes.index()] = procs;
+                v
+            };
+            let aterm_v = vals(&f.aterm, tokens.out, s.aterm_sockets, aterm_procs(&f.aterm));
+            self.aterm.push(t, aterm_v);
             for (root, acc) in s.tabs.iter().zip(&f.tabs) {
                 let rings = self.tabs.entry(root.key).or_default();
                 let tab_sock = s
@@ -4352,21 +4596,32 @@ impl Rows {
                     .iter()
                     .find(|(k, _)| *k == root.key)
                     .map(|(_, c)| *c);
+                let tab_procs = (!starts).then(|| f64::from(acc.procs));
                 rings.push(
-                    now,
-                    vals(acc, tokens.tabs.get(&root.key).copied(), tab_sock),
+                    t,
+                    vals(
+                        acc,
+                        tokens.tabs.get(&root.key).copied(),
+                        tab_sock,
+                        tab_procs,
+                    ),
                 );
             }
             facts.writers = crate::writes::top_per_scope(f.writers.iter().cloned(), |w| w.scope);
             facts.busiest = f.busiest.clone();
-        } else if let Some(a_sock) = s.aterm_sockets {
+        } else {
             let mut v = [None; 7];
-            v[Network.index()] = Some(f64::from(a_sock));
-            self.aterm.push(now, v);
-            for &(key, count) in &s.tab_sockets {
-                let mut tv = [None; 7];
-                tv[Network.index()] = Some(f64::from(count));
-                self.tabs.entry(key).or_default().push(now, tv);
+            v[Network.index()] = s.aterm_sockets.map(f64::from);
+            if starts {
+                v[Processes.index()] = facts.flow.as_ref().and_then(|f| f.aterm_starts_ps);
+            }
+            self.aterm.push(t, v);
+            if s.aterm_sockets.is_some() {
+                for &(key, count) in &s.tab_sockets {
+                    let mut tv = [None; 7];
+                    tv[Network.index()] = Some(f64::from(count));
+                    self.tabs.entry(key).or_default().push(t, tv);
+                }
             }
         }
         let gpu_held = self.gpu_clients.held();
@@ -4408,17 +4663,11 @@ impl Rows {
             let (capacity, basis) = match res {
                 Network => (rx_cap, net_basis),
                 Tokens => (tok_cap, tok_basis),
-                Processes => (s.room.procs_max.map(|n| n as f64), CapBasis::Fixed),
+                Processes => (proc_cap, proc_basis),
                 _ => (self.caps[i], CapBasis::Fixed),
             };
             let second = match res {
                 Network => Some(series(&self.net_tx, now, NOW_WINDOW_MS, tx_cap)),
-                Processes => Some(series(
-                    &self.yours,
-                    now,
-                    NOW_WINDOW_MS,
-                    s.room.user_procs_max.map(|n| n as f64),
-                )),
                 _ => None,
             };
             let mut view = ResourceView::of(
@@ -4467,6 +4716,26 @@ impl Rows {
             view
         });
         (resources, facts, net)
+    }
+
+    /// Whether this reading's Processes figures are starts a second (`true`) or the count against
+    /// its limit: starts where the reading carries a start counter (record §8.2), and still starts
+    /// for a reading that missed one in a run that read one, which reads as unread. A run that
+    /// reads no counter counts, over restored starts too. Where the meaning moves, the rings that
+    /// held the other are cleared, so no box mixes the two.
+    fn proc_meaning(&mut self, has_counter: bool) -> bool {
+        self.starts_read |= has_counter;
+        let starts = has_counter || (self.starts_read && self.proc_starts == Some(true));
+        if self.proc_starts.is_some_and(|was| was != starts) {
+            let i = Resource::Processes.index();
+            self.rings[i] = BucketRing::default();
+            self.aterm.0[i] = None;
+            for rings in self.tabs.values_mut() {
+                rings.0[i] = None;
+            }
+        }
+        self.proc_starts = Some(starts);
+        starts
     }
 
     fn absorb_links(
@@ -4957,8 +5226,9 @@ mod tests {
     use super::*;
 
     /// The live box (`docs/DESIGN-stats-deck-units-2026-11-04.md` §3): its tick is the largest
-    /// reading of the last 10 s and its cap the share of them over, the larger series' on a
-    /// two-series row; a reading older than the window or ahead of now counts for neither.
+    /// reading of the last 10 s and its cap the share of their read time over, the larger
+    /// series' on a two-series row; a reading older than the window or ahead of now counts for
+    /// neither.
     /// CONTROL: those left out are the minute's largest, so counting them would change both.
     #[test]
     fn the_live_box_ticks_its_ten_second_max_and_caps_its_over_share() {
@@ -4967,6 +5237,7 @@ mod tests {
             at_ms: NOW - back_s * 1000,
             v,
             over,
+            w_ms: 1_000,
         };
         let recent: Arc<[Reading]> = vec![
             reading(40, 9.5, true),
@@ -5016,6 +5287,42 @@ mod tests {
             (over2 - 1.0).abs() < 1e-6,
             "the larger series' over share: {over2}"
         );
+    }
+
+    /// A1 §3 as F4′ amends it: the live box's over cap is the share of its 10 s's read time that
+    /// was over, each reading weighed by the time it stands for, as its column (the 10 s mean)
+    /// and every other box are: a 5 s reading over beside a 1 s one not over caps five sixths.
+    /// CONTROL: the same two readings each standing for a second cap half, so the law tells the
+    /// time share from the count share.
+    #[test]
+    fn the_live_box_caps_the_share_of_its_read_time_over() {
+        const NOW: i64 = 1_792_000_000_000;
+        let view = |w_over: u32, w_not: u32| ResourceView {
+            capacity: Some(10.0),
+            recent: vec![
+                Reading {
+                    at_ms: NOW - 6_000,
+                    v: 9.0,
+                    over: true,
+                    w_ms: w_over,
+                },
+                Reading {
+                    at_ms: NOW,
+                    v: 1.0,
+                    over: false,
+                    w_ms: w_not,
+                },
+            ]
+            .into(),
+            ..ResourceView::default()
+        };
+        let (_, over) = view(5_000, 1_000).live_box(NOW);
+        assert!(
+            (over - 5.0 / 6.0).abs() < 1e-6,
+            "five of six seconds: {over}"
+        );
+        let (_, count) = view(1_000, 1_000).live_box(NOW);
+        assert!((count - 0.5).abs() < 1e-6, "CONTROL: one of two: {count}");
     }
 
     /// A kernel record's cut name (16 bytes) and a client's are the sweep's whole one or its
@@ -6225,26 +6532,11 @@ mod tests {
         assert_eq!(net.binding().now, tx.now);
         assert_eq!(s.resources[Tokens.index()].basis, CapBasis::Peak);
         assert!(close(heat(&s, Tokens), 0.5));
+        // With no start counter the row is the count against the machine's limit, and the
+        // user's limit is Details' to say: the row carries no second series.
         assert!(close(heat(&s, Processes), 900.0 / 16_000.0));
-        assert!(
-            !s.resources[Processes.index()]
-                .second
-                .as_ref()
-                .expect("yours")
-                .binds
-        );
-        let mut crowded = at(6000, 1000);
-        crowded.room.user_procs = Some(9_000);
-        let s = v.absorb(&crowded);
-        let yours = s.resources[Processes.index()]
-            .second
-            .clone()
-            .expect("yours");
-        assert!(yours.binds);
-        assert!(close(
-            heat(&s, Processes),
-            (6.0 * 500.0 + 9_000.0) / 7.0 / 10_666.0
-        ));
+        assert_eq!(s.resources[Processes.index()].basis, CapBasis::Fixed);
+        assert!(s.resources[Processes.index()].second.is_none());
 
         let col = |s: &Snapshot| {
             s.resources[Tokens.index()].heat_columns(10, 1, T0 + 6_000)[0]
@@ -6310,11 +6602,12 @@ mod tests {
     #[test]
     fn busier_columns_take_each_column_from_its_busier_series() {
         let k = 1_000_000_i64;
-        let cell = |v: Option<(f64, f64)>, over_n: f64| Cell {
+        // Four readings of a second each: the read time and its over seconds, in ms.
+        let cell = |v: Option<(f64, f64)>, over_s: f64| Cell {
             mean: v.map(|v| v.0),
             max: v.map(|v| v.1),
-            n: if v.is_some() { 4.0 } else { 0.0 },
-            over_n,
+            tau_ms: if v.is_some() { 4_000.0 } else { 0.0 },
+            over_ms: over_s * 1_000.0,
         };
         // Receiving against 10, sending against 20.
         let rx: Arc<[Cell]> = vec![
@@ -6475,8 +6768,8 @@ mod tests {
     /// by on its minute's mean, so with rates that hold through the minute, as here, the amount,
     /// the deck's no-heat fill and the Network lens's Traffic line name the series its trace's
     /// newest column draws. Read through [`Vitals::absorb`] in the first day of learning, on a
-    /// link that reports no speed: sending 14 MB/s against receiving's 2.1 binds; Processes with
-    /// no limits read keeps all, whose count yours never passes; equal figures keep the first.
+    /// link that reports no speed: sending 14 MB/s against receiving's 2.1 binds; equal figures
+    /// keep the first. (Processes has one series since F4′, which retired its yours, record §8.1.)
     /// NEGATIVE CONTROL: the old arm, which bound the first series whenever no share was known,
     /// binds receiving.
     #[test]
@@ -6506,14 +6799,6 @@ mod tests {
         assert_eq!(net.binding().now, tx.now);
         let (cells, _) = net.busier_columns(10, 1, s.at_unix_ms);
         assert!(close(cells[0].mean, 14e6), "the trace's column: {cells:?}");
-        let procs = &s.resources[Processes.index()];
-        let yours = procs.second.as_ref().expect("yours");
-        assert_eq!((procs.capacity, yours.capacity), (None, None));
-        assert!(
-            close(procs.now, 900.0) && close(yours.now, 500.0),
-            "{procs:?}"
-        );
-        assert!(!yours.binds);
         let even = |b: f64| Series {
             now: Some(b),
             ..Series::default()
@@ -7376,31 +7661,396 @@ mod tests {
         assert_eq!(s.facts.flow.map(|f| f.starts_ps), Some(300.0));
     }
 
-    /// No meaning change: the Processes row is the processes against the machine's limit, and
-    /// its second series this user's against theirs, whatever the start counter says.
+    /// Record §9: a base and the tail lines written after it restore what a whole checkpoint
+    /// at the newest line would: every ring's closed buckets, the ten-minute buckets each folded
+    /// once, the capacities, the gaps and events, and the newest wall clock. A line at or before
+    /// the base's epoch replays nothing. CONTROL: a line put past the fold mark folds twice.
     #[test]
-    fn the_processes_row_keeps_its_count_against_its_limit_beside_the_flow() {
-        let mut quiet = Vitals::new();
-        let mut busy = Vitals::new();
-        let (mut a, mut b) = (Snapshot::default(), Snapshot::default());
-        for i in 0..6u64 {
-            let t = 1_000 * (i + 1);
-            a = quiet.absorb(&forks_at(t, t as i64, None));
-            b = busy.absorb(&forks_at(t, t as i64, Some(10_000 * i)));
+    fn a_base_and_its_replayed_lines_restore_the_whole_strip() {
+        let mut v = Vitals::new();
+        for t in 0..60 {
+            v.absorb(&at(t * 1000, 1000));
         }
-        assert_eq!(a.facts.flow, None);
-        assert_eq!(b.facts.flow.map(|f| f.starts_ps), Some(10_000.0));
-        for r in [Processes, Cpu, Memory, Gpu, Disk, Network, Tokens] {
-            assert_eq!(a.resources[r.index()], b.resources[r.index()], "{r:?}");
+        let base = v.saved_strip(false);
+        assert_eq!(Some(base.through_k + 1), v.strip_open_k());
+        let mut lines: Vec<StripLine> = Vec::new();
+        let mut through = base.through_k;
+        for t in 60..700 {
+            v.absorb(&at(t * 1000, 1000));
+            if t == 300 {
+                v.record_time_gap(TimeGap {
+                    start_ms: T0 + 200_000,
+                    end_ms: T0 + 230_000,
+                    kind: GapKind::Paused,
+                });
+            }
+            let open = v.strip_open_k().expect("read");
+            for k in through + 1..open {
+                if let Some(mut line) = v.strip_line(k) {
+                    if k + 1 == open {
+                        (line.time_gaps, line.strip_events) = v.strip_marks();
+                    }
+                    lines.push(line);
+                }
+            }
+            through = through.max(open - 1);
         }
-        assert!(close(
-            b.resources[Processes.index()].heat_now.map(f64::from),
-            900.0 / 16_000.0
-        ));
+        assert!(
+            v.strip_line(through + 1).is_none(),
+            "the open epoch is no line"
+        );
+        let whole = v.saved_strip(false);
+        let mut replayed = base.clone();
+        for line in lines.iter().cloned() {
+            assert!(replayed.replay(line));
+        }
+        assert!(!replayed.replay(lines[0].clone()), "a line the strip holds");
+        assert_eq!(replayed.through_k, through);
+        assert_eq!(replayed.last_wall_ms, lines.last().expect("lines").wall_ms);
+        assert_eq!(replayed.caps, whole.caps);
+        let closed = |r: &crate::ring::SavedRing| {
+            r.buckets
+                .iter()
+                .filter(|(k, _)| *k <= through)
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        for slot in 0..STRIP_RINGS {
+            let (mut a, mut b) = (replayed.clone(), whole.clone());
+            let (a, b) = (
+                a.ring_mut(slot).expect("slot").clone(),
+                b.ring_mut(slot).expect("slot").clone(),
+            );
+            assert_eq!(closed(&a), closed(&b), "slot {slot}");
+            assert_eq!(a.long, b.long, "slot {slot}");
+        }
+        // Restored after a crash, the strip's gaps are the whole one's, and the crash starts at
+        // the newest line: the readings after it were in no closed epoch.
+        let now = T0 + 701_000;
+        let last_wall = lines.last().expect("lines").wall_ms;
+        let (mut x, mut y) = (Vitals::new(), Vitals::new());
+        x.restore_strip_history(replayed, now);
+        y.restore_strip_history(whole.clone(), now);
+        let gaps = |v: &Vitals, kind: GapKind| -> Vec<TimeGap> {
+            v.strip_marks()
+                .0
+                .into_iter()
+                .filter(|g| g.kind == kind)
+                .collect()
+        };
+        assert_eq!(gaps(&x, GapKind::Paused), gaps(&y, GapKind::Paused));
+        assert_eq!(gaps(&x, GapKind::Paused).len(), 1);
+        assert_eq!(
+            gaps(&x, GapKind::Crash)
+                .iter()
+                .map(|g| (g.start_ms, g.end_ms))
+                .collect::<Vec<_>>(),
+            [(last_wall, now)]
+        );
+
+        let mut doubled = whole.clone();
+        let first = lines[0].clone();
+        for ring in &mut doubled.rings {
+            ring.folded_below = i64::MIN;
+        }
+        for (slot, agg) in first.rings {
+            if let Some(r) = doubled.ring_mut(usize::from(slot)) {
+                r.put_closed(first.k, agg);
+            }
+        }
+        assert_ne!(doubled.rings[0].long, whole.rings[0].long, "CONTROL");
     }
 
+    /// Record §9: a ring that read nothing while the strip went on (aterm's while the deck is
+    /// hidden, whose readings are the machine's alone) holds its open bucket past the base's
+    /// epoch, unfolded; when it reads again, the live ring folds that bucket as a later one opens,
+    /// and the base with its tail lines replayed folds it too, before the line's own, so every
+    /// slot's 10 s and ten-minute buckets restore as the live model holds them. Negative control:
+    /// `SavedRing::put_closed` folding only the line's bucket leaves aterm's ten-minute buckets
+    /// short of the lagging bucket's read time (the mutant the F4′ review ran).
     #[test]
-    fn the_per_user_limit_binds_processes_and_a_writes_run_is_carried_raw() {
+    fn a_ring_that_lagged_the_strip_restores_its_old_bucket_folded_once() {
+        let mut v = Vitals::new();
+        for t in 0..25 {
+            v.absorb(&at(t * 1000, 1000));
+        }
+        for t in 25..100 {
+            let mut s = at(t * 1000, 1000);
+            s.machine_only = true;
+            v.absorb(&s);
+        }
+        let base = v.saved_strip(false);
+        let lagging = base.aterm[Cpu.index()].clone();
+        assert!(
+            lagging
+                .buckets
+                .last()
+                .is_some_and(|&(k, _)| k <= base.through_k && k >= lagging.folded_below),
+            "aterm's CPU ring holds its open bucket behind the base's epoch, unfolded"
+        );
+        let mut through = base.through_k;
+        let mut lines: Vec<StripLine> = Vec::new();
+        for t in 100..140 {
+            v.absorb(&at(t * 1000, 1000));
+            let open = v.strip_open_k().expect("read");
+            lines.extend((through + 1..open).filter_map(|k| v.strip_line(k)));
+            through = through.max(open - 1);
+        }
+        let whole = v.saved_strip(false);
+        let mut replayed = base;
+        for line in lines {
+            assert!(replayed.replay(line));
+        }
+        for slot in 0..STRIP_RINGS {
+            let (a, b) = (
+                replayed.ring(slot).expect("slot"),
+                whole.ring(slot).expect("slot"),
+            );
+            let closed = |r: &crate::ring::SavedRing| -> Vec<_> {
+                r.buckets
+                    .iter()
+                    .filter(|(k, _)| *k <= through)
+                    .copied()
+                    .collect()
+            };
+            assert_eq!(closed(a), closed(b), "slot {slot}");
+            assert_eq!(a.long, b.long, "slot {slot}");
+        }
+        let cpu = &replayed.aterm[Cpu.index()];
+        let tau = |b: &[crate::ring::SavedBucket]| b.iter().map(|(_, a)| a.tau_ms).sum::<u32>();
+        let closed: Vec<_> = cpu
+            .buckets
+            .iter()
+            .filter(|(k, _)| *k <= through)
+            .copied()
+            .collect();
+        assert_eq!(
+            tau(&cpu.long),
+            tau(&closed),
+            "aterm's CPU folds every closed second it read, the lagging bucket's among them"
+        );
+    }
+
+    /// `forks_at` reading `i`, one a second.
+    fn starts_at(i: u64, forks: Option<u64>) -> Sample {
+        forks_at(1_000 * (i + 1), 1_000 * (i as i64 + 1), forks)
+    }
+
+    /// The Processes ring's read buckets' largest readings, oldest first.
+    fn proc_held(v: &Vitals) -> Vec<f64> {
+        v.saved_strip(false).rings[Processes.index()]
+            .buckets
+            .iter()
+            .map(|(_, b)| b.max)
+            .collect()
+    }
+
+    /// Record §8.1: where a start counter reads, the Processes row is starts a second against
+    /// the 7-day peak of sustained-30 s starts (`CapBasis::Peak`): its % is the 10 s mean over
+    /// that peak, its strip each box's mean starts a second over the same peak, and it carries
+    /// no second series (the count is the run's words, kept in its own ring). CONTROL: the same
+    /// machine read with no start counter is the count against the machine's limit.
+    #[test]
+    fn the_processes_row_heats_by_starts_against_its_seven_day_peak() {
+        let peaks = || Peaks {
+            proc_starts: DailyMax {
+                days: vec![(day_of(T0), 200.0)],
+                read_s: PROC_LEARN_S,
+            },
+            ..Peaks::default()
+        };
+        let mut v = Vitals::new();
+        v.restore_peaks(peaks());
+        let mut s = Snapshot::default();
+        for i in 0..12 {
+            s = v.absorb(&starts_at(i, Some(50 * i)));
+        }
+        let p = &s.resources[Processes.index()];
+        assert_eq!(p.basis, CapBasis::Peak);
+        assert_eq!(p.capacity, Some(200.0));
+        assert!(close(p.now, 50.0), "{p:?}");
+        assert!(close(p.heat_now.map(f64::from), 0.25), "{p:?}");
+        assert!(
+            p.ring
+                .iter()
+                .filter_map(|c| c.mean)
+                .all(|m| (m - 50.0).abs() < 1e-9),
+            "{:?}",
+            p.ring
+        );
+        assert!(p.second.is_none());
+        let kept = v.saved_strip(false);
+        assert!(
+            kept.proc_count.buckets.iter().any(|(_, b)| b.max == 900.0),
+            "the count is kept beside the starts"
+        );
+        assert_eq!(kept.proc_starts, Some(true));
+
+        let mut counts = Vitals::new();
+        counts.restore_peaks(peaks());
+        let mut c = Snapshot::default();
+        for i in 0..12 {
+            c = counts.absorb(&starts_at(i, None));
+        }
+        let p = &c.resources[Processes.index()];
+        assert_eq!(
+            (p.basis, p.capacity),
+            (CapBasis::Fixed, Some(16_000.0)),
+            "CONTROL"
+        );
+        assert!(close(p.heat_now.map(f64::from), 900.0 / 16_000.0));
+    }
+
+    /// Record §8.1: for its first 10 minutes ever (`PROC_LEARN_S`) the row learns its start
+    /// peak, and its strip's place and its sentence say how far it has read: "learning its start
+    /// peak: 4 of 10 min". The peak is fed at each bucket's close with the sustained-30 s
+    /// starts, as Network's is; once learned the row heats against it. CONTROL: a row with no
+    /// start counter counts and never learns.
+    #[test]
+    fn the_processes_row_learns_for_ten_minutes_and_says_so() {
+        let reading = |i: u64, forks: Option<u64>| Sample {
+            cadence_ms: 10_000,
+            ..forks_at(10_000 * (i + 1), 10_000 * (i as i64 + 1), forks)
+        };
+        let mut v = Vitals::new();
+        let mut mid = Snapshot::default();
+        let mut s = Snapshot::default();
+        for i in 0..64 {
+            s = v.absorb(&reading(i, Some(300 * i)));
+            if i == 30 {
+                mid = s.clone();
+            }
+            if i == 62 {
+                assert_eq!(
+                    s.resources[Processes.index()].basis,
+                    CapBasis::Learning,
+                    "590 s read"
+                );
+            }
+        }
+        let p = &mid.resources[Processes.index()];
+        assert_eq!(
+            (p.basis, p.capacity, p.heat_now),
+            (CapBasis::Learning, None, None)
+        );
+        assert_eq!(mid.facts.proc_read_s, 270);
+        assert_eq!(
+            crate::words::strip_words(Processes, &mid).and_then(|f| f.first().cloned()),
+            Some("learning its start peak: 4 of 10 min".to_string())
+        );
+        let said =
+            crate::words::row_sentence(Processes, &mid, &[], &crate::words::Locale::default());
+        assert!(
+            said.starts_with("Processes: learning its start peak, 4 of 10 minutes."),
+            "{said}"
+        );
+        let p = &s.resources[Processes.index()];
+        assert_eq!(s.facts.proc_read_s, PROC_LEARN_S);
+        assert_eq!((p.basis, p.capacity), (CapBasis::Peak, Some(30.0)));
+        assert!(close(p.heat_now.map(f64::from), 1.0));
+        assert_eq!(crate::words::strip_words(Processes, &s), None);
+
+        let mut counts = Vitals::new();
+        let mut c = Snapshot::default();
+        for i in 0..64 {
+            c = counts.absorb(&reading(i, None));
+        }
+        assert_eq!(
+            c.resources[Processes.index()].basis,
+            CapBasis::Fixed,
+            "CONTROL"
+        );
+        assert_eq!(c.facts.proc_read_s, 0);
+        assert_eq!(crate::words::strip_words(Processes, &c), None);
+    }
+
+    /// Record §8.1: a peak basis has no maximum to exceed, so the Processes row never draws an
+    /// over cap: a burst far past its peak heats the row to the top of its ramp and no further,
+    /// and no box holds over time. CONTROL: the burst is fifty times the peak.
+    #[test]
+    fn the_processes_row_never_sets_over() {
+        let mut v = Vitals::new();
+        v.restore_peaks(Peaks {
+            proc_starts: DailyMax {
+                days: vec![(day_of(T0), 10.0)],
+                read_s: PROC_LEARN_S,
+            },
+            ..Peaks::default()
+        });
+        let mut s = Snapshot::default();
+        for i in 0..25 {
+            s = v.absorb(&starts_at(i, Some(500 * i)));
+        }
+        let p = &s.resources[Processes.index()];
+        assert_eq!(p.heat_now, Some(1.0));
+        assert!(!p.over);
+        assert!(
+            p.ring
+                .iter()
+                .all(|c| c.over_ms == 0.0 && c.over_share() == 0.0)
+        );
+        assert_eq!(p.live_box(s.at_unix_ms).1, 0.0);
+        assert!(
+            p.now.zip(p.capacity).is_some_and(|(n, c)| n / c >= 50.0),
+            "CONTROL: {p:?}"
+        );
+    }
+
+    /// What the Processes rings hold follows the start counter (record §8.2): a run whose
+    /// readings carry one reads starts; a reading that misses it in such a run is unread, not a
+    /// count; and where the meaning moves, the rings that held the other are cleared and the
+    /// strip's checkpoint is told to write a whole base. A run that reads no counter counts over
+    /// a restored starts strip. CONTROL: a run that always counts never clears.
+    #[test]
+    fn the_processes_rings_never_mix_starts_and_counts() {
+        let mut v = Vitals::new();
+        for i in 0..19 {
+            v.absorb(&starts_at(i, None));
+        }
+        let rewrites = v.strip_rewrites();
+        assert_eq!(proc_held(&v), [900.0, 900.0], "counts");
+        v.absorb(&starts_at(19, Some(0)));
+        assert_eq!(v.strip_rewrites(), rewrites + 1);
+        assert!(proc_held(&v).is_empty(), "the counts are cleared");
+        v.absorb(&starts_at(20, Some(40)));
+        let s = v.absorb(&starts_at(21, None));
+        assert_eq!(
+            v.strip_rewrites(),
+            rewrites + 1,
+            "a missed counter changes nothing"
+        );
+        assert_eq!(proc_held(&v), [40.0]);
+        assert_ne!(s.resources[Processes.index()].basis, CapBasis::Fixed);
+        assert_eq!(
+            s.resources[Processes.index()].recent.last().map(|r| r.v),
+            Some(40.0),
+            "the missed reading is unread"
+        );
+
+        let saved = v.saved_strip(true);
+        let mut later = Vitals::new();
+        later.restore_strip_history(saved, T0 + 25_000);
+        let after = later.strip_rewrites();
+        later.absorb(&starts_at(25, None));
+        assert_eq!(later.strip_rewrites(), after + 1);
+        assert_eq!(
+            proc_held(&later),
+            [900.0],
+            "a run with no counter counts over restored starts"
+        );
+
+        let mut counts = Vitals::new();
+        for i in 0..30 {
+            counts.absorb(&starts_at(i, None));
+        }
+        assert_eq!(counts.strip_rewrites(), 0, "CONTROL");
+    }
+
+    /// With no start counter the row is the count against the machine's limit even where the
+    /// user's own limit is nearer (record §8.1 retires meter §3's binding per-user limit), and a
+    /// scope's writes run is carried raw.
+    #[test]
+    fn the_processes_row_counts_against_the_machines_limit_and_a_writes_run_is_carried_raw() {
         let mut v = Vitals::new();
         let mut s = Snapshot::default();
         for i in 0..12 {
@@ -7410,8 +8060,8 @@ mod tests {
         }
         assert_eq!(
             s.resources[Processes.index()].binding().capacity,
-            Some(1_000.0),
-            "the per-user limit binds, not the first series' system limit"
+            Some(16_000.0),
+            "the machine's limit, not the user's"
         );
         assert!(
             s.resource(Disk, &[7])
@@ -8283,59 +8933,104 @@ mod tests {
         );
     }
 
-    /// Readings paced from the moment each was asked drift through the second. The snapshot's
-    /// slot grid keeps its edges between them, so each reading of a second's cadence opens one
-    /// slot, and each pair of the lens's half-second cadence one, even as their place in the
-    /// second drifts past the wall clock's edge and jitters by tens of ms; on the wall clock's
-    /// own seconds the same readings open none and then two.
+    /// Readings asked on the half-slot (`due_on_phase`, record §5.2) stand each in its own second
+    /// of the wall clock, which every snapshot's slot grid now is: each reading of a second's
+    /// cadence opens one slot, and each ten-second bucket weighs its whole ten seconds. CONTROL:
+    /// readings paced from the moment each was asked drift through the second, and on the wall
+    /// clock's seconds they open none and then two, which the adaptive grid this replaced hid.
     #[test]
-    fn the_slot_grid_keeps_a_reading_a_slot_as_readings_drift() {
+    fn readings_on_the_half_slot_stand_each_in_its_own_second() {
         let blank = |at_ms: i64| Sample {
             at_unix_ms: at_ms,
             cadence_ms: 1000,
+            gpu: Some(GpuSample {
+                device_pct: Some(10),
+                ..GpuSample::default()
+            }),
             ..Sample::default()
         };
-        // A small fixed jitter, ±20 ms.
-        let jitter = |i: i64| ((i * 7_919) % 41) - 20;
-        for (cadence, per_slot) in [(1_003_i64, 1_i64), (501, 2)] {
-            let mut v = Vitals::new();
-            let times: Vec<i64> = (0..400)
-                .map(|i| T0 + 900 + i * cadence + jitter(i))
-                .collect();
-            let (mut opened, mut seconds) = (Vec::new(), Vec::new());
-            let mut prev: Option<i64> = None;
-            for &t in &times {
-                let snap = v.absorb(&blank(t));
-                assert!(snap.slot_grid.clear(t, SLOT_GUARD_MS) || prev.is_none());
-                if let Some(p) = prev {
-                    opened.push(snap.slot_grid.opened(p, t));
-                    seconds.push(SlotGrid::SECONDS.opened(p, t));
-                }
-                prev = Some(t);
+        let mut v = Vitals::new();
+        let mut prev: Option<i64> = None;
+        let mut snap = Snapshot::default();
+        for i in 0..40 {
+            let t = T0 + 500 + i * 1_000;
+            snap = v.absorb(&blank(t));
+            assert_eq!(snap.slot_grid, SlotGrid::SECONDS);
+            if let Some(p) = prev {
+                assert_eq!(snap.slot_grid.opened(p, t), 1, "{t}");
             }
-            let at = format!("cadence {cadence} ms");
-            // At a second's cadence every reading opens a slot; at the lens's, never two readings
-            // in a row open none (the strip never stands a second).
-            let steady = |opened: &[i64]| {
-                opened.iter().all(|&o| o == 0 || o == 1)
-                    && if per_slot == 1 {
-                        opened.iter().all(|&o| o == 1)
-                    } else {
-                        !opened.windows(2).any(|w| w == [0, 0])
-                    }
-            };
-            assert!(steady(&opened), "{at}: {opened:?}");
-            let span_s = (times[times.len() - 1] - times[0]) / SLOT_MS;
-            let sum = opened.iter().sum::<i64>();
-            assert!(
-                (sum - span_s).abs() <= 1,
-                "{at}: {sum} slots over {span_s} s"
-            );
-            assert!(
-                !steady(&seconds),
-                "CONTROL {at}: on the wall clock's seconds the strip stutters: {seconds:?}"
-            );
+            prev = Some(t);
         }
+        let gpu = &snap.resources[Gpu.index()];
+        let closed = &gpu.ring[gpu.ring.len() - 2];
+        assert_eq!(
+            closed.tau_ms, 10_000.0,
+            "a closed bucket weighs its ten seconds"
+        );
+        let drift: Vec<i64> = (0..400)
+            .map(|i| T0 + 900 + i * 1_003 + ((i * 7_919) % 41) - 20)
+            .collect();
+        let opened: Vec<i64> = drift
+            .windows(2)
+            .map(|w| SlotGrid::SECONDS.opened(w[0], w[1]))
+            .collect();
+        assert!(
+            opened.contains(&0) && opened.contains(&2),
+            "CONTROL: drifting readings stutter on the wall clock's seconds"
+        );
+    }
+
+    /// A1 §9 (F4′): a control worker's pull between two of the deck's half-slot readings stands
+    /// for an instant, so each deck reading keeps its own second in its bucket, in the 10 s mean
+    /// and in the 1 s band, and an over reading just after the pull keeps its over time; the
+    /// pull's cadence still serves the gap rule, so the swap rate across it reads. CONTROL: the
+    /// pull weighed by its own 3 s cadence takes the over reading's second, which keeps 1 ms.
+    #[test]
+    fn a_pull_between_deck_readings_leaves_each_its_second_and_its_over_time() {
+        let read = |t: i64, pull: bool, kib: u64, cadence_ms: u32| Sample {
+            at_unix_ms: T0 + t,
+            mono_ms: t as u64,
+            cadence_ms,
+            pull,
+            mem: Some(MemSample {
+                total: 32 << 30,
+                app: 8 << 30,
+                ..MemSample::default()
+            }),
+            swapped_kib: Some(kib),
+            ..Sample::default()
+        };
+        let run = |pull: bool| {
+            let mut v = Vitals::new();
+            let mut snap = Snapshot::default();
+            for s in [
+                read(500, false, 0, 1_000),
+                read(1_500, false, 0, 1_000),
+                read(1_750, pull, 0, 3_000),
+                read(2_500, false, 100_000, 1_000),
+                read(3_500, false, 100_000, 1_000),
+            ] {
+                snap = v.absorb(&s);
+            }
+            let mem = &snap.resources[Memory.index()];
+            let open = *mem.ring.last().expect("the open bucket");
+            let over_w = mem
+                .recent
+                .iter()
+                .find(|r| r.at_ms == T0 + 2_500)
+                .map(|r| (r.over, r.w_ms));
+            (open.tau_ms, open.over_ms, over_w)
+        };
+        assert_eq!(
+            run(true),
+            (4_001.0, 1_000.0, Some((true, 1_000))),
+            "four deck seconds and the pull's instant; the over reading's whole second"
+        );
+        assert_eq!(
+            run(false),
+            (4_001.0, 1.0, Some((true, 1))),
+            "CONTROL: a pull weighed by its cadence leaves the over reading 1 ms"
+        );
     }
 
     /// A snapshot carries each row's last minute of readings, a reading a second in order: the

@@ -855,6 +855,18 @@ pub struct Forwarding {
 /// once.
 pub static FORWARDING_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Spawn a test's child in this process's forwarding turn ([`FORWARDING_TURN`]), so it starts
+/// with the SIGINT and SIGQUIT dispositions this process has outside any wait: a
+/// [`wait_standing_aside`] ignores both for the whole process, only inside its turn, and a child
+/// another test of the binary spawned meanwhile would start with them ignored and keep them so.
+#[cfg(test)]
+pub(crate) fn spawn_outside_a_stand_aside<T>(spawn: impl FnOnce() -> T) -> T {
+    let _turn = FORWARDING_TURN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    spawn()
+}
+
 /// Arm the SIGTERM and SIGHUP forwarding before the child is spawned, once no other forwarding is
 /// armed in this process ([`FORWARDING_TURN`]).
 #[must_use]

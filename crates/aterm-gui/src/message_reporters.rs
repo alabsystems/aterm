@@ -6858,12 +6858,19 @@ fn strip_place(line: &str) -> Option<&str> {
     let (place, rest) = line.split_once(" \u{00b7} ")?;
     let number = |n: &str| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
     let tab = |p: &str| p.strip_prefix("tab ").is_some_and(number);
+    // A worker's place is its name ([`worker_place`]), which moves as its tab is retitled.
+    let worker = |p: &str| {
+        p.strip_prefix(crate::native_workers::WORKERS_TITLE)
+            .and_then(|p| p.strip_prefix(" \u{25b8} "))
+            .is_some_and(|name| !name.is_empty())
+    };
     let placed = place == "in its tab"
         || place.strip_prefix("in ").is_some_and(|p| {
             tab(p)
+                || worker(p)
                 || p.strip_prefix("window ")
                     .and_then(|p| p.split_once(", "))
-                    .is_some_and(|(w, p)| number(w) && tab(p))
+                    .is_some_and(|(w, p)| number(w) && (tab(p) || worker(p)))
         });
     placed.then_some(rest)
 }

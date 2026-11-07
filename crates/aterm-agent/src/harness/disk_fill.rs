@@ -9,7 +9,7 @@
 //! ([`Fill::crossing`]).
 
 use aterm_vitals::history::{FILLING_FOR_MS, Rates, rates_within, time_to_line};
-use aterm_vitals::ring::{BucketRing, RING_BUCKETS};
+use aterm_vitals::ring::{BucketRing, RING_BUCKETS, Taken};
 
 /// How far ahead a crossing counts: two hours (§8.1, "Why two hours").
 pub const HORIZON_MS: i64 = 2 * 3_600_000;
@@ -176,7 +176,8 @@ impl Fill {
         floor: u64,
     ) -> Option<Projection> {
         let used = self.credit as f64 - free as f64;
-        let _ = self.ring.push(now_ms, Some(used), false);
+        // A look is an instant, asked at no cadence: it weighs its bucket alone.
+        let _ = self.ring.push(Taken::at(now_ms, 0), Some(used), false);
         let gap = self
             .last_ms
             .is_some_and(|last| now_ms.saturating_sub(last) > GAP_MS);

@@ -232,7 +232,6 @@ fn an_unproven_peer_is_listed_on_its_word_alone() {
             .expect("studio");
         assert_eq!(m.unproven, marked);
         assert_eq!(m.node.as_deref(), node);
-        assert_eq!(m.ident(), node.unwrap_or("studio.local"));
         assert_eq!(m.host.as_deref(), Some(host));
         assert_eq!((m.drive, m.counts()), (drive, counts), "unproven={marked}");
         assert_eq!(m.needs.len(), 1, "its needs are read either way");
@@ -544,7 +543,10 @@ fn a_peer_known_by_name_is_dialled_by_it() {
         (m17.dial.as_str(), m17.name.as_str()),
         ("mac-17.local", "mac-17")
     );
-    assert_eq!(m17.ident(), "ab12cd34ef56ab12cd34ef56ab12cd34");
+    assert_eq!(
+        m17.node.as_deref(),
+        Some("ab12cd34ef56ab12cd34ef56ab12cd34")
+    );
     assert_eq!(
         fleet_read_args(&m17.dial, Some("s-w")),
         Some(
@@ -569,16 +571,13 @@ fn a_peer_known_by_name_is_dialled_by_it() {
     );
     let moved = parse(&at("192.168.1.40"), None, 0).expect("a survey");
     assert_eq!(
-        herald_key(moved.macs[0].ident(), "s-w"),
-        herald_key(m17.ident(), "s-w")
+        (&moved.macs[0].dial, &moved.macs[0].node),
+        (&m17.dial, &m17.node),
+        "a new address is the same Mac"
     );
     assert_eq!(fleet_read_args("mac-17.local at 192.168.1.17", None), None);
     assert_eq!(fleet_read_args("-x", None), None);
     assert_eq!(fleet_read_args("mac-17", Some("not a sid")), None);
-    assert_ne!(
-        herald_key("mac-17.local at 192.168.1.40", "s-w"),
-        herald_key("mac-17.local at 192.168.1.17", "s-w")
-    );
 }
 
 #[test]
@@ -1237,7 +1236,6 @@ fn read_slot(read_at_ms: u64, dark: bool) -> FleetSlot {
         what: None,
         claim: None,
         carries_on: false,
-        ids: Vec::new(),
     };
     FleetSlot {
         generation: 1,
@@ -1266,139 +1264,81 @@ fn read_slot(read_at_ms: u64, dark: bool) -> FleetSlot {
     }
 }
 
-/// A fleet read heralds each need of a Mac that counts once per transition, and a read that
-/// reached no Mac, or one stale or from the future, heralds nothing.
+/// A fleet read's need counts where its Mac does, and a read that reached no Mac counts nothing;
+/// a read stale or from the future lists its need and counts none of it.
 #[test]
-fn a_fleet_read_heralds_its_needs() {
-    let take_posts =
-        || crate::app_tabs::HERALD_POSTS.with(|p| std::mem::take(&mut *p.borrow_mut()));
-    let settle = |app: &mut crate::App| {
-        if let Some(due) = app.messages_deadline() {
-            let _ = app.settle_messages(due + Duration::from_secs(1));
-        }
-    };
+fn a_fleet_read_counts_its_needs() {
     let now = aterm_time::unix_millis().unwrap_or(0);
     let mut app = crate::App::headless_for_test();
-    app.headless = false;
-    app.config.desktop_alerts = Some(true);
-    crate::app_tabs::HERALD_REFUSAL.set(None);
-    let _ = take_posts();
 
     app.fleet_glance = Some(glance_over(read_slot(now, true)));
     app.on_fleet_read();
-    assert!(
-        take_posts().is_empty(),
+    assert_eq!(
+        app.status_glance().need_count(),
+        0,
         "a read that reached no Mac is no need"
     );
 
     app.fleet_glance = Some(glance_over(read_slot(now, false)));
     app.on_fleet_read();
-    settle(&mut app);
-    let posts = take_posts();
-    assert_eq!(posts.len(), 1, "one notice for the fleet need");
-    assert!(is_herald_key(posts[0].session));
-    assert_eq!(
-        posts[0].title,
-        crate::status_item::headline(NeedWord::Stalled)
-    );
-    app.on_fleet_read();
-    assert!(take_posts().is_empty(), "the same need re-read");
     assert_eq!(app.status_glance().need_count(), 1);
 
     let mut stale = crate::App::headless_for_test();
-    stale.headless = false;
-    stale.config.desktop_alerts = Some(true);
     let old = now.saturating_sub(millis(COUNT_FRESH) + 60_000);
     stale.fleet_glance = Some(glance_over(read_slot(old, false)));
     stale.on_fleet_read();
-    assert!(take_posts().is_empty(), "a stale read heralds nothing");
     let glance = stale.status_glance();
     assert_eq!((glance.needs.len(), glance.need_count()), (1, 0));
 
     let future = now + 86_400_000;
     stale.fleet_glance = Some(glance_over(read_slot(future, false)));
     stale.on_fleet_read();
-    assert!(take_posts().is_empty(), "a future read heralds nothing");
     let glance = stale.status_glance();
     assert_eq!((glance.needs.len(), glance.need_count()), (1, 0));
 }
 
-/// A SEAMLESS SUCCESSOR TELLS NO STANDING FLEET NEED AGAIN: the outgoing
-/// herald's told fleet needs, as its park stamps them
-/// (`App::fleet_told_rows`) and the successor reads them back
-/// (`parse_told`), are taken as told at the successor's first fresh read
-/// where it finds the same word on the same Mac's session — whenever that
-/// read comes, as one process reading on would — and still count; a need
-/// that arises after posts.
-#[cfg(unix)]
+/// A fleet read owes the menu-bar item a rebuild whether or not the Network State band is drawn;
+/// a drawn band's next service turn is due at once, and a band nobody draws keeps the poll it had.
 #[test]
-fn a_successors_first_fleet_read_tells_no_standing_need_again() {
-    let take_posts =
-        || crate::app_tabs::HERALD_POSTS.with(|p| std::mem::take(&mut *p.borrow_mut()));
-    let now = aterm_time::unix_millis().unwrap_or(0);
-    let key = herald_key("mac-17", "s-w");
-    let first_read = |adopt: Option<std::collections::HashMap<u64, NeedWord>>,
-                      refusal: Option<&'static str>| {
-        let mut app = crate::App::headless_for_test();
-        app.headless = false;
-        app.config.desktop_alerts = Some(true);
-        crate::app_tabs::HERALD_REFUSAL.set(refusal);
-        app.fleet_adopt = adopt;
-        app.fleet_glance = Some(glance_over(read_slot(now, false)));
-        let _ = take_posts();
-        app.on_fleet_read();
-        crate::app_tabs::HERALD_REFUSAL.set(None);
-        let posted = take_posts().len();
-        (app, posted)
-    };
-    let (parent, told) = first_read(None, None);
-    assert_eq!(told, 1, "no update: told");
-    let rows = parent.fleet_told_rows();
-    assert_eq!(rows, vec![told_row(key, NeedWord::Stalled)]);
-    let carried = parse_told(&rows);
-    assert_eq!(carried.get(&key), Some(&NeedWord::Stalled));
+fn a_fleet_read_dirties_the_status_item_and_calls_a_drawn_band_now() {
+    let mut app = crate::App::headless_for_test();
+    app.config
+        .sys
+        .get_or_insert_with(Default::default)
+        .stats_bars = Some("off".into());
+    let due = std::time::Instant::now() + std::time::Duration::from_secs(60);
 
-    let (mut app, posted) = first_read(Some(carried.clone()), None);
-    assert_eq!(posted, 0, "told before the update");
-    assert_eq!(app.status_glance().need_count(), 1, "still counted");
-    assert!(app.fleet_adopt.is_none(), "spent by the first read");
-    let mut slot = read_slot(now, false);
-    let mut snapshot = (*slot.snapshot.take().expect("a read")).clone();
-    let arose = FleetNeed {
-        sid: "s-x".to_string(),
-        ..snapshot.macs[0].needs[0].clone()
-    };
-    snapshot.macs[0].needs.push(arose);
-    slot.snapshot = Some(Arc::new(snapshot));
-    slot.generation = 2;
-    app.fleet_glance = Some(glance_over(slot));
+    assert!(!app.network_band_drawn());
+    app.network_next_poll = Some(due);
+    let _ = app.take_status_rebuild();
     app.on_fleet_read();
-    assert_eq!(take_posts().len(), 1, "the need that arose since");
+    assert!(
+        app.take_status_rebuild(),
+        "a fleet read dirties the status item"
+    );
+    assert_eq!(
+        app.network_next_poll,
+        Some(due),
+        "a band nobody draws keeps its poll"
+    );
 
-    let (_, unnamed) = first_read(Some(std::collections::HashMap::new()), None);
-    assert_eq!(unnamed, 1, "arose during the update: told");
-    let other = std::collections::HashMap::from([(key, NeedWord::Ask)]);
-    assert_eq!(first_read(Some(other), None).1, 1, "another word: told");
-    let (refused, _) = first_read(None, Some("the notifier's queue is full"));
-    assert!(refused.fleet_told_rows().is_empty(), "owed is not told");
+    assert!(app.open_network_lens());
+    assert!(app.network_band_drawn());
+    app.network_next_poll = Some(due);
+    let _ = app.take_status_rebuild();
+    app.on_fleet_read();
+    assert!(
+        app.take_status_rebuild(),
+        "a fleet read dirties the status item with the band drawn"
+    );
+    assert_eq!(
+        app.network_next_poll, None,
+        "a drawn band reads the new slot on its next turn"
+    );
 }
 
 #[test]
-fn told_fleet_rows_read_back_and_drop_what_does_not_read() {
-    let key = herald_key("mac-17", "s-w");
-    let rows = vec![
-        told_row(key, NeedWord::Ask),
-        format!("{:016x}=ask", 7_u64),
-        format!("{:016x}=someday", herald_key("mac-1", "s-1")),
-        "no row".to_string(),
-    ];
-    let told = parse_told(&rows);
-    assert_eq!(told.len(), 1);
-    assert_eq!(told.get(&key), Some(&NeedWord::Ask));
-}
-
-#[test]
-fn host_words_and_herald_keys() {
+fn host_words() {
     for ok in ["mac-17", "mac-17.local", "10.0.0.5", "a_b"] {
         assert_eq!(host_word(ok).as_deref(), Some(ok));
     }
@@ -1407,10 +1347,6 @@ fn host_words_and_herald_keys() {
     for bad in ["", "-x", "a b", "a;b", "a/b", "x@y", "\u{e9}"] {
         assert_eq!(host_word(bad), None, "{bad:?}");
     }
-    let key = herald_key("mac-17", "s-1");
-    assert!(is_herald_key(key));
-    assert_ne!(key, herald_key("mac-17", "s-2"));
-    assert!(!is_herald_key(0) && !is_herald_key(u64::from(u32::MAX)));
 }
 
 /// A FLEET ACT GOES THROUGH THE PLATFORM SEAMS, whose test arms open and
@@ -1478,7 +1414,6 @@ fn mac17(read_at_ms: u64, need: bool) -> FleetMac {
                 what: None,
                 claim: None,
                 carries_on: false,
-                ids: Vec::new(),
             })
             .into_iter()
             .collect(),
@@ -1607,29 +1542,17 @@ fn future_fleet_reads_are_uncounted_and_repolled_after_a_clock_rollback() {
     assert!(!previous.fresh(at + fresh + 1));
 }
 
-fn take_posts() -> Vec<crate::status_item::HeraldNotice> {
-    crate::app_tabs::HERALD_POSTS.with(|p| std::mem::take(&mut *p.borrow_mut()))
-}
-
-fn windowed_app() -> crate::App {
-    let mut app = crate::App::headless_for_test();
-    app.headless = false;
-    app.config.desktop_alerts = Some(true);
-    crate::app_tabs::HERALD_REFUSAL.set(None);
-    let _ = take_posts();
-    app
-}
-
+/// The badge follows the last read that counts: a stale read counts nothing, a read a Mac did not
+/// answer has no rows of it to count, and the need counts again from the next fresh read.
 #[test]
-fn a_standing_fleet_need_posts_once_across_a_stale_read_and_a_silent_mac() {
+fn a_standing_fleet_need_counts_across_a_stale_read_and_a_silent_mac() {
     let now = aterm_time::unix_millis().unwrap_or(0);
     let old = now.saturating_sub(millis(COUNT_FRESH) + 60_000);
-    let mut app = windowed_app();
-    let key = herald_key("n17", "s-w");
+    let mut app = crate::App::headless_for_test();
     let read = |app: &mut crate::App, slot| {
         app.fleet_glance = Some(glance_over(slot));
         app.on_fleet_read();
-        take_posts().len()
+        app.status_glance().need_count()
     };
     assert_eq!(
         read(&mut app, slot_of(now, vec![mac17(now, true)], vec![])),
@@ -1637,32 +1560,21 @@ fn a_standing_fleet_need_posts_once_across_a_stale_read_and_a_silent_mac() {
     );
     assert_eq!(
         read(&mut app, slot_of(old, vec![mac17(old, true)], vec![])),
-        0
-    );
-    assert_eq!(
-        app.status_glance().need_count(),
         0,
         "a stale read counts nothing"
     );
     assert_eq!(
         read(&mut app, slot_of(now, vec![], vec![silent("mac-17.local")])),
-        0
-    );
-    assert!(
-        app.fleet_heralded.contains_key(&key),
-        "a silent Mac's need is kept"
+        0,
+        "a Mac that did not answer has no rows to count"
     );
     assert_eq!(
         read(&mut app, slot_of(now, vec![mac17(now, true)], vec![])),
-        0
+        1
     );
-    assert_eq!(app.status_glance().need_count(), 1);
     assert_eq!(
         read(&mut app, slot_of(now, vec![mac17(now, false)], vec![])),
-        0
-    );
-    assert!(
-        !app.fleet_heralded.contains_key(&key),
+        0,
         "answered without it"
     );
     assert_eq!(
@@ -1672,50 +1584,22 @@ fn a_standing_fleet_need_posts_once_across_a_stale_read_and_a_silent_mac() {
 }
 
 #[test]
-fn an_unproven_macs_need_is_never_told() {
+fn an_unproven_macs_need_never_counts() {
     let now = aterm_time::unix_millis().unwrap_or(0);
-    for (marked, posts) in [(true, 0), (false, 1)] {
-        let mut app = windowed_app();
+    for (marked, counted) in [(true, 0), (false, 1)] {
+        let mut app = crate::App::headless_for_test();
         let studio = FleetMac {
             unproven: marked,
             ..mac17(now, true)
         };
         app.fleet_glance = Some(glance_over(slot_of(now, vec![studio], vec![])));
         app.on_fleet_read();
-        assert_eq!(take_posts().len(), posts, "unproven={marked}");
-        assert_eq!(app.fleet_heralded.len(), posts);
-        assert_eq!(app.status_glance().need_count(), posts);
+        assert_eq!(
+            app.status_glance().need_count(),
+            counted,
+            "unproven={marked}"
+        );
     }
-}
-
-#[test]
-fn a_fleet_need_that_cannot_be_told_owes_nothing() {
-    let now = aterm_time::unix_millis().unwrap_or(0);
-    let old = now.saturating_sub(millis(COUNT_FRESH) + 60_000);
-    let later = std::time::Instant::now() + Duration::from_secs(120);
-    let key = herald_key("n17", "s-w");
-    let owed = |app: &crate::App| app.presence.herald.due(later).0.contains(&key);
-    let mut app = windowed_app();
-    let read = |app: &mut crate::App, slot| {
-        app.fleet_glance = Some(glance_over(slot));
-        app.on_fleet_read();
-    };
-    crate::app_tabs::HERALD_REFUSAL.set(Some("the notifier's queue is full"));
-    read(&mut app, slot_of(now, vec![mac17(now, true)], vec![]));
-    assert!(owed(&app), "the control: a refused notice is owed");
-    read(&mut app, slot_of(now, vec![mac17(now, true)], vec![]));
-    assert!(owed(&app), "the control: still owed while it stands");
-    read(&mut app, slot_of(old, vec![mac17(old, true)], vec![]));
-    assert!(!owed(&app), "a stale read owes nothing");
-    let mut asks = mac17(now, true);
-    asks.needs[0].word = NeedWord::Ask;
-    crate::app_tabs::HERALD_REFUSAL.set(Some("the notifier's queue is full"));
-    read(&mut app, slot_of(now, vec![asks], vec![]));
-    assert!(owed(&app));
-    read(&mut app, slot_of(now, vec![], vec![silent("mac-17.local")]));
-    assert!(!owed(&app), "a silent Mac's need owes nothing");
-    assert!(app.fleet_heralded.contains_key(&key), "and is kept");
-    let _ = take_posts();
 }
 
 #[test]
@@ -1989,7 +1873,6 @@ fn the_glance_spawns_no_child_process_and_shows_a_fixtures_now_needs_rows() {
             what: None,
             claim: None,
             carries_on: false,
-            ids: Vec::new(),
         }]
     );
     assert_eq!(

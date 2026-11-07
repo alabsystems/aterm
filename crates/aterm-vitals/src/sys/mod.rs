@@ -15,7 +15,9 @@ pub mod view;
 pub mod why;
 
 pub use delta::{Fingerprints, apply_delta, fingerprints};
-pub use disk::{DirSize, DiskTotals, HugeDirFact, RootSize, RootSizes};
+pub use disk::{
+    DirSize, DiskTotals, HugeDirFact, PaneLine, RootSize, RootSizes, ScopeBytes, ScopeLine,
+};
 pub use predicate::{AwaitSys, Metric, Outcome, Term, evaluate};
 pub use query::{Cursor, ScopeArg, SysQuery, USAGE, View, WHY_USAGE};
 pub use view::{Reply, render_json, render_text};
@@ -48,6 +50,7 @@ pub const UNAVAILABLE_WORDS: &[&str] = &[
     "dataless",
     "other_user",
     "too_broad",
+    "other_pool",
     "walking",
     "unread_format",
     "os_error:",
@@ -179,37 +182,47 @@ pub struct Root {
     pub shared_with: Vec<usize>,
     /// The tab (1-based) whose total counts it whole.
     pub counted_in: Option<usize>,
+    /// The scopes that hold it (`tab:1`, `aterm`); none for an opt-in.
+    pub scopes: Vec<String>,
+    /// Whether it lies on home's pool (`same`, `other`, `unknown`), where the walker said.
+    pub pool: Option<&'static str>,
 }
 
 impl Root {
     /// Where it lies when its path may not be printed: `home`, `tmp` or `volume`.
     #[must_use]
     pub fn under(&self, home: Option<&str>) -> &'static str {
-        use std::path::{Component, Path};
-        let path = Path::new(&self.path);
-        if path.components().any(|c| matches!(c, Component::ParentDir)) {
-            return "volume";
-        }
-        let valid_home = home.map(Path::new).filter(|h| {
-            h.is_absolute()
-                && h.components().any(|c| matches!(c, Component::Normal(_)))
-                && !h.components().any(|c| matches!(c, Component::ParentDir))
-        });
-        if valid_home.is_some_and(|h| path.starts_with(h)) {
-            "home"
-        } else if [
-            "/tmp",
-            "/private/tmp",
-            "/var/folders",
-            "/private/var/folders",
-        ]
-        .iter()
-        .any(|t| path.starts_with(t))
-        {
-            "tmp"
-        } else {
-            "volume"
-        }
+        under(&self.path, home)
+    }
+}
+
+/// Where `path` lies when it may not be printed: `home`, `tmp` or `volume`.
+#[must_use]
+pub fn under(path: &str, home: Option<&str>) -> &'static str {
+    use std::path::{Component, Path};
+    let path = Path::new(path);
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return "volume";
+    }
+    let valid_home = home.map(Path::new).filter(|h| {
+        h.is_absolute()
+            && h.components().any(|c| matches!(c, Component::Normal(_)))
+            && !h.components().any(|c| matches!(c, Component::ParentDir))
+    });
+    if valid_home.is_some_and(|h| path.starts_with(h)) {
+        "home"
+    } else if [
+        "/tmp",
+        "/private/tmp",
+        "/var/folders",
+        "/private/var/folders",
+    ]
+    .iter()
+    .any(|t| path.starts_with(t))
+    {
+        "tmp"
+    } else {
+        "volume"
     }
 }
 

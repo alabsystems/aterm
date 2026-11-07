@@ -4316,6 +4316,9 @@ fn idle_screen() -> String {
 #[cfg(unix)]
 const TOKEN: &str = "0badf00d0badf00d";
 
+#[cfg(unix)]
+type NativeObserver = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
 /// What [`instance_with`]'s stand-in answers, beyond its fixed replies.
 #[cfg(unix)]
 #[derive(Clone)]
@@ -4363,6 +4366,8 @@ struct Answers {
     prompt: Option<Prompt>,
     /// The `native-act …` reply, to every request of a native restart's operation.
     native: &'static str,
+    /// Observe a native request before its scripted response.
+    on_native: Option<NativeObserver>,
     /// A process that dies as the `await` for its first idle arrives, before that is answered.
     dies_at_await: Option<std::sync::Arc<std::sync::Mutex<Option<aterm_uds::spawnfd::Child>>>>,
 }
@@ -4427,6 +4432,7 @@ impl Default for Answers {
             who: None,
             prompt: None,
             native: "ERR unscripted",
+            on_native: None,
             dies_at_await: None,
         }
     }
@@ -4574,7 +4580,12 @@ fn instance_for(
                 }
             }
             "send" => answers.send.to_string(),
-            "native-act" => answers.native.to_string(),
+            "native-act" => {
+                if let Some(observe) = &answers.on_native {
+                    observe(line);
+                }
+                answers.native.to_string()
+            }
             "key" => "OK seq=1".to_string(),
             "signal" if !answers.signal.is_empty() => answers.signal.to_string(),
             "signal" => match line
@@ -17044,12 +17055,6 @@ fn a_relaunch_found_gone_waits_for_its_native_retirement_and_then_stops() {
     a.forget_record();
     let me = std::process::id();
     let waiting = load(&a.opts, SESSION).expect("the record");
-    a.st = waiting.clone();
-    a.st.stop("no-resume", now_s());
-    a.st.reopen_landed(now_s());
-    let r = a.step(&Script::new(me, 0, None));
-    assert_eq!(r.step, "wait:resume", "a stop closes that end: {r:?}");
-    save(&a.opts, SESSION, &waiting);
     let retires = scratch("gone-native-retires");
     let (sock, _instance) = instance_with(
         &retires,
@@ -17066,6 +17071,88 @@ fn a_relaunch_found_gone_waits_for_its_native_retirement_and_then_stops() {
     assert_eq!(a.st.native, None);
     assert_eq!(ledger_details(&a.opts, "failed:no-resume").len(), 1);
     let _ = std::fs::remove_dir_all(&retires);
+    let _ = std::fs::remove_dir_all(&a.dir);
+}
+
+/// Stopping a pending retirement clears its recorded end without reusing a stale
+/// snapshot to restore another branch of the same record's history.
+#[cfg(unix)]
+#[test]
+fn a_stopped_relaunch_clears_its_recorded_end_while_retirement_is_pending() {
+    let mut a = FoundGone::new(
+        "gone-native-stopped",
+        "",
+        Answers {
+            native: "OK native-act state=unknown",
+            ..Answers::default()
+        },
+    );
+    a.st.native = Some(crate::harness::native_act::Binding {
+        id: "ab".repeat(16),
+        capability: "cd".repeat(32),
+    });
+    assert_eq!(a.found_step().step, "wait:native-retirement");
+    a.forget_record();
+    a.st = load(&a.opts, SESSION).expect("the current record");
+    a.st.stop("no-resume", now_s());
+    a.st.reopen_landed(now_s());
+    let r = a.step(&Script::new(std::process::id(), 0, None));
+    assert_eq!(r.step, "wait:resume", "a stop closes that end: {r:?}");
+    let _ = std::fs::remove_dir_all(&a.dir);
+}
+
+/// The end survives a crash after the pre-retirement save, before its reply or
+/// the caller's subsequent status save.
+#[cfg(unix)]
+#[test]
+fn a_relaunch_records_its_found_end_before_native_retirement() {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let record = Arc::new(Mutex::new(None::<Opts>));
+    let record_at_host = Arc::clone(&record);
+    let reconciled = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&reconciled);
+    let mut a = FoundGone::new(
+        "gone-native-published",
+        "",
+        Answers {
+            native: "OK native-act state=unknown",
+            on_native: Some(Arc::new(move |line| {
+                let request = line
+                    .split_once("native-act ")
+                    .and_then(|(_, body)| crate::harness::native_act::Request::parse(body));
+                if matches!(
+                    request,
+                    Some(crate::harness::native_act::Request::Reconcile(_))
+                ) {
+                    let opts = record_at_host
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .expect("record location");
+                    assert!(
+                        load(&opts, SESSION).expect("published record").found_gone,
+                        "the request must not precede the durable observed end"
+                    );
+                    counted.fetch_add(1, Ordering::Release);
+                }
+            })),
+            ..Answers::default()
+        },
+    );
+    *record.lock().unwrap() = Some(a.opts.clone());
+    a.st.native = Some(crate::harness::native_act::Binding {
+        id: "ab".repeat(16),
+        capability: "cd".repeat(32),
+    });
+    assert_eq!(a.found_step().step, "wait:native-retirement");
+    assert_eq!(
+        reconciled.load(Ordering::Acquire),
+        1,
+        "the request was observed"
+    );
     let _ = std::fs::remove_dir_all(&a.dir);
 }
 

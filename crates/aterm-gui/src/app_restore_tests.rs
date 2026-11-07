@@ -2264,6 +2264,9 @@ fn a_graft_carries_a_leaf_only_onto_the_shell_that_leaf_names() {
 
 #[test]
 fn a_handed_shells_frozen_flag_reaches_both_adoption_paths() {
+    if !crate::test_alone::alone() {
+        return;
+    }
     let state = std::env::temp_dir().join(format!(
         "aterm-restore-frozen-{}-{}",
         std::process::id(),
@@ -7911,7 +7914,9 @@ fn restored_up(app: &App) -> Vec<(String, Vec<String>)> {
 
 #[test]
 fn a_restored_row_said_before_a_later_one_is_passed_over() {
-    let _lane = crate::message_inbox::lane_test_guard();
+    if !crate::message_inbox::lane_zero_alone() {
+        return;
+    }
     for stale_last in [true, false] {
         let _ = crate::message_inbox::take_queued();
         let (mut app, sids) = restored_desk(2);
@@ -8938,6 +8943,9 @@ fn a_cold_restart_does_not_resume_the_disk_worker() {
 /// deadline judges what its screen shows. CONTROL: one whose agent was followed stays `restored`.
 #[test]
 fn a_kept_worker_no_agent_was_followed_in_goes_back_under_the_startup_deadline() {
+    if !crate::test_alone::alone() {
+        return;
+    }
     use crate::task_record::TaskState::Working;
     let state = aterm_tempfile::Builder::new()
         .prefix("aterm-restored-unstarted")

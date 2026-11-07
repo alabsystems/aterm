@@ -121,9 +121,15 @@ pub(crate) enum Retired {
     TextInput(Arc<TextInput>),
 }
 
-/// Test toggle for `retire_tests`: when false, retired devices are dropped immediately.
+/// Test toggle for `retire_tests`: when false, retired devices are dropped immediately. Every
+/// test that turns it holds [`RETIRE_TESTS`] until it has turned it back.
 #[cfg(test)]
 pub(crate) static RETIRE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Serialises the tests that turn [`RETIRE`], so one test's restore turns back no toggle another
+/// test still runs under.
+#[cfg(test)]
+pub(crate) static RETIRE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn retire(list: &mut Vec<Retired>, retired: Retired) {
     #[cfg(test)]

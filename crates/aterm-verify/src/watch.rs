@@ -787,8 +787,9 @@ fn attribute(root: &Path, record: &mut Record) -> Result<(), String> {
                 .find(|r| r.id == row.id)
                 .ok_or("missing attribution row")?
         };
-        let roots = item_crates(evidence);
-        let paths = item_paths(root, &roots, row.outcome == "red")?;
+        let links = transition_gitlinks(root, &base.commit)?;
+        let roots = item_crates(evidence, &links);
+        let paths = item_paths(root, &roots, row.outcome == "red", &links)?;
         let range = format!("{}..{}", base.commit, record.commit);
         let mut args = vec!["rev-list", "--no-merges", range.as_str()];
         if !paths.is_empty() {
@@ -815,16 +816,34 @@ fn attribute(root: &Path, record: &mut Record) -> Result<(), String> {
     Ok(())
 }
 
-fn item_crates(row: &Row) -> BTreeSet<String> {
+fn transition_gitlinks(root: &Path, base: &str) -> Result<String, String> {
+    let mut links = git(root, &["ls-tree", "-rz", "--full-tree", "HEAD"])?;
+    links.push('\0');
+    links.push_str(&git(root, &["ls-tree", "-rz", "--full-tree", base])?);
+    Ok(links)
+}
+
+fn item_crates(row: &Row, links: &str) -> BTreeSet<String> {
     let text = format!("{}\n{}", row.log, row.red_items.join("\n"));
     let mut result = BTreeSet::new();
     for token in text.split(|c: char| !(c.is_alphanumeric() || matches!(c, '/' | '-' | '_' | '.')))
     {
-        if let Some(at) = token.find("crates/") {
-            let dir = token[at..].split('/').take(2).collect::<Vec<_>>().join("/");
-            if dir != "crates/" {
-                result.insert(dir);
-            }
+        let scoped =
+            gitlink_suffix(token, links).or_else(|| token.find("crates/").map(|at| &token[at..]));
+        let Some(scoped) = scoped else {
+            continue;
+        };
+        let parts: Vec<_> = Path::new(scoped)
+            .components()
+            .filter_map(|part| match part {
+                std::path::Component::Normal(part) => part.to_str(),
+                _ => None,
+            })
+            .collect();
+        if let Some(at) = parts.iter().position(|part| *part == "crates")
+            && parts.get(at + 1).is_some()
+        {
+            result.insert(parts[..=at + 1].join("/"));
         }
     }
     let words: Vec<_> = text.split_whitespace().collect();
@@ -846,9 +865,14 @@ fn item_paths(
     root: &Path,
     roots: &BTreeSet<String>,
     dependencies: bool,
+    links: &str,
 ) -> Result<BTreeSet<String>, String> {
     if roots.is_empty() {
         return Ok(BTreeSet::new());
+    }
+    let (mut paths, roots) = split_gitlink_paths(roots, links);
+    if roots.is_empty() {
+        return Ok(paths);
     }
     let env = crate::EnvSnapshot::capture();
     let tools = crate::preflight(&env, root)?;
@@ -859,14 +883,14 @@ fn item_paths(
     let text = judged::output(&mut cmd, None)?;
     let metadata: aterm_json::Value = aterm_json::from_str(&text).map_err(|e| e.to_string())?;
     let graph = metadata_graph(root, &metadata)?;
-    let roots = resolve_roots(root, roots, &metadata, &graph)?;
-    let paths = if dependencies {
+    let roots = resolve_roots(root, &roots, &metadata, &graph)?;
+    let resolved = if dependencies {
         dependency_closure(&roots, &graph)
     } else {
         roots
     };
-    let links = git(root, &["ls-tree", "-rz", "--full-tree", "HEAD"])?;
-    Ok(gitlink_paths(&paths, &links))
+    paths.extend(gitlink_paths(&resolved, links));
+    Ok(paths)
 }
 
 fn resolve_roots(
@@ -900,6 +924,24 @@ fn resolve_roots(
                 resolved.insert(dir.to_owned());
                 found = true;
             }
+            if let Some(dependencies) = package
+                .get("dependencies")
+                .and_then(aterm_json::Value::as_array)
+            {
+                for dependency in dependencies {
+                    if dependency.get("name").and_then(aterm_json::Value::as_str) == Some(name)
+                        && let Some(path) =
+                            dependency.get("path").and_then(aterm_json::Value::as_str)
+                        && let Some(path) = Path::new(path)
+                            .strip_prefix(root)
+                            .ok()
+                            .and_then(Path::to_str)
+                    {
+                        resolved.insert(path.to_owned());
+                        found = true;
+                    }
+                }
+            }
         }
         if !found {
             return Err(format!("cannot resolve item scope {scope}"));
@@ -909,22 +951,55 @@ fn resolve_roots(
 }
 
 fn gitlink_paths(paths: &BTreeSet<String>, tree: &str) -> BTreeSet<String> {
-    let links: Vec<_> = tree
-        .split('\0')
+    paths
+        .iter()
+        .map(|path| enclosing_gitlink(path, tree).map_or_else(|| path.clone(), str::to_owned))
+        .collect()
+}
+
+fn split_gitlink_paths(
+    paths: &BTreeSet<String>,
+    tree: &str,
+) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut linked = BTreeSet::new();
+    let mut ordinary = BTreeSet::new();
+    for path in paths {
+        if let Some(link) = enclosing_gitlink(path, tree) {
+            linked.insert(link.to_owned());
+        } else {
+            ordinary.insert(path.clone());
+        }
+    }
+    (linked, ordinary)
+}
+
+fn enclosing_gitlink<'a>(path: &str, tree: &'a str) -> Option<&'a str> {
+    tree.split('\0')
         .filter_map(|entry| {
             let (header, path) = entry.split_once('\t')?;
             header.starts_with("160000 ").then_some(path)
         })
-        .collect();
-    paths
-        .iter()
-        .map(|path| {
-            links
-                .iter()
-                .find(|link| Path::new(path).starts_with(link))
-                .map_or_else(|| path.clone(), |link| (*link).to_owned())
+        .find(|link| Path::new(path).starts_with(link))
+}
+
+fn gitlink_suffix<'a>(path: &'a str, tree: &str) -> Option<&'a str> {
+    tree.split('\0')
+        .filter_map(|entry| {
+            let (header, link) = entry.split_once('\t')?;
+            header.starts_with("160000 ").then_some(link)
         })
-        .collect()
+        .filter_map(|link| {
+            if path == link || path.starts_with(&format!("{link}/")) {
+                return Some((link.len(), path));
+            }
+            let needle = format!("/{link}");
+            let at = path.find(&needle)? + 1;
+            let end = at + link.len();
+            (path.as_bytes().get(end).is_none() || path.as_bytes().get(end) == Some(&b'/'))
+                .then_some((link.len(), &path[at..]))
+        })
+        .max_by_key(|(link_len, _)| *link_len)
+        .map(|(_, suffix)| suffix)
 }
 
 type DependencyGraph = BTreeMap<String, (String, BTreeSet<String>)>;
@@ -1042,13 +1117,84 @@ mod tests {
     #[test]
     fn attribution_queries_real_metadata_without_a_compilation_lane() {
         let root = std::fs::canonicalize(aterm_tempfile::manifest_dir().join("../..")).unwrap();
+        let links = git(&root, &["ls-tree", "-rz", "--full-tree", "HEAD"]).unwrap();
         let paths = item_paths(
             &root,
             &BTreeSet::from(["crates/aterm-verify".into()]),
             false,
+            &links,
         )
         .unwrap();
         assert_eq!(paths, BTreeSet::from(["crates/aterm-verify".into()]));
+    }
+    #[test]
+    fn attribution_preserves_a_nested_crate_at_its_git_pin() {
+        let root = std::fs::canonicalize(aterm_tempfile::manifest_dir().join("../..")).unwrap();
+        let links = git(&root, &["ls-tree", "-rz", "--full-tree", "HEAD"]).unwrap();
+        let evidence = row(
+            "tree",
+            Some(1),
+            "FAIL -p astream-effects at /fleet/other-checkout/vendor/astream/crates/astream-effects/src/lib.rs:12",
+        );
+        let roots = item_crates(&evidence, &links);
+        assert_eq!(
+            roots,
+            BTreeSet::from([
+                "crates/astream-effects".into(),
+                "vendor/astream/crates/astream-effects".into()
+            ])
+        );
+        assert_eq!(
+            item_paths(&root, &roots, false, &links).unwrap(),
+            BTreeSet::from(["vendor/astream".into()])
+        );
+    }
+    #[test]
+    fn attribution_keeps_a_git_pin_removed_by_the_fix() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-b", "main"]).unwrap();
+        git(dir.path(), &["config", "user.name", "Andrew Yates"]).unwrap();
+        git(
+            dir.path(),
+            &["config", "user.email", "test@example.invalid"],
+        )
+        .unwrap();
+        fs::write(dir.path().join("item"), "seed").unwrap();
+        git(dir.path(), &["add", "item"]).unwrap();
+        git(dir.path(), &["commit", "-m", "seed"]).unwrap();
+        let target = git(dir.path(), &["rev-parse", "HEAD"]).unwrap();
+        git(
+            dir.path(),
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000",
+                &target,
+                "vendor/retired",
+            ],
+        )
+        .unwrap();
+        git(dir.path(), &["commit", "-m", "pin"]).unwrap();
+        let pinned = git(dir.path(), &["rev-parse", "HEAD"]).unwrap();
+        git(
+            dir.path(),
+            &["update-index", "--force-remove", "vendor/retired"],
+        )
+        .unwrap();
+        git(dir.path(), &["commit", "-m", "remove pin"]).unwrap();
+        let links = transition_gitlinks(dir.path(), &pinned).unwrap();
+        assert_eq!(
+            item_crates(
+                &row(
+                    "tree",
+                    Some(1),
+                    "error at /fleet/old/vendor/retired/crates/client/src/lib.rs"
+                ),
+                &links
+            ),
+            BTreeSet::from(["vendor/retired/crates/client".into()])
+        );
     }
     #[test]
     fn stopping_a_sample_first_allows_its_signal_handler_to_clean_up() {
@@ -1390,12 +1536,15 @@ mod tests {
                 ("crates/unrelated".into(), BTreeSet::new()),
             ),
         ]);
-        let roots = item_crates(&row("tree", Some(1), "FAIL -p a --lib item"));
+        let roots = item_crates(&row("tree", Some(1), "FAIL -p a --lib item"), "");
         assert_eq!(
             dependency_closure(&roots, &graph),
             BTreeSet::from(["crates/a".into(), "crates/b".into(), "crates/c".into()])
         );
-        let roots = item_crates(&row("compat", Some(1), "error at crates/b/src/lib.rs:12"));
+        let roots = item_crates(
+            &row("compat", Some(1), "error at crates/b/src/lib.rs:12"),
+            "",
+        );
         assert_eq!(roots, BTreeSet::from(["crates/b".into()]));
         let metadata = aterm_json::json!({"packages": [
             {"name": "alias", "manifest_path": "/repo/crates/a/Cargo.toml", "dependencies": [{"name": "renamed", "path": "/repo/crates/b"}, {"name": "external", "path": null}]},

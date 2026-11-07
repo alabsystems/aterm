@@ -5543,7 +5543,6 @@ impl App {
         let manifest = stamp_status_seen(manifest, &status);
         let carried_claims = stamp_claim_banners(carried_claims, &status);
         let manifest = stamp_autopilot_end(manifest, &self.end_carry_rows());
-        let manifest = stamp_fleet_told(manifest, self.fleet_told_rows());
 
         let layout = self.capture_handoff_layout();
 
@@ -7199,7 +7198,6 @@ impl App {
         let manifest = stamp_status_seen(manifest, &status);
         let carried_claims = stamp_claim_banners(carried_claims, &status);
         let manifest = stamp_autopilot_end(manifest, &self.end_carry_rows());
-        let manifest = stamp_fleet_told(manifest, self.fleet_told_rows());
         let carry_lone_lists = policy.grant_desk || same_image.is_some();
         let layout = self.capture_handoff_layout_for(carry_lone_lists);
         let layout_digest = match commit_handoff_layout(&layout) {
@@ -9564,15 +9562,6 @@ fn stamp_autopilot_end(
 }
 
 #[cfg(unix)]
-fn stamp_fleet_told(
-    mut manifest: crate::session_store::SessionHandoff,
-    rows: Vec<String>,
-) -> crate::session_store::SessionHandoff {
-    manifest.fleet_told = rows;
-    manifest
-}
-
-#[cfg(unix)]
 fn stamp_journal_keys(
     mut manifest: crate::session_store::SessionHandoff,
     keys: &[(u64, (u32, u64))],
@@ -10141,7 +10130,6 @@ impl App {
         let manifest = stamp_journal_keys(manifest, &self.journal_keys());
         let manifest = stamp_status_seen(manifest, &self.status_carry_snapshots());
         let manifest = stamp_autopilot_end(manifest, &self.end_carry_rows());
-        let manifest = stamp_fleet_told(manifest, self.fleet_told_rows());
         let layout = self.capture_handoff_layout();
         let layout_digest = crate::seamless::layout_digest(&layout);
         let history = crate::handoff_history::HistoryPlan::deferred_under(ceiling, || {

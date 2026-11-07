@@ -38,6 +38,9 @@
 use super::{FabricSession, serving_driver};
 use serde::{Deserialize, Serialize};
 
+#[cfg(unix)]
+pub mod watch;
+
 const ROWS: usize = 64;
 const PER_NODE: usize = 16;
 const TEXT: usize = 4096;
@@ -221,6 +224,8 @@ impl Stamp {
 #[cfg(unix)]
 pub fn stamp(path: &std::path::Path) -> std::io::Result<Stamp> {
     use aterm_uds::private_file::{JudgedDir, PrivateFileError, check_private_dir};
+    #[cfg(test)]
+    STAMPS.with(|n| n.set(n.get() + 1));
     let dir = path
         .parent()
         .ok_or_else(|| std::io::Error::other("the mailbox has no directory"))?;
@@ -254,6 +259,8 @@ thread_local! {
     static TRANSACTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Those of them the handler tally times as [`super::handler_tally::Row::FleetMail`].
     static TIMED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// This thread's mailbox stamps ([`stamp`]).
+    static STAMPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// A negative control's switch: this thread's refreshes ring no waiter.
     static UNRUNG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// A negative control's switch: this thread's ring listings write no mark ([`mark_listed`]).
@@ -1403,7 +1410,7 @@ pub fn pending(
 }
 
 #[cfg(all(test, unix))]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::{Driver, DrivingAs, FabricFact, SessionFabric};
     use aterm_session::SessionId;
@@ -1440,20 +1447,20 @@ mod tests {
     }
 
     /// How a test serves a fleet drive: the Mac and the request line in, the answer out.
-    type Drive = Box<dyn Fn(&str, &str) -> Result<String, String> + Send + Sync>;
+    pub(super) type Drive = Box<dyn Fn(&str, &str) -> Result<String, String> + Send + Sync>;
 
-    struct Session {
-        sid: SessionId,
-        fabric: SessionFabric,
-        path: std::path::PathBuf,
-        facts: std::sync::Mutex<Vec<String>>,
-        wakes: std::sync::atomic::AtomicU64,
-        ready: std::sync::atomic::AtomicBool,
+    pub(super) struct Session {
+        pub(super) sid: SessionId,
+        pub(super) fabric: SessionFabric,
+        pub(super) path: std::path::PathBuf,
+        pub(super) facts: std::sync::Mutex<Vec<String>>,
+        pub(super) wakes: std::sync::atomic::AtomicU64,
+        pub(super) ready: std::sync::atomic::AtomicBool,
         /// The Macs whose presence row this session's Mac heard (§11 C6).
-        heard: Vec<String>,
-        drive: Option<Drive>,
+        pub(super) heard: Vec<String>,
+        pub(super) drive: Option<Drive>,
         /// Every fleet drive asked for: the Mac and the request line.
-        drives: std::sync::Mutex<Vec<(String, String)>>,
+        pub(super) drives: std::sync::Mutex<Vec<(String, String)>>,
     }
 
     impl FabricSession for Session {
@@ -1501,7 +1508,7 @@ mod tests {
         }
     }
 
-    fn session(path: &std::path::Path) -> Session {
+    pub(super) fn session(path: &std::path::Path) -> Session {
         Session {
             sid: SessionId::new("s-12345678"),
             fabric: SessionFabric::default(),
@@ -1526,7 +1533,7 @@ mod tests {
         }
     }
 
-    fn as_node<T>(byte: &str, f: impl FnOnce() -> T) -> T {
+    pub(super) fn as_node<T>(byte: &str, f: impl FnOnce() -> T) -> T {
         let _driver = DrivingAs::enter(Driver {
             node: byte.repeat(32),
             host: "peer.local".to_owned(),

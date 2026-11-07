@@ -87,6 +87,9 @@ mod kept_worker_tests {
     /// of what runs there. CONTROL: with the shell leading its terminal, the same death ends it.
     #[test]
     fn a_dead_agents_pid_ends_nothing_with_a_job_in_front_of_its_shell() {
+        if !crate::test_alone::alone() {
+            return;
+        }
         let state = aterm_tempfile::tempdir().unwrap();
         crate::test_env::scoped("ATERM_STATE_HOME", state.path(), || {
             let app = App::headless_for_test();
@@ -169,6 +172,9 @@ mod kept_worker_tests {
 
     #[test]
     fn restored_worker_closure_requires_positive_identity_evidence_and_the_same_record() {
+        if !crate::test_alone::alone() {
+            return;
+        }
         let state = aterm_tempfile::tempdir().unwrap();
         crate::test_env::scoped("ATERM_STATE_HOME", state.path(), || {
             for (presence, start, ended) in [

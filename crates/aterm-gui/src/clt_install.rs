@@ -400,6 +400,8 @@ pub(crate) enum Activity {
     /// Nothing installs them: a placeholder left behind by an install that ended is no install.
     #[default]
     Idle,
+    /// Installer evidence could not be read, so another installer must not start yet.
+    Unread,
     /// Apple's own installer window (`Install Command Line Developer Tools`, which
     /// `xcode-select --install` and the `git` and `cc` shims open) is open, at any age: waiting
     /// for the person's own Install or Agree press, or running the install a press started
@@ -415,6 +417,8 @@ pub(crate) enum Activity {
 /// What [`activity`] reads of this Mac at one moment.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Reading {
+    /// Installer evidence could not be read, so absence of an installer is unproved.
+    pub(crate) unread: bool,
     /// The on-demand placeholder ([`aterm_types::macos_setup::COMMAND_LINE_TOOLS_INSTALLING`]) is
     /// there.
     pub(crate) placeholder: bool,
@@ -444,6 +448,8 @@ pub(crate) const fn activity(reading: Reading) -> Activity {
         Activity::Installing
     } else if reading.apple_window {
         Activity::AppleWindow
+    } else if reading.unread {
+        Activity::Unread
     } else {
         Activity::Idle
     }
@@ -1110,10 +1116,9 @@ impl App {
         reading
     }
 
-    /// Whether an installer is up on this Mac, running or waiting in Apple's own window, as a
-    /// dispatch boundary reads it live ([`Self::developer_tools_reading`]): no second one opens
-    /// beside it.
-    fn developer_tools_installing(&mut self) -> bool {
+    /// Whether installer custody blocks another opening at this dispatch boundary: a known
+    /// installer or unread evidence ([`Self::developer_tools_reading`]).
+    fn developer_tools_install_blocked(&mut self) -> bool {
         activity(self.developer_tools_reading()) != Activity::Idle
     }
 
@@ -1135,7 +1140,10 @@ impl App {
     /// Whether an installer is up on this Mac, as the window knows it
     /// ([`Self::developer_tools_known`]).
     fn developer_tools_installing_known(&self) -> bool {
-        activity(self.developer_tools_known()) != Activity::Idle
+        matches!(
+            activity(self.developer_tools_known()),
+            Activity::Installing | Activity::AppleWindow
+        )
     }
 
     /// A person's press of the GitHub repositories row's Install… (design §3.3): the tab opens
@@ -1175,7 +1183,7 @@ impl App {
         else {
             return false;
         };
-        if self.developer_tools_installing() {
+        if self.developer_tools_install_blocked() {
             return false;
         }
         // A new press: the reason the last one opened nothing is spent.
@@ -1239,7 +1247,16 @@ impl App {
             return false;
         }
         let front = self.system_state_frontmost_in(window);
-        if front && !self.developer_tools_installing() {
+        let installer = front.then(|| activity(self.developer_tools_reading()));
+        if installer == Some(Activity::Unread) {
+            self.workstation_setup.developer_tools = Install::PressedQueued { wanted: None };
+            aterm_log::info!(
+                "System State: the Mac Setup tab Install… asked for waits for readable installer state"
+            );
+            self.republish_system_state_developer_tools();
+            return false;
+        }
+        if installer == Some(Activity::Idle) {
             if !self.access_dialog_up() && self.reserve_access_dialog() {
                 return true;
             }
@@ -1894,10 +1911,12 @@ impl App {
             Some(NOTHING_OWED)
         } else if self.developer_tools_tab_adopted() {
             Some("an earlier aterm's tab runs on")
-        } else if self.developer_tools_installing_known() {
-            Some("an installer runs")
         } else {
-            None
+            match activity(self.developer_tools_known()) {
+                Activity::Idle => None,
+                Activity::Unread => Some("the installer state could not be read"),
+                Activity::Installing | Activity::AppleWindow => Some("an installer runs"),
+            }
         }
     }
 
@@ -1959,7 +1978,7 @@ impl App {
             && self.developer_tools_install_authorized(revision)
             && !self.developer_tools_tab_adopted()
             && !self.access_dialog_up()
-            && !self.developer_tools_installing()
+            && !self.developer_tools_install_blocked()
             && self.reserve_access_dialog()
         {
             if self.workstation_setup.developer_tools_mark.claim() {
@@ -2081,7 +2100,7 @@ impl App {
             }
             if self.developer_tools_install_active()
                 || dialog_up
-                || self.developer_tools_installing_known()
+                || activity(self.developer_tools_known()) != Activity::Idle
                 || !crate::hands_off_keys(true, self.last_keystroke_at, std::time::Instant::now())
             {
                 return None;

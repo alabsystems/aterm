@@ -11,6 +11,9 @@ pub const PEAK_DAYS: u32 = 7;
 pub const NET_LEARN_S: u32 = 86_400;
 /// Seconds of agent readings before tokens have learned their peak.
 pub const TOKENS_LEARN_S: u32 = 600;
+/// Seconds of start counts before the Processes row has learned its start peak: ten minutes
+/// (record §8.1).
+pub const PROC_LEARN_S: u32 = 600;
 
 /// The last [`PEAK_DAYS`] days' maxima of one quantity.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -114,6 +117,10 @@ pub struct Peaks {
     pub tokens: DailyMax,
     /// Compressor churn, bytes compressed and decompressed per second.
     pub mem_churn: DailyMax,
+    /// Process starts per second: the Processes row's capacity (record §8.2), fed at each
+    /// bucket's close as Network's are. A file written before it restores and learns it from
+    /// zero.
+    pub proc_starts: DailyMax,
     /// Each device's, most recently read first, at most
     /// [`crate::units::DISK_DEVICES_KEPT`] ([`Self::disk`]).
     pub disks: Vec<DiskPeaks>,
@@ -121,13 +128,19 @@ pub struct Peaks {
 
 impl Peaks {
     /// The fixed rows' names, first in [`Self::to_pairs`].
-    pub const NAMES: [&'static str; 4] = ["net_rx", "net_tx", "tokens", "mem_churn"];
+    pub const NAMES: [&'static str; 5] = ["net_rx", "net_tx", "tokens", "mem_churn", "proc_starts"];
 
     /// Each peak as `(name, read_s, days)`: the [`Self::NAMES`] rows, then each device's write
     /// and read rows, most recently read first.
     #[must_use]
     pub fn to_pairs(&self) -> Vec<PeakRow> {
-        let fixed = [&self.net_rx, &self.net_tx, &self.tokens, &self.mem_churn];
+        let fixed = [
+            &self.net_rx,
+            &self.net_tx,
+            &self.tokens,
+            &self.mem_churn,
+            &self.proc_starts,
+        ];
         let mut rows: Vec<PeakRow> = Self::NAMES
             .iter()
             .zip(fixed)
@@ -163,6 +176,7 @@ impl Peaks {
                 "net_tx" => &mut p.net_tx,
                 "tokens" => &mut p.tokens,
                 "mem_churn" => &mut p.mem_churn,
+                "proc_starts" => &mut p.proc_starts,
                 _ => {
                     let (id, write) = match (device(DISK_WRITE), device(DISK_READ)) {
                         (Some(id), _) => (id, true),
@@ -241,8 +255,11 @@ mod tests {
         let mut day = DailyMax::default();
         let t0 = 1_792_000_800_000i64;
         for (i, v) in [3.0, 3.2, 40.0, 3.1, 2.9, 3.0, 3.3].into_iter().enumerate() {
-            if let Some(k) = ring.push(t0 + i as i64 * 10_000, Some(v), false)
-                && let Some(s) = ring.sustained(k)
+            if let Some(k) = ring.push(
+                crate::ring::Taken::at(t0 + i as i64 * 10_000, 1_000),
+                Some(v),
+                false,
+            ) && let Some(s) = ring.sustained(k)
             {
                 day.note_bucket(20_740, s);
             }

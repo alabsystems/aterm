@@ -9,60 +9,55 @@ use aterm_session::SessionId;
 
 pub(crate) use aterm_gui_fabric::*;
 
-/// One worker observes atomic mailbox replacements, including writes by a handoff peer
-/// after this process adopted the session. GUI readers only use the cached metadata, and a
-/// parked `await inbox` is woken only by a refresh that changed it: nothing else rechecks.
-/// Only the active owner's mailbox is observed. An uncommitted successor waits for Commit;
-/// unknown legacy mailboxes may still belong to older readers and are left untouched.
+/// The one worker that reads each session's direct mailbox again after a write by another
+/// process, a handoff peer's included ([`fleet_mail::watch`]): it hears each mailbox replaced
+/// and waits with no deadline while every one is read. GUI readers only use the cached metadata,
+/// and a parked `await inbox` is woken only by a refresh that changed it: nothing else rechecks.
+/// Only the active owner's mailbox is read. An uncommitted successor waits for Commit; unknown
+/// legacy mailboxes may still belong to older readers and are left untouched.
+#[cfg(all(unix, not(test)))]
+static MAIL_WATCH: std::sync::Mutex<Option<fleet_mail::watch::Door<crate::SessionCtx>>> =
+    std::sync::Mutex::new(None);
+
+/// Keep `ctx`'s direct mailbox read, starting the worker for the first session, or again where
+/// it ended.
 #[cfg(all(unix, not(test)))]
 pub(crate) fn watch_direct_mail(ctx: &Arc<crate::SessionCtx>) {
-    use std::sync::{Mutex, Weak, mpsc};
-    type Sender = mpsc::Sender<Weak<crate::SessionCtx>>;
-    static WORKER: Mutex<Option<Sender>> = Mutex::new(None);
-    let mut worker = WORKER.lock().unwrap_or_else(|p| p.into_inner());
-    if worker
-        .as_ref()
-        .is_some_and(|tx| tx.send(Arc::downgrade(ctx)).is_ok())
-    {
+    let mut door = MAIL_WATCH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if door.as_ref().is_some_and(|door| door.watch(ctx)) {
         return;
     }
-    let (tx, rx) = mpsc::channel();
-    if std::thread::Builder::new()
-        .name("fleet-mail-watch".to_owned())
-        .spawn(move || {
-            let mut sessions = Vec::new();
-            loop {
-                match rx.recv_timeout(std::time::Duration::from_secs(1)) {
-                    Ok(ctx) => sessions.push((ctx, None)),
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                }
-                sessions.retain_mut(|(weak, seen): &mut (Weak<crate::SessionCtx>, _)| {
-                    let Some(ctx) = weak.upgrade() else {
-                        return false;
-                    };
-                    if !ctx.fleet_mail_ready() {
-                        return true;
-                    }
-                    let stamp = ctx
-                        .fleet_mail_path()
-                        .and_then(|path| crate::fabric::fleet_mail::stamp(&path).ok());
-                    if stamp != *seen && crate::fabric::fleet_mail::restore(&*ctx) {
-                        *seen = stamp;
-                    }
-                    true
-                });
+    match fleet_mail::watch::Door::spawn() {
+        Ok(started) => {
+            if started.watch(ctx) {
+                *door = Some(started);
             }
-        })
-        .is_ok()
+        }
+        Err(why) => aterm_log::info!(
+            "fleet mail: no mailbox worker ({why}), so another process's mail waits for this session's next mailbox verb"
+        ),
+    }
+}
+
+/// Stop reading `sid`'s direct mailbox: its session closed.
+#[cfg(all(unix, not(test)))]
+pub(crate) fn forget_direct_mail(sid: &SessionId) {
+    if let Some(door) = MAIL_WATCH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
     {
-        let _ = tx.send(Arc::downgrade(ctx));
-        *worker = Some(tx);
+        door.forget(sid);
     }
 }
 
 #[cfg(all(not(unix), not(test)))]
 pub(crate) fn watch_direct_mail(_ctx: &Arc<crate::SessionCtx>) {}
+
+#[cfg(all(not(unix), not(test)))]
+pub(crate) fn forget_direct_mail(_sid: &SessionId) {}
 
 impl FabricSession for crate::SessionCtx {
     fn self_id(&self) -> &SessionId {

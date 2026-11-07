@@ -128,6 +128,7 @@ pub(crate) fn offer_box(rows: &[String]) -> Option<PromptV2> {
         title: title_text.to_string(),
         command_rows: Vec::new(),
         description_rows: 0,
+        spellings: None,
         gutter: false,
         command: title_text.to_string(),
         description: prose,

@@ -67,6 +67,16 @@ impl From<GateRefusal> for String {
     }
 }
 
+#[cfg(target_vendor = "apple")]
+impl From<GateRefusal> for CheckError {
+    fn from(refused: GateRefusal) -> Self {
+        match refused {
+            GateRefusal::Unanswered(why) => Self::Unanswered(why),
+            GateRefusal::Failed(why) => Self::Unchecked(why),
+        }
+    }
+}
+
 /// `work`, a code check that waits on `trustd`, through the process's one `trustd` gate.
 #[cfg(target_vendor = "apple")]
 fn through_trust_gate<T: Send + 'static>(
@@ -95,10 +105,7 @@ fn gate_refusal(refused: aterm_uds::deadline::Refused, what: &str) -> GateRefusa
 /// The gate's `refused` of a peer check, as the check's error.
 #[cfg(target_vendor = "apple")]
 fn peer_refusal(refused: aterm_uds::deadline::Refused) -> CheckError {
-    match gate_refusal(refused, THE_PEERS_CODE) {
-        GateRefusal::Unanswered(why) => CheckError::Unanswered(why),
-        GateRefusal::Failed(why) => CheckError::Unchecked(why),
-    }
+    gate_refusal(refused, THE_PEERS_CODE).into()
 }
 
 /// A peer check [`Identity::start_check_named`] began, its wait on `trustd` left to the caller.
@@ -174,10 +181,10 @@ pub enum IdentityPolicy {
     Designated,
 }
 
-/// Why [`Identity::check`] did not admit a peer.
+/// Why a peer or an on-disk code check did not admit its subject.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CheckError {
-    /// The peer was checked and refused.
+    /// The code was checked and refused.
     Refused(String),
     /// The check could not run.
     Unchecked(String),
@@ -329,9 +336,10 @@ impl Identity {
     /// static check (`kSecCSStrictValidate`, every architecture, nested code): a copy about to be
     /// adopted as a root service's image.
     /// # Errors
-    /// Why the code does not pass, could not be read, or (off macOS, or with no requirement in
-    /// force) cannot be checked.
-    pub fn admits_code_at_strictly(&self, path: &Path) -> Result<(), String> {
+    /// A definite signature or requirement refusal is [`CheckError::Refused`]. A check
+    /// that could not run, read the code, or interpret a framework failure is
+    /// [`CheckError::Unchecked`]; a silent `trustd` is [`CheckError::Unanswered`].
+    pub fn admits_code_at_strictly(&self, path: &Path) -> Result<(), CheckError> {
         #[cfg(target_vendor = "apple")]
         if let Some(req) = &self.requirement {
             let (owned, req) = (path.to_path_buf(), Arc::clone(req));
@@ -340,10 +348,13 @@ impl Identity {
                 CODE_CHECK_HANG,
                 &path.display().to_string(),
                 move || sec::check_static_with(&owned, &req, sec::STRICT),
-            )?;
+            )
+            .map_err(CheckError::from)?;
         }
         let _ = path;
-        Err("no code requirement is in force to check a copy against".to_string())
+        Err(CheckError::Unchecked(
+            "no code requirement is in force to check a copy against".to_string(),
+        ))
     }
 
     /// The policy in force.
@@ -705,7 +716,7 @@ mod sec {
     /// `req`.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn check_static(path: &std::path::Path, req: &Owned) -> Result<(), String> {
-        check_static_with(path, req, 0)
+        check_static_with(path, req, 0).map_err(|why| why.to_string())
     }
 
     /// `kSecCSCheckAllArchitectures | kSecCSCheckNestedCode | kSecCSStrictValidate`.
@@ -717,13 +728,29 @@ mod sec {
         path: &std::path::Path,
         req: &Owned,
         flags: u32,
-    ) -> Result<(), String> {
-        let code = static_code_at(path)?;
+    ) -> Result<(), super::CheckError> {
+        let code = static_code_at(path).map_err(super::CheckError::Unchecked)?;
         // SAFETY: both objects are live.
-        status(
-            unsafe { SecStaticCodeCheckValidity(code.0, flags, req.0) },
-            "the code does not satisfy the requirement in force",
-        )
+        static_validity(unsafe { SecStaticCodeCheckValidity(code.0, flags, req.0) })
+    }
+
+    /// Classify only definite code refusals; unknown framework and operational
+    /// failures remain unchecked, including unreadable or incomplete resources.
+    pub(super) fn static_validity(rc: OSStatus) -> Result<(), super::CheckError> {
+        // Security.framework/Headers/CSCommon.h: errSecCSUnsigned,
+        // errSecCSSignatureFailed, errSecCSReqFailed. Unsupported signature
+        // formats (including errSecCSSignatureInvalid) remain unchecked.
+        const UNSIGNED: OSStatus = -67062;
+        const SIGNATURE_FAILED: OSStatus = -67061;
+        const REQUIREMENT_FAILED: OSStatus = -67050;
+        if rc == 0 {
+            return Ok(());
+        }
+        let why = format!("the code does not satisfy the requirement in force: OSStatus {rc}");
+        Err(match rc {
+            UNSIGNED | SIGNATURE_FAILED | REQUIREMENT_FAILED => super::CheckError::Refused(why),
+            _ => super::CheckError::Unchecked(why),
+        })
     }
 
     /// The team identifier this process's code is signed by, or `None` (ad hoc, or unsigned).
@@ -874,11 +901,33 @@ mod tests {
         // A test binary is signed ad hoc by its linker: no team, and no strict check without a
         // requirement in force.
         assert_eq!(own_team(), Ok(None));
-        assert!(
-            Identity::same_uid()
-                .admits_code_at_strictly(Path::new("/bin/ls"))
-                .is_err()
-        );
+        assert!(matches!(
+            Identity::same_uid().admits_code_at_strictly(Path::new("/bin/ls")),
+            Err(CheckError::Unchecked(_))
+        ));
+        assert_eq!(sec::static_validity(0), Ok(()));
+        for status in [-67062, -67061, -67050] {
+            assert!(
+                matches!(sec::static_validity(status), Err(CheckError::Refused(_))),
+                "a definite code refusal: {status}"
+            );
+        }
+        for status in [
+            -67060, -67068, -67048, -67032, -67033, -67025, -67006, -67056, -67054, -67045, -1,
+        ] {
+            assert!(
+                matches!(sec::static_validity(status), Err(CheckError::Unchecked(_))),
+                "an operational, incomplete or unknown result is not a refusal: {status}"
+            );
+        }
+        assert!(matches!(
+            CheckError::from(GateRefusal::Unanswered("silent".into())),
+            CheckError::Unanswered(_)
+        ));
+        assert!(matches!(
+            CheckError::from(GateRefusal::Failed("could not run".into())),
+            CheckError::Unchecked(_)
+        ));
     }
 
     #[test]

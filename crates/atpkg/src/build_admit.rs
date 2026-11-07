@@ -654,6 +654,17 @@ impl Ended {
     /// `kind=build` or `kind=test` row ([`telemetry`]). The bytes kept; `None` when nothing was,
     /// or the record could not be written (said in one line).
     pub fn keep(self, end: BuildEnd, peak: u64, say: &mut dyn FnMut(&str)) -> Option<u64> {
+        self.keep_then(end, peak, say, telemetry::ended)
+    }
+
+    /// [`Self::keep`], its row handed to `row` once the book is done.
+    fn keep_then(
+        self,
+        end: BuildEnd,
+        peak: u64,
+        say: &mut dyn FnMut(&str),
+        row: impl FnOnce(&telemetry::Run, &str, &BuildEnd, u64),
+    ) -> Option<u64> {
         let Ended {
             claimed,
             key,
@@ -683,7 +694,7 @@ impl Ended {
             }
             None => None,
         };
-        telemetry::ended(&run, &stage, &end, peak);
+        row(&run, &stage, &end, peak);
         kept
     }
 }

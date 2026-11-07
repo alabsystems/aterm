@@ -582,11 +582,22 @@ pub(super) fn recover(
     let Request::Prepare(prepare) = &request else {
         return Err("native-plan");
     };
+    if !request.matches_retained(&st.native_prepare) {
+        return Err("native-plan");
+    }
+    if st
+        .native
+        .as_ref()
+        .is_some_and(|binding| binding.id != prepare.id)
+    {
+        return Err("native-plan");
+    }
     // Prepare replay can admit an operation whose earlier request never arrived.
     // Reconfirm persistence on every attempt, including after a lost directory
     // barrier acknowledgement; a visible or in-memory record is insufficient.
     upgrade_drive::save_checked(opts, session, st).map_err(|_| "native-unsaved")?;
-    let reply = native_act::exchange(client, tab, &request).map_err(|_| "native-unknown")?;
+    let reply = native_act::exchange_retained(client, tab, &request, &st.native_prepare)
+        .map_err(|_| "native-unknown")?;
     if matches!(&reply, Reply::Admitted(binding) | Reply::Pending(binding) if binding.id != prepare.id)
     {
         return Err("native-unknown");
@@ -776,6 +787,14 @@ pub(super) fn human_seq(status: &str) -> Option<u64> {
     (values.next().is_none() && parsed.to_string() == text).then_some(parsed)
 }
 
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeReplayPublication",
+        action = "Attempt",
+        project = "aterm_agent::harness::native_restart::transport_tests::replay_model::retirement_transition"
+    )
+)]
 pub(super) fn retire(
     opts: &Opts,
     session: &str,
@@ -784,6 +803,12 @@ pub(super) fn retire(
     st: &mut St,
 ) -> bool {
     if st.native_retired_unissued {
+        return false;
+    }
+    if st.native.is_none() && st.native_prepare.is_empty() {
+        return true;
+    }
+    if opts.dry_run {
         return false;
     }
     if st.native.is_none() && !st.native_prepare.is_empty() {
@@ -799,6 +824,11 @@ pub(super) fn retire(
     let Some(binding) = st.native.clone() else {
         return st.native_prepare.is_empty();
     };
+    // Reconcile can seal this operation. A loaded binding may be visible after
+    // an unacknowledged rename, so it needs this writer's durability barrier too.
+    if upgrade_drive::save_checked(opts, session, st).is_err() {
+        return false;
+    }
     native_act::exchange(client, tab, &Request::Reconcile(binding))
         .ok()
         .and_then(|reply| terminal_reply(st, &reply))

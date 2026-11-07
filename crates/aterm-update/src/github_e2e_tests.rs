@@ -60,7 +60,13 @@ fn probe_one_check_over_real_curl_if_asked() -> bool {
     };
     let said = format!(
         "{:?}",
-        check_and_stage_in(world, RUNNING, &test_source(), Asked::Schedule)
+        check_and_stage_in(
+            world,
+            RUNNING,
+            &test_source(),
+            Asked::Schedule,
+            &crate::progress::DownloadBegan::default()
+        )
     );
     let pending = dir.join("said.pending");
     std::fs::write(&pending, said).unwrap();

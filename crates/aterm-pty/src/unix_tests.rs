@@ -2069,9 +2069,79 @@ enum ProbePass {
 /// `aterm_uds::keep_out_of_children` sets there (off Apple it sets nothing).
 const FD_CLOFORK: libc::c_int = 2;
 
+/// The exec-status carrier a spawn here uses unless its atomic one cannot be made.
+#[cfg(target_os = "macos")]
+const ATOMIC_EXEC_STATUS_CARRIER: ExecStatusCarrier = ExecStatusCarrier::Fifo;
+#[cfg(target_os = "linux")]
+const ATOMIC_EXEC_STATUS_CARRIER: ExecStatusCarrier = ExecStatusCarrier::Pipe2;
+
+/// A spawn tells the exec-status carrier of the kit it took, wherever that kit was opened: a
+/// lent kit whose channel is the racy pipe is this spawn's racy carrier, and a fresh kit after it
+/// the atomic one. Nothing it tells is another thread's, whose spawns run at once with this one.
+#[test]
+fn a_spawn_tells_the_exec_status_carrier_of_the_kit_it_took() {
+    // SAFETY: the trusted-launcher contract holds in a test that mints its own caps.
+    let authority = unsafe { aterm_cap::Authority::root_authority() };
+    let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
+    let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
+    let pool: &'static std::sync::Mutex<KitPool> =
+        Box::leak(Box::new(std::sync::Mutex::new(KitPool::new())));
+    TEST_KITS.with(|kits| kits.set(Some(pool)));
+    assert_eq!(fill_kits(pool, 1).expect("a kit opens"), 1);
+    {
+        let mut kits = pool.lock().unwrap();
+        let kit = &mut kits.ready[0];
+        close_fd(kit.status_rd);
+        close_fd(kit.status_wr);
+        (kit.status_rd, kit.status_wr) = racy_status_pipe();
+        kit.carrier = ExecStatusCarrier::RacyPipe;
+    }
+    let exec: Vec<std::ffi::OsString> = vec!["/bin/sh".into(), "-c".into(), "exit 0".into()];
+    let spawn = || {
+        let _ = exec_carrier_seen::take();
+        let sh = spawn_shell_with_pid_cell_px(
+            24,
+            80,
+            &spawn_cap,
+            &sandbox_cap,
+            &[],
+            None,
+            None,
+            None,
+            Some(&exec),
+            None,
+            None,
+            aterm_sandbox::Limits::inherit(),
+            None,
+            None,
+        )
+        .expect("the probe command must spawn");
+        reap(sh.pid);
+        close_fd(sh.master);
+        exec_carrier_seen::take()
+    };
+    let lent = spawn();
+    assert!(
+        pool.lock().unwrap().ready.is_empty(),
+        "the spawn took the kit"
+    );
+    let fresh = spawn();
+    TEST_KITS.with(|kits| kits.set(None));
+    assert_eq!(fill_kits(pool, 0).expect("close the spent ends"), 0);
+    assert_eq!(
+        lent,
+        Some(ExecStatusCarrier::RacyPipe),
+        "a spawn told a carrier other than its lent kit's"
+    );
+    assert_eq!(
+        fresh,
+        Some(ATOMIC_EXEC_STATUS_CARRIER),
+        "a spawn told a carrier other than its fresh kit's"
+    );
+}
+
 fn spawn_probe_checks_the_child(absent: Option<&[libc::c_int]>, pass: ProbePass) {
     use std::os::fd::{BorrowedFd, IntoRawFd};
-    use std::sync::atomic::Ordering;
     use std::time::Duration;
     // SAFETY: single-threaded test, trusted-launcher contract trivially holds.
     let authority = unsafe { aterm_cap::Authority::root_authority() };
@@ -2158,7 +2228,7 @@ fn spawn_probe_checks_the_child(absent: Option<&[libc::c_int]>, pass: ProbePass)
         at,
     });
     let exec: Vec<std::ffi::OsString> = vec!["/bin/sh".into(), "-c".into(), script.into()];
-    let racy_before = RACY_EXEC_STATUS_CARRIERS.load(Ordering::Relaxed);
+    let _ = exec_carrier_seen::take();
     let sh = spawn_shell_with_pid_cell_px(
         41,
         137,
@@ -2183,7 +2253,7 @@ fn spawn_probe_checks_the_child(absent: Option<&[libc::c_int]>, pass: ProbePass)
         "{pass:?}: the spawn returns while its program runs, so nothing the child holds past \
          its exec keeps the exec-status channel open"
     );
-    let racy_after = RACY_EXEC_STATUS_CARRIERS.load(Ordering::Relaxed);
+    let carrier = exec_carrier_seen::take();
     let marked_after = fd_flags(pipe_rd, "the passed read end") & FD_CLOFORK;
     for fd in [parked, pipe_rd, pipe_wr] {
         close_fd(fd);
@@ -2292,7 +2362,8 @@ fn spawn_probe_checks_the_child(absent: Option<&[libc::c_int]>, pass: ProbePass)
     // SAFETY: `cfgetospeed` only reads the termios.
     assert_eq!(unsafe { libc::cfgetospeed(&termios) }, libc::B230400);
     assert_eq!(
-        racy_before, racy_after,
+        carrier,
+        Some(ATOMIC_EXEC_STATUS_CARRIER),
         "the spawn fell back to the RACY `pipe(2)`+fcntl status carrier"
     );
     assert_ne!(

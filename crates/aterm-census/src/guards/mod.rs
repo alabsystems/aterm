@@ -43,6 +43,7 @@ mod release_test_state;
 mod rules;
 mod rustup_keg;
 mod seam_caller;
+mod seam_reset;
 mod shown_term;
 mod slog_inert;
 mod stock_label;
@@ -120,6 +121,7 @@ pub const GUARDS: &[Rule] = &[
     shown_term::SHOWN_TERM,
     slog_inert::SLOG_INERT,
     eager_drop::EAGER_DROP,
+    seam_reset::SEAM_RESET,
     doc_sentence::DOC_SENTENCE,
     stock_label::STOCK_LABEL,
     github::GITHUB_AUTH_DOOR,

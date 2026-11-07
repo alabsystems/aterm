@@ -266,9 +266,15 @@ fn rewriting_source_config_is_refused_before_any_import() {
     let root = aterm_tempfile::tempdir().unwrap();
     let target = repo(root.path(), "target", false);
     let bare = repo(root.path(), "remote.git", true);
-    // The same source is admissible before its config redirects Git. Refusal
-    // below must be caused by that rewrite, not another fixture setup failure.
-    drop(local(&target, &bare));
+    let client = |effects| {
+        GithubBuilder::new(Router::empty())
+            .fx(effects)
+            .git_remote_for_tests("fixture/app", &bare)
+            .build()
+    };
+    let effects = || Arc::new(agh::Fx::simulated(agh::Fx::live().wall_secs().unwrap()));
+    let slug = Slug::parse("fixture/app").unwrap();
+    drop(Remote::new(client(effects()), slug.clone(), &target).unwrap());
     git(
         &target,
         &[
@@ -277,11 +283,32 @@ fn rewriting_source_config_is_refused_before_any_import() {
             "https://github.com/",
         ],
     );
-    let client = GithubBuilder::new(Router::empty())
-        .git_remote_for_tests("fixture/app", &bare)
-        .build();
-    assert!(Remote::new(client, Slug::parse("fixture/app").unwrap(), &target).is_err());
+    let config = std::fs::read(target.join(".git/config")).unwrap();
+    let effects = effects();
+    let error = Remote::new(client(Arc::clone(&effects)), slug, &target)
+        .err()
+        .unwrap();
+    assert!(
+        !error.contains("other.invalid"),
+        "private URL leaked: {error}"
+    );
+    assert!(
+        effects.children_run().iter().all(|child| {
+            !child
+                .args
+                .iter()
+                .any(|arg| matches!(arg.to_str(), Some("clone" | "fetch" | "ls-remote" | "push")))
+        }),
+        "source refusal must precede all remote Git commands"
+    );
+    assert_eq!(std::fs::read(target.join(".git/config")).unwrap(), config);
     assert!(git(&target, &["for-each-ref"]).is_empty());
+    assert!(git(&bare, &["for-each-ref"]).is_empty());
+    git(
+        &target,
+        &["config", "--unset", "url.https://other.invalid/.insteadOf"],
+    );
+    drop(local(&target, &bare));
 }
 
 #[test]

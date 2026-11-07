@@ -16,7 +16,7 @@ use crate::wall::{ApiCause, Placement, Wall, WallKind};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 14, "0.14");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 15, "0.15");
 
 const SPINNER: std::ops::RangeInclusive<char> = '\u{2801}'..='\u{28FF}';
 
@@ -1483,6 +1483,7 @@ fn box_prompt(rows: &[String], b: AgyBox) -> PromptV2 {
         title: crate::text::trim(&rows[title_row]).to_string(),
         command_rows,
         description_rows: 0,
+        spellings: None,
         gutter: false,
         command,
         description,
@@ -1517,6 +1518,7 @@ fn alert_prompt(rows: &[String]) -> Option<PromptV2> {
         title: crate::text::trim(&rows[row]).to_string(),
         command_rows: Vec::new(),
         description_rows: 0,
+        spellings: None,
         gutter: false,
         command: String::new(),
         description: String::new(),
@@ -1611,6 +1613,7 @@ fn onboarding(rows: &[String]) -> Option<PromptV2> {
         title: title.to_string(),
         command_rows: Vec::new(),
         description_rows: 0,
+        spellings: None,
         gutter: false,
         command: String::new(),
         description: String::new(),

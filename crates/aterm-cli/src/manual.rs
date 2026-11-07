@@ -3027,7 +3027,11 @@ THE BOARD (this Mac's record of every worker it started, here or on another Mac)
                              SHA-256 (never its text), state, `rev=`, conclusion, `why=`,
                              `checked=`, the commit it landed and the accept result;
                              the aterm serving this Mac keeps it current, as does a
-                             wait here that asks a worker where its row says it runs
+                             wait here that asks a worker where its row says it runs;
+                             a worker sent with `--sock` to an aterm of another
+                             environment (a `lab instance`), whose sessions this Mac's
+                             socket folder does not record, is that aterm's: no row
+                             here, and no `from=` naming this shell's session there
   aterm ctl await task board [any|all] [since=0] [from=<sid>] [label=<word>]
                              wait on every open row, each where it runs, without its
                              sid (with no `since=`, from what the board last read)

@@ -241,23 +241,26 @@ mod tests {
     /// The report of a front started by `sh` with `trap` set (empty for none).
     fn report(trap: &str) -> String {
         let exe = std::env::current_exe().expect("test binary");
-        let mut child = aterm_uds::spawnfd::command("/bin/sh")
-            .args([
-                "-c",
-                &format!(
-                    "{trap} exec \"$0\" --exact \
-                     build_admit::becoming::tests::standin_front_handles_and_becomes \
-                     --test-threads=1 --nocapture"
-                ),
-            ])
-            .arg(&exe)
-            .env(FRONT, "1")
-            .env(REPORT, "1")
-            .stdin(aterm_uds::spawnfd::Stdio::null())
-            .stdout(aterm_uds::spawnfd::Stdio::piped())
-            .stderr(aterm_uds::spawnfd::Stdio::null())
-            .spawn()
-            .expect("the front");
+        // The report is of what the front inherits.
+        let mut child = crate::platform::spawn_outside_a_stand_aside(|| {
+            aterm_uds::spawnfd::command("/bin/sh")
+                .args([
+                    "-c",
+                    &format!(
+                        "{trap} exec \"$0\" --exact \
+                         build_admit::becoming::tests::standin_front_handles_and_becomes \
+                         --test-threads=1 --nocapture"
+                    ),
+                ])
+                .arg(&exe)
+                .env(FRONT, "1")
+                .env(REPORT, "1")
+                .stdin(aterm_uds::spawnfd::Stdio::null())
+                .stdout(aterm_uds::spawnfd::Stdio::piped())
+                .stderr(aterm_uds::spawnfd::Stdio::null())
+                .spawn()
+                .expect("the front")
+        });
         let status = until_within(MUST_HAPPEN, "the stand-ins' end", || {
             child.try_wait().ok().flatten()
         });

@@ -11,8 +11,9 @@
 //!   ([`CmdMeter::slice`], one `proc_pid_rusage` of the shell at each edge); its peak memory and
 //!   a `stalled` stop are the jobs engine's readings of the block's job ([`jobs_passed`]).
 //! * An agent's tool call (`kind=agent-call`): the jobs engine's `agent-call` jobs as they end
-//!   ([`jobs_passed`]), every figure sampled at its passes. How it ended is its leader's wait
-//!   status, which a kernel exit watch on the leader reads though aterm is not its parent
+//!   ([`jobs_passed`]), every figure sampled at its passes but, where its leader's exit was read,
+//!   its end. How and when it ended is its leader's wait status and the moment the kernel
+//!   reported it, which kernel exit watches on the leader read though aterm is not its parent
 //!   ([`CallWatch`]); its label is the program the call ran, never the agent's shell wrapper.
 //! * A worker spawn (`kind=spawn`): the `spawn` verb's answer ([`spawned`]).
 //!
@@ -277,8 +278,8 @@ fn take_block_job(session: u64, block: u64) -> Option<(Option<u64>, bool)> {
 }
 
 /// After a jobs pass at host clock `at_ms`: keep what it read of each block's job for that block's
-/// command row, and write a row for each agent call that ended.
-pub(crate) fn jobs_passed(jobs: &mut aterm_vitals::jobs::Jobs, at_ms: u64) {
+/// command row, and write a row for each agent call that ended, counted on `calls`'s counts.
+pub(crate) fn jobs_passed(jobs: &mut aterm_vitals::jobs::Jobs, at_ms: u64, calls: &CallWatch) {
     {
         let mut kept = BLOCK_JOBS.lock().unwrap_or_else(PoisonError::into_inner);
         for m in jobs.block_meters() {
@@ -293,14 +294,31 @@ pub(crate) fn jobs_passed(jobs: &mut aterm_vitals::jobs::Jobs, at_ms: u64) {
             }
         }
     }
-    let ended = jobs.take_ended();
-    let _ = count_missed(&ended);
-    let Some((host_name, facts)) = host() else {
+    calls_ended(
+        &jobs.take_ended(),
+        (at_ms, aterm_telemetry::now_ms()),
+        calls.counts,
+        host(),
+        emit,
+    );
+}
+
+/// The jobs that `ended` by a pass at host clock `at` (with the wall clock then): each agent call
+/// that ended with no status counted missed on `counts`, whether or not this process writes rows,
+/// and each agent call's row handed to `emit` where it has a `host` to name.
+fn calls_ended(
+    ended: &[aterm_vitals::jobs::Ended],
+    (at_ms, wall_now): (u64, u64),
+    counts: &CallCounts,
+    host: Option<(&str, Digest)>,
+    mut emit: impl FnMut(Row),
+) {
+    counts.missed(ended);
+    let Some((host_name, facts)) = host else {
         return;
     };
-    let wall_now = aterm_telemetry::now_ms();
     for e in ended {
-        if let Some(row) = agent_call_row(&e, at_ms, wall_now, host_name, facts) {
+        if let Some(row) = agent_call_row(e, at_ms, wall_now, host_name, facts) {
             emit(row);
         }
     }
@@ -317,7 +335,18 @@ fn agent_call_row(
     if e.kind != aterm_vitals::jobs::JobKind::AgentCall {
         return None;
     }
-    let to_wall = |ms: u64| wall_now.saturating_sub(host_at_ms.saturating_sub(ms));
+    // A moment on the host's clock as a wall time: the pass's `host_at_ms` read as `wall_now`. A
+    // leader's exit can fall past the pass's start, between it and the read that took it.
+    let to_wall = |ms: u64| {
+        if ms <= host_at_ms {
+            wall_now.saturating_sub(host_at_ms - ms)
+        } else {
+            wall_now.saturating_add(ms - host_at_ms)
+        }
+    };
+    // A watched call ended when its leader did, as the watch stamped it; any other at the pass
+    // that found it gone, which may come long after (a windowless instance reads at its edges).
+    let end_ms = e.leader_exited_ms.unwrap_or(e.ended_ms);
     // The program the call ran, as the kernel named it: a call no pass saw run one (shell
     // builtins alone) has no label and no key, as a command no read confirmed has none.
     let program = e.ran.as_deref();
@@ -336,7 +365,7 @@ fn agent_call_row(
         stop = Stop::Stalled;
     }
     Some(Row {
-        at_ms: to_wall(e.ended_ms),
+        at_ms: to_wall(end_ms),
         kind: Kind::AgentCall,
         key: what.map(|what| Digest::key(&Kind::AgentCall, what, None)),
         dir: None,
@@ -345,7 +374,7 @@ fn agent_call_row(
         on: None,
         host: host_name.to_owned(),
         facts,
-        wall_ms: Fig::Known(e.ended_ms.saturating_sub(e.opened_ms)),
+        wall_ms: Fig::Known(end_ms.saturating_sub(e.opened_ms)),
         cpu_ms: e.cpu_ns.map_or_else(
             || Fig::unknown(source::JOBS),
             |ns| Fig::Known(ns / 1_000_000),
@@ -363,9 +392,10 @@ fn agent_call_row(
     })
 }
 
-/// The most agent calls' leaders a [`CallWatch`] holds a kernel watch on at once (one kqueue
-/// each): past it a new call goes unwatched until a watch frees, and one that ends unwatched ends
-/// with no status, counted missed.
+/// The most agent calls' leaders a [`CallWatch`] watches at once (each two kqueues, the status's
+/// and the moment's, and the moment's pipe and thread, [`Watched`]): past it a new call goes
+/// unwatched until a watch frees, and one that ends unwatched ends with no status, counted
+/// missed.
 #[cfg(target_vendor = "apple")]
 pub(crate) const CALL_WATCH_CAP: usize = 64;
 
@@ -375,14 +405,13 @@ pub(crate) const CALL_WATCH_CAP: usize = 64;
 #[cfg(target_vendor = "apple")]
 pub(crate) const GONE_WAIT: Duration = Duration::from_millis(10);
 
-/// What this process's agent-call watches did, for the `telemetry` verb's `calls` line.
-static CALLS: CallCounts = CallCounts {
-    watched: AtomicU64::new(0),
-    read: AtomicU64::new(0),
-    missed: AtomicU64::new(0),
-};
+/// What this process's agent-call watches did, for the `telemetry` verb's `calls` line: the
+/// window's one [`CallWatch`] counts here.
+static CALLS: CallCounts = CallCounts::new();
 
-struct CallCounts {
+/// What a [`CallWatch`] did, since its process started.
+#[derive(Debug)]
+pub(crate) struct CallCounts {
     /// Leaders a watch was registered on and proved to be the call's ([`CallWatch::watch`]).
     watched: AtomicU64,
     /// Watched leaders whose status was read ([`CallWatch::read`]).
@@ -393,13 +422,37 @@ struct CallCounts {
     missed: AtomicU64,
 }
 
+impl CallCounts {
+    pub(crate) const fn new() -> Self {
+        Self {
+            watched: AtomicU64::new(0),
+            read: AtomicU64::new(0),
+            missed: AtomicU64::new(0),
+        }
+    }
+
+    /// `(watched, read, missed)`.
+    pub(crate) fn get(&self) -> (u64, u64, u64) {
+        (
+            self.watched.load(Ordering::Relaxed),
+            self.read.load(Ordering::Relaxed),
+            self.missed.load(Ordering::Relaxed),
+        )
+    }
+
+    /// The agent calls of `ended` that ended with no status, counted missed.
+    fn missed(&self, ended: &[aterm_vitals::jobs::Ended]) {
+        let n = ended
+            .iter()
+            .filter(|e| e.kind == aterm_vitals::jobs::JobKind::AgentCall && e.ended_by.is_none())
+            .count() as u64;
+        self.missed.fetch_add(n, Ordering::Relaxed);
+    }
+}
+
 /// What this process's agent-call watches counted: `(watched, read, missed)`.
 pub(crate) fn call_counts() -> (u64, u64, u64) {
-    (
-        CALLS.watched.load(Ordering::Relaxed),
-        CALLS.read.load(Ordering::Relaxed),
-        CALLS.missed.load(Ordering::Relaxed),
-    )
+    CALLS.get()
 }
 
 #[cfg(target_vendor = "apple")]
@@ -407,43 +460,55 @@ fn count(n: &AtomicU64) {
     n.fetch_add(1, Ordering::Relaxed);
 }
 
-/// The agent calls of `ended` that ended with no status, added to the `missed` count.
-fn count_missed(ended: &[aterm_vitals::jobs::Ended]) -> u64 {
-    let n = ended
-        .iter()
-        .filter(|e| e.kind == aterm_vitals::jobs::JobKind::AgentCall && e.ended_by.is_none())
-        .count() as u64;
-    CALLS.missed.fetch_add(n, Ordering::Relaxed);
-    n
-}
-
 /// A kernel exit watch on each live agent call's leader ([`aterm_vitals::jobs::JobRow::leader`]),
 /// on the jobs pass's thread: aterm is not the leader's parent, but a process of the same user may
-/// watch it (`EVFILT_PROC` `NOTE_EXIT | NOTE_EXITSTATUS`, [`aterm_uds::exitwatch::ExitWatch`]), and
-/// the status it reads is the call's own, which the agent alone reaps. [`Self::watch`] registers a
-/// watch after each pass on each new call, then re-reads the leader's start, so a pid taken anew
-/// is never watched as the call's; [`Self::read`] hands the next pass each status read, decoded
-/// ([`aterm_vitals::jobs::LeaderExit`]). Off Apple platforms there is no such watch, and every
-/// call ends with no status.
+/// watch it (`EVFILT_PROC` `NOTE_EXIT | NOTE_EXITSTATUS`), and the status it reads is the call's
+/// own, which the agent alone reaps. Each watch is two on the one pid ([`Watched`]): the pass
+/// reads the status from an [`aterm_uds::exitwatch::ExitWatch`], and an
+/// [`aterm_uds::exitwatch::ExitMoment`]'s thread stamps the moment the kernel reports the exit, so
+/// the call's end is its own, however long before the pass that reads it. [`Self::watch`]
+/// registers a watch after each pass on each new call, then re-reads the leader's start, so a pid
+/// taken anew is never watched as the call's; [`Self::read`] hands the next pass each status read,
+/// decoded, with its moment on the pass's clock ([`aterm_vitals::jobs::LeaderExit`]). Off Apple
+/// platforms there is no such watch, and every call ends with no status.
 #[derive(Debug)]
 pub(crate) struct CallWatch {
+    /// Where it counts what it did: [`CALLS`], which the `telemetry` verb reads.
+    counts: &'static CallCounts,
     #[cfg(target_vendor = "apple")]
     live: bool,
     #[cfg(target_vendor = "apple")]
-    watches: BTreeMap<(u32, u64), aterm_uds::exitwatch::ExitWatch>,
+    watches: BTreeMap<(u32, u64), Watched>,
     /// Open calls whose leader no watch may be the call's: gone before the watch, or another
     /// process than the start the row read. Never asked again while the call is open.
     #[cfg(target_vendor = "apple")]
     refused: BTreeSet<(u32, u64)>,
 }
 
+/// One leader's watches. The kernel posts a pid's exit to every kqueue watching it at once, so
+/// both report the one exit: the status the pass reads, and the moment a thread stamped as the
+/// kernel reported it. The pass never waits on the thread: a status it reads before the stamp
+/// lands (or with no moment's watch, its thread not started) takes the read's own instant.
+#[cfg(target_vendor = "apple")]
+#[derive(Debug)]
+struct Watched {
+    exit: aterm_uds::exitwatch::ExitWatch,
+    moment: Option<aterm_uds::exitwatch::ExitMoment<Instant>>,
+}
+
 impl CallWatch {
     /// A watch; `live` false makes one that never registers (a unit test's jobs pass, whose
     /// scripted pids are no process of its own).
     pub(crate) fn new(live: bool) -> Self {
+        Self::counting(live, &CALLS)
+    }
+
+    /// [`Self::new`], counting on `counts`.
+    pub(crate) fn counting(live: bool, counts: &'static CallCounts) -> Self {
         #[cfg(not(target_vendor = "apple"))]
         let _ = live;
         Self {
+            counts,
             #[cfg(target_vendor = "apple")]
             live,
             #[cfg(target_vendor = "apple")]
@@ -454,36 +519,67 @@ impl CallWatch {
     }
 
     /// Before a pass, after its sweep: the status of each watched leader the kernel has queued,
-    /// its watch let go. A leader the sweep no longer lists (`listed` false) is waited on
-    /// briefly, all such leaders within [`GONE_WAIT`] together; one still without a status keeps
-    /// its watch, which [`Self::watch`] lets go once the engine no longer holds its call open.
+    /// its watch let go, with the moment its exit was stamped as `now_ms` (the pass's clock now)
+    /// reads it. A leader the sweep no longer lists (`listed` false) is waited on briefly, all
+    /// such leaders within [`GONE_WAIT`] together; one still without a status keeps its watch,
+    /// which [`Self::watch`] lets go once the engine no longer holds its call open.
     #[cfg(target_vendor = "apple")]
     pub(crate) fn read(
         &mut self,
         listed: impl Fn(u32) -> bool,
+        now_ms: impl Fn() -> u64,
     ) -> Vec<aterm_vitals::jobs::LeaderExit> {
-        let deadline = Instant::now() + GONE_WAIT;
-        let mut out = Vec::new();
+        self.read_within(listed, now_ms, GONE_WAIT)
+    }
+
+    /// [`Self::read`], waiting up to `gone_wait` for the leaders the sweep no longer lists.
+    #[cfg(target_vendor = "apple")]
+    fn read_within(
+        &mut self,
+        listed: impl Fn(u32) -> bool,
+        now_ms: impl Fn() -> u64,
+        gone_wait: Duration,
+    ) -> Vec<aterm_vitals::jobs::LeaderExit> {
+        let deadline = Instant::now() + gone_wait;
+        let counts = self.counts;
+        let mut read = Vec::new();
         self.watches.retain(|&(pid, start), watch| {
-            let raw = watch.exit_status().or_else(|| {
+            let raw = watch.exit.exit_status().or_else(|| {
                 if listed(pid) {
                     None
                 } else {
-                    watch.exit_status_within(deadline.saturating_duration_since(Instant::now()))
+                    watch
+                        .exit
+                        .exit_status_within(deadline.saturating_duration_since(Instant::now()))
                 }
             });
             let Some(end) = raw.and_then(exit_of) else {
                 return true;
             };
-            count(&CALLS.read);
-            out.push(aterm_vitals::jobs::LeaderExit {
-                pid,
-                start: Some(start),
-                end,
-            });
+            let read_at = Instant::now();
+            let moment = watch
+                .moment
+                .as_ref()
+                .and_then(aterm_uds::exitwatch::ExitMoment::get)
+                .map_or(read_at, |m| m.min(read_at));
+            count(&counts.read);
+            read.push((pid, start, end, moment));
             false
         });
-        out
+        // One reading of both clocks puts every moment on the pass's.
+        let (now, now_ms) = (Instant::now(), now_ms());
+        read.into_iter()
+            .map(|(pid, start, end, moment)| {
+                let ago = u64::try_from(now.saturating_duration_since(moment).as_millis())
+                    .unwrap_or(u64::MAX);
+                aterm_vitals::jobs::LeaderExit {
+                    pid,
+                    start: Some(start),
+                    end,
+                    at_ms: now_ms.saturating_sub(ago),
+                }
+            })
+            .collect()
     }
 
     /// See the Apple twin: no exit watch here.
@@ -491,6 +587,7 @@ impl CallWatch {
     pub(crate) fn read(
         &mut self,
         _listed: impl Fn(u32) -> bool,
+        _now_ms: impl Fn() -> u64,
     ) -> Vec<aterm_vitals::jobs::LeaderExit> {
         Vec::new()
     }
@@ -543,9 +640,16 @@ impl CallWatch {
             if self.watches.len() >= CALL_WATCH_CAP {
                 break;
             }
-            match aterm_uds::exitwatch::ExitWatch::watch(pid) {
+            // Registered first, then the start re-read: the watches hold the exit of whatever
+            // process had the pid as they registered, which the re-read proves is the call's. A
+            // moment's watch that fails (no thread) leaves the status's, read at the pass.
+            let watch = aterm_uds::exitwatch::ExitWatch::watch(pid).map(|exit| Watched {
+                exit,
+                moment: aterm_uds::exitwatch::ExitMoment::watch(pid, Instant::now),
+            });
+            match watch {
                 Some(w) if birth(pid) == Some(start) => {
-                    count(&CALLS.watched);
+                    count(&self.counts.watched);
                     self.watches.insert((pid, start), w);
                 }
                 // Gone before the watch (its call ends with no status), or a pid taken anew.
@@ -560,6 +664,15 @@ impl CallWatch {
     #[cfg(all(test, target_vendor = "apple"))]
     pub(crate) fn watching(&self) -> usize {
         self.watches.len()
+    }
+
+    /// How many of its watches have stamped an exit not read yet.
+    #[cfg(all(test, target_vendor = "apple"))]
+    fn stamps(&self) -> usize {
+        self.watches
+            .values()
+            .filter(|w| w.moment.as_ref().is_some_and(|m| m.get().is_some()))
+            .count()
     }
 }
 

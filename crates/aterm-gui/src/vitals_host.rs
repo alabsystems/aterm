@@ -23,16 +23,16 @@ use aterm_vitals::history::{FreeHistory, SavedFree, VolumeId};
 use aterm_vitals::model::{
     AccountIx, AneCheck, AneSample, ClusterSpec, CommitSample, DiskFacts, DiskLevel, GpuSample,
     Hog, LinkKind, LinkSample, MemCounters, MemSample, PlanFact, Pressure, ProcSample, ProcState,
-    Sample, SavedStrip, Snapshot, StripEvent, StripEventKind, TabRoot, TabTokens, TaskRoom,
-    Thermal, Throttle, Ticks, VolumeSample,
+    Sample, SavedStrip, Snapshot, TabRoot, TabTokens, TaskRoom, Thermal, Throttle, Ticks,
+    VolumeSample,
 };
-use aterm_vitals::ring::{GapKind, SavedRing, TimeGap};
 use aterm_vitals::sys::Machine;
 
 use crate::disk_board::{Clock, DiskFactsRaw, Shelf};
 use crate::disk_where::Where;
 use crate::occupancy_host::Arming;
 use crate::sys_host::PaneFact;
+use strip::StripStore;
 
 /// A reading a second while a focused window shows the Deck.
 pub(crate) const FOCUSED_PERIOD: Duration = Duration::from_secs(1);
@@ -45,23 +45,25 @@ const PEAKS_FILE: &str = "vitals-peaks.json";
 const PEAKS_SCHEMA: u32 = 1;
 const PEAKS_MAX_BYTES: u64 = 16 * 1024;
 /// The disk's free history, kept beside [`PEAKS_FILE`] and written as it is; a full day on a mount
-/// point of up to 1024 bytes is under [`PEAKS_MAX_BYTES`].
+/// point of up to 1024 bytes is under [`FREE_MAX_BYTES`].
 const FREE_FILE: &str = "vitals-free.json";
-const FREE_SCHEMA: u32 = 1;
-/// The 1-hour multi-scale strip rings, gaps and event markers, checkpointed on a reading at least
-/// 10 s after the last write, at the start of a lock holder that restored an unclean checkpoint
-/// ([`restore_strip`]) and at the thread's stop (clean only at a quit, [`VitalsHost::stopping`]) so
-/// restarts and crashes retain pre-crash history. A start's first checkpoint is due at once, and so
-/// is the first reading's after a write at the start.
-const STRIP_EVERY: Duration = Duration::from_secs(10);
-const STRIP_FILE: &str = "vitals-strip.json";
-/// The lock beside [`STRIP_FILE`] whose holder is the one aterm of a state home that writes it and
-/// [`PEAKS_FILE`] ([`StripLock`]).
+/// The bound [`FREE_FILE`] is read under: a day of the widest time-weighted buckets fits in 75 %
+/// of it.
+const FREE_MAX_BYTES: u64 = 32 * 1024;
+/// Schema 2: each bucket is a time-weighted [`aterm_vitals::Agg`]. A schema-1 file (least free
+/// and a count) restores nothing.
+const FREE_SCHEMA: u32 = 2;
+/// The lock beside [`PEAKS_FILE`] whose holder is the one aterm of a state home that writes it and
+/// the strip's checkpoint ([`StripLock`], [`strip::StripStore`]): the strip's base, rewritten at a
+/// start's first reading, hourly and at the thread's stop (clean only at a quit,
+/// [`VitalsHost::stopping`]), and its tail, a line per closed epoch, so restarts and crashes keep
+/// the strip; a lock holder that restored an unclean checkpoint writes its base at its start too
+/// ([`restore_strip`]).
 const STRIP_LOCK: &str = "vitals-strip.lock";
-const STRIP_SCHEMA: u32 = 1;
-const STRIP_MAX_BYTES: u64 = 512 * 1024;
 /// Raw anomaly evidence is saved by the existing probe thread, separately from live state.
 const CPU_REPORT_FILE: &str = "vitals-cpu-report.json";
+/// The CPU report is written at most this often, and at once at a start.
+const CPU_REPORT_EVERY: Duration = Duration::from_secs(10);
 const CPU_REPORT_MAX_BYTES: u64 = 4 * 1024 * 1024;
 /// How long the quit waits for the probe thread to end and write the peaks and the free history.
 pub(crate) const STOP_BOUND: Duration = Duration::from_millis(500);
@@ -309,14 +311,79 @@ impl Audience {
     }
 }
 
-fn due_at(
+/// When the next reading at cadence `period` is due at `now`, `wall_ms` on the wall clock: at
+/// once before any ask, else on the half-slot (record §5.2), the first instant at least half a
+/// period after the last ask (`asked`) whose wall time is half a period past a multiple of the
+/// period (focused: x.500; a lens: x.250 and x.750; the background: 2.5 s into each 5 s), so each
+/// reading stands in the middle of its own slot and a wake's lateness never accumulates; and no
+/// later than `armed`. With no wall clock (`wall_ms` `None`), a period after the last ask.
+fn due_on_phase(
     asked: Option<Instant>,
     armed: Option<Instant>,
     period: Duration,
     now: Instant,
+    wall_ms: Option<i64>,
 ) -> Instant {
-    let paced = asked.map_or(now, |t| t + period);
+    let paced = asked.map_or(now, |t| match wall_ms {
+        Some(wall_ms) => on_phase(t + period / 2, period, now, wall_ms),
+        None => t + period,
+    });
     armed.map_or(paced, |a| a.min(paced))
+}
+
+/// The first instant at or after `from` whose wall time is half of `period` past a multiple of
+/// it, `now` being `wall_ms` on the wall clock.
+fn on_phase(from: Instant, period: Duration, now: Instant, wall_ms: i64) -> Instant {
+    let p = i64::try_from(period.as_millis()).unwrap_or(i64::MAX).max(1);
+    let from_wall = wall_ms.saturating_add(signed_ms(from, now));
+    let wait = (p / 2).saturating_sub(from_wall).rem_euclid(p);
+    from + Duration::from_millis(u64::try_from(wait).unwrap_or(0))
+}
+
+/// `a − b` in whole milliseconds, either way round.
+fn signed_ms(a: Instant, b: Instant) -> i64 {
+    let ms = |d: Duration| i64::try_from(d.as_millis()).unwrap_or(i64::MAX);
+    match a.checked_duration_since(b) {
+        Some(ahead) => ms(ahead),
+        None => -ms(b.saturating_duration_since(a)),
+    }
+}
+
+/// Where the reading cadence reads the wall clock it keeps to ([`due_on_phase`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Wall {
+    /// The system's.
+    #[cfg_attr(
+        test,
+        expect(
+            dead_code,
+            reason = "a test's host keeps to no clock or to a fixed one"
+        )
+    )]
+    System,
+    /// `wall_ms` at `at`, moving with the monotonic clock: a test's.
+    #[cfg(test)]
+    Fixed { at: Instant, wall_ms: i64 },
+    /// None: a reading is due a period after the last ask. Tests default to it, so their
+    /// cadences count from their asks whatever the clock reads.
+    #[cfg(test)]
+    Unread,
+}
+
+impl Wall {
+    /// The wall clock at `now`, unix ms; `None` where it does not read.
+    fn at(self, now: Instant) -> Option<i64> {
+        match self {
+            Self::System => {
+                let wall_ms = unix_ms_now();
+                (wall_ms > 0).then(|| wall_ms.saturating_sub(signed_ms(Instant::now(), now)))
+            }
+            #[cfg(test)]
+            Self::Fixed { at, wall_ms } => Some(wall_ms.saturating_add(signed_ms(now, at))),
+            #[cfg(test)]
+            Self::Unread => None,
+        }
+    }
 }
 
 /// What the loop asks the thread to read.
@@ -354,7 +421,8 @@ pub(crate) struct Request {
     /// The stuck engine looks at this reading even inside its own cadence.
     pub(crate) jobs_now: bool,
     /// A control worker's pull ([`Msg::Pull`]; the thread sets it): it reads
-    /// the split set only while a `sys why` arms it ([`SPLIT_ARMED`]).
+    /// the split set only while a `sys why` arms it ([`SPLIT_ARMED`]), and its readings stand
+    /// for an instant in the rings ([`aterm_vitals::model::Sample::pull`]).
     pub(crate) pull: bool,
     /// A pull that a `sys cores`, `sys report` or forced `sys why` had armed when it began
     /// ([`HARDWARE_ARMED`]; the thread sets it): its readings take a CPU Stats sample. The pull
@@ -783,6 +851,8 @@ pub(crate) struct VitalsHost {
     survey: Arc<Where>,
     board: &'static crate::vitals_jobs::JobsBoard,
     proc_edge: &'static ProcEdge,
+    /// The wall clock the reading cadence keeps to.
+    pub(crate) wall: Wall,
     /// The closed tabs whose leftovers a `proc.left` record told, among those the adopted view
     /// holds: each close is told once ([`crate::message_reporters::newly_left`]).
     left_told: std::collections::BTreeSet<u64>,
@@ -844,6 +914,10 @@ impl Default for VitalsHost {
             } else {
                 &PROC_EDGE
             },
+            #[cfg(test)]
+            wall: Wall::Unread,
+            #[cfg(not(test))]
+            wall: Wall::System,
             left_told: std::collections::BTreeSet::new(),
             links_told: std::collections::VecDeque::new(),
         }
@@ -938,7 +1012,8 @@ impl VitalsHost {
     }
 
     fn windowless_deadline(&self, hidden: Option<Duration>, now: Instant) -> Option<Instant> {
-        let paced = hidden.map(|period| due_at(self.asked_at, None, period, now));
+        let wall_ms = self.wall.at(now);
+        let paced = hidden.map(|period| due_on_phase(self.asked_at, None, period, now, wall_ms));
         let full = match (self.jobs_due, self.delegated_due) {
             (Some(engine), Some(delegated)) => Some(engine.min(delegated)),
             (engine, delegated) => engine.or(delegated),
@@ -1415,7 +1490,10 @@ fn run(
         shared
     });
     let free = peaks.as_deref().map(|p| p.with_file_name(FREE_FILE));
-    let strip = peaks.as_deref().map(|p| p.with_file_name(STRIP_FILE));
+    let home = peaks
+        .as_deref()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf);
     let report = peaks.as_deref().map(|p| p.with_file_name(CPU_REPORT_FILE));
     let mut writer = StripLock::take(peaks.as_deref().map(|p| p.with_file_name(STRIP_LOCK)));
     let open_at = Instant::now();
@@ -1424,7 +1502,14 @@ fn run(
     source.model().restore_peaks(restored);
     let (mut free, kept) = FreeFile::open(free, open_at, open_ms);
     source.model().restore_free_history(kept);
-    let mut strip = restore_strip(strip, open_at, open_ms, prior, &mut writer, source.model());
+    let mut strip = restore_strip(
+        home.as_deref(),
+        open_at,
+        open_ms,
+        prior,
+        &mut writer,
+        source.model(),
+    );
     let (mut report, prior_report) = CpuReportFile::open(report, open_at, open_ms);
     source.model().restore_cpu_report(prior_report);
     let mut current_report = None;
@@ -1529,12 +1614,7 @@ fn run(
         }
         peaks.keep_owned(source.model().peaks(), kept_at, false, &mut writer);
         free.keep(source.model().free_history(), kept_at, false);
-        strip.keep_owned(
-            &source.model().saved_strip(false),
-            kept_at,
-            false,
-            &mut writer,
-        );
+        strip.keep(source.model(), kept_at, &mut writer);
     }
     let stop_at = Instant::now();
     let quit = stopping.load(Ordering::Acquire);
@@ -1543,12 +1623,7 @@ fn run(
     }
     peaks.keep_owned(source.model().peaks(), stop_at, true, &mut writer);
     free.keep(source.model().free_history(), stop_at, true);
-    strip.keep_owned(
-        &source.model().saved_strip(quit),
-        stop_at,
-        true,
-        &mut writer,
-    );
+    strip.stop(source.model(), quit, stop_at, &mut writer);
     // The lock goes only after the stop's write, so the aterm that takes it next writes after it.
     drop(writer);
     // After the files above, so a slow write of the closed-tab record delays none of them.
@@ -1562,7 +1637,10 @@ fn run(
 /// pair) leaves that word stamped before the output, naming no wait. `req` keeps the words the
 /// last reading read with, which the view is handed back with. The pull keeps the engine's
 /// cadence, whatever that request asked of it, but for its last reading while a `sys jobs`
-/// arms the engine ([`Source::jobs_armed`]): one look, never the warm one's too.
+/// arms the engine ([`Source::jobs_armed`]): one look, never the warm one's too. Its readings'
+/// cadence, [`COLD_PAIR`] or [`COLD_AFTER`], is the gap rule's alone: each stands for an instant
+/// in the rings ([`aterm_vitals::model::Sample::pull`]), so the deck's reading after it keeps its
+/// whole slot and its over time.
 fn pull(
     source: &mut impl Source,
     req: &mut Request,
@@ -3115,6 +3193,7 @@ impl Reader {
             at_unix_ms,
             mono_ms: u64::try_from(since.as_millis()).unwrap_or(u64::MAX),
             cadence_ms: req.cadence_ms,
+            pull: req.pull,
             machine_only: req.machine_only,
             load1: load.map(|l| l[0]),
             load,
@@ -3646,8 +3725,6 @@ struct KeptFile<T> {
 type PeakFile = KeptFile<Peaks>;
 /// [`FREE_FILE`].
 type FreeFile = KeptFile<FreeHistory>;
-/// [`STRIP_FILE`].
-type StripFile = KeptFile<SavedStrip>;
 type CpuReportFile = KeptFile<Option<aterm_vitals::sys::json::Jv>>;
 
 impl<T: Clone + Default + PartialEq> KeptFile<T> {
@@ -3691,12 +3768,6 @@ impl<T: Clone + Default + PartialEq> KeptFile<T> {
         if self.due(value, now, stopping) && lock.writes() {
             self.write(value, now);
         }
-    }
-
-    /// Sets the file's clock one `every` before `now`, as [`StripFile::open`] arms it, so the next
-    /// value that changed is due at once.
-    fn arm(&mut self, now: Instant) {
-        self.at = now.checked_sub(self.every).unwrap_or(now);
     }
 
     /// Whether `value` is to be written at `now`: it changed, and `every` has passed since the last
@@ -3743,28 +3814,10 @@ impl KeptFile<FreeHistory> {
             path,
             now,
             PEAKS_EVERY,
-            PEAKS_MAX_BYTES,
+            FREE_MAX_BYTES,
             "the disk's free history",
             free_json,
             |text| free_of(text, now_unix_ms),
-        )
-    }
-}
-
-impl KeptFile<SavedStrip> {
-    /// Open [`STRIP_FILE`], arming `at` one [`STRIP_EVERY`] in the past so the first checkpoint,
-    /// `clean_stop = false`, is due at once: at the start of a lock holder that restored an
-    /// unclean checkpoint ([`restore_strip`]), else at the first live sample.
-    fn open(path: Option<PathBuf>, now: Instant) -> (Self, SavedStrip) {
-        let armed = now.checked_sub(STRIP_EVERY).unwrap_or(now);
-        Self::read(
-            path,
-            armed,
-            STRIP_EVERY,
-            STRIP_MAX_BYTES,
-            "the 1-hour strip history",
-            strip_json,
-            strip_of,
         )
     }
 }
@@ -3781,8 +3834,8 @@ struct PriorRun {
     killed_since: Option<i64>,
 }
 
-/// [`StripFile::open`] at `now` (`now_ms` on the wall clock) for a start that knows how the run
-/// before it stopped (`prior`): whether it stopped on purpose ([`VitalsHost::handed_off`]), when a
+/// [`strip::StripStore::open`] in the state folder `home` at `now_ms` on the wall clock for a start
+/// that knows how the run before it stopped (`prior`): whether it stopped on purpose ([`VitalsHost::handed_off`]), when a
 /// crashed one crashed ([`VitalsHost::crashed_at`]), and when a killed one launched
 /// ([`VitalsHost::killed_since`]). A checkpoint whose writer still runs, another aterm of this
 /// state home holding [`STRIP_LOCK`] (`lock` [`StripLock::Peer`]), is marked clean, so the restore
@@ -3809,17 +3862,16 @@ struct PriorRun {
 /// than the kept strip dates nothing: the strip's writer ran past it (a panic it caught and
 /// survived, or another aterm's crash).
 fn open_strip(
-    path: Option<PathBuf>,
-    now: Instant,
+    home: Option<&Path>,
     now_ms: i64,
     prior: PriorRun,
     lock: &StripLock,
-) -> (StripFile, SavedStrip) {
-    let written_ms = path
-        .as_deref()
-        .and_then(crate::vitals_startup::written_ms)
-        .unwrap_or(0);
-    let (file, mut kept) = StripFile::open(path, now);
+) -> (StripStore, SavedStrip) {
+    let (file, mut kept) = StripStore::open(
+        home.map(strip::strip_dir),
+        home.map(|h| h.join(strip::LEGACY_FILE)),
+    );
+    let written_ms = file.written_ms().unwrap_or(0);
     if lock.peer_holds() {
         kept.clean_stop = true;
         return (file, kept);
@@ -3854,16 +3906,16 @@ fn open_strip(
 }
 
 /// [`open_strip`]'s kept strip restored into `model` at `now` (`now_ms` on the wall clock), and the
-/// file it is kept in. Where that strip is unclean and this thread holds [`STRIP_LOCK`], its
-/// checkpoint is written at once, before any reading: until then the file holds the dead run's
+/// checkpoint it is kept in. Where that strip is unclean and this thread holds [`STRIP_LOCK`], its
+/// base is written at once, before any reading: until then the file holds the dead run's
 /// unclean checkpoint, which an aterm started beside this live holder would mark clean and draw as
 /// a pause where the restore here draws a crash. The checkpoint written carries that crash gap and
 /// its "aterm crash" event, with the open as its last reading, so such a start draws the crash and
 /// then a pause from the open. An unclean strip whose last reading is older than the strips' six
 /// hours draws no crash here or beside, and is written back as restored, with that reading still
-/// its last. After that write the file's clock is armed again, as at its open, so the first
-/// reading's checkpoint, which carries the marks the launch noted (its "restarted" event), is due
-/// at once too. A clean kept strip (one that stopped clean on disk, or one [`open_strip`] marked
+/// its last. After that write the checkpoint is armed again, as at its open, so the first
+/// reading's base, which carries the marks the launch noted (its "restarted" event), is due at
+/// once too. A clean kept strip (one that stopped clean on disk, or one [`open_strip`] marked
 /// clean for a handoff or a live peer) is not written at once, and its first checkpoint waits for
 /// the first reading: one written at once, after a stop under a 10 s bucket ago, would give the
 /// earlier run's last reading as this run's unclean one. After a handoff the file keeps the
@@ -3871,24 +3923,24 @@ fn open_strip(
 /// draws the handoff's span as a crash ([`crate::vitals_startup::date_unseen_kill`]), as before the
 /// lock.
 fn restore_strip(
-    path: Option<PathBuf>,
+    home: Option<&Path>,
     now: Instant,
     now_ms: i64,
     prior: PriorRun,
     lock: &mut StripLock,
     model: &mut aterm_vitals::Vitals,
-) -> StripFile {
-    let (mut file, kept) = open_strip(path, now, now_ms, prior, lock);
+) -> StripStore {
+    let (mut file, kept) = open_strip(home, now_ms, prior, lock);
     let crashed = !kept.clean_stop;
     model.restore_strip_history(kept, now_ms);
     if crashed && matches!(lock, StripLock::Held { .. }) {
-        file.keep_owned(&model.saved_strip(false), now, false, lock);
-        file.arm(now);
+        file.keep(model, now, lock);
+        file.arm();
     }
     file
 }
 
-/// Whether this probe thread writes [`STRIP_FILE`] and [`PEAKS_FILE`]. Every aterm of one state
+/// Whether this probe thread writes the strip's checkpoint and [`PEAKS_FILE`]. Every aterm of one state
 /// home reads them (an installed app and a dev app beside it, an update's successor while its
 /// predecessor runs), and only the one whose probe thread holds [`STRIP_LOCK`] writes them. A
 /// writer that crashes or is killed lets go with its process.
@@ -3967,8 +4019,8 @@ impl CpuReportFile {
     ) -> (Self, Option<aterm_vitals::sys::json::Jv>) {
         Self::read(
             path,
-            now.checked_sub(STRIP_EVERY).unwrap_or(now),
-            STRIP_EVERY,
+            now.checked_sub(CPU_REPORT_EVERY).unwrap_or(now),
+            CPU_REPORT_EVERY,
             CPU_REPORT_MAX_BYTES,
             "the historical CPU diagnostic report",
             cpu_report_json,
@@ -4198,8 +4250,9 @@ struct FreeDoc {
     schema: u32,
     mount: String,
     total: u64,
-    /// `(bucket start in unix ms, least free bytes, readings)`, oldest first.
-    buckets: Vec<(i64, u64, u32)>,
+    /// `(bucket start in unix ms, τ ms, readings, over ms, mean, least and most free bytes)`,
+    /// oldest first.
+    buckets: Vec<(i64, u32, u16, u32, f64, f64, f64)>,
 }
 
 fn free_json(history: &FreeHistory) -> Option<String> {
@@ -4208,7 +4261,7 @@ fn free_json(history: &FreeHistory) -> Option<String> {
         schema: FREE_SCHEMA,
         mount: saved.volume.mount,
         total: saved.volume.total,
-        buckets: saved.rows,
+        buckets: saved.rows.iter().map(strip::agg_doc).collect(),
     };
     aterm_json::to_string(&doc).ok()
 }
@@ -4221,183 +4274,9 @@ fn free_of(text: &str, now_unix_ms: i64) -> Option<FreeHistory> {
                 mount: doc.mount,
                 total: doc.total,
             },
-            rows: doc.buckets,
+            rows: doc.buckets.into_iter().map(strip::agg_of).collect(),
         };
         FreeHistory::restored(&saved, now_unix_ms)
-    })
-}
-
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
-struct RingDoc {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    buckets: Vec<(i64, f64, u16, f64, u16)>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    recent: Vec<(i64, f64, bool)>,
-    /// The ten-minute buckets (`aterm_vitals::ring::LONG_BUCKET_MS`); absent from a file written
-    /// before them, which then restores none.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    long: Vec<(i64, f64, u16, f64, u16)>,
-}
-
-impl RingDoc {
-    fn from_saved(r: &SavedRing) -> Self {
-        Self {
-            buckets: r.buckets.clone(),
-            recent: r.recent.clone(),
-            long: r.long.clone(),
-        }
-    }
-
-    fn into_saved(self) -> SavedRing {
-        SavedRing {
-            buckets: self.buckets,
-            recent: self.recent,
-            long: self.long,
-        }
-    }
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct StripDoc {
-    schema: u32,
-    last_wall_ms: i64,
-    clean_stop: bool,
-    caps: Vec<Option<f64>>,
-    rings: Vec<RingDoc>,
-    #[serde(default)]
-    net_tx: RingDoc,
-    #[serde(default)]
-    yours: RingDoc,
-    #[serde(default)]
-    pressure: RingDoc,
-    #[serde(default)]
-    aterm: Vec<RingDoc>,
-    #[serde(default)]
-    gaps: Vec<(i64, i64, String)>,
-    #[serde(default)]
-    events: Vec<(i64, String, String)>,
-}
-
-fn gap_kind_word(kind: GapKind) -> &'static str {
-    match kind {
-        GapKind::Paused => "paused",
-        GapKind::Sleep => "sleep",
-        GapKind::Crash => "crash",
-    }
-}
-
-fn gap_kind_of(word: &str) -> Option<GapKind> {
-    match word {
-        "paused" => Some(GapKind::Paused),
-        "sleep" => Some(GapKind::Sleep),
-        "crash" => Some(GapKind::Crash),
-        _ => None,
-    }
-}
-
-fn strip_event_kind_word(kind: StripEventKind) -> &'static str {
-    match kind {
-        StripEventKind::SleepWake => "sleep_wake",
-        StripEventKind::PressureSpike => "pressure_spike",
-        StripEventKind::Restart => "restart",
-        StripEventKind::Crash => "crash",
-    }
-}
-
-fn strip_event_kind_of(word: &str) -> Option<StripEventKind> {
-    match word {
-        "sleep_wake" => Some(StripEventKind::SleepWake),
-        "pressure_spike" => Some(StripEventKind::PressureSpike),
-        "restart" => Some(StripEventKind::Restart),
-        "crash" => Some(StripEventKind::Crash),
-        _ => None,
-    }
-}
-
-fn strip_json(strip: &SavedStrip) -> Option<String> {
-    if strip.last_wall_ms <= 0 {
-        return None;
-    }
-    let doc = StripDoc {
-        schema: STRIP_SCHEMA,
-        last_wall_ms: strip.last_wall_ms,
-        clean_stop: strip.clean_stop,
-        caps: strip.caps.to_vec(),
-        rings: strip.rings.iter().map(RingDoc::from_saved).collect(),
-        net_tx: RingDoc::from_saved(&strip.net_tx),
-        yours: RingDoc::from_saved(&strip.yours),
-        pressure: RingDoc::from_saved(&strip.pressure),
-        aterm: strip.aterm.iter().map(RingDoc::from_saved).collect(),
-        gaps: strip
-            .time_gaps
-            .iter()
-            .map(|g| (g.start_ms, g.end_ms, gap_kind_word(g.kind).to_owned()))
-            .collect(),
-        events: strip
-            .strip_events
-            .iter()
-            .map(|e| {
-                (
-                    e.at_unix_ms,
-                    strip_event_kind_word(e.kind).to_owned(),
-                    e.label.clone(),
-                )
-            })
-            .collect(),
-    };
-    aterm_json::to_string(&doc).ok()
-}
-
-fn strip_of(text: &str) -> Option<SavedStrip> {
-    let doc: StripDoc = aterm_json::from_str(text).ok()?;
-    if doc.schema != STRIP_SCHEMA || doc.last_wall_ms <= 0 {
-        return None;
-    }
-    let mut caps = [None; 7];
-    for (dst, src) in caps.iter_mut().zip(doc.caps) {
-        *dst = src.filter(|x| x.is_finite() && *x > 0.0);
-    }
-    let mut rings: [SavedRing; 7] = std::array::from_fn(|_| SavedRing::default());
-    for (dst, src) in rings.iter_mut().zip(doc.rings) {
-        *dst = src.into_saved();
-    }
-    let mut aterm: [SavedRing; 7] = std::array::from_fn(|_| SavedRing::default());
-    for (dst, src) in aterm.iter_mut().zip(doc.aterm) {
-        *dst = src.into_saved();
-    }
-    let time_gaps = doc
-        .gaps
-        .into_iter()
-        .filter_map(|(start_ms, end_ms, kind)| {
-            (end_ms > start_ms).then_some(TimeGap {
-                start_ms,
-                end_ms,
-                kind: gap_kind_of(&kind)?,
-            })
-        })
-        .collect();
-    let strip_events = doc
-        .events
-        .into_iter()
-        .filter_map(|(at_unix_ms, kind, label)| {
-            Some(StripEvent {
-                at_unix_ms,
-                kind: strip_event_kind_of(&kind)?,
-                label,
-            })
-        })
-        .collect();
-    Some(SavedStrip {
-        last_wall_ms: doc.last_wall_ms,
-        clean_stop: doc.clean_stop,
-        caps,
-        rings,
-        net_tx: doc.net_tx.into_saved(),
-        yours: doc.yours.into_saved(),
-        pressure: doc.pressure.into_saved(),
-        aterm,
-        time_gaps,
-        strip_events,
     })
 }
 
@@ -4427,16 +4306,21 @@ impl crate::App {
     }
 
     /// A window woke from rest at `now`: while a window shows the bars, the next reading is due
-    /// at once, or a focused cadence after the last one asked if that is later, so the deck is
-    /// live again from the next reading rather than the background cadence's next.
+    /// at once, or at the focused cadence's next half-slot after the last one asked if that is
+    /// later ([`due_on_phase`]), so the deck is live again from the next reading rather than the
+    /// background cadence's next.
     pub(crate) fn vitals_ask_now(&mut self, now: Instant) {
         if !self.vitals.windowed {
             return;
         }
-        let paced = self
-            .vitals
-            .asked_at
-            .map_or(now, |asked| (asked + FOCUSED_PERIOD).max(now));
+        let paced = due_on_phase(
+            self.vitals.asked_at,
+            None,
+            FOCUSED_PERIOD,
+            now,
+            self.vitals.wall.at(now),
+        )
+        .max(now);
         self.vitals.next_due = Some(self.vitals.next_due.map_or(paced, |due| due.min(paced)));
     }
 
@@ -4514,14 +4398,21 @@ impl crate::App {
         }
         self.vitals.disk_pull = false;
         self.vitals.edge = false;
-        let due = due_at(self.vitals.asked_at, self.vitals.next_due, period, now);
+        let wall_ms = self.vitals.wall.at(now);
+        let due = due_on_phase(
+            self.vitals.asked_at,
+            self.vitals.next_due,
+            period,
+            now,
+            wall_ms,
+        );
         if due > now {
             self.vitals.next_due = Some(due);
             self.send_layout(now, period, machine_only);
             return;
         }
         self.vitals.asked_at = Some(now);
-        self.vitals.next_due = Some(now + period);
+        self.vitals.next_due = Some(due_on_phase(Some(now), None, period, now, wall_ms));
         // Age is a UI fact even if the worker is delayed or its queue is full.
         // Reuse this visible cadence; do not start a separate polling timer.
         if self.allocation_visible() {
@@ -4645,7 +4536,13 @@ impl crate::App {
                 self.vitals.jobs_due = Some(now + JOBS_FLOOR);
             }
         } else if let Some((period, machine_only)) = hidden
-            && due_at(self.vitals.asked_at, None, period, now) <= now
+            && due_on_phase(
+                self.vitals.asked_at,
+                None,
+                period,
+                now,
+                self.vitals.wall.at(now),
+            ) <= now
         {
             self.vitals.asked_at = Some(now);
             self.ask_reading(now, period, machine_only, false);
@@ -5168,6 +5065,7 @@ impl crate::App {
                             key: pane,
                             window: wid.0,
                             tab: i + 1,
+                            tab_id: Some(tab.id),
                         });
                     }
                     let facts = tl.claude_footer();
@@ -5335,11 +5233,25 @@ impl crate::App {
     fn tab_sessions(&self, tab: &crate::tab_model::Tab) -> Vec<u64> {
         std::iter::once(tab.focus)
             .chain(tab.root.leaves().into_iter().filter(|v| *v != tab.focus))
-            .filter_map(|view| match self.view_store.get(view).copied() {
-                Some(crate::tab_model::View::Terminal(view)) => Some(view.session),
-                _ => None,
-            })
+            .filter_map(|view| self.terminal_session(view))
             .collect()
+    }
+
+    /// The terminal sessions of `tab` in layout order, whichever has the focus:
+    /// the disk walker's panes, numbered `pane=` in that order by `sys disk`.
+    pub(crate) fn tab_layout_sessions(&self, tab: &crate::tab_model::Tab) -> Vec<u64> {
+        tab.root
+            .leaves()
+            .into_iter()
+            .filter_map(|view| self.terminal_session(view))
+            .collect()
+    }
+
+    fn terminal_session(&self, view: crate::tab_model::ViewId) -> Option<u64> {
+        match self.view_store.get(view).copied() {
+            Some(crate::tab_model::View::Terminal(view)) => Some(view.session),
+            _ => None,
+        }
     }
 }
 
@@ -5354,6 +5266,9 @@ impl VitalsHost {
         rx
     }
 }
+
+#[path = "vitals_strip.rs"]
+mod strip;
 
 #[cfg(test)]
 #[path = "vitals_host_tests.rs"]

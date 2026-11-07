@@ -414,7 +414,11 @@ fn no_unit_ring_keeps_a_six_hour_history() {
     // Negative control: a row's ring pushed the same readings keeps them.
     let mut row = BucketRing::with_capacity(UNIT_RING_BUCKETS);
     for t in 1..=720i64 {
-        let _ = row.push(T0 + t * 1000, Some(1.0), false);
+        let _ = row.push(
+            crate::ring::Taken::at(T0 + t * 1000, 1_000),
+            Some(1.0),
+            false,
+        );
     }
     assert_eq!(row.long_cells().len(), 2, "two ten-minute buckets");
 }
