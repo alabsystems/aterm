@@ -1645,8 +1645,12 @@ pub fn sh_exec_target(line: &str) -> Option<PathBuf> {
     (sh_quote_str(&target) == quoted).then(|| PathBuf::from(target))
 }
 
+mod native_claude_restart;
 #[cfg(unix)]
 mod probe_shim;
+#[cfg(unix)]
+mod shim_producer;
+pub use native_claude_restart::{NativeClaudeRestart, native_claude_restart};
 #[cfg(unix)]
 pub use probe_shim::{ProbeForwarder, ProbeImage, ProbeShim, probe_shim};
 

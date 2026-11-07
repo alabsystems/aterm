@@ -248,6 +248,9 @@ pub mod file_lock;
 /// Path-aware file events, with optional debounce and content-stamp filtering.
 pub mod file_watch;
 
+/// Descriptor-pinned app-image cloning and confined filesystem seals.
+#[cfg(unix)]
+pub mod app_image;
 /// Test support (test and debug builds): the `git` a fixture runs, isolated from this machine.
 #[cfg(all(any(test, debug_assertions), not(target_arch = "wasm32")))]
 pub mod fixture_git;

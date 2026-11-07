@@ -119,6 +119,124 @@ exit 7
 }
 
 #[test]
+fn named_lean_install_survives_gc_before_lease_and_expired_use_still_needs_custody() {
+    if !crate::testdir::isolated_lifecycle(
+        "prerequisite::tests::named_lean_install_survives_gc_before_lease_and_expired_use_still_needs_custody",
+    ) {
+        return;
+    }
+    let mut fixture = Fixture::new(Prerequisite::Lake);
+    fixture.historical_lean();
+    fixture.fresh_install();
+    fixture.index = fixture.index.replace("lean4=7", "lean4=1");
+    let current = fixture.layout.build_dir("lean4", 1);
+    std::fs::create_dir_all(current.join("bin")).unwrap();
+    std::fs::write(
+        current.join("bin/lake"),
+        b"selected default, never executed",
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        current.join("bin/lake"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    crate::store::mark_build_ready(&current).unwrap();
+    crate::activate::install_tools(
+        &fixture.layout,
+        &current,
+        &[crate::store::ToolName::new("lake").unwrap()],
+        crate::activate::Aliases::Off,
+    )
+    .unwrap();
+    crate::activate::activate_build(&fixture.layout, &current).unwrap();
+    let selected = crate::ops::which(&fixture.layout, "lake");
+    let install = || {
+        crate::flow::install_build(
+            &fixture,
+            &fixture.layout,
+            &testkit::anchor(),
+            BuildFloor {
+                index_build: 0,
+                roster_seq: 0,
+            },
+            testkit::NOW,
+            &crate::InstallRequest {
+                channel: "stable",
+                program: "lean4",
+                triple: TRIPLE,
+                installed: Some(1),
+            },
+            crate::flow::NamedAsk {
+                build: 7,
+                expect_root: None,
+                retry: false,
+            },
+        )
+        .unwrap()
+    };
+    let mark = fixture
+        .root
+        .with_file_name(format!("7{}", crate::trust_lock::LOCKED_SUFFIX));
+    let expire = || {
+        let at = std::time::SystemTime::now()
+            - crate::trust_lock::LOCKED_KEEP
+            - std::time::Duration::from_secs(60);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&mark)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+    };
+    assert!(matches!(install(), crate::flow::NamedBuild::Staged { .. }));
+    assert!(crate::gc::run(&fixture.layout, None).reclaimed.is_empty());
+    assert!(
+        fixture.root.is_dir(),
+        "GC between install and lease retains the exact named build"
+    );
+    expire();
+    assert!(matches!(install(), crate::flow::NamedBuild::Present { .. }));
+    assert_eq!(
+        fixture.downloads.get(),
+        1,
+        "retention refresh needs no new archive"
+    );
+    assert!(crate::gc::run(&fixture.layout, None).reclaimed.is_empty());
+    assert_eq!(crate::ops::which(&fixture.layout, "lake"), selected);
+
+    // Negative control: without the installation mark, GC produces the observed
+    // supported-install -> absent-at-lease failure; a sidecar never authenticates bytes.
+    std::fs::remove_file(&mark).unwrap();
+    assert_eq!(
+        crate::gc::run(&fixture.layout, None).reclaimed,
+        vec![("lean4".to_string(), vec![7])]
+    );
+    let session = fixture.session(TRIPLE).unwrap();
+    assert!(
+        session
+            .acquire_build(Prerequisite::Lake, 7)
+            .unwrap_err()
+            .contains("is not staged")
+    );
+
+    assert!(matches!(install(), crate::flow::NamedBuild::Staged { .. }));
+    let held = session.acquire_build(Prerequisite::Lake, 7).unwrap();
+    expire();
+    assert!(
+        crate::gc::run(&fixture.layout, None).reclaimed.is_empty(),
+        "a real lease keeps expired recent use alive"
+    );
+    assert_eq!(held.root(), fixture.root.canonicalize().unwrap());
+    drop(held);
+    assert_eq!(
+        crate::gc::run(&fixture.layout, None).reclaimed,
+        vec![("lean4".to_string(), vec![7])]
+    );
+    assert_eq!(crate::ops::which(&fixture.layout, "lake"), selected);
+}
+
+#[test]
 fn named_lean_build_keeps_default_selection_and_binds_its_import_world() {
     let mut fixture = Fixture::new(Prerequisite::Lake);
     fixture.historical_lean();

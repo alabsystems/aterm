@@ -99,6 +99,13 @@ fn a_full_factory_snapshot_keeps_policy_exports_tap_and_published_image_identity
     )
     .unwrap();
     assert_eq!(mains(&snapshot), [std::fs::canonicalize(&a).unwrap()]);
+    let token_body = crate::launch_tap::with_token_block(
+        "claude",
+        std::str::from_utf8(&file.body).unwrap().to_string(),
+        Some(&atpkg),
+    );
+    let token_snapshot = probe_shim(&wrapper, &token_body, &bridge(&root)).unwrap();
+    assert_eq!(mains(&token_snapshot), mains(&snapshot));
     assert!(snapshot.body.contains(&sh_yolo_prelude(
         "claude",
         &crate::yolo::policy_of("claude"),

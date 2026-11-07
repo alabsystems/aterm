@@ -20,14 +20,25 @@
 //! nearest one above it that is there, whose every change is a look (each
 //! finding no change until the file is made), so a file whose folder does
 //! not exist yet, or went with it, is heard once both are made. Every folder
-//! above that one, up to the root, listens only for its own rename or end, one
-//! listener per folder however many files' paths run through it, so a folder
-//! of the path renamed (a project folder moved, a checkout swapped in) is
-//! heard as well. A file no arm took (a folder refused it, descriptors or
-//! watches ran out, or its folders kept being made or moved while it armed)
-//! is armed again every `REARM_EVERY`, and only while some file is unarmed;
-//! each round that still finds it unarmed looks at it, so its change is told
-//! with no event to tell of it.
+//! above that one, up to the root, listens only for its own rename, end or
+//! change of mode, one listener per folder however many files' paths run
+//! through it, so a folder of the path renamed (a project folder moved, a
+//! checkout swapped in) or made unsearchable is heard as well. A file no arm
+//! took (a folder refused it, descriptors or watches ran out, or its folders
+//! kept being made or moved while it armed) is armed again every
+//! `REARM_EVERY`, and only while some file is unarmed; each round that still
+//! finds it unarmed looks at it, so its change is told with no event to tell
+//! of it. A look tells a path missing from one it could not look at, and a
+//! link made again from the one it replaced; a file whose look could not see
+//! it is looked at in the rounds too, since no event need tell when that
+//! ends. A relative path is watched where it names when it is watched.
+//!
+//! A folder is watched the same way ([`FileWatch::watch_directory`]), on its
+//! entries ([`FileEvents::arm_directory`]): each settled burst of them tells,
+//! whatever the folder's stamp says, since a folder's times need not tell two
+//! entries made inside one tick apart. While it is missing, or where no arm
+//! hears a folder's entries (the stat poll), it is watched as a file is, by its
+//! stamp, and its making is told.
 //!
 //! The watch only tells: the host re-reads the file through the document's
 //! own capability and decides (reload a clean buffer in place, or offer
@@ -71,14 +82,20 @@ pub struct FileStamp {
 }
 
 impl FileStamp {
-    /// The stamp of the file `path` names now, or `None` when it names none.
+    /// The stamp of the file `path` names now, or `None` when it names none (or cannot be
+    /// looked at).
     #[must_use]
     pub fn of(path: &Path) -> Option<Self> {
-        let meta = std::fs::metadata(path).ok()?;
+        std::fs::metadata(path)
+            .ok()
+            .map(|meta| Self::from_metadata(&meta))
+    }
+
+    fn from_metadata(meta: &std::fs::Metadata) -> Self {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt as _;
-            Some(Self {
+            Self {
                 dev: meta.dev(),
                 ino: meta.ino(),
                 len: meta.size(),
@@ -86,7 +103,7 @@ impl FileStamp {
                     + i128::from(meta.mtime_nsec()),
                 changed_ns: i128::from(meta.ctime()) * 1_000_000_000
                     + i128::from(meta.ctime_nsec()),
-            })
+            }
         }
         #[cfg(not(unix))]
         {
@@ -95,14 +112,64 @@ impl FileStamp {
                 .ok()
                 .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
                 .map_or(0, |since| since.as_nanos() as i128);
-            Some(Self {
+            Self {
                 dev: 0,
                 ino: 0,
                 len: meta.len(),
                 modified_ns,
                 changed_ns: 0,
-            })
+            }
         }
+    }
+}
+
+/// What one look at a watched path found: the link it is, if it is one, and what it names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Look {
+    /// The link's own stamp, where the path is one: a link made again to name the same file is
+    /// a new one.
+    link: Option<FileStamp>,
+    found: Found,
+}
+
+/// What a path names, as [`Look`] found it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Found {
+    /// Nothing there.
+    Missing,
+    /// It could not be looked at: a folder on the way this user cannot search, an I/O error, a
+    /// loop of links. No event need tell such a refusal's end ([`Unarmed`]).
+    Unreadable,
+    /// A file or a folder, with this stamp.
+    At(FileStamp),
+}
+
+impl Look {
+    /// Look at `path` now. Only an answer that nothing is there is [`Found::Missing`]; any
+    /// other refusal is [`Found::Unreadable`].
+    fn of(path: &Path) -> Self {
+        let refused = |error: io::Error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                Found::Missing
+            } else {
+                Found::Unreadable
+            }
+        };
+        let link = match std::fs::symlink_metadata(path) {
+            Ok(entry) => entry
+                .file_type()
+                .is_symlink()
+                .then(|| FileStamp::from_metadata(&entry)),
+            Err(error) => {
+                return Self {
+                    link: None,
+                    found: refused(error),
+                };
+            }
+        };
+        let found = std::fs::metadata(path)
+            .map_or_else(refused, |meta| Found::At(FileStamp::from_metadata(&meta)));
+        Self { link, found }
     }
 }
 
@@ -235,8 +302,9 @@ pub trait FileEvents: Send {
     /// still being made or a folder above it kept moving.
     fn arm(&mut self, key: u64, path: &Path) -> io::Result<()>;
 
-    /// Hear entries created, removed or replaced in the existing directory `path`, and the
-    /// directory or its lookup ancestry moved or removed, under `key`. This replaces that key's
+    /// Hear entries created, removed or replaced in the existing directory `path` (the one it
+    /// names, where it is a link to one), and the directory or its lookup ancestry moved or
+    /// removed, under `key`. This replaces that key's
     /// previous arm. A write into an existing entry need not be heard: callers publishing new
     /// contents replace the entry by rename. The caller reads its snapshot after arming and
     /// arms again after invalidation, since events can refer to a retired directory.
@@ -260,11 +328,123 @@ pub trait FileEvents: Send {
 
     /// What wakes a parked [`Self::wait`].
     fn waker(&self) -> Waker;
+
+    /// Whether the volumes `key` was last armed on (its folder's, and its file's) report every
+    /// writer's change to this machine's events. A network volume reports only this machine's
+    /// own writes, and a user-space one only those made through its mount here; the watch looks
+    /// at such a key in every round, as at one no arm takes.
+    fn hears_every_writer(&self, _key: u64) -> bool {
+        true
+    }
+}
+
+/// Whether a volume of the type `fstype` (`statfs`'s `f_fstypename`) with `f_flags` reports
+/// every writer's change to this Mac's kqueue: a local one does, while a network volume
+/// (`MNT_LOCAL` clear, or a network type), a user-space one, or a virtual machine's share
+/// (virtiofs, VMware's), whose writes from elsewhere reach no kernel here, does not.
+#[cfg(any(target_os = "macos", test))]
+fn volume_reports_every_writer(f_flags: u32, fstype: &str) -> bool {
+    const MNT_LOCAL: u32 = 0x0000_1000;
+    const ELSEWHERE: &[&str] = &[
+        "nfs", "smbfs", "afpfs", "webdav", "cifs", "ftp", "macfuse", "osxfuse", "fusefs", "fuse",
+        "sshfs", "virtiofs", "vmhgfs",
+    ];
+    f_flags & MNT_LOCAL != 0 && !ELSEWHERE.contains(&fstype.to_ascii_lowercase().as_str())
+}
+
+/// Whether a Linux volume of `statfs`'s `f_type` `magic` reports every writer's change to
+/// inotify, which hears only what this kernel's own calls do. One the shared-write rule counts as
+/// a network or FUSE one does not ([`crate::shared_write::REMOTE_FILESYSTEMS`]: NFS, SMB 2 and
+/// 3, Ceph, both AFS clients, 9p, Lustre, GPFS and FUSE, whose type virtiofs reports too), nor
+/// does SMB 1, a virtual machine's share (VirtualBox, Parallels, VMware), a cluster's shared
+/// disk (OCFS2, GFS2), Coda or OrangeFS. An overlay does: a change made through it is this
+/// kernel's, and its layers changed beneath it are outside what an overlay defines.
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn volume_type_reports_every_writer(magic: u32) -> bool {
+    const ELSEWHERE: &[u32] = &[
+        0x517B,      // SMB 1
+        0x786F_4256, // VirtualBox's vboxsf
+        0x7C7C_6673, // Parallels' prl_fs
+        0xBACB_ACBC, // VMware's vmhgfs
+        0x7461_636F, // OCFS2
+        0x0116_1970, // GFS2
+        0x7375_7245, // Coda
+        0x2003_0528, // OrangeFS
+    ];
+    !crate::shared_write::remote_filesystem(magic) && !ELSEWHERE.contains(&magic)
 }
 
 enum Command {
-    Watch(u64, PathBuf),
+    Watch(u64, PathBuf, Shape),
     Unwatch(u64),
+}
+
+/// What a key watches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shape {
+    /// A file, and its folder ([`FileEvents::arm`]).
+    File,
+    /// A folder's entries ([`FileEvents::arm_directory`]).
+    Directory,
+}
+
+/// How a key's arm took.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Took {
+    /// Not at all: the key is armed again in [`Unarmed`]'s rounds.
+    No,
+    /// On the path as a file and its folder, which hears a folder still missing made.
+    File,
+    /// On the folder's entries.
+    Entries,
+}
+
+impl Took {
+    /// Arm `key` as `shape` on `path`. Where no arm hears a folder's entries, a folder arms as
+    /// a file; so does one not there (or a file where it was), whose own folder hears it made.
+    /// A link that names no folder is left to the rounds instead: the folder it would name is
+    /// made where no listener of the link's own folder hears it, and a round's look at the
+    /// path follows the link. So is any other refusal.
+    fn of(events: &mut dyn FileEvents, key: u64, path: &Path, shape: Shape) -> Self {
+        let armed = match shape {
+            Shape::File => events.arm(key, path).map(|()| Self::File),
+            Shape::Directory => match events.arm_directory(key, path) {
+                Ok(()) => Ok(Self::Entries),
+                Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                    events.arm(key, path).map(|()| Self::File)
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                    ) && !std::fs::symlink_metadata(path)
+                        .is_ok_and(|there| there.file_type().is_symlink()) =>
+                {
+                    events.arm(key, path).map(|()| Self::File)
+                }
+                Err(error) => Err(error),
+            },
+        };
+        armed.unwrap_or(Self::No)
+    }
+}
+
+/// `path` made absolute against the working folder now, as a look at it would read it, so its
+/// folders above can be walked: a relative one ends in an empty path no listen opens. One the
+/// platform cannot make absolute (an empty one) stays as it is.
+fn absolute(path: PathBuf) -> PathBuf {
+    std::path::absolute(&path).unwrap_or(path)
+}
+
+/// One watched key.
+struct Watched {
+    path: PathBuf,
+    shape: Shape,
+    /// What the watch last told.
+    seen: Seen,
+    /// Armed on the folder's entries, whose every settled burst tells: a folder's own times
+    /// need not tell two entries made inside one of their ticks apart.
+    entries: bool,
 }
 
 /// The watch thread and the door to it.
@@ -309,9 +489,31 @@ impl FileWatch {
         })
     }
 
-    /// Watch the file at `path` as `key` (again, after a save-as).
+    /// Watch the file at `path` as `key` (again, after a save-as). A relative path is the one it
+    /// names now ([`std::path::absolute`]).
     pub fn watch(&self, key: u64, path: PathBuf) {
-        if self.commands.send(Command::Watch(key, path)).is_ok() {
+        if self
+            .commands
+            .send(Command::Watch(key, absolute(path), Shape::File))
+            .is_ok()
+        {
+            (self.wake)();
+        }
+    }
+
+    /// Watch the folder at `path` as `key`: told at each settled burst of its entries made,
+    /// removed or replaced (a write into one need not be heard, as
+    /// [`FileEvents::arm_directory`] says) or of the folder moved or gone, and at its first
+    /// look. A folder that is a link to one is watched through the link. While the folder is
+    /// missing it is watched as a file is, told once it is made; a link that names no folder is
+    /// looked at every `REARM_EVERY` until it names one. A relative path is the one it names
+    /// now, as [`Self::watch`]'s is.
+    pub fn watch_directory(&self, key: u64, path: PathBuf) {
+        if self
+            .commands
+            .send(Command::Watch(key, absolute(path), Shape::Directory))
+            .is_ok()
+        {
             (self.wake)();
         }
     }
@@ -345,9 +547,9 @@ fn watch_loop(
     stop: &std::sync::atomic::AtomicBool,
     mut notify: Box<dyn FnMut(u64) + Send>,
 ) {
-    // Each watched file and the stamp the watch last told, `Seen::Never`
+    // Each watched key, and the look the watch last told, `Seen::Never`
     // until its first look.
-    let mut watched: BTreeMap<u64, (PathBuf, Seen)> = BTreeMap::new();
+    let mut watched: BTreeMap<u64, Watched> = BTreeMap::new();
     let mut unarmed = Unarmed::default();
     let mut debounce = Debounce::default();
     let mut touched = Vec::new();
@@ -358,13 +560,21 @@ fn watch_loop(
                 return;
             }
             match commands.try_recv() {
-                Ok(Command::Watch(key, path)) => {
+                Ok(Command::Watch(key, path, shape)) => {
                     // Armed, then looked at once, and that first look tells:
                     // the host read the file before this, so a change since
                     // its read may already be in any stamp taken here.
                     let now = Instant::now();
-                    unarmed.arm(events.as_mut(), key, &path, now);
-                    watched.insert(key, (path, Seen::Never));
+                    let took = unarmed.arm(events.as_mut(), key, &path, shape, now);
+                    watched.insert(
+                        key,
+                        Watched {
+                            path,
+                            shape,
+                            seen: Seen::Never,
+                            entries: took == Took::Entries,
+                        },
+                    );
                     debounce.note(key, now);
                 }
                 Ok(Command::Unwatch(key)) => {
@@ -403,21 +613,38 @@ fn watch_loop(
         }
         let now = Instant::now();
         for key in unarmed.due(now) {
-            let Some((path, seen)) = watched.get_mut(&key) else {
+            let Some(key_watched) = watched.get_mut(&key) else {
                 continue;
             };
-            if unarmed.arm(events.as_mut(), key, path, now) {
+            if unarmed.armed(key) {
+                // Armed, but its last look could not see it, or its volume does not report every
+                // writer, so no event need tell of it: the round looks, and a look that moved is
+                // due at once, armed again.
+                if Seen::Looked(Look::of(&key_watched.path)) != key_watched.seen {
+                    debounce.note(key, now);
+                }
+                continue;
+            }
+            let took = unarmed.arm(
+                events.as_mut(),
+                key,
+                &key_watched.path,
+                key_watched.shape,
+                now,
+            );
+            key_watched.entries = took == Took::Entries;
+            if took == Took::No {
+                // Still unarmed, so no event can tell of the file: the round
+                // looks at it itself.
+                let look = Seen::Looked(Look::of(&key_watched.path));
+                if look != key_watched.seen {
+                    key_watched.seen = look;
+                    notify(key);
+                }
+            } else {
                 // An arm that takes now is looked at, as a first look is:
                 // the file may have come back with its folder before the arm.
                 debounce.note(key, now);
-            } else {
-                // Still unarmed, so no event can tell of the file: the round
-                // looks at it itself.
-                let stamp = Seen::Stamp(FileStamp::of(path));
-                if stamp != *seen {
-                    *seen = stamp;
-                    notify(key);
-                }
             }
         }
         for key in &touched {
@@ -426,13 +653,26 @@ fn watch_loop(
             }
         }
         for key in debounce.due(now) {
-            let Some((path, seen)) = watched.get_mut(&key) else {
+            let Some(key_watched) = watched.get_mut(&key) else {
                 continue;
             };
-            unarmed.arm(events.as_mut(), key, path, now);
-            let stamp = Seen::Stamp(FileStamp::of(path));
-            if stamp != *seen {
-                *seen = stamp;
+            // A burst on a folder's entries tells whatever the folder's stamp says. The tell
+            // comes after the arm again, so the host's read then holds whatever the new
+            // listener came too late to hear.
+            let burst = key_watched.entries;
+            let took = unarmed.arm(
+                events.as_mut(),
+                key,
+                &key_watched.path,
+                key_watched.shape,
+                now,
+            );
+            key_watched.entries = took == Took::Entries;
+            let look = Look::of(&key_watched.path);
+            unarmed.looked(key, look.found == Found::Unreadable, now);
+            let look = Seen::Looked(look);
+            if burst || look != key_watched.seen {
+                key_watched.seen = look;
                 notify(key);
             }
         }
@@ -443,9 +683,16 @@ fn watch_loop(
 /// again in batches every [`REARM_EVERY`] while one is left, looking at each
 /// one a batch still could not arm. New failures do not postpone a pending
 /// batch; with none left the watch waits on events alone.
+///
+/// An armed key whose last look could not see its path ([`Found::Unreadable`]) is in the rounds
+/// too, looked at in each: no event need tell the end of an I/O error or a refusal no
+/// permission change on the path made (a privacy grant). So is one armed on a volume that does
+/// not report every writer's change ([`FileEvents::hears_every_writer`]).
 #[derive(Debug)]
 struct Unarmed {
     keys: BTreeSet<u64>,
+    unreadable: BTreeSet<u64>,
+    elsewhere: BTreeSet<u64>,
     round_at: Instant,
 }
 
@@ -453,46 +700,90 @@ impl Default for Unarmed {
     fn default() -> Self {
         Self {
             keys: BTreeSet::new(),
+            unreadable: BTreeSet::new(),
+            elsewhere: BTreeSet::new(),
             round_at: Instant::now(),
         }
     }
 }
 
 impl Unarmed {
-    /// Arm `key` on `path` at `now`: whether it took. One that did not is
-    /// armed again later ([`Self::due`]).
-    fn arm(&mut self, events: &mut dyn FileEvents, key: u64, path: &Path, now: Instant) -> bool {
-        let armed = events.arm(key, path).is_ok();
-        if armed {
-            self.keys.remove(&key);
-        } else {
-            if self.keys.is_empty() {
-                self.round_at = now;
-            }
+    /// Arm `key` as `shape` on `path` at `now`: how it took ([`Took::of`]). One that did not
+    /// is armed again later ([`Self::due`]).
+    fn arm(
+        &mut self,
+        events: &mut dyn FileEvents,
+        key: u64,
+        path: &Path,
+        shape: Shape,
+        now: Instant,
+    ) -> Took {
+        let took = Took::of(events, key, path, shape);
+        if took == Took::No {
+            self.begin(now);
             self.keys.insert(key);
+            self.elsewhere.remove(&key);
+        } else {
+            self.keys.remove(&key);
+            if events.hears_every_writer(key) {
+                self.elsewhere.remove(&key);
+            } else {
+                self.begin(now);
+                self.elsewhere.insert(key);
+            }
         }
-        armed
+        took
+    }
+
+    /// `key`'s look at `now` could not see its path, or could.
+    fn looked(&mut self, key: u64, unreadable: bool, now: Instant) {
+        if unreadable {
+            self.begin(now);
+            self.unreadable.insert(key);
+        } else {
+            self.unreadable.remove(&key);
+        }
+    }
+
+    /// A batch begins at `now` where none is pending.
+    fn begin(&mut self, now: Instant) {
+        if self.is_empty() {
+            self.round_at = now;
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.keys.is_empty() && self.unreadable.is_empty() && self.elsewhere.is_empty()
+    }
+
+    /// Whether `key`'s last arm took.
+    fn armed(&self, key: u64) -> bool {
+        !self.keys.contains(&key)
     }
 
     /// `key` is no longer watched.
     fn forget(&mut self, key: u64) {
         self.keys.remove(&key);
+        self.unreadable.remove(&key);
+        self.elsewhere.remove(&key);
     }
 
-    /// How long from `now` until the next arm again, if a file is unarmed.
+    /// How long from `now` until the next round, if a key is in them.
     fn wait(&self, now: Instant) -> Option<Duration> {
-        (!self.keys.is_empty())
+        (!self.is_empty())
             .then(|| REARM_EVERY.saturating_sub(now.saturating_duration_since(self.round_at)))
     }
 
-    /// The unarmed files to arm again at `now`: every one once
-    /// [`REARM_EVERY`] passed since this batch began, else none.
+    /// The keys a round looks at, or arms again, at `now`: every one once [`REARM_EVERY`]
+    /// passed since this batch began, else none.
     fn due(&mut self, now: Instant) -> Vec<u64> {
         if self.wait(now) != Some(Duration::ZERO) {
             return Vec::new();
         }
         self.round_at = now;
-        self.keys.iter().copied().collect()
+        let mut due: BTreeSet<u64> = self.keys.union(&self.unreadable).copied().collect();
+        due.extend(&self.elsewhere);
+        due.into_iter().collect()
     }
 }
 
@@ -501,8 +792,8 @@ impl Unarmed {
 enum Seen {
     /// Nothing yet: its first look tells.
     Never,
-    /// This stamp (`None`: no file at the path).
-    Stamp(Option<FileStamp>),
+    /// This look.
+    Looked(Look),
 }
 
 /// This platform's file events: kqueue on macOS, inotify on Linux, a stat
@@ -588,15 +879,14 @@ impl FileEvents for InertEvents {
 #[cfg(any(test, not(any(target_os = "macos", target_os = "linux"))))]
 #[derive(Default)]
 pub struct PollEvents {
-    files: BTreeMap<u64, (PathBuf, Option<FileStamp>)>,
+    files: BTreeMap<u64, (PathBuf, Look)>,
     inert: InertEvents,
 }
 
 #[cfg(any(test, not(any(target_os = "macos", target_os = "linux"))))]
 impl FileEvents for PollEvents {
     fn arm(&mut self, key: u64, path: &Path) -> io::Result<()> {
-        let stamp = FileStamp::of(path);
-        self.files.insert(key, (path.to_path_buf(), stamp));
+        self.files.insert(key, (path.to_path_buf(), Look::of(path)));
         Ok(())
     }
 
@@ -608,9 +898,9 @@ impl FileEvents for PollEvents {
         let nap = timeout.map_or(POLL_EVERY, |timeout| timeout.min(POLL_EVERY));
         self.inert.wait(Some(nap), touched)?;
         for (key, (path, seen)) in &mut self.files {
-            let stamp = FileStamp::of(path);
-            if stamp != *seen {
-                *seen = stamp;
+            let look = Look::of(path);
+            if look != *seen {
+                *seen = look;
                 touched.push(*key);
             }
         }
@@ -924,14 +1214,23 @@ mod kqueue {
         | libc::NOTE_LINK;
 
     /// The events that mean an entry of a directory came, went or was
-    /// renamed (a replace by rename writes the directory).
-    const DIRECTORY_EVENTS: u32 =
-        libc::NOTE_WRITE | libc::NOTE_DELETE | libc::NOTE_RENAME | libc::NOTE_REVOKE;
+    /// renamed (a replace by rename writes the directory), or the directory's
+    /// own attributes changed (a `chmod` that lets the path below be read, or
+    /// stops it).
+    const DIRECTORY_EVENTS: u32 = libc::NOTE_WRITE
+        | libc::NOTE_ATTRIB
+        | libc::NOTE_DELETE
+        | libc::NOTE_RENAME
+        | libc::NOTE_REVOKE;
 
     /// The events that mean a folder above a file's own one was renamed or went, which moves the
-    /// file's path off what its own listeners hold. A write into one is not among them, so a busy
-    /// folder up the path (a home folder) wakes nothing.
-    const ABOVE_EVENTS: u32 = libc::NOTE_DELETE | libc::NOTE_RENAME | libc::NOTE_REVOKE;
+    /// file's path off what its own listeners hold, or that its own attributes changed, which
+    /// can let the lookup through it or stop it. A write into one is not among them, and nor is
+    /// an entry's change, which tells no folder's attributes (measured on macOS 27.0: an entry
+    /// made, replaced or removed is `NOTE_WRITE` alone), so a busy folder up the path (a home
+    /// folder) wakes nothing.
+    const ABOVE_EVENTS: u32 =
+        libc::NOTE_ATTRIB | libc::NOTE_DELETE | libc::NOTE_RENAME | libc::NOTE_REVOKE;
 
     /// The listener on one folder above some keys' own folders, which every key whose path runs
     /// through that folder shares (closing it drops its filter).
@@ -1011,7 +1310,9 @@ mod kqueue {
         /// Where that nearest one is a link to a folder (a dotfiles `~/.config`), which a listen
         /// refuses, since it opens no link it is not asked to, the listener is on the folder the
         /// link names, and the walk above starts at the link: its own listener there hears it
-        /// made to name another folder, and the folders behind it are walked too.
+        /// made to name another folder, and the folders behind it are walked too. A link made to
+        /// name another one before that listener took is caught by [`Self::arm_around`]'s
+        /// [`Self::first_named_by`].
         fn listen_folder(
             &mut self,
             key: u64,
@@ -1031,19 +1332,11 @@ mod kqueue {
                         });
                     }
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error)
-                        if matches!(error.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP))
-                            && std::fs::symlink_metadata(directory)
-                                .is_ok_and(|there| there.file_type().is_symlink()) =>
-                    {
-                        // A link to no folder answers as a link refused: that is all it is.
-                        let named = std::fs::canonicalize(directory).map_err(|_| error)?;
-                        let listened = self.listen(key, &named, true, step);
-                        step(Listen::Answered, &named)?;
-                        listened?;
+                    Err(error) if refused_as_link(&error, directory) => {
+                        let held = self.listen_named(key, directory, error, step)?;
                         return Ok(Folder {
                             from: directory.to_path_buf(),
-                            held: named,
+                            held,
                             made,
                         });
                     }
@@ -1051,6 +1344,22 @@ mod kqueue {
                 }
             }
             Err(io::Error::from(io::ErrorKind::NotFound))
+        }
+
+        /// Listen on the folder the link `link` names, whose own listen answered `refused`
+        /// ([`refused_as_link`]): the folder listened on. A link to no folder answers `refused`,
+        /// since that is all it is.
+        fn listen_named(
+            &mut self,
+            key: u64,
+            link: &Path,
+            refused: io::Error,
+            step: &mut impl FnMut(Listen, &Path) -> io::Result<()>,
+        ) -> io::Result<PathBuf> {
+            let named = std::fs::canonicalize(link).map_err(|_| refused)?;
+            let listened = self.listen(key, &named, true, step);
+            step(Listen::Answered, &named)?;
+            listened.map(|()| named)
         }
 
         /// Listen on the folder `path`, or the link itself where `link`, for `fflags` under `key`,
@@ -1126,9 +1435,10 @@ mod kqueue {
         }
 
         /// Listen for `key` on every folder and link that looking `from` up passes through
-        /// ([`super::passed_through`]) and its own listeners do not hold, each for its own rename
-        /// or end ([`Self::listen_one`]): any of them renamed, gone or replaced moves the path off
-        /// what those listeners hold. A link is listened on itself, which hears it replaced (made
+        /// ([`super::passed_through`]) and its own listeners do not hold, each for its own rename,
+        /// end or change of mode ([`Self::listen_one`]): any of them renamed, gone or replaced
+        /// moves the path off what those listeners hold, and a mode can stop the lookup through
+        /// it or let it through. A link is listened on itself, which hears it replaced (made
         /// to name another folder), and so is each folder the lookup goes on through behind it.
         /// One that cannot be opened for events is passed over, and the rest are still listened
         /// on. The root, which nothing renames, is left out unless it holds a volume's root.
@@ -1212,6 +1522,8 @@ mod kqueue {
                     Ok(Folder { from, held, .. }) => match self.listen_above(key, &from, &held) {
                         // A folder on the way moved as the walk listened: arm again.
                         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        // The link made to name another folder before its own listener took.
+                        Ok(()) if from != held && !self.first_named_by(key, &from)? => {}
                         above => return above.and(file_answer(file)),
                     },
                     Err(error) => match (file, path.parent()) {
@@ -1228,23 +1540,54 @@ mod kqueue {
 
         /// A directory arm, running `between` after its own listener takes and before its lookup
         /// ancestry is listened on. The ancestry walk rechecks that the listener still holds
-        /// this path's directory; a replacement in between requires another arm.
+        /// this path's directory; a replacement in between requires another arm. Where `path` is
+        /// a link to a folder, the listener is on the folder it names and the walk starts at the
+        /// link, as [`Self::listen_folder`]'s does, and then the link must still name that
+        /// folder ([`Self::first_named_by`]).
         pub(super) fn arm_directory_then(
             &mut self,
             key: u64,
             path: &Path,
             mut between: impl FnMut(&Path),
         ) -> io::Result<()> {
+            let step = &mut |_, _: &Path| Ok(());
             for _ in 0..=super::ARM_AGAIN {
                 self.disarm(key);
-                self.listen(key, path, true, &mut |_, _| Ok(()))?;
+                let held = match self.listen(key, path, true, step) {
+                    Ok(()) => path.to_path_buf(),
+                    Err(error) if refused_as_link(&error, path) => {
+                        self.listen_named(key, path, error, step)?
+                    }
+                    Err(error) => return Err(error),
+                };
                 between(path);
-                match self.listen_above(key, path, path) {
+                match self.listen_above(key, path, &held) {
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    // The link made to name another folder before its own listener took.
+                    Ok(()) if held.as_path() != path && !self.first_named_by(key, path)? => {}
                     answer => return answer,
                 }
             }
             Err(io::Error::from(io::ErrorKind::WouldBlock))
+        }
+
+        /// Whether `link` still names the folder `key`'s first listener is on. A walk from a link
+        /// ([`Self::listen_above`]) listens on the link it finds, so a link made to name another
+        /// folder before then is heard by nothing; after then, by that listener.
+        ///
+        /// # Errors
+        /// The platform's, when the listener or the lookup could not be read.
+        fn first_named_by(&self, key: u64, link: &Path) -> io::Result<bool> {
+            use std::os::unix::fs::MetadataExt as _;
+            let Some(first) = self.armed.get(&key).and_then(|files| files.first()) else {
+                return Ok(false);
+            };
+            let held = first.metadata()?;
+            match std::fs::metadata(link) {
+                Ok(there) => Ok((held.dev(), held.ino()) == (there.dev(), there.ino())),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(error),
+            }
         }
 
         /// How many folders above the keys' own have a listener, and which keys share each.
@@ -1277,6 +1620,31 @@ mod kqueue {
         Answered,
     }
 
+    /// Whether a listen on the folder `path` answered `error` because `path` is a link, which a
+    /// listen does not open unless it is asked to.
+    fn refused_as_link(error: &io::Error, path: &Path) -> bool {
+        matches!(error.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP))
+            && std::fs::symlink_metadata(path).is_ok_and(|there| there.file_type().is_symlink())
+    }
+
+    /// Whether the volume `file` is on reports every writer's change to this kqueue
+    /// ([`super::volume_reports_every_writer`]); `false` where `fstatfs` refuses.
+    fn volume_hears_every_writer(file: &std::fs::File) -> bool {
+        // SAFETY: `statfs` is integers and arrays: all-zero is a value.
+        let mut volume: libc::statfs = unsafe { std::mem::zeroed() };
+        // SAFETY: a live descriptor and a writable `statfs`.
+        if unsafe { libc::fstatfs(file.as_raw_fd(), &raw mut volume) } != 0 {
+            return false;
+        }
+        let fstype: Vec<u8> = volume
+            .f_fstypename
+            .iter()
+            .take_while(|&&byte| byte != 0)
+            .map(|&byte| byte.to_ne_bytes()[0])
+            .collect();
+        super::volume_reports_every_writer(volume.f_flags, &String::from_utf8_lossy(&fstype))
+    }
+
     /// Whether `file` is still what `path` names.
     fn still_at(file: &std::fs::File, path: &Path) -> io::Result<bool> {
         use std::os::unix::fs::MetadataExt as _;
@@ -1303,6 +1671,14 @@ mod kqueue {
     impl FileEvents for KqueueEvents {
         fn arm(&mut self, key: u64, path: &Path) -> io::Result<()> {
             self.arm_around(key, path, |_, _| Ok(()))
+        }
+
+        /// Read from the volume of each of the key's own listeners (its folder and its file); a
+        /// key one of whose volumes cannot be read is looked at in rounds.
+        fn hears_every_writer(&self, key: u64) -> bool {
+            self.armed
+                .get(&key)
+                .is_none_or(|files| files.iter().all(volume_hears_every_writer))
         }
 
         fn arm_directory(&mut self, key: u64, path: &Path) -> io::Result<()> {
@@ -1434,6 +1810,14 @@ const IN_Q_OVERFLOW: u32 = 0x0000_4000;
 #[cfg(any(target_os = "linux", test))]
 const INOTIFY_SELF: u32 = 0x0000_0800 | 0x0000_0400;
 
+/// What a folder above a key's own one listens for: [`INOTIFY_SELF`], and `IN_ATTRIB`, its own
+/// attributes changed (a `chmod` that lets the lookup through it or stops it). inotify has no
+/// way to ask for a folder's own `IN_ATTRIB` alone: each entry's comes too (a `chmod`, `touch`
+/// or an atomic write's `fchmod` in the folder), with the entry's name. It touches no key above,
+/// and the wait it comes in goes on (the inotify events' `wait`).
+#[cfg(any(target_os = "linux", test))]
+const INOTIFY_ABOVE: u32 = INOTIFY_SELF | 0x0000_0004;
+
 /// A named file arm filters sibling entries; a directory arm hears all of them.
 #[cfg(any(target_os = "linux", test))]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1461,6 +1845,8 @@ struct InotifyRoutes {
     own: BTreeMap<i32, BTreeMap<Vec<u8>, BTreeSet<u64>>>,
     directories: BTreeMap<i32, BTreeSet<u64>>,
     above: BTreeMap<i32, BTreeSet<u64>>,
+    /// The file keys each watch on a file itself is for.
+    files: BTreeMap<i32, BTreeSet<u64>>,
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -1518,10 +1904,25 @@ impl InotifyRoutes {
         }
     }
 
+    fn replace_file(&mut self, key: u64, old: Option<i32>, new: Option<i32>) {
+        if let Some(wd) = old
+            && let Some(keys) = self.files.get_mut(&wd)
+        {
+            keys.remove(&key);
+            if keys.is_empty() {
+                self.files.remove(&wd);
+            }
+        }
+        if let Some(wd) = new {
+            self.files.entry(wd).or_default().insert(key);
+        }
+    }
+
     fn held(&self, wd: i32) -> bool {
         self.own.contains_key(&wd)
             || self.directories.contains_key(&wd)
             || self.above.contains_key(&wd)
+            || self.files.contains_key(&wd)
     }
 
     fn touch(&self, wd: i32, mask: u32, name: &[u8], touched: &mut Vec<u64>) {
@@ -1538,12 +1939,18 @@ impl InotifyRoutes {
                 touched.extend(keys);
             }
         }
+        // A file's own watch: a write or attribute change through any of its names.
+        if name.is_empty()
+            && let Some(keys) = self.files.get(&wd)
+        {
+            touched.extend(keys);
+        }
         if name.is_empty() || self.directories.contains_key(&wd) {
             touched[start..].sort_unstable();
         }
         // Entry events from a shared watch never invalidate ancestor listeners.
         if name.is_empty()
-            && mask & INOTIFY_SELF != 0
+            && mask & INOTIFY_ABOVE != 0
             && let Some(keys) = self.above.get(&wd)
         {
             touched.extend(keys);
@@ -1553,8 +1960,9 @@ impl InotifyRoutes {
 
 /// Push the keys a buffer of `struct inotify_event`s touches: each event
 /// whose watch and entry name are a key's (one on the directory itself, with
-/// no name, touches every key on it), each one on a folder above a key's own
-/// (which hears only that folder renamed or gone) touches that key,
+/// no name, touches every key on it), each one of a folder above a key's own
+/// renamed, gone or changed in mode (no name: [`INOTIFY_ABOVE`]) touches that
+/// key, while an entry's own event there touches none,
 /// and every key after a queue overflow, whose look then finds which files
 /// really changed.
 #[cfg(any(target_os = "linux", test))]
@@ -1602,20 +2010,24 @@ mod inotify {
     //! Linux: one inotify descriptor watching each watched file's directory, or
     //! the nearest one above it that is there (events name the entry, so a
     //! replace by rename is heard, as is the making of the missing folder), each
-    //! folder above that for its own rename or end, and a pipe that wakes the
-    //! wait. The kernel keeps one watch per folder, so a watch two keys hold
-    //! stays until neither does.
+    //! folder above that for its own rename, end or change of mode, the regular
+    //! file a file key names (which hears a write through another of its names,
+    //! a hard link, that its folder's watch does not name), and a pipe that
+    //! wakes the wait. The kernel keeps one watch per folder, so a watch
+    //! two keys hold stays until neither does. A folder's `IN_ATTRIB` cannot be
+    //! asked for without its entries' (inotify(7)): those reach the wait, touch
+    //! no key, and end no wait ([`InotifyEvents::wait`]).
 
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::CString;
     use std::io;
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
     use std::os::unix::ffi::OsStrExt as _;
     use std::path::Path;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    use super::{FileEvents, INOTIFY_SELF, InotifyEntry, InotifyRoutes, Waker, inotify_touched};
+    use super::{FileEvents, INOTIFY_ABOVE, InotifyEntry, InotifyRoutes, Waker, inotify_touched};
 
     /// `<sys/inotify.h>`'s event bits the generated libc does not carry.
     const IN_MODIFY: u32 = 0x0000_0002;
@@ -1623,6 +2035,10 @@ mod inotify {
     const IN_CLOSE_WRITE: u32 = 0x0000_0008;
     /// `<sys/inotify.h>`'s flag that adds a watch's mask to the one its folder has.
     const IN_MASK_ADD: u32 = 0x2000_0000;
+
+    /// What a file's own watch hears through any of its names: a write, a write's close, and a
+    /// change of mode, owner, times or link count.
+    const FILE_EVENTS: u32 = IN_MODIFY | IN_ATTRIB | IN_CLOSE_WRITE;
 
     const DIRECTORY_EVENTS: u32 = IN_MODIFY
         | IN_ATTRIB
@@ -1642,6 +2058,12 @@ mod inotify {
         keys: BTreeMap<u64, (i32, InotifyEntry)>,
         /// Each key's watches on the folders above its directory.
         above: BTreeMap<u64, Vec<i32>>,
+        /// Each file key's watch on the file itself, which hears a write made through another
+        /// name (a hard link) that its folder's watch, routed by name, does not.
+        files: BTreeMap<u64, i32>,
+        /// The keys last armed on a volume that does not report every writer
+        /// ([`super::volume_type_reports_every_writer`]).
+        elsewhere: BTreeSet<u64>,
         routes: InotifyRoutes,
     }
 
@@ -1668,11 +2090,13 @@ mod inotify {
                 wake_write: Arc::new(wake_write),
                 keys: BTreeMap::new(),
                 above: BTreeMap::new(),
+                files: BTreeMap::new(),
+                elsewhere: BTreeSet::new(),
                 routes: InotifyRoutes::default(),
             })
         }
 
-        /// Whether any key still holds `wd`, as its directory or as a folder above it.
+        /// Whether any key still holds `wd`, as its directory, a folder above it or its file.
         fn held(&self, wd: i32) -> bool {
             self.routes.held(wd)
         }
@@ -1689,7 +2113,8 @@ mod inotify {
 
         /// Watch every folder and link that looking `folder` up passes through
         /// ([`super::passed_through`]), but `folder`, `key`'s own watch, and the root, which
-        /// nothing renames, for its own rename or end; a mask added to whatever another key
+        /// nothing renames, for its own rename, end or change of mode ([`INOTIFY_ABOVE`]); a mask
+        /// added to whatever another key
         /// watches there. A link is watched itself, which hears it replaced (made to name another
         /// folder), and so is each folder the lookup goes on through behind it. A folder on
         /// another device is watched too: a btrfs subvolume can be renamed, and so can the folder
@@ -1720,7 +2145,7 @@ mod inotify {
                         libc::inotify_add_watch(
                             self.fd.as_raw_fd(),
                             path.as_ptr(),
-                            INOTIFY_SELF | IN_MASK_ADD | only | libc::IN_DONT_FOLLOW,
+                            INOTIFY_ABOVE | IN_MASK_ADD | only | libc::IN_DONT_FOLLOW,
                         )
                     };
                     if wd >= 0 {
@@ -1824,10 +2249,90 @@ mod inotify {
                 match self.watch_above(key, folder) {
                     // A folder on the way moved as the walk watched: arm again.
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Ok(()) => {
+                        let file = (below == path).then_some(path);
+                        self.watch_file(key, file)?;
+                        self.note_volume(
+                            key,
+                            folder,
+                            self.files.contains_key(&key).then_some(path),
+                        );
+                        return Ok(());
+                    }
                     above => return above,
                 }
             }
             Err(io::Error::from(io::ErrorKind::WouldBlock))
+        }
+
+        /// Watch the regular file `path` names, where it is one, for writes and attribute changes
+        /// made through any of its names, in place of `key`'s file watch before; none where
+        /// there is no such file (it is missing, or a link, a folder or a device).
+        ///
+        /// # Errors
+        /// The kernel's when it is out of watches, so the arm is made again; any other refusal
+        /// (a file this user cannot read) leaves the key its folder's watch.
+        fn watch_file(&mut self, key: u64, path: Option<&Path>) -> io::Result<()> {
+            let file = path.filter(|path| {
+                std::fs::symlink_metadata(path).is_ok_and(|there| there.file_type().is_file())
+            });
+            let watched = match file {
+                None => None,
+                Some(path) => {
+                    let path = CString::new(path.as_os_str().as_bytes())
+                        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+                    // SAFETY: a live inotify descriptor and a NUL-terminated path.
+                    let wd = unsafe {
+                        libc::inotify_add_watch(
+                            self.fd.as_raw_fd(),
+                            path.as_ptr(),
+                            FILE_EVENTS | IN_MASK_ADD | libc::IN_DONT_FOLLOW,
+                        )
+                    };
+                    if wd < 0 {
+                        let error = io::Error::last_os_error();
+                        if matches!(error.raw_os_error(), Some(libc::ENOSPC | libc::ENOMEM)) {
+                            self.drop_file(key);
+                            return Err(error);
+                        }
+                        None
+                    } else {
+                        Some(wd)
+                    }
+                }
+            };
+            let old = match watched {
+                Some(wd) => self.files.insert(key, wd),
+                None => self.files.remove(&key),
+            };
+            if old != watched {
+                self.routes.replace_file(key, old, watched);
+                self.release(old);
+            }
+            Ok(())
+        }
+
+        /// `key` has no file watch now.
+        fn drop_file(&mut self, key: u64) {
+            if let Some(old) = self.files.remove(&key) {
+                self.routes.replace_file(key, Some(old), None);
+                self.release([old]);
+            }
+        }
+
+        /// Note whether `key`'s volumes, the one `folder` is on and the one its watched `file`
+        /// is on, report every writer; one that cannot be read is taken as not, and the key is
+        /// looked at in rounds.
+        fn note_volume(&mut self, key: u64, folder: &Path, file: Option<&Path>) {
+            let reports = std::iter::once(folder).chain(file).all(|on| {
+                crate::shared_write::filesystem_at(on)
+                    .is_some_and(super::volume_type_reports_every_writer)
+            });
+            if reports {
+                self.elsewhere.remove(&key);
+            } else {
+                self.elsewhere.insert(key);
+            }
         }
 
         /// A directory arm with the same registration boundary as [`Self::arm_then`]: its own
@@ -1839,13 +2344,19 @@ mod inotify {
             path: &Path,
             mut between: impl FnMut(&Path),
         ) -> io::Result<()> {
+            self.drop_file(key);
             for _ in 0..=super::ARM_AGAIN {
                 let wd = self.add_folder_watch(path)?;
                 self.set_own(key, wd, InotifyEntry::Directory);
                 between(path);
                 match self.watch_above(key, path) {
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    answer => return answer,
+                    answer => {
+                        if answer.is_ok() {
+                            self.note_volume(key, path, None);
+                        }
+                        return answer;
+                    }
                 }
             }
             Err(io::Error::from(io::ErrorKind::WouldBlock))
@@ -1902,38 +2413,62 @@ mod inotify {
             let above = self.above.remove(&key).unwrap_or_default();
             self.routes.replace_above(key, &above, &[]);
             self.release(own.into_iter().map(|(wd, _)| wd).chain(above));
+            self.drop_file(key);
+            self.elsewhere.remove(&key);
         }
 
+        fn hears_every_writer(&self, key: u64) -> bool {
+            !self.elsewhere.contains(&key)
+        }
+
+        /// Events that touch no key end no wait: an entry's `IN_ATTRIB` in a folder above a
+        /// key's own ([`INOTIFY_ABOVE`]), which the kernel sends with the folder's own, or one
+        /// for a watch just let go. The wait goes on for what is left of `timeout`, so a caller
+        /// woken only by a key's event, a wake or the time (the board keeper's rest) is not woken
+        /// by a write it does not watch.
         fn wait(&mut self, timeout: Option<Duration>, touched: &mut Vec<u64>) -> io::Result<()> {
-            let mut fds = [
-                libc::pollfd {
-                    fd: self.fd.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-                libc::pollfd {
-                    fd: self.wake_read.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-            ];
-            // SAFETY: two live pollfd slots.
-            let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, super::poll_millis(timeout)) };
-            if ready < 0 {
-                let error = io::Error::last_os_error();
-                return if error.kind() == io::ErrorKind::Interrupted {
-                    Ok(())
-                } else {
-                    Err(error)
+            let deadline = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
+            let before = touched.len();
+            loop {
+                let left = match (timeout, deadline) {
+                    (Some(_), Some(deadline)) => {
+                        Some(deadline.saturating_duration_since(Instant::now()))
+                    }
+                    (timeout, _) => timeout,
                 };
+                let mut fds = [
+                    libc::pollfd {
+                        fd: self.fd.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: self.wake_read.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                ];
+                // SAFETY: two live pollfd slots.
+                let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, super::poll_millis(left)) };
+                if ready < 0 {
+                    let error = io::Error::last_os_error();
+                    return if error.kind() == io::ErrorKind::Interrupted {
+                        Ok(())
+                    } else {
+                        Err(error)
+                    };
+                }
+                let woken = fds[1].revents != 0;
+                if woken {
+                    self.drain_wakes();
+                }
+                if fds[0].revents != 0 {
+                    self.read_events(touched);
+                }
+                if woken || ready == 0 || touched.len() > before || left == Some(Duration::ZERO) {
+                    return Ok(());
+                }
             }
-            if fds[1].revents != 0 {
-                self.drain_wakes();
-            }
-            if fds[0].revents != 0 {
-                self.read_events(touched);
-            }
-            Ok(())
         }
 
         fn waker(&self) -> Waker {

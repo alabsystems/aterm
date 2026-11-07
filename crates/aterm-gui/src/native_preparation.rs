@@ -314,7 +314,8 @@ pub(super) fn authority_current(
     });
     preflight
         && same_actor(op, caller, kernel)
-        && kernel.constructor_enabled(op.request.plan.constructor())
+        && op.authority.asked_matches(&op.request)
+        && kernel.constructor_enabled(op.request.constructor())
         && meta.supervisor_authority(crate::metrics::now_us()) == op.authority.snapshot
         && op.authority.renewal.as_ref().is_none_or(|seal| {
             seal.admits(&op.authority.snapshot, &op.request)

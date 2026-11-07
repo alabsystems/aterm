@@ -4952,7 +4952,7 @@ impl<'a, C: Ctl> Session<'a, C> {
         if !carries.is_empty()
             && let Some(launch) = self.stall_host.as_ref().and_then(|host| host.launch())
         {
-            carries.retain(|&ts| ts >= launch);
+            carries.retain(|&(ts, _)| ts >= launch);
         }
         if !lifted_off
             && let Some((last_ms, streak)) =
@@ -7483,7 +7483,7 @@ impl<C: Ctl> Session<'_, C> {
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
         let reader = self.reader(&screen.rows);
-        self.cruise_carry.read(reader, screen, || self.fx.mono());
+        self.carry_read(reader, screen);
         let carried = self.transcript_wait_seq == Some(screen.seq);
         let unfit = if carried {
             None

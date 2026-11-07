@@ -630,8 +630,9 @@ fn read_records(
             }
         }
         if too_large {
-            record = Vec::new();
-            kept = Vec::new();
+            // Free what was held, not just empty it: nothing reads it again while the rest drains.
+            drop(std::mem::take(&mut record));
+            drop(std::mem::take(&mut kept));
         }
     }
     if too_large || (!record.is_empty() && !offer(&record, &record, &mut kept)) {

@@ -164,9 +164,32 @@ fn read_head(reader: &mut BufReader<&TcpStream>) -> Option<Head> {
 fn serve_one(stream: &TcpStream, origin: FakeOrigin, state: &Mutex<State>) {
     let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
     let mut reader = BufReader::new(stream);
-    let Some(head) = read_head(&mut reader) else {
+    let Some((req, left)) = read_request(&mut reader, origin) else {
         return;
     };
+    let outcome = routes::handle(
+        &mut state.lock().unwrap_or_else(PoisonError::into_inner),
+        &req,
+    );
+    match outcome {
+        Outcome::Answer(answer) => write(stream, &req, &answer, None),
+        Outcome::Close => {}
+        Outcome::Hang(wait) => {
+            hold(stream, &mut reader, wait, state);
+            return;
+        }
+        Outcome::Truncate(answer, at) => write(stream, &req, &answer, Some(at)),
+    }
+    let _ = stream.shutdown(Shutdown::Write);
+    drain(&mut reader, left);
+}
+
+/// Read the shared bounded HTTP framing, returning the request and remaining drain bound.
+pub(crate) fn read_request(
+    reader: &mut BufReader<&TcpStream>,
+    origin: FakeOrigin,
+) -> Option<(Request, u64)> {
+    let head = read_head(reader)?;
     let header = |name: &str| crate::header_in(&head.headers, name);
     let chunked = header("transfer-encoding").is_some_and(|v| {
         v.as_bytes()
@@ -186,7 +209,7 @@ fn serve_one(stream: &TcpStream, origin: FakeOrigin, state: &Mutex<State>) {
         if let Ok(cap) = usize::try_from(bound.min(64 * 1024)) {
             body.reserve(cap);
         }
-        let _ = (&mut reader).take(bound).read_to_end(&mut body);
+        let _ = reader.by_ref().take(bound).read_to_end(&mut body);
         cut = u64::try_from(body.len()).unwrap_or(u64::MAX) < bound;
         over = !cut && declared > BODY_MAX;
         if over {
@@ -204,21 +227,7 @@ fn serve_one(stream: &TcpStream, origin: FakeOrigin, state: &Mutex<State>) {
         cut,
         over,
     };
-    let outcome = routes::handle(
-        &mut state.lock().unwrap_or_else(PoisonError::into_inner),
-        &req,
-    );
-    match outcome {
-        Outcome::Answer(answer) => write(stream, &req, &answer, None),
-        Outcome::Close => {}
-        Outcome::Hang(wait) => {
-            hold(stream, &mut reader, wait, state);
-            return;
-        }
-        Outcome::Truncate(answer, at) => write(stream, &req, &answer, Some(at)),
-    }
-    let _ = stream.shutdown(Shutdown::Write);
-    drain(&mut reader, left);
+    Some((req, left))
 }
 
 /// Hold the connection `wait`, reading and dropping what the client sends, until the client
@@ -267,7 +276,7 @@ fn drain(reader: &mut BufReader<&TcpStream>, left: u64) {
 /// Write `answer`: no body on a HEAD or a 304, and no `Content-Length` on a 304; with `cut`,
 /// only that many bytes of the body after the full head. The fake writes `Connection` and
 /// `Content-Length` itself, so an answer's own header of either name is dropped.
-fn write(stream: &TcpStream, req: &Request, answer: &Answer, cut: Option<usize>) {
+pub(crate) fn write(stream: &TcpStream, req: &Request, answer: &Answer, cut: Option<usize>) {
     use std::fmt::Write as _;
     let status = answer.status;
     let mut out = String::with_capacity(192);

@@ -382,6 +382,7 @@ fn make_prepare(
         ..rollback.clone()
     };
     Some(Prepare {
+        asked_upgrade: None,
         id: id.into(),
         host_epoch: host_epoch()?.into(),
         holder: crate::harness_host::holder(),
@@ -1444,6 +1445,7 @@ mod tests {
             .supervisor_authority(crate::metrics::now_us())
             .revision();
         let prepare = Prepare {
+            asked_upgrade: None,
             id: "ab".repeat(16),
             host_epoch: host_epoch().unwrap().into(),
             holder: crate::harness_host::holder(),
@@ -1741,6 +1743,7 @@ mod tests {
             capability: "ab".repeat(32),
         };
         let operation = Arc::new(Mutex::new(Operation {
+            terminal_acknowledged: None,
             request: seal.prepare.clone(),
             binding: binding.clone(),
             authority,
@@ -1768,6 +1771,7 @@ mod tests {
             observation: None,
             outcome_slot: None,
             completed_observation: None,
+            committed_image: None,
             source_death: None,
             closed_restart: None,
             resume_only: false,

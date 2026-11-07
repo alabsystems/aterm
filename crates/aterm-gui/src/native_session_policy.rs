@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! One session's catalog and native constructor policy. Production uses the shipping
-//! roster and disables generic constructors. Sealed cold relaunch and Codex renewal are
+//! roster and disables generic constructors. Sealed cold relaunch, qualified asked upgrade and Codex renewal are
 //! limited to Apple Silicon macOS; only an explicit debug Rust factory supplies fixtures.
 
 use aterm_agent::harness::contract::{self, Row, Words};
@@ -104,9 +104,11 @@ impl SessionPolicy {
         if let Some(fixture) = &self.fixture {
             return fixture.constructors.enabled(kind);
         }
-        // ColdRestart still requires the built-in Relaunch authority, a captured cold
-        // intent, no renewal/rollback, and owned-helper resolution before any exec grant.
-        matches!(kind, Constructor::ColdRestart) && cold_restart_qualified()
+        // ColdRestart requires built-in Relaunch authority and owned-helper resolution.
+        // AskedUpgrade independently requires the settled predecessor and current Upgrade
+        // authority; advertising either constructor supplies neither admission proof.
+        matches!(kind, Constructor::ColdRestart | Constructor::AskedUpgrade)
+            && cold_restart_qualified()
     }
 
     /// Qualification gate for the sealed same-account service. Generic native
@@ -271,6 +273,7 @@ impl FixtureConstructors {
             Constructor::OwnImage => 1,
             Constructor::PrivateRestart => 2,
             Constructor::ColdRestart => 4,
+            Constructor::AskedUpgrade => 8,
         }
     }
 

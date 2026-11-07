@@ -10,7 +10,7 @@ use aterm_types::control_verbs::TURN_SUBMIT_BUSY_REPLY;
 
 use super::super::config::{Autopilot, SupervisorConfig};
 use super::super::policy::cruise_carry::{
-    BackgroundCarries, RULE_BACKGROUND, carry_words, recovery_words,
+    BackgroundCarries, RULE_BACKGROUND, RULE_BACKGROUND_RESET, carry_words, recovery_words,
 };
 use super::super::policy::go_ahead::{self, RULE_GO_AHEAD};
 use super::super::policy::needs;
@@ -54,6 +54,10 @@ pub(super) struct CarryWatch {
     /// When the last carry of a loop before this one was typed ([`Self::seed`]), until this loop's
     /// first busy read: the counts that carry was typed under were that loop's.
     owed: Option<Instant>,
+    /// A loop before this one left the books ([`Self::seed`]), until this loop's first settled
+    /// break: a turn read live before then may have begun before this loop did, a break short of
+    /// its settle a pause inside it, so where it began went unread ([`Opened::unread`]).
+    unseen_start: bool,
     /// The turn a settled break read whole from the history (`Session::break_turn`), by the mark
     /// of the words its screen shows: read once while they stand, for that turn only. A new turn
     /// read live ([`Self::live`]), a judged point and a carry typed forget it, so a later turn
@@ -138,9 +142,46 @@ struct Opened {
     /// When the stretch running now began: `None` while the turn stands at a break short of its
     /// settle, which is no work.
     since: Option<Instant>,
-    /// A break read as begun before the stretch then running (the loop stepped no break while it
-    /// ran: under Off): where that stretch ended went unread, so its work is unknown.
+    /// Its work is unknown: a break read as begun before the stretch then running (the loop
+    /// stepped no break while it ran: under Off), where that stretch ended went unread, or it was
+    /// read live before this loop's first settled break on books a loop before it left, where it
+    /// began did ([`CarryWatch::seed`]; unless a wake opened it since, [`Self::wake_tells`]).
     unread: bool,
+    /// It is unread for where it began, and opened after this loop's first read found a break,
+    /// until its first read: one that draws the program's own wake newest began there, its start
+    /// read ([`CarryWatch::read`]).
+    wake_tells: bool,
+}
+
+/// Why the books started again where they held a carry, as the row that says it gives it
+/// ([`Session::books_again`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Again {
+    /// A turn of real work ([`BackgroundCarries::ended`]).
+    Work,
+    /// Someone else's message.
+    Theirs,
+    /// A turn whose work went unread ([`Opened::unread`]).
+    Unread,
+    /// The person's gesture after a loop before this one's last carry ([`CarryWatch::read`]).
+    Touched,
+}
+
+impl Again {
+    /// The reason its row gives.
+    const fn reason(self) -> &'static str {
+        match self {
+            Again::Work => "a turn of real work started Cruise's background ladder again",
+            Again::Theirs => "someone else's message started Cruise's background ladder again",
+            Again::Unread => {
+                "a turn whose work went unread started Cruise's background ladder again"
+            }
+            Again::Touched => {
+                "the person's gesture after the last carry started Cruise's background ladder \
+                 again"
+            }
+        }
+    }
 }
 
 /// Why a due carry was not typed, as the journal says it.
@@ -159,12 +200,14 @@ enum CarrySaid {
 
 impl CarryWatch {
     /// A read of a live turn (`Session::took`): the first since the last settled break or point
-    /// opens a turn (`ours` when the harness's own line opened it), the first after a pause
-    /// inside it starts its next stretch, each at `at` (read only then), and the settled break
-    /// that ends it judges it ([`Self::at_break`]).
+    /// opens a turn (`ours` when the harness's own line opened it; unread where it may have begun
+    /// before this loop, [`Self::seed`]), the first after a pause inside it starts its next
+    /// stretch, each at `at` (read only then), and the settled break that ends it judges it
+    /// ([`Self::at_break`]).
     pub(super) fn live(&mut self, ours: bool, at: impl FnOnce() -> Instant) {
         match self.opened.as_mut() {
             None => {
+                let unread = std::mem::take(&mut self.unseen_start);
                 let from = self.carried.unwrap_or_else(at);
                 self.opened = Some(Opened {
                     ours,
@@ -173,7 +216,8 @@ impl CarryWatch {
                     from,
                     busy: Duration::ZERO,
                     since: Some(from),
-                    unread: false,
+                    unread,
+                    wake_tells: unread && self.owed.is_none(),
                 });
                 self.turn_read = None;
             }
@@ -184,32 +228,43 @@ impl CarryWatch {
 
     /// A LOOP BEFORE THIS ONE'S LADDER: its last carry typed `ago` before `now`, the `streak`-th
     /// in a row. The counts it was typed under were that loop's, so this loop's first busy read
-    /// stands for them ([`Self::read`]): the next turn is judged by its busy time unless someone
-    /// else's message lands in it after that read, never as a person's for counts this loop never
-    /// saw.
+    /// stands for them ([`Self::read`]): a turn that opens after this loop's first settled break is
+    /// judged by its busy time unless someone else's message lands in it after that read, never as
+    /// a person's for counts this loop never saw. A TURN RUNNING AT THE RESTART IS UNREAD: one read
+    /// live before that break may have begun before this loop, so its work and a message another
+    /// driver sent it then are unknown, and its break starts the books again ([`Self::at_break`]).
+    /// A break this loop has not yet seen settle may be a pause inside such a turn, or one that
+    /// stood for minutes; a turn opened after the first read found one is unread unless the
+    /// program's own wake its first read draws opened it there ([`Self::read`]: Claude Code's).
     pub(super) fn seed(&mut self, ago: Duration, streak: u32, now: Instant) {
         let Some(last) = now.checked_sub(ago) else {
             return;
         };
         self.books = BackgroundCarries::carried(last, streak);
         self.owed = Some(last);
+        self.unseen_start = true;
     }
 
     /// A busy read on `screen`, at `at` (read only for the first after a seed, or of a turn): an
     /// open turn whose newest prompt row is not the harness's has someone else's message in it.
     /// The first read of a turn counted from the carry's typing that draws the program's own wake
     /// newest ([`opened_by_wake`]) opens it there and counts it from there: the carry's answer was
-    /// over unseen. The first after a seed stands for the counts the last carry was typed under,
-    /// but not where the person's last gesture the host reports came after that carry: the seeded
-    /// books start again even if their turn already reached its break before the restart, so no
-    /// live edge was read. The counts stay unknown and a live turn not the harness's is a person's
-    /// ([`Self::at_break`]).
+    /// over unseen. The first read that draws it of a turn opened after a seeded loop's first read
+    /// found a break reads where that turn began: the wake opened it since, so its busy time
+    /// judges it ([`Opened::wake_tells`]). The first after a seed stands for the counts the last
+    /// carry was typed under, but not where the person's last gesture the host reports came after
+    /// that carry: the seeded books start again even if their turn already reached its break
+    /// before the restart, so no live edge was read. The counts stay unknown and a live turn not
+    /// the harness's is a person's ([`Self::at_break`]). Returns why the books started again where
+    /// they held a carry.
+    #[must_use]
     pub(super) fn read(
         &mut self,
         reader: &dyn ScreenReader,
         screen: &Screen,
         at: impl Fn() -> Instant,
-    ) {
+    ) -> Option<Again> {
+        let mut again = None;
         if let Some(last) = self.owed.take() {
             let touched = match screen.human {
                 HumanInput::Ago(ms) => {
@@ -218,7 +273,7 @@ impl CarryWatch {
                 HumanInput::Unknown | HumanInput::Never | HumanInput::NeverFor(_) => false,
             };
             if touched {
-                self.books.reset();
+                again = self.start_again(Again::Touched, BackgroundCarries::reset);
             } else {
                 self.count = screen.human_seq;
                 self.submits = screen.submits;
@@ -231,18 +286,23 @@ impl CarryWatch {
                 opened.from = woke;
                 opened.since = Some(woke);
             }
+            if std::mem::take(&mut opened.wake_tells) && opened_by_wake(reader, &screen.rows) {
+                opened.unread = false;
+            }
             if !opened.theirs {
                 opened.theirs = newest_prompt_ours(reader, &screen.rows) == Some(false);
             }
         }
+        again
     }
 
     /// A TURN ENDS ONLY AT A SETTLED BREAK: a read on `screen` of a break of the agent's own
     /// background work that began at `began` ends the open turn's stretch there. Unsettled, it is
     /// a pause inside the turn (a reply's text drawn between tool calls under a status line), and
     /// the pause is no work. Settled ([`background_settle`]) with no turn open, it ends the last
-    /// carry's claim: an answer no read saw is over, and the next turn counts from its own live
-    /// edge. Settled with one open, it ends the turn, which is judged:
+    /// carry's claim and a loop before this one's ([`Self::seed`]): an answer or a turn no read saw
+    /// is over, and the next turn counts from its own live edge. Settled with one open, it ends
+    /// the turn, which is judged:
     /// - SOMEONE ELSE'S MESSAGE starts the books again, whoever opened the turn: a submission
     ///   since the last judged turn or carry that is not the harness's own (a person's Enter,
     ///   another driver's `send`; not one the harness submitted, [`Self::keyed`]: an Enter the
@@ -251,29 +311,32 @@ impl CarryWatch {
     ///   A scroll, a click or a key that submits nothing is no message. Where a submission count
     ///   is unknown, the person's count (any gesture) moved since the last carry, or unknown on a
     ///   turn not the harness's, is a person's turn.
-    /// - A turn whose stretch's end went unread starts them again: unsure.
+    /// - A turn whose work went unread ([`Opened::unread`]: a stretch's end, or its start before
+    ///   this loop's) starts them again: unsure.
     /// - THE PROGRAM'S OWN WAKE keeps them, as the harness's own line does: REAL WORK IS BUSY
     ///   TIME, the turn's stretches summed, and a turn of real work starts them again while a
     ///   short one leaves them ([`BackgroundCarries::ended`]).
     ///
-    /// Returns when the turn a settled break ends opened ([`Opened::from`]), which bounds the
-    /// person's key it holds the go-ahead for
-    /// ([`super::super::policy::turn_end::TurnEndState::break_keyed`]), and its busy time, whose
-    /// real work starts the go-ahead's span again
+    /// Returns why the books started again where they held a carry, and, settled, when the turn
+    /// the break ends opened ([`Opened::from`]), which bounds the person's key it holds the
+    /// go-ahead for ([`super::super::policy::turn_end::TurnEndState::break_keyed`]), and its busy
+    /// time, whose real work starts the go-ahead's span again
     /// ([`super::super::policy::turn_end::TurnEndState::go_ahead_worked`]); `None` unsettled, or
     /// with no turn read live since the last settled break or point.
+    #[must_use]
     pub(super) fn at_break(
         &mut self,
         timing: &TurnEndTiming,
         screen: &Screen,
         began: Instant,
         settled: bool,
-    ) -> Option<(Instant, Duration)> {
+    ) -> (Option<Again>, Option<(Instant, Duration)>) {
         let Some(mut turn) = self.opened.take() else {
             if settled {
                 self.carried = None;
+                self.unseen_start = false;
             }
-            return None;
+            return (None, None);
         };
         if let Some(since) = turn.since.take() {
             turn.unread |= began < since;
@@ -283,7 +346,7 @@ impl CarryWatch {
         }
         if !settled {
             self.opened = Some(turn);
-            return None;
+            return (None, None);
         }
         self.carried = None;
         let someone = turn.theirs
@@ -295,11 +358,30 @@ impl CarryWatch {
         self.submits = screen.submits;
         self.keyed = 0;
         if someone || turn.unread {
-            self.books.reset();
-        } else {
-            self.books.ended(timing, turn.busy);
+            let why = if someone {
+                Again::Theirs
+            } else {
+                Again::Unread
+            };
+            let again = self.start_again(why, BackgroundCarries::reset);
+            return (again, Some((turn.from, turn.busy)));
         }
-        Some((turn.from, turn.busy))
+        (
+            self.start_again(Again::Work, |books| books.ended(timing, turn.busy)),
+            Some((turn.from, turn.busy)),
+        )
+    }
+
+    /// Starts the books again as `start` does, for `why`, which it returns where that moved them:
+    /// they held a carry.
+    fn start_again(
+        &mut self,
+        why: Again,
+        start: impl FnOnce(&mut BackgroundCarries),
+    ) -> Option<Again> {
+        let held = self.books;
+        start(&mut self.books);
+        (self.books != held).then_some(why)
     }
 
     /// A judged point: the policy carries the session from here, and the next break is carried
@@ -418,8 +500,32 @@ fn newest_prompt_ours(reader: &dyn ScreenReader, rows: &[String]) -> Option<bool
 }
 
 impl<C: Ctl> Session<'_, C> {
-    /// THE BREAK THAT BEGAN AT `at`, read on `screen` ([`CarryWatch::at_break`]). Settled, the
-    /// real work of the turn it ends starts the go-ahead's span again
+    /// A busy read of a background break on `screen` ([`CarryWatch::read`]), and the row books it
+    /// started again owe ([`Self::books_again`]).
+    pub(super) fn carry_read(&mut self, reader: &dyn ScreenReader, screen: &Screen) {
+        let again = self.cruise_carry.read(reader, screen, || self.fx.mono());
+        self.books_again(again, screen.seq);
+    }
+
+    /// THE BOOKS STARTED AGAIN ARE WRITTEN DOWN: where they held a carry, a row says why
+    /// ([`RULE_BACKGROUND_RESET`]), so a later loop's replay of the ladder starts after it
+    /// ([`super::approvals::background_carries_in`]) though no carry was typed since. A judged
+    /// point's own row ends that replay too ([`CarryWatch::point`]).
+    fn books_again(&mut self, again: Option<Again>, seq: u64) {
+        if let Some(why) = again {
+            self.ledger_row(
+                RULE_BACKGROUND_RESET,
+                Outcome::Waiting,
+                "",
+                why.reason(),
+                seq,
+            );
+        }
+    }
+
+    /// THE BREAK THAT BEGAN AT `at`, read on `screen` ([`CarryWatch::at_break`]), and the row
+    /// books it started again owe ([`Self::books_again`]). Settled, the real work of the turn it
+    /// ends starts the go-ahead's span again
     /// ([`super::super::policy::turn_end::TurnEndState::go_ahead_worked`]), and it reads the
     /// person's last key as a turn end does
     /// ([`super::super::policy::turn_end::TurnEndState::break_keyed`]), bounded by when the turn
@@ -427,9 +533,10 @@ impl<C: Ctl> Session<'_, C> {
     /// `status` or the screen) or a driver's hand, never a draft (`Session::key_ago`). Nothing the harness
     /// types stamps a key, so its own carries and go-aheads never renew the hour.
     pub(super) fn break_judged(&mut self, screen: &Screen, at: Instant, settled: bool) {
-        let turn = self
+        let (again, turn) = self
             .cruise_carry
             .at_break(&self.turn_end.timing, screen, at, settled);
+        self.books_again(again, screen.seq);
         if !settled {
             return;
         }
@@ -661,6 +768,11 @@ impl<C: Ctl> Session<'_, C> {
             || super::approvals::act_reason_after(self.carried(), self.turn_end.limit_try()),
             str::to_string,
         );
+        // The row names the streak it went at, the carry's as what went in its place (the
+        // go-ahead, the continuation owed: all go on the carry's ladder), so a later loop takes
+        // the ladder up as it stands, where it started again in memory alone too.
+        let reason =
+            super::approvals::background_carry_reason(&reason, self.cruise_carry.books.streak());
         self.ledger_row(rule, Outcome::Typed, &text, &reason, seq);
         Ok(true)
     }

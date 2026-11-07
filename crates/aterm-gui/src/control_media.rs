@@ -3963,6 +3963,13 @@ impl crate::App {
         {
             let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             timeline.set_task_worker(worker.order.agent, worker.order.trusted_cwd.clone());
+            timeline.set_task_program(
+                worker
+                    .order
+                    .program
+                    .as_ref()
+                    .and_then(crate::program_worker::ProgramRun::name),
+            );
             // A manager that is a session here is here, whatever drive the spawn came over.
             timeline.set_task_manager_node(
                 worker
@@ -5501,6 +5508,203 @@ mod worker_start_app_tests {
                 "a manager that is a session here"
             );
         });
+    }
+
+    /// A PROGRAM WORKER'S TAB IS NAMED BY ITS PROGRAM WHILE ITS SHELL TITLES IT: its shell titles
+    /// the tab by its folder at a prompt and by the line its launcher typed, which quotes the
+    /// program's path and words (and, for a store binary, opens with its shim's environment
+    /// words), so every message placing it (`in Workers ▸ …`) and "Autopilot set to land" named it
+    /// `Workers ▸ '/opt/lab/bench' '--quick' < "$ATERM_TAS`, its folder once its program ended,
+    /// and a worker whose line never ran had the row `the program`. Each names it by its
+    /// `program=`'s file name now, a busy terminal's as the strip last read it, never by its words,
+    /// its environment words or its folder. CONTROLS: a title its program gives the tab names it
+    /// while it stands; an agent's worker is named by its agent, and a program worker kept as a tab
+    /// and a person's tab running the same line by that line, as their chips read.
+    #[test]
+    fn a_program_workers_tab_is_named_by_its_program_while_its_shell_titles_it() {
+        use crate::app_workers_tests::{land_worker, line_starts, prompt_in};
+        use crate::program_worker::ProgramRun;
+        use crate::task_record::{TaskMark, mark_session_task};
+        use aterm_agent::supervise::Autopilot;
+        let mut app = App::headless_for_test();
+        let host = crate::harness_host::HostHandle::for_supervised_test(
+            Vec::new(),
+            Arc::new(|_| crate::harness_host::BodyEnd::Stopped),
+        );
+        app.harness = Some(host.clone());
+        let started = |app: &mut App, local: u64, ask: WorkerStart| {
+            let sid = sid_of(app, local);
+            let seed = ask.seed();
+            drop(app.ready_worker(&sid, ask, seed).expect("a worker"));
+        };
+        let program = |path: &str, args: &[&str]| {
+            let run = ProgramRun {
+                program: path.to_string(),
+                args: args.iter().map(|word| (*word).to_string()).collect(),
+            };
+            let line = aterm_agent::harness::worker::program_line(
+                Dialect::Zsh,
+                std::path::Path::new(&run.program),
+                &run.args,
+            )
+            .expect("a line");
+            let mut ask = worker();
+            ask.order = TaskOrder::of_program_frame(Some(b"exit 3".to_vec()), run, None, None)
+                .expect("a well-formed order");
+            (ask, line)
+        };
+        let typed = |app: &App, local: u64, bytes: &[u8]| {
+            let term = app.pool.get(local).expect("pooled").term.clone();
+            crate::term_lock(&term).process(bytes);
+        };
+        let record = |app: &App, key: &str| {
+            app.messages
+                .log()
+                .records()
+                .find(|r| r.key.as_deref() == Some(key))
+                .map(|r| (r.title.clone(), r.detail.first().cloned()))
+                .expect("its record")
+        };
+
+        let bench = land_worker(&mut app);
+        let (ask, line) = program("/opt/lab/bench", &["--quick"]);
+        started(&mut app, bench, ask);
+        typed(&app, bench, &prompt_in("~/proj"));
+        typed(&app, bench, &line_starts(&line));
+        assert_eq!(
+            app.tab_label_of_session(bench),
+            "bench",
+            "a program worker's tab is named by its program while its shell titles it by its line"
+        );
+        let sid = sid_of(&app, bench);
+        assert_eq!(app.session_place(&sid), "in Workers \u{25b8} bench");
+        assert!(
+            crate::session_timeline::apply_autopilot(
+                &ctx_of(&app, bench),
+                Some("land".to_owned()),
+                None,
+                aterm_slog::Actor::Aterm,
+                None,
+            )
+            .moved
+        );
+        app.on_meta_changed(bench);
+        assert_eq!(
+            record(&app, &format!("harness.autopilot.{sid}")),
+            (
+                "Autopilot set to land".to_owned(),
+                Some(format!(
+                    "Workers \u{25b8} bench: {}",
+                    crate::autopilot::mode_words(Autopilot::Land).record
+                )),
+            ),
+            "the Autopilot record names it by its program"
+        );
+        app.tab_titles(WindowId(0));
+        {
+            let busy = app.pool.get(bench).expect("pooled").term.clone();
+            let _reading = crate::term_lock(&busy);
+            assert_eq!(
+                app.tab_label_of_session(bench),
+                "bench",
+                "a busy terminal's program worker is named as the strip last read its title"
+            );
+        }
+        // Its program exits 3: the shell reports the status before it titles the next prompt.
+        typed(&app, bench, b"\x1b]133;D;3\x07");
+        let failed = TaskMark {
+            why: Some(crate::task_record::WHY_EXIT_STATUS),
+            exit: Some(3),
+            ..TaskMark::new(TaskState::Failed)
+        };
+        mark_session_task(&ctx_of(&app, bench), bench, &failed).expect("unfenced");
+        assert_eq!(
+            app.tab_label_of_session(bench),
+            "bench",
+            "its program ended, its line still titling the tab"
+        );
+        typed(&app, bench, &prompt_in("~/proj"));
+        assert_eq!(
+            app.tab_label_of_session(bench),
+            "bench",
+            "at its next prompt"
+        );
+
+        // A store binary's line opens with its shim's environment words.
+        let store = land_worker(&mut app);
+        let (ask, _) = program("/Users//me/.atpkg/store/bench/3/bin/bench", &[]);
+        started(&mut app, store, ask);
+        typed(&app, store, &prompt_in("~/proj"));
+        typed(
+            &app,
+            store,
+            &line_starts(
+                " ATPKG_HOME=/Users//me/.atpkg '/Users//me/.atpkg/store/bench/3/bin/bench' < \
+                 \"$ATERM_TASK_FILE\"",
+            ),
+        );
+        assert_eq!(
+            app.tab_label_of_session(store),
+            "bench",
+            "neither its environment words nor its folder name it"
+        );
+        typed(&app, store, b"\x1b]0;bench: 3 of 10\x07");
+        assert_eq!(
+            app.tab_label_of_session(store),
+            "bench: 3 of 10",
+            "CONTROL: a title its program gives the tab names it"
+        );
+
+        let never = land_worker(&mut app);
+        let (ask, _) = program("/opt/lab/bench", &["--quick"]);
+        started(&mut app, never, ask);
+        typed(&app, never, &prompt_in("~/proj"));
+        let stalled = TaskMark {
+            why: Some("startup"),
+            ..TaskMark::new(TaskState::Stalled)
+        };
+        mark_session_task(&ctx_of(&app, never), never, &stalled).expect("unfenced");
+        let row = app
+            .worker_rows(WindowId(0))
+            .into_iter()
+            .find(|row| row.session == never)
+            .expect("its row");
+        assert_eq!(row.title, "bench", "a program worker whose line never ran");
+
+        let claude = land_worker(&mut app);
+        started(&mut app, claude, worker());
+        typed(&app, claude, &prompt_in("~/proj"));
+        typed(
+            &app,
+            claude,
+            &line_starts(" CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 'claude' \"$(cat task.md)\""),
+        );
+        assert_eq!(
+            app.tab_label_of_session(claude),
+            "Claude Code",
+            "CONTROL: an agent's worker is named by its agent"
+        );
+
+        let kept = land_worker(&mut app);
+        let (ask, line) = program("/opt/lab/bench", &[]);
+        started(&mut app, kept, ask);
+        typed(&app, kept, &prompt_in("~/proj"));
+        typed(&app, kept, &line_starts(&line));
+        assert!(app.keep_as_tab(kept), "PRECONDITION: kept as a tab");
+        assert_eq!(
+            app.tab_label_of_session(kept),
+            line.trim(),
+            "CONTROL: a program worker kept as a tab is named as its chip reads"
+        );
+        let person = crate::app_workers_tests::person_tab(&mut app);
+        typed(&app, person, &prompt_in("~/proj"));
+        typed(&app, person, &line_starts(&line));
+        assert_eq!(
+            app.tab_label_of_session(person),
+            line.trim(),
+            "CONTROL: a person's tab running the same line is named by it"
+        );
+        host.shutdown_and_join();
     }
 
     #[cfg(unix)]

@@ -152,7 +152,7 @@ pub(crate) struct SessionRow {
     pub id: u64,
     /// The session's global sid (a task's `from=` names it).
     pub sid: String,
-    /// The tab's label as every Agents surface names it (`App::tab_label_of_session`): its role, else its title pin, else the strip's own rungs (the live OSC title without the status glyph an agent leads it with, a worker's agent instead while its shell titles its tab, then the cwd), else the tab's position, else the short sid.
+    /// The tab's label as every Agents surface names it (`App::tab_label_of_session`): its role, else its title pin, else the strip's own rungs (the live OSC title without the status glyph an agent leads it with, what a parked worker runs instead while nothing it runs has titled its tab (its agent, or a program worker's program), then the cwd), else the tab's position, else the short sid.
     pub title: String,
     /// What the session needs of its owner now, as published.
     pub need: Option<crate::needs::Need>,

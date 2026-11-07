@@ -358,6 +358,11 @@ pub(crate) struct TaskRecord {
     pub(crate) carried_entered: Option<u64>,
     /// Agent program started by `spawn agent=<word>`, if spawned as a worker.
     pub(crate) agent: Option<aterm_phase::Program>,
+    /// A PROGRAM WORKER'S PROGRAM BY NAME ([`Self::runs_a_program`]): the file name of its
+    /// `program=` (`crate::program_worker::program_name`, `bench` for `/opt/lab/bench`), which
+    /// names the worker as an agent's product names an agent's worker ([`Self::worker_name`]);
+    /// none for an agent's worker. A carry row holds it (`program=`).
+    pub(crate) program: Option<String>,
     /// Canonical `cwd` trusted by the starter when spawning the worker.
     pub(crate) trusted_cwd: Option<String>,
     /// A PROGRAM WORKER'S BLOCK ([`Self::runs_a_program`], `crate::program_worker`): the id of the
@@ -393,6 +398,18 @@ impl TaskRecord {
     #[must_use]
     pub(crate) fn runs_a_program(&self) -> bool {
         self.agent == Some(aterm_phase::Program::Generic)
+    }
+
+    /// What the worker runs, by name: its agent's product (`Claude Code`), or a program worker's
+    /// program ([`Self::program`], `bench`), else `the program` ([`aterm_phase::Program::Generic`]'s
+    /// product) for a program worker whose record names none (one an older build carried); `None`
+    /// for a record that is no worker's.
+    #[must_use]
+    pub(crate) fn worker_name(&self) -> Option<&str> {
+        match (self.agent?, self.program.as_deref()) {
+            (aterm_phase::Program::Generic, Some(program)) => Some(program),
+            (agent, _) => Some(agent.product()),
+        }
     }
 
     /// Whether a waiter has news (a terminal state or a standing ask, [`Self::attention`]).
@@ -503,6 +520,10 @@ impl TaskRecord {
             out.push_str(" agent=");
             out.push_str(agent.name());
         }
+        if let Some(program) = &self.program {
+            out.push_str(" program=");
+            out.push_str(&crate::control::pct_encode(program));
+        }
         if let Some(folder) = &self.trusted_cwd {
             out.push_str(" trusted_cwd=");
             out.push_str(&crate::control::pct_encode(folder));
@@ -584,6 +605,7 @@ impl TaskRecord {
         };
         let rev = parse_u64(field("rev")?).filter(|rev| *rev > 0)?;
         let fact_rev = field("fact_rev").and_then(parse_u64).unwrap_or(0);
+        let agent = field("agent").and_then(worker_agent);
         Some(Self {
             rev,
             state: TaskState::parse(field("state")?)?,
@@ -626,7 +648,10 @@ impl TaskRecord {
             started: now.checked_sub(ran).unwrap_or(now),
             entered: rev,
             carried_entered: None,
-            agent: field("agent").and_then(worker_agent),
+            agent,
+            program: field("program")
+                .filter(|_| agent == Some(aterm_phase::Program::Generic))
+                .and_then(program_word),
             trusted_cwd: field("trusted_cwd").and_then(trusted_folder),
             program_block: match field("block") {
                 Some(block) => Some(parse_u64(block)?),
@@ -655,6 +680,13 @@ fn trusted_folder(value: &str) -> Option<String> {
             .all(|c| !matches!(c, Component::ParentDir | Component::CurDir))
         && spelled_as_its_parts(path))
     .then(|| decoded.clone())
+}
+
+/// The program a carried `program=` names: pct-decoded, a program's name as a spawn stored it
+/// (`crate::program_worker::program_name`, so no folder).
+fn program_word(value: &str) -> Option<String> {
+    let decoded = aterm_codec::pct::decode(value);
+    (crate::program_worker::program_name(&decoded) == Some(decoded.as_str())).then_some(decoded)
 }
 
 /// The agent a worker's `agent=` word names: one a spawn can start
@@ -872,6 +904,7 @@ impl TaskMark {
                 entered: 1,
                 carried_entered: None,
                 agent: None,
+                program: None,
                 trusted_cwd: None,
                 program_block: None,
                 fact: None,

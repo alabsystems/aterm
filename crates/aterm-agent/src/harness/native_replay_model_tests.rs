@@ -108,6 +108,51 @@ fn retirement_attempt(state: &State, bypass: bool) -> (usize, bool) {
     (worker.join().unwrap().len(), st == original)
 }
 
+fn renewal_attempt(state: &State, bypass: bool) -> (usize, bool) {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let mut opts = opts(root.path());
+    let mut st = seed();
+    let Request::Prepare(prepare) = Request::parse(&st.native_prepare).unwrap() else {
+        panic!("the original preparation")
+    };
+    st.native = Some(Binding {
+        id: prepare.id.clone(),
+        capability: binding().capability,
+    });
+    let key = format!("renewal-{}", prepare.id);
+    upgrade_drive::save_checked(&opts, &key, &st).unwrap();
+    let mut st = upgrade_drive::load_record(&opts, &key).unwrap().unwrap();
+    st.native_retired_unissued = state["held"] == 1;
+    upgrade_drive::save_checked(&opts, &key, &st).unwrap();
+    opts.dry_run = state["dry"] == 1;
+    let original = st.clone();
+    let expected = Request::Signal(st.native.clone().unwrap());
+    let request_copy = expected.clone();
+    let (mut client, worker) = endpoint(move |line| {
+        assert_eq!(request(line), request_copy, "renewal keeps its binding");
+        None
+    });
+    let fault = (state["barrier_failed"] == 1)
+        .then(|| aterm_durable::seam::FailingDirs::with_kind(std::io::ErrorKind::Unsupported));
+    if bypass {
+        assert!(upgrade_drive::save_checked(&opts, &key, &st).is_err());
+        assert!(native_act::exchange(&mut client, SID, &expected).is_err());
+        drop(client);
+    } else {
+        assert!(
+            super::super::super::codex_renewal::drive_connection(
+                &opts, SID, &prepare, st, client, true
+            )
+            .is_none()
+        );
+    }
+    drop(fault);
+    let mut saved = upgrade_drive::load_record(&opts, &key).unwrap().unwrap();
+    saved.progress_at = original.progress_at;
+    saved.progress_key.clone_from(&original.progress_key);
+    (worker.join().unwrap().len(), saved == original)
+}
+
 pub(super) fn transition(state: &State, action: &str) -> State {
     if action == "Attempt" {
         let (dispatched, intact) = attempt(state, false);
@@ -135,6 +180,15 @@ pub(super) fn retirement_transition(state: &State, action: &str) -> State {
     }
 }
 
+pub(super) fn renewal_transition(state: &State, action: &str) -> State {
+    if action == "Attempt" {
+        let (dispatched, intact) = renewal_attempt(state, false);
+        observed(state, dispatched, intact)
+    } else {
+        transition(state, action)
+    }
+}
+
 #[test]
 fn replay_publication_refines_real_persistence_and_transport() {
     let model = aterm_models_harness::native_replay_publication_model();
@@ -154,6 +208,12 @@ fn replay_publication_refines_real_persistence_and_transport() {
                 assert!(
                     model.successors(action.name, &state).contains(&retired),
                     "retirement {}: {state:?} -> {retired:?}",
+                    action.name
+                );
+                let renewed = renewal_transition(&state, action.name);
+                assert!(
+                    model.successors(action.name, &state).contains(&renewed),
+                    "renewal {}: {state:?} -> {renewed:?}",
                     action.name
                 );
             }
@@ -179,6 +239,18 @@ fn retirement_publication_detects_dispatch_after_a_failed_save() {
     let mut before = model.init_state();
     assert!(model.fire("FailBarrier", &mut before));
     let (dispatched, intact) = retirement_attempt(&before, true);
+    assert_eq!(dispatched, 1, "the negative control must reach the wire");
+    let bad = observed(&before, dispatched, intact);
+    assert!(!model.check_invariant("PublicationBeforeDispatch", &bad));
+    assert!(!model.successors("Attempt", &before).contains(&bad));
+}
+
+#[test]
+fn renewal_publication_detects_dispatch_after_a_failed_save() {
+    let model = aterm_models_harness::native_replay_publication_model();
+    let mut before = model.init_state();
+    assert!(model.fire("FailBarrier", &mut before));
+    let (dispatched, intact) = renewal_attempt(&before, true);
     assert_eq!(dispatched, 1, "the negative control must reach the wire");
     let bad = observed(&before, dispatched, intact);
     assert!(!model.check_invariant("PublicationBeforeDispatch", &bad));

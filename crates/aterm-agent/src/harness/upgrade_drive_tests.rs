@@ -12,6 +12,8 @@ use super::super::relaunch::{
 };
 use super::super::upgrade::Dialect;
 use super::*;
+#[cfg(unix)]
+use crate::harness::native_restart::fixture::retain_bound_preparation;
 use crate::supervise::ScratchDir;
 use crate::supervise::policy::turn_end::RestartClaim;
 use aterm_uds::spawnfd::Command;
@@ -1427,17 +1429,17 @@ fn an_orphan_observes_retirement_before_applying_its_expired_clock() {
         );
         opts.sock = Some(socket);
         opts.token = Some(HarnessToken::new("retirement-orphan"));
-        let st = St {
+        let mut st = St {
             phase: Phase::Exiting { at_s: 1 },
             tab: "retained-tab".into(),
             native_coordination: true,
-            native_prepare: "original predecessor".into(),
             native: Some(super::super::native_act::Binding {
                 id: "ab".repeat(16),
                 capability: "cd".repeat(32),
             }),
             ..St::default()
         };
+        retain_bound_preparation(&mut st);
         save_checked(&opts, SESSION, &st).unwrap();
         let reports = orphans(&opts, &[], None);
         assert_eq!(reports.len(), 1);
@@ -13167,21 +13169,25 @@ fn a_restart_asked_over_a_landed_native_record_goes_its_own_way_at_its_next_ask(
                         (why(agent), Scene::default()),
                     ]
                 },
-                |agent, _| St {
-                    phase: Phase::Relaunched { at_s: now_s() },
-                    pid: dead_pid(),
-                    shell: std::process::id(),
-                    tab: TAB.to_string(),
-                    from: "2.1.281".to_string(),
-                    to: "2.1.283".to_string(),
-                    source: "native".to_string(),
-                    exited_at: now_s() - 3,
-                    relaunched_pid: if adopted { agent } else { 0 },
-                    native: Some(crate::harness::native_act::Binding {
-                        id: "ab".repeat(16),
-                        capability: "cd".repeat(32),
-                    }),
-                    ..St::default()
+                |agent, _| {
+                    let mut st = St {
+                        phase: Phase::Relaunched { at_s: now_s() },
+                        pid: dead_pid(),
+                        shell: std::process::id(),
+                        tab: TAB.to_string(),
+                        from: "2.1.281".to_string(),
+                        to: "2.1.283".to_string(),
+                        source: "native".to_string(),
+                        exited_at: now_s() - 3,
+                        relaunched_pid: if adopted { agent } else { 0 },
+                        native: Some(crate::harness::native_act::Binding {
+                            id: "ab".repeat(16),
+                            capability: "cd".repeat(32),
+                        }),
+                        ..St::default()
+                    };
+                    retain_bound_preparation(&mut st);
+                    st
                 },
             );
             let [(first, after_first), (second, after_second)] = &said[..] else {
@@ -17047,6 +17053,7 @@ fn a_relaunch_found_gone_waits_for_its_native_retirement_and_then_stops() {
         id: "ab".repeat(16),
         capability: "cd".repeat(32),
     });
+    retain_bound_preparation(&mut a.st);
     let r = a.found_step();
     assert_eq!(r.step, "wait:native-retirement", "{r:?}");
     assert!(matches!(a.st.phase, Phase::Relaunched { .. }), "{:?}", a.st);
@@ -17091,6 +17098,7 @@ fn a_stopped_relaunch_clears_its_recorded_end_while_retirement_is_pending() {
         id: "ab".repeat(16),
         capability: "cd".repeat(32),
     });
+    retain_bound_preparation(&mut a.st);
     assert_eq!(a.found_step().step, "wait:native-retirement");
     a.forget_record();
     a.st = load(&a.opts, SESSION).expect("the current record");
@@ -17147,6 +17155,7 @@ fn a_relaunch_records_its_found_end_before_native_retirement() {
         id: "ab".repeat(16),
         capability: "cd".repeat(32),
     });
+    retain_bound_preparation(&mut a.st);
     assert_eq!(a.found_step().step, "wait:native-retirement");
     assert_eq!(
         reconciled.load(Ordering::Acquire),
@@ -17164,7 +17173,7 @@ fn an_unissued_retirement_preserves_the_conversation_instead_of_no_resume_failur
         id: "ab".repeat(16),
         capability: "cd".repeat(32),
     });
-    a.st.native_prepare = "exact predecessor recipe".into();
+    retain_bound_preparation(&mut a.st);
     let retires = aterm_tempfile::tempdir().unwrap();
     let (sock, _instance) = instance_with(
         retires.path(),

@@ -4288,7 +4288,7 @@ mod tests {
                 0,
                 crate::app_tabs::CapturedTitle {
                     title: "~/cached-worktree".to_string(),
-                    shell: false,
+                    untitled: false,
                 },
             );
         let term = app.pool.get(0).expect("session 0").term.clone();

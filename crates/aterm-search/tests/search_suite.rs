@@ -5,6 +5,7 @@
 //! counting `#[global_allocator]` ([`heap`]) for memory tests.
 
 mod casefold_cost;
+mod column_projection_cost;
 mod column_refresh_memory;
 mod index_column_map_memory;
 mod index_release_memory;
@@ -15,6 +16,7 @@ mod regex_retention;
 mod retention_memory;
 mod reverse_casefold_cost;
 mod search_vs_bruteforce;
+mod selection_projection_cost;
 
 /// Net live heap bytes, and bytes ever allocated, on the calling thread.
 mod heap {

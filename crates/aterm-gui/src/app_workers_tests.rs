@@ -33,7 +33,8 @@ pub(crate) fn person_tab(app: &mut App) -> u64 {
     id
 }
 
-fn land_worker(app: &mut App) -> u64 {
+/// A worker landed parked behind the front, its session's local id.
+pub(crate) fn land_worker(app: &mut App) -> u64 {
     let id = app.next_session_id;
     app.next_session_id += 1;
     let parent = app.new_tab_parent(WID);
@@ -1228,14 +1229,14 @@ fn a_worker_whose_agent_has_gone_keeps_its_agents_name() {
 
 /// What the shell's integration writes as it shows its prompt in `folder`
 /// (`aterm_shell_integration.zsh`'s precmd): the tab's title, the folder, then the prompt's marks.
-fn prompt_in(folder: &str) -> Vec<u8> {
+pub(crate) fn prompt_in(folder: &str) -> Vec<u8> {
     format!("\x1b]0;{folder}\x07\x1b]133;A\x07% \x1b]133;B\x07").into_bytes()
 }
 
 /// What the shell's integration writes as it starts running `line` at its prompt
 /// (`aterm_shell_integration.zsh`'s preexec): the line for OSC 633;E, encoded as
 /// `__aterm_encode_cmd` encodes it, then the tab's title, the line itself.
-fn line_starts(line: &str) -> Vec<u8> {
+pub(crate) fn line_starts(line: &str) -> Vec<u8> {
     let encoded: String = line
         .chars()
         .map(|c| match c {
@@ -1437,6 +1438,165 @@ fn a_worker_that_never_started_keeps_its_agents_name() {
             assert_eq!(row.title, "Claude Code", "{word}");
         }
     }
+}
+
+/// Make `session`'s task a program worker's (`spawn program=`) in `mark`'s state, its program named
+/// `program` on its record (`None`, as on a record an older build carried).
+fn program_worker(app: &App, session: u64, mark: &TaskMark, program: Option<&str>) {
+    let ctx = app.pool.get(session).expect("pooled").ctx.clone();
+    mark_session_task(&ctx, session, mark).expect("unfenced");
+    let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+    timeline.set_task_worker(aterm_phase::Program::Generic, None);
+    timeline.set_task_program(program);
+}
+
+/// A stall for `why`.
+fn stalled(why: &'static str) -> TaskMark {
+    TaskMark {
+        why: Some(why),
+        ..TaskMark::new(TaskState::Stalled)
+    }
+}
+
+/// `bytes`, as `session`'s program or shell wrote them.
+fn typed(app: &App, session: u64, bytes: &[u8]) {
+    let term = app.pool.get(session).expect("pooled").term.clone();
+    crate::term_lock(&term).process(bytes);
+}
+
+/// The line a program worker's launcher types for `program=/opt/lab/bench arg=--quick`.
+const BENCH_LINE: &str = "'/opt/lab/bench' '--quick' < \"$ATERM_TASK_FILE\"";
+
+/// A PROGRAM WORKER ITS RECORD DOES NOT NAME IS `the program`: a record an older build carried has
+/// `agent=generic` and no `program=`, so its row, stalled before its line ran, read its tab's
+/// folder, and its chip and every message placing it read its folder at a prompt and its launch
+/// line while it ran. Each reads `the program` now, as its row did before a program worker's
+/// program was named. CONTROL: a title its program gives the tab names it.
+#[test]
+fn a_program_worker_its_record_does_not_name_is_the_program() {
+    let the_program = aterm_phase::Program::Generic.product();
+    let (app, _, workers) = app_with(1, 2);
+    for &worker in &workers {
+        typed(&app, worker, &prompt_in("~/proj"));
+    }
+    program_worker(&app, workers[0], &stalled("startup"), None);
+    let row = rows(&app)
+        .into_iter()
+        .find(|row| row.session == workers[0])
+        .expect("its row");
+    assert_eq!(
+        row.title, the_program,
+        "its row, stalled before its line ran"
+    );
+    assert_eq!(
+        app.tab_label_of_session(workers[0]),
+        the_program,
+        "its chip, at its prompt"
+    );
+
+    program_worker(&app, workers[1], &TaskMark::new(TaskState::Working), None);
+    typed(&app, workers[1], &line_starts(BENCH_LINE));
+    let sid = app.session_id_text(workers[1]).expect("a sid");
+    assert_eq!(
+        app.session_place(&sid),
+        format!("in Workers \u{25b8} {the_program}"),
+        "while its shell titles its tab by its line"
+    );
+    typed(&app, workers[1], b"\x1b]0;bench: 3 of 10\x07");
+    assert_eq!(
+        app.tab_label_of_session(workers[1]),
+        "bench: 3 of 10",
+        "CONTROL: a title its program gives the tab names it"
+    );
+}
+
+/// A PARKED WORKER WHOSE TAB'S TITLE SAYS NOTHING IS NAMED BY WHAT IT RUNS, NOT BY ITS FOLDER: a
+/// program that empties its tab's title leaves its label nothing but the folder its shell
+/// reported, so its chip and every message placing it read `Workers ▸ /private/tmp/lab/proj` while
+/// it ran. They read its program now, a busy terminal's as the strip last read it. CONTROL: a
+/// person's tab whose program empties its title is named by its folder.
+#[test]
+fn a_parked_workers_tab_whose_title_says_nothing_is_named_by_what_it_runs() {
+    let (mut app, tabs, workers) = app_with(1, 1);
+    for session in [tabs[0], workers[0]] {
+        typed(
+            &app,
+            session,
+            b"\x1b]7;file://localhost/private/tmp/lab/proj\x07",
+        );
+        typed(&app, session, &prompt_in("/private/tmp/lab/proj"));
+        typed(&app, session, &line_starts(BENCH_LINE));
+        typed(&app, session, b"\x1b]2;\x07");
+    }
+    program_worker(
+        &app,
+        workers[0],
+        &TaskMark::new(TaskState::Working),
+        Some("bench"),
+    );
+    assert_eq!(
+        app.tab_label_of_session(workers[0]),
+        "bench",
+        "a program worker whose program emptied its tab's title"
+    );
+    app.tab_titles(WID);
+    {
+        let busy = app.pool.get(workers[0]).expect("pooled").term.clone();
+        let _reading = crate::term_lock(&busy);
+        assert_eq!(
+            app.tab_label_of_session(workers[0]),
+            "bench",
+            "a busy terminal's, as the strip last read it"
+        );
+    }
+    assert_eq!(
+        app.tab_label_of_session(tabs[0]),
+        "/private/tmp/lab/proj",
+        "CONTROL: a person's tab whose program emptied its title is named by its folder"
+    );
+}
+
+/// A PROGRAM WORKER'S ROW NAMES ITS PROGRAM ONCE IT HAS GONE, WHATEVER TITLES ITS TAB: a worker
+/// stalled at its start in a shell that showed no integration marks keeps the title that shell
+/// gave it, which aterm cannot know to be its shell's, so its chip reads that title while its row
+/// reads its program. NEGATIVE CONTROL: a working program worker's row reads its chip's title.
+#[test]
+fn a_gone_program_workers_row_names_its_program_whatever_titles_its_tab() {
+    let (app, _, workers) = app_with(1, 2);
+    for &worker in &workers {
+        typed(&app, worker, b"\x1b]2;/private/tmp/lab/proj\x07");
+    }
+    program_worker(&app, workers[0], &stalled("startup"), Some("bench"));
+    program_worker(
+        &app,
+        workers[1],
+        &TaskMark::new(TaskState::Working),
+        Some("bench"),
+    );
+    for &worker in &workers {
+        assert_eq!(
+            app.tab_label_of_session(worker),
+            "/private/tmp/lab/proj",
+            "PRECONDITION: its chip reads its tab's title"
+        );
+    }
+    let rows = rows(&app);
+    let title = |session: u64| {
+        rows.iter()
+            .find(|row| row.session == session)
+            .map(|row| row.title.clone())
+            .expect("its row")
+    };
+    assert_eq!(
+        title(workers[0]),
+        "bench",
+        "stalled before its program started"
+    );
+    assert_eq!(
+        title(workers[1]),
+        "/private/tmp/lab/proj",
+        "NEGATIVE CONTROL: its program runs"
+    );
 }
 
 /// The strip line's pushed tooltips are what the strip was given: one tip per shown tab, never a

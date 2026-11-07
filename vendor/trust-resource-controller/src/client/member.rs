@@ -485,6 +485,14 @@ impl ProxyChild {
             return Ok(None);
         }
         if self.helper.try_wait()?.is_some() {
+            // The helper may have written its last frames, and exited, after the ready checks
+            // above: the next poll reads what it left (a frame, or the end that refuses it)
+            // before its lifecycle reads as lost.
+            if self.control.ready_to_receive()?
+                || (!self.proof_done && self.proof.ready_to_receive()?)
+            {
+                return Ok(None);
+            }
             return Err(io::ErrorKind::UnexpectedEof.into());
         }
         Ok(None)

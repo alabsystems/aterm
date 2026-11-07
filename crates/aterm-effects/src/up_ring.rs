@@ -394,5 +394,21 @@ mod tests {
         assert!(raw < RING_CONTRAST, "CONTROL: unfloored {raw:.2}:1");
         let k = key(PAPER, PAPER_FG, RingHue::Rule(violet));
         assert!(contrast_ratio(ring_ink(&k), PAPER) >= RING_CONTRAST);
+        assert_eq!(
+            ring_ink(&key(
+                0xFF00_0000 | PAPER,
+                0xFF00_0000 | PAPER_FG,
+                RingHue::Rule(0xFF00_0000 | violet),
+            )),
+            ring_ink(&k),
+        );
+        assert_eq!(
+            ring_ink(&key(
+                0xFF00_0000 | PAPER,
+                0xFF00_0000 | PAPER_FG,
+                RingHue::Neutral,
+            )),
+            ring_ink(&key(PAPER, PAPER_FG, RingHue::Neutral)),
+        );
     }
 }

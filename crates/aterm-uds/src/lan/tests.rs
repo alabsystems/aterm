@@ -121,11 +121,13 @@ fn broker_arrivals_recheck_an_unready_socket_and_skip_its_retry_on_replacement()
 
 /// A direct path that macOS allowed and whose server answers a hello, as aterm-lan's does.
 #[cfg(target_os = "macos")]
-struct AnswersHello;
+#[derive(Default)]
+struct AnswersHello(std::sync::atomic::AtomicUsize);
 
 #[cfg(target_os = "macos")]
 impl direct::Direct for AnswersHello {
     fn allowed(&self) -> Result<String, String> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok("a stand-in allowance".into())
     }
 
@@ -154,12 +156,26 @@ fn broker_arrivals_never_hear_the_direct_path() {
         socket: Some(path.clone()),
         ..Seam::default()
     };
-    let (mut changes, hello) = seam_here(seam, || {
-        direct::seam_here(&AnswersHello, || (Arrivals::new(), broker::hello()))
+    static DIRECT: AnswersHello = AnswersHello(std::sync::atomic::AtomicUsize::new(0));
+    let direct = &DIRECT;
+    let (mut changes, installed, hello) = seam_here(seam, || {
+        direct::seam_here(direct, || {
+            let installed = broker::installed_hello();
+            assert_eq!(
+                direct.0.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "installed readiness never even asks for the direct path"
+            );
+            (Arrivals::new(), installed, broker::hello())
+        })
     });
+    assert!(matches!(
+        installed,
+        Err(LanError::Unavailable(Unavailable::NotInstalled))
+    ));
     let hello = hello.unwrap();
     assert_eq!(hello.direct.as_deref(), Some("a stand-in allowance"));
-    let heard = direct::seam_here(&AnswersHello, || changes.poll().unwrap());
+    let heard = direct::seam_here(direct, || changes.poll().unwrap());
     assert!(!heard, "a stale socket beside a direct path is no broker");
 }
 

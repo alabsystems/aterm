@@ -20,6 +20,11 @@ aterm-digest = { workspace = true }
 # Hex (ETags, digests, tokens) and base64 (contents answers).
 aterm-codec = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+# Optional real smart-HTTP fixture: owned scratch and bounded/cancellable Git CGI children.
+aterm-tempfile = { workspace = true }
+aterm-uds = { workspace = true }
+
 [lints]
 workspace = true
 

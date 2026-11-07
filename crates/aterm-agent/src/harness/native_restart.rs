@@ -6,14 +6,18 @@
 
 use super::contract::Scope;
 use super::native_act::{
-    self, Binding, Constructor, Decision, Image, ImagePhase, NativePlan, Prepare, Process, Reply,
-    Request,
+    self, AskedUpgradeIntent, Binding, Constructor, Decision, Image, ImagePhase, NativePlan,
+    Prepare, Process, Reply, Request,
 };
 use super::upgrade_drive::{self, Client, Opts, St, Terminated, Typed};
 
 #[cfg(all(test, unix))]
 #[path = "native_restart_transport_tests.rs"]
 mod transport_tests;
+
+#[cfg(all(test, unix))]
+#[path = "native_restart_fixture.rs"]
+pub(super) mod fixture;
 
 #[path = "native_restart_observation.rs"]
 mod observation;
@@ -180,7 +184,7 @@ fn terminal_reply(st: &mut St, reply: &Reply) -> Option<Recovery> {
     Some(outcome)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(super) fn terminal_for_test(st: &mut St, reply: &Reply) -> Option<Recovery> {
     terminal_reply(st, reply)
 }
@@ -218,8 +222,37 @@ pub(super) fn begin(
     command: Option<&super::relaunch::PlannedCommand>,
     rollback: Option<&super::relaunch::PlannedCommand>,
 ) -> Result<Recovery, &'static str> {
+    let asked = if duty == Scope::Upgrade && coordinated(st) {
+        if st.native.is_some()
+            || !st.native_prepare.is_empty()
+            || st.native_rollback
+            || st.native_retired_unissued
+            || st.native_account_candidate.is_some()
+        {
+            return Err("native-unresolved-operation");
+        }
+        let previous = st
+            .native_completed_prepare
+            .as_deref()
+            .ok_or("native-asked-predecessor-unproven")?;
+        Some(AskedUpgradeIntent {
+            predecessor: previous.id.clone(),
+        })
+    } else {
+        None
+    };
     begin_plan(
-        opts, client, st, session, duty, target, command, rollback, None, None,
+        opts,
+        client,
+        st,
+        session,
+        duty,
+        target,
+        command,
+        rollback,
+        None,
+        None,
+        asked.as_ref(),
     )
 }
 
@@ -257,6 +290,7 @@ pub(super) fn begin_crash(
         None,
         observed,
         cold,
+        None,
     )
 }
 
@@ -340,6 +374,7 @@ pub(super) fn begin_completed_rollback(
         None,
         Some((observed.registration, observed.binding)),
         None,
+        None,
     )
 }
 
@@ -393,13 +428,23 @@ fn begin_plan(
         super::native_observe::ObservationBinding,
     )>,
     cold: Option<&super::native_act::ColdIntent>,
+    asked: Option<&AskedUpgradeIntent>,
 ) -> Result<Recovery, &'static str> {
     if st.native_retired_unissued {
         return Ok(Recovery::Held);
     }
     // CLI/operator constructors preserve their independent legacy authority. Only the real
     // private host opts contain this token; holder/as=person words never select this branch.
-    if cold.is_some() {
+    if asked.is_some() {
+        if duty != Scope::Upgrade || cold.is_some() || observed.is_some() || opts.token.is_none() {
+            return Err("native-asked-upgrade-unqualified");
+        }
+        if !matches!(native_act::exchange(client, &st.tab, &Request::Constructors),
+            Ok(Reply::Constructors(enabled)) if enabled.contains(&Constructor::AskedUpgrade))
+        {
+            return Err("native-asked-constructor-disabled");
+        }
+    } else if cold.is_some() {
         require_cold_constructor(opts, client, st)?;
     } else if legacy_before_prepare(opts, client, st)? {
         return Ok(Recovery::Legacy);
@@ -446,7 +491,13 @@ fn begin_plan(
         }
         let target = Image::at(target).ok_or("native-target")?;
         let forward = command
-            .and_then(super::relaunch::PlannedCommand::capture)
+            .and_then(|command| {
+                if asked.is_some() {
+                    command.capture_native()
+                } else {
+                    command.capture()
+                }
+            })
             .ok_or("native-command")?;
         if forward.image != target || forward.legacy_line().as_deref() != Some(st.line.as_str()) {
             return Err("native-command-changed");
@@ -480,6 +531,7 @@ fn begin_plan(
             .and_then(|now| now.checked_add(120_000_000))
             .ok_or("native-clock")?;
         let request = Request::prepare(Prepare {
+            asked_upgrade: asked.cloned(),
             id: native_act::operation_id().map_err(|_| "native-entropy")?,
             host_epoch,
             holder: upgrade_drive::hand_name(),
@@ -578,13 +630,36 @@ pub(super) fn recover(
     if opts.dry_run {
         return Err("native-dry-run");
     }
+    let prepare = retained_prepare(st)?;
+    let expected_id = prepare.id.clone();
+    let request = Request::Prepare(prepare);
+    // Prepare replay can admit an operation whose earlier request never arrived.
+    // Reconfirm persistence on every attempt, including after a lost directory
+    // barrier acknowledgement; a visible or in-memory record is insufficient.
+    upgrade_drive::save_checked(opts, session, st).map_err(|_| "native-unsaved")?;
+    let reply = native_act::exchange_retained(client, tab, &request, &st.native_prepare).map_err(
+        |error| {
+            aterm_log::debug!("native prepare replay error kind={:?}", error.kind());
+            "native-unknown"
+        },
+    )?;
+    if matches!(&reply, Reply::Admitted(binding) | Reply::Pending(binding) if binding.id != expected_id)
+    {
+        return Err("native-unknown");
+    }
+    recover_reply(st, reply)
+}
+
+/// Check the retained wire before a binding can consume or change its debt.
+/// This binds the operation ID, not every field of a server-side receipt.
+pub(super) fn retained_prepare(st: &St) -> Result<Box<Prepare>, &'static str> {
     let request = Request::parse(&st.native_prepare).ok_or("native-plan")?;
-    let Request::Prepare(prepare) = &request else {
-        return Err("native-plan");
-    };
     if !request.matches_retained(&st.native_prepare) {
         return Err("native-plan");
     }
+    let Request::Prepare(prepare) = request else {
+        return Err("native-plan");
+    };
     if st
         .native
         .as_ref()
@@ -592,17 +667,7 @@ pub(super) fn recover(
     {
         return Err("native-plan");
     }
-    // Prepare replay can admit an operation whose earlier request never arrived.
-    // Reconfirm persistence on every attempt, including after a lost directory
-    // barrier acknowledgement; a visible or in-memory record is insufficient.
-    upgrade_drive::save_checked(opts, session, st).map_err(|_| "native-unsaved")?;
-    let reply = native_act::exchange_retained(client, tab, &request, &st.native_prepare)
-        .map_err(|_| "native-unknown")?;
-    if matches!(&reply, Reply::Admitted(binding) | Reply::Pending(binding) if binding.id != prepare.id)
-    {
-        return Err("native-unknown");
-    }
-    recover_reply(st, reply)
+    Ok(prepare)
 }
 
 pub(super) fn abort(
@@ -667,6 +732,7 @@ fn query_observation(
     let Some(binding) = st.native.clone() else {
         return Ok(None);
     };
+    retained_prepare(st)?;
     let reply = native_act::exchange(client, tab, &Request::Query(binding))
         .map_err(|_| "native-recovery")?;
     // Even a probe for a different condition has received this irreversible
@@ -711,6 +777,9 @@ pub(super) fn complete(
     let Some(binding) = st.native.clone() else {
         return st.native_prepare.is_empty();
     };
+    let Ok(prepare) = retained_prepare(st) else {
+        return false;
+    };
     if let Ok(reply) = native_act::exchange(client, tab, &Request::Query(binding.clone())) {
         if let Some(outcome) = terminal_reply(st, &reply) {
             if outcome == Recovery::Cancelled {
@@ -722,9 +791,13 @@ pub(super) fn complete(
             Reply::Resumed(ImagePhase::Rollback) => {
                 // The exact host operation can have accepted Rollback before
                 // its Resume ACK was lost. Observe its phase; never re-signal.
-                if !matches!(Request::parse(&st.native_prepare), Some(Request::Prepare(prepare))
-                    if matches!(prepare.plan, NativePlan::Restart { rollback: Some(_), .. }))
-                {
+                if !matches!(
+                    prepare.plan,
+                    NativePlan::Restart {
+                        rollback: Some(_),
+                        ..
+                    }
+                ) {
                     return false;
                 }
                 st.native_rollback = true;
@@ -824,6 +897,9 @@ pub(super) fn retire(
     let Some(binding) = st.native.clone() else {
         return st.native_prepare.is_empty();
     };
+    if retained_prepare(st).is_err() {
+        return false;
+    }
     // Reconcile can seal this operation. A loaded binding may be visible after
     // an unacknowledged rename, so it needs this writer's durability barrier too.
     if upgrade_drive::save_checked(opts, session, st).is_err() {

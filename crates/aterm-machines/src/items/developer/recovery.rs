@@ -180,7 +180,7 @@ pub(super) fn install(sys: &dyn System) -> Result<(), Failure> {
     let _stops = sys.defer_stops();
     let mut network = sys.install_network();
     let mut noted_installer = false;
-    let stamp = loop {
+    let placeholder = loop {
         if let Some(signal) = sys.stopped() {
             return Err(Failure::new(
                 Unfinished::Stopped,
@@ -191,7 +191,7 @@ pub(super) fn install(sys: &dyn System) -> Result<(), Failure> {
             return Ok(());
         }
         match CommandLineTools::hold_placeholder(sys) {
-            Ok(Some(stamp)) => break stamp,
+            Ok(Some(placeholder)) => break placeholder,
             Ok(None) => return CommandLineTools::through_open_window(sys),
             Err(failure) if failure.class == Unfinished::Busy => {
                 if !noted_installer {
@@ -212,7 +212,7 @@ pub(super) fn install(sys: &dyn System) -> Result<(), Failure> {
         }
     };
     let mut custody = Custody {
-        placeholder: Placeholder { sys, stamp },
+        placeholder,
         network,
     };
     let mut attempt = 0usize;
@@ -273,9 +273,9 @@ mod tests {
         let own = std::process::id();
         let other = own.saturating_add(1);
         sys.born(own, 123).born(other, 456).running(&[]);
-        let stamp = CommandLineTools::hold_placeholder(&sys).unwrap().unwrap();
+        let placeholder = CommandLineTools::hold_placeholder(&sys).unwrap().unwrap();
         let custody = Custody {
-            placeholder: Placeholder { sys: &sys, stamp },
+            placeholder,
             network: None,
         };
         sys.on_owned_read(move |sys, path| {

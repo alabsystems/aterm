@@ -3257,80 +3257,197 @@ fn a_mac_waiting_for_alab_asks_its_members_from_its_subscriber() {
 /// even after the ordinary member requests backed off to fifteen minutes.
 #[test]
 fn a_route_asks_pending_members_without_waiting_for_the_vault_long_poll() {
-    let root = aterm_tempfile::tempdir().expect("tempdir");
-    let server = serve_holding(&root.path().join("store"), Duration::from_secs(600));
-    let (_admin, mb, alab) = waiting_for_alab(root.path(), &server);
-    let asks = std::sync::atomic::AtomicUsize::new(0);
-    let stop = AtomicBool::new(false);
-    let (route, routes) = std::sync::mpsc::channel();
-    let (handled, handling) = std::sync::mpsc::channel();
-    std::thread::scope(|scope| {
-        let _stops = StopsOnDrop(&stop);
-        let me = &mb;
-        let asks = &asks;
-        let stop = &stop;
-        let subscriber = scope.spawn(move || {
-            crate::envelope::TEST_RETIRED.with(|cell| *cell.borrow_mut() = Some(alab.clone()));
-            let ask = |_: &Paths| Ok(asks.fetch_add(1, Ordering::SeqCst));
-            let hearing = Hearing {
-                members: std::sync::Mutex::new(MembersAsked {
-                    at: Some(Instant::now()),
-                    asks: 6,
-                    ..MembersAsked::default()
-                }),
-                ask: &ask,
-                ..deaf()
-            };
-            let mut consumed = false;
-            member_routes::while_hearing(
-                me,
-                &hearing.members,
-                &ask,
-                &|_| {},
-                &|_| {},
-                move |most| {
-                    crate::envelope::TEST_RETIRED
-                        .with(|cell| *cell.borrow_mut() = Some(alab.clone()));
-                    if std::mem::take(&mut consumed) {
-                        handled.send(()).expect("route handled");
-                    }
-                    consumed = routes.recv_timeout(most).is_ok();
-                    consumed
-                },
-                |maintain| {
-                    subscriber_loop_projecting(
-                        me,
-                        &|_| {},
-                        &|| stop.load(Ordering::SeqCst),
-                        &hearing,
-                        &projection::Projection::new(&Converging {
-                            start: &|_, _| None,
-                            routes: &crate::server::route_sources,
-                        }),
-                        maintain,
-                    )
-                },
-            )
-        });
-        until("the subscriber's long-poll is held", || {
-            server.waiting() == 1
+    use crate::members::{desk, join, joiner};
+    use std::os::unix::net::UnixStream;
+    use std::sync::Arc;
+
+    struct EndServer(Option<crate::server::Running>);
+    impl Drop for EndServer {
+        fn drop(&mut self) {
+            if let Some(server) = self.0.take() {
+                server.stop();
+            }
+        }
+    }
+
+    let cases: &[bool] = if cfg!(target_os = "macos") {
+        &[false, true]
+    } else {
+        &[false]
+    };
+    for &initially_unavailable in cases {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let server = serve_holding(&root.path().join("store"), Duration::from_secs(600));
+        let (admin, mb, alab) = waiting_for_alab(root.path(), &server);
+        let desk = std::sync::Mutex::new(desk::Desk::new(
+            desk::Local::of(&admin)
+                .unwrap()
+                .expect("the admin's real member desk"),
+        ));
+        let asks = std::sync::atomic::AtomicUsize::new(0);
+        let stop = AtomicBool::new(false);
+        let observing = Arc::new(AtomicBool::new(false));
+        let resources_ready = Arc::new(AtomicBool::new(!initially_unavailable));
+        #[cfg(target_os = "macos")]
+        let (opened, openings) = mpsc::channel();
+        #[cfg(target_os = "macos")]
+        let (heard, kernel) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        #[cfg(target_os = "macos")]
+        let changes = {
+            let resources_ready = Arc::clone(&resources_ready);
+            let mut heard = Some(heard);
+            member_routes::NativeChanges::opening(move || {
+                let ready = resources_ready.load(Ordering::SeqCst);
+                opened.send(ready).unwrap();
+                if !ready {
+                    return Err(std::io::Error::from_raw_os_error(libc::EMFILE));
+                }
+                Ok(crate::network::RouteChanges::over(
+                    heard.take().expect("one recovered subscription").into(),
+                ))
+            })
+        };
+        #[cfg(not(target_os = "macos"))]
+        let (route, routes) = mpsc::channel();
+        #[cfg(not(target_os = "macos"))]
+        let changes = move |most| routes.recv_timeout(most).is_ok();
+        let (handled, handling) = mpsc::channel();
+        let result = std::thread::scope(|scope| {
+            let mut server = EndServer(Some(server));
+            let _stops = StopsOnDrop(&stop);
+            let observing_worker = Arc::clone(&observing);
+            let me = &mb;
+            let desk = &desk;
+            let asks = &asks;
+            let stop = &stop;
+            let subscriber = scope.spawn(move || {
+                crate::envelope::TEST_RETIRED.with(|cell| *cell.borrow_mut() = Some(alab.clone()));
+                let ask = |paths: &Paths| {
+                    let device = crate::commons::bootstrap::Device::open(paths)?
+                        .expect("the waiting Mac's device");
+                    let joining = joiner::Joining {
+                        records_bound: crate::crossing::RecordsBound::uncrossed(),
+                        device: &device,
+                        node: [7; 32],
+                        name: "route-recovery".into(),
+                        model: "inert route fixture".into(),
+                    };
+                    std::thread::scope(|exchange| {
+                        let (ours, mut theirs) = UnixStream::pair().unwrap();
+                        for end in [&ours, &theirs] {
+                            end.set_read_timeout(Some(HANG_DETECTOR)).unwrap();
+                        }
+                        let member = exchange.spawn(move || {
+                            desk::serve(desk, &mut theirs, "127.0.0.2".parse().unwrap(), &|_| {
+                                panic!("an ask hands no admission bundle")
+                            })
+                        });
+                        let stream = std::sync::Mutex::new(Some(ours));
+                        let dial = |_: &str| -> crate::Result<Box<dyn join::Stream>> {
+                            Ok(Box::new(stream.lock().unwrap().take().unwrap()))
+                        };
+                        let (heard, missed) = join::ask_all_admitted(
+                            &dial,
+                            &joining,
+                            &["owned-member".into()],
+                            &|| Ok(()),
+                        );
+                        assert!(missed.is_empty(), "{missed:?}");
+                        assert_eq!(heard.len(), 1);
+                        assert!(matches!(heard[0].signed, joiner::Signed::Verified));
+                        assert!(member.join().unwrap().unwrap().is_none());
+                        asks.fetch_add(1, Ordering::SeqCst);
+                        Ok(heard.len())
+                    })
+                };
+                let hearing = Hearing {
+                    members: std::sync::Mutex::new(MembersAsked {
+                        at: Some(Instant::now()),
+                        asks: 6,
+                        ..MembersAsked::default()
+                    }),
+                    ask: &ask,
+                    ..deaf()
+                };
+                member_routes::while_hearing(
+                    me,
+                    &hearing.members,
+                    &ask,
+                    &|_| {},
+                    &|event| {
+                        crate::envelope::TEST_RETIRED
+                            .with(|cell| *cell.borrow_mut() = Some(alab.clone()));
+                        if matches!(event, member_routes::ProjectionEvent::Maintenance)
+                            && observing_worker.load(Ordering::SeqCst)
+                        {
+                            handled.send(()).unwrap();
+                        }
+                    },
+                    changes,
+                    |maintain| {
+                        subscriber_loop_projecting(
+                            me,
+                            &|_| {},
+                            &|| stop.load(Ordering::SeqCst),
+                            &hearing,
+                            &projection::Projection::new(&Converging {
+                                start: &|_, _| None,
+                                routes: &crate::server::route_sources,
+                            }),
+                            maintain,
+                        )
+                    },
+                )
+            });
+            until("the subscriber's long-poll is held", || {
+                server.0.as_ref().unwrap().waiting() == 1
+            });
+            #[cfg(target_os = "macos")]
+            if initially_unavailable {
+                // Construction and the owned reset both failed. The recovery due
+                // cannot ask members while observation custody is still absent.
+                assert!(!openings.recv_timeout(HANG_DETECTOR).unwrap());
+                assert!(!openings.recv_timeout(HANG_DETECTOR).unwrap());
+            }
+            assert_eq!(
+                asks.load(Ordering::SeqCst),
+                0,
+                "ordinary requests backed off"
+            );
+            observing.store(true, Ordering::SeqCst);
+            resources_ready.store(true, Ordering::SeqCst);
+            #[cfg(target_os = "macos")]
+            if !initially_unavailable {
+                let change: Vec<u8> = [24_u32, 1, 1, 1, 37, 1]
+                    .into_iter()
+                    .flat_map(u32::to_ne_bytes)
+                    .collect();
+                kernel.send(&change).unwrap();
+            }
+            #[cfg(not(target_os = "macos"))]
+            route.send(()).unwrap();
+            // The second maintenance boundary follows a whole completed round,
+            // including any member ask. No HTTP answer or new route event is needed
+            // after resources return, even if the original move was missed.
+            handling.recv_timeout(HANG_DETECTOR).unwrap();
+            handling.recv_timeout(HANG_DETECTOR).unwrap();
+            let rows = desk.lock().unwrap().rows(aterm_time::Instant::now());
+            let observed = (
+                asks.load(Ordering::SeqCst),
+                rows.iter().any(|row| row.name == "route-recovery"),
+                server.0.as_ref().unwrap().waiting(),
+            );
+            stop.store(true, Ordering::SeqCst);
+            server.0.take().unwrap().stop();
+            subscriber.join().unwrap().unwrap();
+            observed
         });
         assert_eq!(
-            asks.load(Ordering::SeqCst),
-            0,
-            "ordinary requests backed off"
+            result,
+            (1, true, 1),
+            "initially_unavailable={initially_unavailable}"
         );
-        route.send(()).expect("route change");
-        handling.recv_timeout(HANG_DETECTOR).expect("route handled");
-        assert_eq!(asks.load(Ordering::SeqCst), 1);
-        assert_eq!(server.waiting(), 1, "the vault poll did not have to finish");
-        stop.store(true, Ordering::SeqCst);
-        server.stop();
-        subscriber
-            .join()
-            .expect("subscriber ended")
-            .expect("cleanly");
-    });
+    }
 }
 
 /// A newly installed broker ends the member backoff while the route is unchanged

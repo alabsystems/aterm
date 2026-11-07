@@ -4543,6 +4543,12 @@ impl St {
             .as_ref()
             .is_some_and(super::native_restart::coordinated);
         let native_record = prior.as_ref().map(|st| st.native_record.clone());
+        // Retargeting changes the proposed build, not the last positively completed
+        // preparation. This bounded data is only a predecessor name; the host must
+        // independently prove its settlement and current authority for each new move.
+        let native_completed_prepare = prior
+            .as_ref()
+            .and_then(|st| st.native_completed_prepare.clone());
         let left = prior
             .as_ref()
             .map(|p| p.left_typed.clone())
@@ -4726,6 +4732,9 @@ impl St {
         st.native_coordination |= native_coordination;
         if let Some(native_record) = native_record {
             st.native_record = native_record;
+        }
+        if st.native_completed_prepare.is_none() {
+            st.native_completed_prepare = native_completed_prepare;
         }
         if st.left_typed.is_empty() {
             st.left_typed = left;
@@ -7280,20 +7289,40 @@ fn host_candidates<'a>(
     mut read_group: impl FnMut(u32) -> Option<i64>,
     mut read_ids: impl FnMut(u32) -> Option<(u32, i64, i64)>,
 ) -> Vec<Result<Claimed<'a>, Report>> {
+    aterm_log::debug!(
+        "upgrade candidates: records={} tabs={}",
+        files.len(),
+        live_tabs.len()
+    );
     if !live_tabs.iter().any(|tab| tab.fgpgid.is_some()) {
+        aterm_log::debug!(
+            "upgrade candidates: no foreground tab, records={}",
+            files.len()
+        );
         return Vec::new();
     }
     files
         .iter()
         .filter(|sf| {
-            sf.kind == "interactive"
+            let supported = sf.kind == "interactive"
                 && sf.entrypoint == "cli"
-                && upgrade::is_session_id(&sf.session_id)
+                && upgrade::is_session_id(&sf.session_id);
+            if !supported {
+                aterm_log::debug!("upgrade candidate pid={} rejected=record-kind", sf.pid);
+            }
+            supported
         })
         .filter_map(|sf| {
-            let group = read_group(sf.pid)?;
-            let tab = unique_tab_for_group(live_tabs, group)?;
+            let Some(group) = read_group(sf.pid) else {
+                aterm_log::debug!("upgrade candidate pid={} rejected=group-unread", sf.pid);
+                return None;
+            };
+            let Some(tab) = unique_tab_for_group(live_tabs, group) else {
+                aterm_log::debug!("upgrade candidate pid={} rejected=tab-attribution", sf.pid);
+                return None;
+            };
             if !needs_inspection(sf, tab) {
+                aterm_log::debug!("upgrade candidate pid={} rejected=no-inspection", sf.pid);
                 return None;
             }
             let read = read_ids(sf.pid)
@@ -7312,8 +7341,13 @@ fn host_candidates<'a>(
                 .env_var("ATERM_PARENT_SESSION_ID")
                 .is_some_and(|env_tab| env_tab != tab)
             {
+                aterm_log::debug!("upgrade candidate pid={} rejected=parent-session", sf.pid);
                 return None;
             }
+            aterm_log::debug!(
+                "upgrade candidate pid={} accepted tab={tab} group={group}",
+                sf.pid
+            );
             Some(Ok((
                 sf,
                 args,
@@ -7345,11 +7379,19 @@ fn needs_upgrade_inspection(sf: &SessionFile, targets: &Targets, prior: Option<&
     let Some(running) = Version::parse(&sf.version) else {
         return true;
     };
-    targets
+    let needed = targets
         .managed
         .iter()
         .chain(targets.native.iter())
-        .any(|target| target.version > running)
+        .any(|target| target.version > running);
+    aterm_log::debug!(
+        "upgrade eligibility pid={} record={} managed={:?} native={:?} needed={needed}",
+        sf.pid,
+        sf.version,
+        targets.managed.as_ref().map(|target| &target.version),
+        targets.native.as_ref().map(|target| &target.version),
+    );
+    needed
 }
 
 fn claim_still_live(c: &mut Client, pid: u32, claim: &HostClaim) -> bool {
@@ -9034,12 +9076,15 @@ pub fn due(opts: &Opts) -> Due {
         return Due::Unread(UNREAD_SOCKET);
     };
     if status_line(&mut c, tab).is_some_and(|l| self_claimed_by_status(&l)) {
+        aterm_log::debug!("upgrade due tab={tab} result=No reason=self-claimed");
         return Due::No;
     }
     let Some(tabs) = host_roster(&mut c) else {
         return Due::Unread(UNREAD_SOCKET);
     };
-    due_after_lanes(opts, &tabs, &|agent| lane_due(opts, &tabs, agent))
+    let due = due_after_lanes(opts, &tabs, &|agent| lane_due(opts, &tabs, agent));
+    aterm_log::debug!("upgrade due tab={tab} result={due:?}");
+    due
 }
 
 fn lane_due(opts: &Opts, tabs: &[LiveTab], agent: upgrade::Agent) -> Option<Due> {
@@ -9058,16 +9103,19 @@ fn due_after_lanes(
 ) -> Due {
     for &agent in upgrade::Agent::others() {
         if let Some(due) = lane_due(agent) {
-            return if lane_on(opts, agent) { due } else { Due::No };
+            let enabled = lane_on(opts, agent);
+            aterm_log::debug!("upgrade due lane={agent:?} enabled={enabled} observed={due:?}");
+            return if enabled { due } else { Due::No };
         }
     }
-    let Some(tab) = opts
-        .only_sid
-        .as_deref()
-        .filter(|_| lane_on(opts, upgrade::Agent::Claude))
-    else {
+    let Some(tab) = opts.only_sid.as_deref() else {
+        aterm_log::debug!("upgrade due result=No reason=no-only-sid");
         return Due::No;
     };
+    if !lane_on(opts, upgrade::Agent::Claude) {
+        aterm_log::debug!("upgrade due tab={tab} result=No reason=claude-lane-disabled");
+        return Due::No;
+    }
     let homes = Homes::read(
         opts,
         Some(tabs),
@@ -9077,6 +9125,11 @@ fn due_after_lanes(
     let Some(files) = homes.roster(claude_records(&opts.home)) else {
         return Due::Unread(UNREAD_FILES);
     };
+    aterm_log::debug!(
+        "upgrade due tab={tab} records={} tabs={}",
+        files.len(),
+        tabs.len()
+    );
     match due_among(
         opts,
         &files,
@@ -10974,13 +11027,18 @@ fn visit_models(
     }
     // The relaunch the move would type from the foreground shell `shell`: the notice carries its
     // line, and a tell, which promises the move, goes only where it can be made.
+    let plan_move = if super::native_restart::coordinated(&st) {
+        super::relaunch::plan_native_upgrade
+    } else {
+        plan
+    };
     let move_plan = |shell: u32| -> Result<Plan, NoPlan> {
         let home = args.env_var(super::accounts::HOME_ENV);
         let homedir = home_carried(&opts.home, home, &sf.cwd, &records)?;
         let mode = resume_mode(&records, &sf.session_id, shown_mode.clone());
         let model = model_to.clone().or_else(hand_model);
         let launch_record = super::accounts::LaunchEnv::of_exec_env(&args.env);
-        plan(
+        plan_move(
             opts,
             &Launch {
                 homedir: homedir.as_deref(),
@@ -12965,7 +13023,11 @@ fn restart(
             homedir: homedir.as_deref(),
             ..launch
         };
-        plan(opts, &launch, proven, t)
+        if super::native_restart::coordinated(st) {
+            super::relaunch::plan_native_upgrade(opts, &launch, proven, t)
+        } else {
+            plan(opts, &launch, proven, t)
+        }
     });
     let Plan {
         shell,

@@ -151,7 +151,7 @@ fn final_view_detach_retires_per_session_chrome_state_exactly_once() {
         0,
         crate::app_tabs::CapturedTitle {
             title: "private title".to_string(),
-            shell: false,
+            untitled: false,
         },
     );
     window

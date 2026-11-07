@@ -17685,14 +17685,14 @@ impl App {
             self.session_chrome_retry.remove(&session);
             return true;
         };
-        let Some((live_epoch, live_title, live_cwd, shell_titled, timeline)) =
+        let Some((live_epoch, live_title, live_cwd, untitled, timeline)) =
             s.term.try_lock().ok().map(|t| {
                 use crate::cwd_native::ReportedCwd as _;
                 (
                     t.title_epoch(),
                     t.title().to_string(),
                     t.native_working_directory().map(|cwd| cwd.into_owned()),
-                    crate::app_take_over::shell_titled(&t),
+                    crate::app_take_over::untitled_by_its_program(&t),
                     s.ctx.timeline.clone(),
                 )
             })
@@ -17810,7 +17810,7 @@ impl App {
                     &mut ws.tab_title_cache,
                     session,
                     resolved_title_rung.as_deref(),
-                    shell_titled,
+                    untitled,
                     needs_refresh,
                 );
             }
@@ -26122,6 +26122,41 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     main_entry_with_first_run(argv, None);
 }
 
+/// Install an ephemeral native bundle before any window route can start setup.
+/// A relaunch or a concise native refusal ends this original launch.
+#[cfg(target_os = "macos")]
+pub fn prepare_window_launch(
+    parsed: &[std::ffi::OsString],
+    forwarded: Vec<std::ffi::OsString>,
+) -> Option<std::process::ExitCode> {
+    // A headless engine carries private lifeline/ready descriptors and already suppresses
+    // both launch CLT and root steps (workstation_setup::Host::for_launch_marked).
+    #[cfg(any(debug_assertions, feature = "dev-seams"))]
+    if lab_window_custody::present() {
+        return None;
+    }
+    if cli::launch_behavior(parsed) != cli::LaunchBehavior::Window {
+        return None;
+    }
+    match aterm_update::first_launch::native::prepare(
+        forwarded,
+        aterm_update::first_launch::native::Entry::Window,
+    ) {
+        Ok(code) => code,
+        Err(reason) => {
+            crate::logging::stderr_line!("aterm: {reason}");
+            aterm_log::warn!("first launch refused: {reason}");
+            // A private/headless fixture never touches WindowServer. Finder gets one
+            // error acknowledgement, not a second setup or administrator question.
+            if !aterm_types::dirs::runs_under_private_state_root() && !cfg!(test) {
+                let windowed = platform::Windowed::launch();
+                menu::launch_error(windowed, "aterm could not finish installing", &reason);
+            }
+            Some(std::process::ExitCode::FAILURE)
+        }
+    }
+}
+
 /// The terminal window entry with an optional cold interactive startup action.
 pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Option<fn() -> bool>) {
     #[expect(
@@ -26147,6 +26182,16 @@ pub fn main_entry_with_network(
     network_source: Option<NetworkSnapshotSource>,
     maintenance: Option<HostMaintenance>,
 ) {
+    #[cfg(target_os = "macos")]
+    {
+        if let Err(reason) = aterm_update::first_launch::native::acknowledge_relaunch(&argv) {
+            crate::logging::stderr_line!("aterm: {reason}");
+            return;
+        }
+        if prepare_window_launch(&argv, argv.clone()).is_some() {
+            return;
+        }
+    }
     metrics::mark_process_start();
     #[cfg(target_os = "macos")]
     code_readahead::read_ahead_own_code();

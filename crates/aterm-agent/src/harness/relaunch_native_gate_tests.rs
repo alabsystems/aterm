@@ -3,6 +3,7 @@
 
 use super::super::upgrade_drive::{HarnessToken, Instances, Tell};
 use super::*;
+use crate::harness::native_restart::fixture::retain_bound_preparation;
 use crate::harness::upgrade_drive::load;
 use std::io::{BufRead, Write};
 use std::os::unix::net::UnixStream;
@@ -96,11 +97,11 @@ fn uncertain_queries_and_unsealed_timeouts_preserve_native_debt() {
         st.shell = 0;
         st.phase = upgrade::Phase::Relaunched { at_s: 1 };
         st.back_line = "original rollback".into();
-        st.native_prepare = "retained original preparation".into();
         st.native = Some(super::super::native_act::Binding {
             id: "ab".repeat(16),
             capability: "cd".repeat(32),
         });
+        retain_bound_preparation(&mut st);
         let original = st.clone();
         let (mut client, worker) = endpoint_with(move |line| {
             if line.contains(" lease acquire ") || line.contains(" lease release ") {
@@ -161,11 +162,11 @@ fn retirement_queries_without_a_registered_process_never_consume_debt() {
             st.phase = upgrade::Phase::Relaunched { at_s: 1 };
             st.found_gone = found_gone;
             st.back_line = "original rollback".into();
-            st.native_prepare = "retained original preparation".into();
             st.native = Some(super::super::native_act::Binding {
                 id: "ab".repeat(16),
                 capability: "cd".repeat(32),
             });
+            retain_bound_preparation(&mut st);
             let before = st.clone();
             let mut queries = 0;
             let (mut client, worker) = endpoint_with(move |line| {
@@ -217,6 +218,7 @@ fn a_closure_observes_retirement_before_testing_whether_the_tab_was_taken() {
         id: "ab".repeat(16),
         capability: "cd".repeat(32),
     });
+    retain_bound_preparation(&mut st);
     let (mut client, worker) = endpoint_with(|line| {
         assert!(line.contains(" native-act query "));
         "OK native-act state=retired reason=no-exec-grant\n".into()
@@ -254,11 +256,12 @@ fn retirement_after_registration_keeps_the_prior_gone_observation() {
         st.shell = ids(pid).unwrap().0;
         st.phase = upgrade::Phase::Relaunched { at_s: 7 };
         st.found_gone = true;
-        st.native_prepare = "retained original recipe".into();
         st.native = Some(super::super::native_act::Binding {
             id: "ab".repeat(16),
             capability: "cd".repeat(32),
         });
+        retain_bound_preparation(&mut st);
+        let original_prepare = st.native_prepare.clone();
         let mut queries = 0;
         let (mut client, worker) = endpoint_with(move |line| {
             if line.contains(" lease acquire ") {
@@ -286,7 +289,7 @@ fn retirement_after_registration_keeps_the_prior_gone_observation() {
         let saved = load(&opts, SESSION).unwrap();
         assert!(saved.native_retired_unissued && saved.found_gone);
         assert_eq!(saved.phase, upgrade::Phase::Relaunched { at_s: 7 });
-        assert_eq!(saved.native_prepare, "retained original recipe");
+        assert_eq!(saved.native_prepare, original_prepare);
         drop(client);
         assert_eq!(
             worker
@@ -360,6 +363,7 @@ fn retirement_discovered_during_abort_is_saved_before_any_further_observation() 
     let mut st = state(true);
     st.line = command.legacy_line().unwrap();
     st.native_prepare = Request::prepare(Prepare {
+        asked_upgrade: None,
         id: "ab".repeat(16),
         host_epoch: "ef".repeat(16),
         holder: super::super::upgrade_drive::hand_name(),
@@ -610,6 +614,7 @@ fn helper_refused_during_observation_keeps_the_same_operation_and_owed_work() {
         id: "ab".repeat(16),
         capability: "cd".repeat(32),
     });
+    retain_bound_preparation(&mut st);
     let original = st.native.clone();
     let mut client = connect(&opts, TAB).unwrap();
     let _waits = virtual_waits();
@@ -1322,6 +1327,7 @@ fn a_native_act_is_this_hosts_only_by_its_epoch() {
         "nothing stamped is never asked"
     )));
     st.native_completed_prepare = Some(Box::new(super::super::native_act::Prepare {
+        asked_upgrade: None,
         id: "12".repeat(16),
         host_epoch: "34".repeat(16),
         holder: "fixture@1".into(),

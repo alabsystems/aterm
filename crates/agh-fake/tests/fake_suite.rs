@@ -6,6 +6,8 @@
 //! here never compiles. Each test starts its own `FakeGithub`.
 
 mod faults;
+#[cfg(unix)]
+mod git_backend;
 mod git_http;
 mod raw;
 mod routes;

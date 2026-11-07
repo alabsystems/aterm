@@ -7231,10 +7231,37 @@ fn a_named_build_is_staged_beside_current_which_stays() {
     );
 }
 
-/// A named build is refused, with nothing staged, when the channel withdrew it, holds it below
-/// its floor, or signs another tree than the one asked for; and a store copy that is not the
-/// signed tree is never taken for it: the signed pack is staged over it.
+/// Both newly staged and already-present named builds refuse success if retention cannot be
+/// recorded; a completed payload alone cannot bridge the first consumer's lease acquisition.
 #[test]
+fn a_named_install_cannot_claim_success_without_recording_its_retention() {
+    let dir = scratch("named-retention-refused");
+    let (fake, _) = fixture_with_unpinned_17(&dir);
+    let layout = layout(&dir);
+    install(&fake, &layout, &anchor(), &AY, fl(0), 0).unwrap();
+    let mark = layout.build_dir("ay", 17).with_file_name("17.locked");
+    std::fs::create_dir(&mark).unwrap();
+    for expected_staged in [false, true] {
+        assert_eq!(
+            crate::store::build_is_complete(&layout.build_dir("ay", 17)),
+            expected_staged
+        );
+        let error =
+            install_build(&fake, &layout, &anchor(), fl(0), 0, &AY, named(17, None)).unwrap_err();
+        assert!(
+            error.to_string().contains("named build retention"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_link(layout.program_current("ay")).unwrap(),
+            layout.build_dir("ay", 18)
+        );
+    }
+}
+
+#[test]
+/// A withdrawn, floored or wrong-tree named build refuses before staging; changed local bytes
+/// are replaced only by the signed pack.
 fn a_named_build_withdrawn_floored_or_not_the_tree_asked_for_is_refused() {
     let dir = scratch("named-refused");
     let layout = layout(&dir);

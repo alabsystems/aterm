@@ -5,7 +5,7 @@ use super::*;
 use crate::harness::accounts::{AuthRoute, Mode};
 use crate::harness::native_act::{ColdBilling, ColdIntent};
 
-fn old_prepare(seed: &St, stored: bool) -> (Request, String) {
+pub(super) fn old_prepare(seed: &St, stored: bool) -> (Request, String) {
     let Request::Prepare(mut prepare) = Request::parse(&seed.native_prepare).unwrap() else {
         unreachable!();
     };

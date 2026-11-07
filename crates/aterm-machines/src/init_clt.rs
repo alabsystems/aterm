@@ -490,7 +490,8 @@ impl CommandLineTools {
         match ended {
             Err(_)
                 if matches!((self.found)(sys), Found::Present(_))
-                    && (self.owed)(sys).is_empty() =>
+                    && (self.owed)(sys).is_empty()
+                    && crate::items::lan::ready(sys).unwrap_or(false) =>
             {
                 Ok(())
             }
@@ -715,13 +716,10 @@ pub const APPLE_WINDOW_OPEN: &str = "Apple's installer window is open for them: 
 /// beside the placeholder, or a live run of the root half that stamped it, which alone may hold
 /// or replace it), Apple's installer window at any age with the placeholder beside it or not (its
 /// own flow, pressed or not, which makes the placeholder as it opens unless one is there, and
-/// unlinks it when its request ends), or nothing. A process table that cannot be read is no
-/// install here (the root half then says whether one holds a placeholder there).
+/// unlinks it when its request ends), or nothing. Unread placeholder or process-table state
+/// remains unknown unless independent evidence proves custody.
 fn held(sys: &dyn System) -> crate::items::developer::Holder {
-    let placeholder = sys
-        .stat(std::path::Path::new(crate::items::developer::PLACEHOLDER))
-        .is_ok();
-    crate::items::developer::holder(sys, placeholder)
+    crate::items::developer::holder(sys, crate::items::developer::placeholder_state(sys))
 }
 
 /// Whether `row` is this item's, deferred: to an install under way, to Apple's installer window
@@ -852,7 +850,15 @@ impl CommandLineTools {
                     Some(Unfinished::AppleWindow),
                 );
             }
-            crate::items::developer::Holder::Nothing | crate::items::developer::Holder::Unread => {}
+            crate::items::developer::Holder::Unread => {
+                return (
+                    Probe::Unusable {
+                        why: format!("{from}; the current installer owner could not be read"),
+                    },
+                    Some(Unfinished::Unread),
+                );
+            }
+            crate::items::developer::Holder::Nothing => {}
         }
         if let Some(held) = self.held_back(sys, &from, true) {
             return held;
@@ -993,6 +999,7 @@ mod tests {
     use crate::model::{Mode, Outcome};
     use crate::port::{Fake, Ran, Stat};
     use aterm_converge::{Class, Layer, NoJournal, Scope};
+    use std::path::Path;
 
     const ATERM: &str = "/Applications/aterm.app/Contents/MacOS/aterm";
 
@@ -1000,6 +1007,12 @@ mod tests {
 
     /// The person's own run at this Mac's console (alice, 501), with a terminal to ask in.
     fn console() -> Fake {
+        let sys = unread_console();
+        sys.running(&[]);
+        sys
+    }
+
+    fn unread_console() -> Fake {
         let mut sys = Fake::root();
         sys.euid = 501;
         sys.tty = true;
@@ -1529,6 +1542,64 @@ mod tests {
             assert_eq!(row.outcome, outcome, "{found:?}: {row:?}");
         }
         assert!(asked(&sys).is_empty(), "{:?}", sys.calls());
+    }
+
+    #[test]
+    fn unread_installer_custody_asks_nothing_and_recovers_on_a_later_read() {
+        for placeholder in [false, true] {
+            let sys = Arc::new(unread_console());
+            if placeholder {
+                sys.file(crate::items::developer::PLACEHOLDER, b"");
+            }
+            let item = missing();
+            for mode in [Mode::Plan, Mode::Apply] {
+                let row = run(&sys, &item, mode);
+                assert_eq!(row.outcome, Outcome::Unknown, "{placeholder}: {row:?}");
+                assert!(asked(&sys).is_empty(), "no password with unread custody");
+            }
+            let (tab_item, said, tab) =
+                in_tab(&sys, Found::Missing("no developer directory".into()));
+            assert_eq!(run(&sys, &tab_item, Mode::Apply).outcome, Outcome::Unknown);
+            assert_eq!(tab.unfinished(), Some(Unfinished::Unread));
+            assert!(said.lock().unwrap().is_empty());
+            assert!(asked(&sys).is_empty());
+
+            sys.running(&[]);
+            assert_eq!(run(&sys, &item, Mode::Plan).outcome, Outcome::Planned);
+            sys.on(&argv(), Ran::ok(""))
+                .on_write(&argv(), std::path::Path::new(CC), b"");
+            assert_eq!(run(&sys, &item, Mode::Apply).outcome, Outcome::Changed);
+            assert_eq!(asked(&sys), [argv()], "one prompt after known idle");
+        }
+    }
+
+    #[test]
+    fn an_unread_placeholder_does_not_admit_an_install_and_can_recover() {
+        use std::io::ErrorKind;
+        let placeholder = crate::items::developer::PLACEHOLDER;
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::NotADirectory,
+            ErrorKind::Other,
+        ] {
+            for processes in [vec![], vec!["/usr/sbin/softwareupdate"]] {
+                let sys = Arc::new(console());
+                sys.running(&processes).stat_fails(placeholder, kind);
+                let (item, said, tab) =
+                    in_tab(&sys, Found::Missing("no developer directory".into()));
+                assert_eq!(run(&sys, &item, Mode::Apply).outcome, Outcome::Unknown);
+                assert_eq!(tab.unfinished(), Some(Unfinished::Unread));
+                assert!(asked(&sys).is_empty());
+                assert!(said.lock().unwrap().is_empty());
+
+                sys.running(&[])
+                    .stat_fails(placeholder, ErrorKind::NotFound);
+                sys.on(&argv(), Ran::ok(""))
+                    .on_write(&argv(), std::path::Path::new(CC), b"");
+                assert_eq!(run(&sys, &item, Mode::Apply).outcome, Outcome::Changed);
+                assert_eq!(asked(&sys), [argv()]);
+            }
+        }
     }
 
     type TabMessages = Arc<Mutex<Vec<(usize, String)>>>;
@@ -2137,6 +2208,33 @@ mod tests {
             );
             assert_eq!(said.lock().unwrap().len(), 1, "the intro alone: {status:?}");
         }
+
+        // Completed tools cannot hide a failed root helper transaction. This
+        // follows the actual tab producer through its installed-tools fallback.
+        let mut fake = console();
+        fake.running_app = Some("/Applications/aterm.app".into());
+        let sys = Arc::new(fake);
+        let image = aterm_uds::lan::install::test_image(0x0100_000c, &[b"this build"]);
+        sys.file("/Applications/aterm.app/Contents/MacOS/aterm", &image)
+            .file(aterm_uds::lan::IMAGE_EXECUTABLE, &image)
+            .file(
+                aterm_uds::lan::PLIST_PATH,
+                aterm_uds::lan::install::plist_text(Path::new("/Applications/aterm.app"))
+                    .as_bytes(),
+            )
+            .on(
+                "/bin/launchctl print system/systems.alab.aterm-lan",
+                Ran::exit(113, "Could not find service"),
+            );
+        let (item, _, tab) = in_tab(&sys, Found::Missing("no developer directory".into()));
+        sys.on(
+            &argv(),
+            Ran::exit(i32::from(Unfinished::Other.code().unwrap()), ""),
+        )
+        .on_write(&argv(), Path::new(CC), b"");
+        let row = run(&sys, &item, Mode::Apply);
+        assert_eq!(row.outcome, Outcome::Failed, "{row:?}");
+        assert_eq!(tab.unfinished(), Some(Unfinished::Other));
     }
 
     /// A stop the person sent while the root half ran (a Ctrl-C in the tab, which reaches the

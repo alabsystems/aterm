@@ -30,6 +30,14 @@ pub const CLT_RECEIPT: &str = "com.apple.pkg.CLTools_Executables";
 /// an install running.
 pub const PLACEHOLDER: &str = aterm_types::macos_setup::COMMAND_LINE_TOOLS_INSTALLING;
 
+/// A root-owned, persistent lock inode shared by every aterm placeholder writer.
+/// Never unlink it: replacement would give concurrent writers different locks.
+const PLACEHOLDER_LOCK: &str = "/var/run/aterm-command-line-tools.lock";
+
+fn placeholder_lock(sys: &dyn System) -> std::io::Result<Box<dyn std::any::Any>> {
+    sys.exclusive(Path::new(PLACEHOLDER_LOCK), Duration::ZERO)
+}
+
 /// `softwareupdate`.
 pub const SOFTWAREUPDATE: &str = "/usr/sbin/softwareupdate";
 
@@ -230,8 +238,8 @@ pub enum Holder {
     /// Nothing: no install runs, and a placeholder there is one an install that ended left, which
     /// the root half replaces.
     Nothing,
-    /// The process table could not be read, and no live run stamped a placeholder: nobody can
-    /// vouch for a placeholder there, so the root half takes it from no one.
+    /// Placeholder or process-table state could not be read, with no independent proof of
+    /// installer custody: the root half takes a placeholder from no one.
     Unread,
 }
 
@@ -241,23 +249,34 @@ pub enum Holder {
 /// the kernel names it ([`System::processes`]; one it names none for is none of Apple's
 /// installers, which live on the sealed system volume), a command-line installer beside the
 /// placeholder or a live run's stamp in it first, then Apple's installer window, placeholder or
-/// not. [`Holder::Unread`] only where the process table itself cannot be read.
+/// not. `None` for `placeholder` preserves an unread observation. Without independent
+/// custody evidence, unread placeholder or process-table state returns [`Holder::Unread`].
 #[must_use]
-pub fn holder(sys: &dyn System, placeholder: bool) -> Holder {
+pub fn holder(sys: &dyn System, placeholder: Option<bool>) -> Holder {
     use aterm_types::macos_setup::ToolsInstaller;
     let held = sys.processes().map(|processes| {
         aterm_types::macos_setup::tools_held_by(
-            placeholder,
+            placeholder.unwrap_or(false),
             processes.into_iter().map(|process| process.exe),
             is_install_process,
         )
     });
     match held {
         Some(Some(ToolsInstaller::CommandLine)) => Holder::Install,
-        _ if placeholder && placeholder_held_by_a_live_run(sys) => Holder::Install,
+        _ if placeholder != Some(false) && placeholder_held_by_a_live_run(sys) => Holder::Install,
         Some(Some(ToolsInstaller::AppleWindow)) => Holder::AppleWindow,
-        Some(None) => Holder::Nothing,
-        None => Holder::Unread,
+        Some(None) if placeholder.is_some() => Holder::Nothing,
+        _ => Holder::Unread,
+    }
+}
+
+/// The on-demand placeholder's presence, preserving failed reads as unknown.
+#[must_use]
+pub fn placeholder_state(sys: &dyn System) -> Option<bool> {
+    match sys.stat(Path::new(PLACEHOLDER)) {
+        Ok(_) => Some(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
     }
 }
 
@@ -381,7 +400,10 @@ fn window_closed(
 /// here, as the guard would remove it with the window gone), and so is one with no stamp
 /// (Apple's own, an older aterm's).
 fn remove_a_gone_runs_placeholder(sys: &dyn System) {
-    if stamped(sys).is_some() && holder(sys, true) == Holder::Nothing {
+    let Ok(_claim) = placeholder_lock(sys) else {
+        return;
+    };
+    if stamped(sys).is_some() && holder(sys, Some(true)) == Holder::Nothing {
         let _ = sys.remove(Path::new(PLACEHOLDER));
     }
 }
@@ -411,15 +433,18 @@ fn placeholder_held_by_a_live_run(sys: &dyn System) -> bool {
 /// goes without ending its request (quit before Install was pressed, or killed outright), its
 /// run gone, is stale: a later run waiting on that window removes it as the window goes
 /// ([`remove_a_gone_runs_placeholder`]), and the next run replaces it ([`Holder::Nothing`]).
+/// An unread installer table proves no permission to remove this run's placeholder.
+/// The exclusive guard survives through this destructor's removal decision and unlink.
 struct Placeholder<'a> {
     sys: &'a dyn System,
     stamp: Vec<u8>,
+    _claim: Box<dyn std::any::Any>,
 }
 
 impl Drop for Placeholder<'_> {
     fn drop(&mut self) {
         if stamped(self.sys).as_deref() == Some(self.stamp.as_slice())
-            && !installers_listed(self.sys).is_some_and(|owners| !owners.is_empty())
+            && installers_listed(self.sys).is_some_and(|owners| owners.is_empty())
         {
             let _ = self.sys.remove(Path::new(PLACEHOLDER));
         }
@@ -490,52 +515,61 @@ impl CommandLineTools {
     }
 
     /// Put softwareupdate's on-demand placeholder in place, stamped as this run's ([`stamp`]),
-    /// and say it is this run's (`Some`, its stamp), unless Apple's installer window holds the
+    /// and retain this run's exclusive claim (`Some`), unless Apple's installer window holds the
     /// tools, with a placeholder beside it or none ([`Holder::AppleWindow`]: `None`, this run
     /// makes or takes no placeholder and waits on that window). One already there is left alone
     /// where an install holds it or nobody can tell ([`Holder::Install`], [`Holder::Unread`]:
     /// another install runs); else it is stale, left by an install that ended without removing
-    /// it, and this one takes its place.
-    fn hold_placeholder(sys: &dyn System) -> Result<Option<Vec<u8>>, Failure> {
+    /// it, and this one takes its place. Unread custody prevents a claim before any mutation,
+    /// including when no placeholder has been observed. The persistent lock serializes the
+    /// entire claim through installation and cleanup, independent of readable process birth.
+    fn hold_placeholder(sys: &dyn System) -> Result<Option<Placeholder<'_>>, Failure> {
+        let claim = placeholder_lock(sys).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                Failure::new(
+                    Unfinished::Busy,
+                    "another aterm setup owns the developer-tools install".into(),
+                )
+            } else {
+                Failure::new(Unfinished::Unread, format!("{PLACEHOLDER_LOCK}: {error}"))
+            }
+        })?;
         let placeholder = Path::new(PLACEHOLDER);
         let held =
             |e: std::io::Error| Failure::new(Unfinished::Other, format!("{PLACEHOLDER}: {e}"));
         let stamp = stamp(sys);
-        // With no placeholder there, Apple's window holds the tools all the same: it opened
-        // beside another install's placeholder, which that install has removed since.
-        if sys
-            .stat(placeholder)
-            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
-            && holder(sys, false) == Holder::AppleWindow
-        {
+        let may_claim = |state| match holder(sys, state) {
+            Holder::Nothing => Ok(true),
+            Holder::AppleWindow => Ok(false),
+            Holder::Install => Err(Failure::new(
+                Unfinished::Busy,
+                format!(
+                    "another install of the Command Line Tools is running ({PLACEHOLDER} is its)"
+                ),
+            )),
+            Holder::Unread => Err(Failure::new(
+                Unfinished::Unread,
+                "the current installer owner could not be read".into(),
+            )),
+        };
+        if !may_claim(placeholder_state(sys))? {
             return Ok(None);
         }
         match sys.create_new(placeholder, &stamp, 0o644) {
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => match holder(sys, true) {
-                Holder::Install => {
-                    return Err(Failure::new(
-                        Unfinished::Busy,
-                        format!(
-                            "another install of the Command Line Tools is running ({PLACEHOLDER} \
-                             is its)"
-                        ),
-                    ));
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if !may_claim(Some(true))? {
+                    return Ok(None);
                 }
-                Holder::Unread => {
-                    return Err(Failure::new(
-                        Unfinished::Unread,
-                        "the current installer owner could not be read".into(),
-                    ));
-                }
-                Holder::AppleWindow => return Ok(None),
-                Holder::Nothing => {
-                    sys.remove(placeholder).map_err(held)?;
-                    sys.create_new(placeholder, &stamp, 0o644).map_err(held)?;
-                }
-            },
+                sys.remove(placeholder).map_err(held)?;
+                sys.create_new(placeholder, &stamp, 0o644).map_err(held)?;
+            }
             created => created.map_err(held)?,
         }
-        Ok(Some(stamp))
+        Ok(Some(Placeholder {
+            sys,
+            stamp,
+            _claim: claim,
+        }))
     }
 
     /// The install with softwareupdate's on-demand placeholder in place, removed when it ends
@@ -544,10 +578,9 @@ impl CommandLineTools {
     /// that window alone, which takes over no placeholder and asks `softwareupdate` for none of
     /// the tools the window's own flow installs.
     fn install_placeheld(sys: &dyn System) -> Result<(), Failure> {
-        let Some(stamp) = Self::hold_placeholder(sys)? else {
+        let Some(_placeholder) = Self::hold_placeholder(sys)? else {
             return Self::through_open_window(sys);
         };
-        let _placeholder = Placeholder { sys, stamp };
         Self::install_catalog(sys, None)
     }
 
@@ -964,7 +997,7 @@ mod tests {
         sys.on(SOFTWAREUPDATE_LIST, Ran::ok(VM_LIST));
         sys.on_sleep(|sys, _| {
             assert_eq!(stamped(sys), Some(stamp(sys)));
-            assert_eq!(holder(sys, true), Holder::Install);
+            assert_eq!(holder(sys, Some(true)), Holder::Install);
         });
         let items = retained_items();
         let rows = engine::run(&items, Mode::Apply, &sys, &ctx(), &mut NoJournal);
@@ -1338,6 +1371,7 @@ Software Update found the following new or updated software:\n\
     #[test]
     fn a_catalog_failure_recovers_in_the_same_authorized_run() {
         let sys = Fake::root();
+        sys.running(&[]);
         sys.on(
             SOFTWAREUPDATE_LIST,
             Ran {
@@ -1375,6 +1409,7 @@ Software Update found the following new or updated software:\n\
     fn a_persistent_catalog_failure_is_bounded_and_a_stop_prevents_recovery() {
         for stop_after in [None, Some(0), Some(1)] {
             let mut sys = Fake::root();
+            sys.running(&[]);
             sys.stop_after = stop_after;
             sys.on(
                 SOFTWAREUPDATE_LIST,
@@ -1411,6 +1446,7 @@ Software Update found the following new or updated software:\n\
     fn recovery_rechecks_low_data_and_tools_installed_during_the_wait() {
         for low_data in [false, true] {
             let mut sys = Fake::root();
+            sys.running(&[]);
             sys.low_data = Some(low_data);
             sys.on(
                 SOFTWAREUPDATE_LIST,
@@ -1447,6 +1483,7 @@ Software Update found the following new or updated software:\n\
             "/usr/sbin/softwareupdate -i 'Command Line Tools for Xcode 27.0-27.0'";
         for reached_installer in [false, true] {
             let sys = Fake::root();
+            sys.running(&[]);
             sys.on(SOFTWAREUPDATE_LIST, Ran::ok(VM_LIST))
                 .on(
                     INSTALL,
@@ -1576,6 +1613,7 @@ Software Update found the following new or updated software:\n\
     #[test]
     fn a_fresh_mac_installs_the_listed_label_then_selects_it_and_the_placeholder_goes() {
         let sys = Fake::root();
+        sys.running(&[]);
         sys.on("/usr/bin/xcode-select -p", none_selected())
             .on("/usr/bin/xcode-select -p", none_selected())
             .on(
@@ -1640,6 +1678,7 @@ Software Update found the following new or updated software:\n\
     #[test]
     fn a_stop_while_the_catalog_is_read_installs_nothing_and_removes_the_placeholder() {
         let mut sys = Fake::root();
+        sys.running(&[]);
         sys.stop_after = Some(0);
         sys.on("/usr/sbin/softwareupdate -l", Ran::ok(VM_LIST));
         let failure = CommandLineTools::install(&sys).unwrap_err();
@@ -1659,6 +1698,7 @@ Software Update found the following new or updated software:\n\
 
         let unstopped = Fake::root();
         unstopped
+            .running(&[])
             .on("/usr/sbin/softwareupdate -l", Ran::ok(VM_LIST))
             .on(
                 "/usr/sbin/softwareupdate -i 'Command Line Tools for Xcode 27.0-27.0'",
@@ -1731,6 +1771,7 @@ Software Update found the following new or updated software:\n\
     #[test]
     fn an_unlisted_catalog_recovers_without_launching_apples_installer() {
         let sys = Fake::root();
+        sys.running(&[]);
         sys.on(SOFTWAREUPDATE_LIST, Ran::ok("No new software available.\n"))
             .on(SOFTWAREUPDATE_LIST, Ran::ok("No new software available.\n"))
             .on(SOFTWAREUPDATE_LIST, Ran::ok(VM_LIST))
@@ -1771,6 +1812,7 @@ Software Update found the following new or updated software:\n\
     fn an_unlisted_catalog_reports_unavailability_without_a_gui_fallback() {
         for stop_after in [None, Some(0)] {
             let mut sys = Fake::root();
+            sys.running(&[]);
             sys.stop_after = stop_after;
             sys.on(SOFTWAREUPDATE_LIST, Ran::ok("No new software available.\n"));
             let failure = CommandLineTools::install(&sys).unwrap_err();
@@ -1801,6 +1843,7 @@ Software Update found the following new or updated software:\n\
     #[test]
     fn tools_arriving_during_an_unlisted_catalog_retry_end_the_wait() {
         let sys = Fake::root();
+        sys.running(&[]);
         sys.on(SOFTWAREUPDATE_LIST, Ran::ok("No new software available.\n"));
         sys.on_sleep(|sys, _| {
             sys.stat_of(CLT_GIT, git()).stat_of(CLT_CLANG, git());
@@ -1837,7 +1880,11 @@ Software Update found the following new or updated software:\n\
             if unnamed_beside {
                 sys.process(unnamed(), None);
             }
-            assert_eq!(holder(&sys, false), Holder::AppleWindow, "{unnamed_beside}");
+            assert_eq!(
+                holder(&sys, Some(false)),
+                Holder::AppleWindow,
+                "{unnamed_beside}"
+            );
             sys.on_sleep(|sys, _| {
                 if sys
                     .calls()
@@ -1877,7 +1924,7 @@ Software Update found the following new or updated software:\n\
             .on_stat(RETAINED_INSTALL, Path::new(CLT_GIT), git())
             .on_stat(RETAINED_INSTALL, Path::new(CLT_CLANG), git())
             .on(PKGUTIL, Ran::ok(RECEIPT));
-        assert_eq!(holder(&control, false), Holder::Nothing);
+        assert_eq!(holder(&control, Some(false)), Holder::Nothing);
         CommandLineTools::install(&control).unwrap();
         let calls = control.calls();
         let at = |needle: &str| calls.iter().position(|c| c.starts_with(needle));
@@ -1953,7 +2000,7 @@ Software Update found the following new or updated software:\n\
                 Some(stamp(&sys)),
                 "{route}: kept for the window still open"
             );
-            assert_eq!(holder(&sys, true), Holder::AppleWindow, "{route}");
+            assert_eq!(holder(&sys, Some(true)), Holder::AppleWindow, "{route}");
 
             sys.stop_after = None;
             let next = CommandLineTools::install(&sys).unwrap_err();
@@ -2017,6 +2064,7 @@ Software Update found the following new or updated software:\n\
     #[test]
     fn a_stop_during_the_install_finishes_it_then_ends_the_run() {
         let mut sys = Fake::root();
+        sys.running(&[]);
         sys.stop_after = Some(1);
         sys.on("/usr/sbin/softwareupdate -l", Ran::ok(VM_LIST))
             .on(
@@ -2040,6 +2088,7 @@ Software Update found the following new or updated software:\n\
     #[test]
     fn the_placeholder_is_removed_even_when_softwareupdate_lists_no_tools() {
         let sys = Fake::root();
+        sys.running(&[]);
         sys.on("/usr/bin/xcode-select -p", none_selected()).on(
             "/usr/sbin/softwareupdate -l",
             Ran::ok(&VM_LIST.replace("Command Line Tools for Xcode 27.0", "Safari 27.0")),
@@ -2087,6 +2136,7 @@ Software Update found the following new or updated software:\n\
         ] {
             for receipt in [no_receipt(), Ran::ok(RECEIPT)] {
                 let sys = Fake::root();
+                sys.running(&[]);
                 sys.stat_of(CLT_CLANG, git());
                 if let Some(stat) = stat {
                     sys.stat_of(CLT_GIT, stat);
@@ -2126,6 +2176,7 @@ Software Update found the following new or updated software:\n\
     #[test]
     fn a_first_catalog_outage_reaches_recovery_through_the_apply_engine() {
         let sys = Fake::root();
+        sys.running(&[]);
         let install = "/usr/sbin/softwareupdate -i 'Command Line Tools for Xcode 27.0-27.0'";
         sys.on("/usr/bin/xcode-select -p", none_selected())
             .on("/usr/bin/xcode-select -p", none_selected())
@@ -2211,6 +2262,7 @@ Software Update found the following new or updated software:\n\
     #[test]
     fn a_selected_xcode_is_left_selected_when_the_tools_are_added() {
         let sys = Fake::root();
+        sys.running(&[]);
         sys.on(
             "/usr/bin/xcode-select -p",
             Ran::ok("/Applications/Xcode.app/Contents/Developer\n"),
@@ -2274,6 +2326,75 @@ Software Update found the following new or updated software:\n\
     }
 
     #[test]
+    fn unread_placeholder_state_preserves_independent_custody_evidence() {
+        for process in [
+            None,
+            Some("softwareupdate"),
+            Some("installer"),
+            Some("lookalike"),
+        ] {
+            let sys = Fake::root();
+            installers(&sys, process);
+            assert_eq!(holder(&sys, None), Holder::Unread, "{process:?}");
+        }
+
+        let window = Fake::root();
+        installers(&window, Some("apple"));
+        assert_eq!(holder(&window, None), Holder::AppleWindow);
+
+        let live = Fake::root();
+        live.file(PLACEHOLDER, b"aterm 4242 1000\n")
+            .born(4242, 1000);
+        assert_eq!(
+            holder(&live, None),
+            Holder::Install,
+            "the verified stamp proves custody"
+        );
+        live.born(4242, 1001);
+        assert_eq!(
+            holder(&live, None),
+            Holder::Unread,
+            "a reused pid proves no custody"
+        );
+    }
+
+    #[test]
+    fn root_admission_mutates_no_placeholder_while_custody_is_unread() {
+        let unread_table = Fake::root();
+        let unread_path = Fake::root();
+        unread_path
+            .running(&[])
+            .stat_fails(PLACEHOLDER, std::io::ErrorKind::PermissionDenied);
+        for sys in [&unread_table, &unread_path] {
+            let Err(failure) = CommandLineTools::hold_placeholder(sys) else {
+                panic!("unread custody admits no claim");
+            };
+            assert_eq!(failure.class, Unfinished::Unread, "{failure:?}");
+            assert!(sys.written(PLACEHOLDER).is_none());
+            assert!(
+                sys.calls()
+                    .iter()
+                    .all(|call| { !call.starts_with("create ") && !call.starts_with("remove ") }),
+                "{:?}",
+                sys.calls()
+            );
+        }
+        unread_table.running(&[]);
+        let claim = CommandLineTools::hold_placeholder(&unread_table).unwrap();
+        assert!(claim.is_some());
+        assert!(unread_table.written(PLACEHOLDER).is_some());
+        drop(claim);
+
+        installers(&unread_path, Some("apple"));
+        assert!(
+            CommandLineTools::hold_placeholder(&unread_path)
+                .unwrap()
+                .is_none()
+        );
+        assert!(unread_path.written(PLACEHOLDER).is_none());
+    }
+
+    #[test]
     fn a_clt_marker_an_install_holds_is_never_replaced_or_removed_by_an_install() {
         let ready = || {
             let sys = Fake::root();
@@ -2289,6 +2410,7 @@ Software Update found the following new or updated software:\n\
         };
 
         let fresh = ready();
+        fresh.running(&[]);
         CommandLineTools::install(&fresh).unwrap();
         assert!(fresh.written(PLACEHOLDER).is_none());
         assert!(
@@ -2311,6 +2433,7 @@ Software Update found the following new or updated software:\n\
         );
 
         let no_tools = Fake::root();
+        no_tools.running(&[]);
         no_tools.on("/usr/sbin/softwareupdate -l", Ran::ok("no tools listed\n"));
         assert!(CommandLineTools::install(&no_tools).is_err());
         assert!(no_tools.written(PLACEHOLDER).is_none());
@@ -2468,6 +2591,97 @@ Software Update found the following new or updated software:\n\
         );
     }
 
+    #[test]
+    fn placeholder_cleanup_requires_a_readable_empty_installer_table() {
+        let sys = Fake::root();
+        let saved = stamp(&sys);
+        sys.file(PLACEHOLDER, &saved);
+        drop(Placeholder {
+            sys: &sys,
+            stamp: saved.clone(),
+            _claim: placeholder_lock(&sys).unwrap(),
+        });
+        assert_eq!(sys.written(PLACEHOLDER).as_deref(), Some(saved.as_slice()));
+        assert!(!sys.calls().iter().any(|call| call.starts_with("remove ")));
+
+        installers(&sys, Some("apple"));
+        drop(Placeholder {
+            sys: &sys,
+            stamp: saved.clone(),
+            _claim: placeholder_lock(&sys).unwrap(),
+        });
+        assert_eq!(sys.written(PLACEHOLDER).as_deref(), Some(saved.as_slice()));
+
+        installers(&sys, None);
+        drop(Placeholder {
+            sys: &sys,
+            stamp: saved,
+            _claim: placeholder_lock(&sys).unwrap(),
+        });
+        assert!(
+            sys.written(PLACEHOLDER).is_none(),
+            "known idle permits cleanup"
+        );
+    }
+
+    #[test]
+    fn a_placeholder_claim_excludes_a_second_root_without_a_readable_birth() {
+        let sys = Fake::root();
+        installers(&sys, None);
+        let first = CommandLineTools::hold_placeholder(&sys).unwrap().unwrap();
+        let saved = sys.written(PLACEHOLDER).unwrap();
+        match CommandLineTools::hold_placeholder(&sys) {
+            Err(failure) => assert_eq!(failure.class, Unfinished::Busy),
+            Ok(_) => panic!("the first claim still owns the install"),
+        }
+        assert_eq!(sys.written(PLACEHOLDER).as_deref(), Some(saved.as_slice()));
+        drop(first);
+        assert!(CommandLineTools::hold_placeholder(&sys).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_placeholder_claim_excludes_stale_cleanup_until_it_drops() {
+        let sys = Fake::root();
+        installers(&sys, None);
+        let first = CommandLineTools::hold_placeholder(&sys).unwrap().unwrap();
+        let saved = sys.written(PLACEHOLDER).unwrap();
+        remove_a_gone_runs_placeholder(&sys);
+        assert_eq!(sys.written(PLACEHOLDER).as_deref(), Some(saved.as_slice()));
+        installers(&sys, Some("apple"));
+        drop(first);
+        assert_eq!(sys.written(PLACEHOLDER).as_deref(), Some(saved.as_slice()));
+        installers(&sys, None);
+        remove_a_gone_runs_placeholder(&sys);
+        assert!(sys.written(PLACEHOLDER).is_none());
+    }
+
+    #[test]
+    fn a_refused_placeholder_lock_permits_no_claim_or_stale_cleanup() {
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::Unsupported,
+        ] {
+            let sys = Fake::root();
+            installers(&sys, None);
+            sys.file(PLACEHOLDER, b"aterm 4242 0\n")
+                .exclusive_fails(Path::new(PLACEHOLDER_LOCK), kind);
+            let Err(failure) = CommandLineTools::hold_placeholder(&sys) else {
+                panic!("a refused lock cannot admit a claim");
+            };
+            assert_eq!(failure.class, Unfinished::Unread);
+            remove_a_gone_runs_placeholder(&sys);
+            assert_eq!(
+                sys.written(PLACEHOLDER).as_deref(),
+                Some(b"aterm 4242 0\n".as_slice())
+            );
+            assert!(
+                sys.calls()
+                    .iter()
+                    .all(|call| { !call.starts_with("create ") && !call.starts_with("remove ") })
+            );
+        }
+    }
+
     /// A placeholder no install holds (neither `softwareupdate` nor `installer` runs, nor Apple's
     /// installer window, nor a live run of the root half) is stale, left by an install that ended
     /// without removing it: the install takes its place instead of failing on it, and removes it
@@ -2547,7 +2761,7 @@ Software Update found the following new or updated software:\n\
             sys
         };
         let unnamed_beside = ready(false);
-        assert_eq!(holder(&unnamed_beside, true), Holder::Nothing);
+        assert_eq!(holder(&unnamed_beside, Some(true)), Holder::Nothing);
         CommandLineTools::install(&unnamed_beside).unwrap();
         let calls = unnamed_beside.calls();
         let at = |needle: &str| calls.iter().position(|c| c.starts_with(needle));
@@ -2557,7 +2771,7 @@ Software Update found the following new or updated software:\n\
         assert!(removed < created && created < installed, "{calls:?}");
 
         let control = ready(true);
-        assert_eq!(holder(&control, true), Holder::Install);
+        assert_eq!(holder(&control, Some(true)), Holder::Install);
         let failure = CommandLineTools::install(&control).unwrap_err();
         assert_eq!(failure.class, Unfinished::Busy, "{failure:?}");
         assert!(
@@ -2601,7 +2815,7 @@ Software Update found the following new or updated software:\n\
             if let Some(age) = age {
                 sys.born(window, sys.now - age);
             }
-            assert_eq!(holder(&sys, true), Holder::AppleWindow, "{age:?}");
+            assert_eq!(holder(&sys, Some(true)), Holder::AppleWindow, "{age:?}");
             sys.on_sleep(|sys, _| {
                 if sys
                     .calls()
@@ -2643,7 +2857,7 @@ Software Update found the following new or updated software:\n\
             } else {
                 sys.running(&["/sbin/launchd", APPLE_WINDOW, SOFTWAREUPDATE]);
             }
-            assert_eq!(holder(&sys, true), Holder::Install, "{beside}");
+            assert_eq!(holder(&sys, Some(true)), Holder::Install, "{beside}");
             let failure = CommandLineTools::install(&sys).unwrap_err();
             assert_eq!(failure.class, Unfinished::Busy, "{beside}: {failure:?}");
             assert!(
@@ -2756,7 +2970,7 @@ Software Update found the following new or updated software:\n\
                 _ => {
                     quit.file(PLACEHOLDER, b"aterm 4242 1000\n");
                     installers(&quit, Some("apple"));
-                    assert_eq!(holder(&quit, true), Holder::AppleWindow);
+                    assert_eq!(holder(&quit, Some(true)), Holder::AppleWindow);
                 }
             }
             quit.on_sleep(|sys, _| {
@@ -2806,7 +3020,7 @@ Software Update found the following new or updated software:\n\
     /// went, is left, the wait removing nothing.
     /// NEGATIVE CONTROL: that other run gone (its start matches no process), its stamp goes with
     /// the window. The mutant `remove_a_gone_runs_placeholder` without its
-    /// `holder(sys, true) == Holder::Nothing` check removes both live stamps and fails this test.
+    /// `holder(sys, Some(true)) == Holder::Nothing` check removes both live stamps and fails this test.
     #[test]
     fn a_live_runs_placeholder_stays_as_apples_window_goes() {
         let own = Fake::root();
@@ -2814,7 +3028,11 @@ Software Update found the following new or updated software:\n\
         let own_stamp = stamp(&own);
         own.file(PLACEHOLDER, &own_stamp);
         installers(&own, Some("apple"));
-        assert_eq!(holder(&own, true), Holder::Install, "this run is alive");
+        assert_eq!(
+            holder(&own, Some(true)),
+            Holder::Install,
+            "this run is alive"
+        );
         own.on_sleep(|sys, _| {
             sys.running(&["/sbin/launchd"]);
         });
@@ -2864,6 +3082,7 @@ Software Update found the following new or updated software:\n\
     fn each_way_the_install_falls_short_is_named_by_its_class() {
         let applied = |script: &dyn Fn(&Fake)| {
             let sys = Fake::root();
+            sys.running(&[]);
             sys.on("/usr/bin/xcode-select -p", none_selected());
             script(&sys);
             let items = expand(

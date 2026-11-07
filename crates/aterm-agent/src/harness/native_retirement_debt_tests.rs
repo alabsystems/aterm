@@ -36,6 +36,7 @@ fn pending() -> St {
     };
     let line = command.legacy_line().unwrap();
     let prepare = Request::prepare(Prepare {
+        asked_upgrade: None,
         id: "ab".repeat(16),
         host_epoch: "ef".repeat(16),
         holder: "model-holder".into(),

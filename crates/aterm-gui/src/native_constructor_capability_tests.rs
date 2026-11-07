@@ -29,7 +29,7 @@ fn shipping_generic_constructors_stay_disabled_and_new_prepare_has_no_custody() 
     assert_eq!(
         enabled,
         if crate::native_session_policy::cold_restart_qualified() {
-            vec![Constructor::ColdRestart]
+            vec![Constructor::ColdRestart, Constructor::AskedUpgrade]
         } else {
             Vec::new()
         }

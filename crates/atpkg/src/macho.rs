@@ -488,8 +488,10 @@ pub(crate) fn is_native_object(path: &Path) -> bool {
         .is_ok_and(|head| is_macho_header(&head) || head.starts_with(b"\x7fELF"))
 }
 
-/// Whether `head` opens this platform's native executable format: Mach-O on macOS, ELF on every other unix.
-pub(crate) fn is_native_executable(head: &[u8]) -> bool {
+/// Recognize the native Unix image header: Mach-O on macOS, ELF elsewhere.
+/// This is a format check, not proof of a runnable image, ownership or signature.
+#[must_use]
+pub fn is_native_executable(head: &[u8]) -> bool {
     if cfg!(target_os = "macos") {
         is_macho_header(head)
     } else {

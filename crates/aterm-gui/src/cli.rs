@@ -752,6 +752,147 @@ impl OrdinaryWindowOption {
     }
 }
 
+/// The remaining parser operations. Their arity and exit behavior belong to the
+/// same tokens the real parser dispatches, so launch preparation cannot read an operand as a flag.
+#[derive(Clone, Copy)]
+enum LaunchOption {
+    Help,
+    Version,
+    Diagnose,
+    ListActions,
+    ValidateConfig,
+    ListFonts,
+    ShowConfig,
+    WriteConfig,
+    ListKeybinds,
+    ShowFace,
+    ListThemes,
+    #[cfg(windows)]
+    InstallContextMenu,
+    #[cfg(windows)]
+    UninstallContextMenu,
+    #[cfg(windows)]
+    SetDefaultTerminal,
+    #[cfg(windows)]
+    UnsetDefaultTerminal,
+    Containment,
+    Sandbox,
+    NoSandbox,
+    ControlSock,
+    NoControlSock,
+    Headless,
+    Lifeline,
+    Ready,
+    Command,
+}
+
+#[derive(Clone, Copy)]
+#[cfg(target_os = "macos")]
+enum Operation {
+    Answer,
+    Value,
+    Flag,
+    Headless,
+    Command,
+}
+
+impl LaunchOption {
+    fn parse(arg: &std::ffi::OsStr) -> Option<Self> {
+        Some(match arg.to_str()? {
+            "-h" | "--help" => Self::Help,
+            "-V" | "--version" => Self::Version,
+            "--diagnose" => Self::Diagnose,
+            "--list-actions" => Self::ListActions,
+            "--validate-config" => Self::ValidateConfig,
+            "--list-fonts" => Self::ListFonts,
+            "--show-config" => Self::ShowConfig,
+            "--write-config" => Self::WriteConfig,
+            "--list-keybinds" => Self::ListKeybinds,
+            "--show-face" => Self::ShowFace,
+            "--list-themes" => Self::ListThemes,
+            #[cfg(windows)]
+            "--install-context-menu" => Self::InstallContextMenu,
+            #[cfg(windows)]
+            "--uninstall-context-menu" => Self::UninstallContextMenu,
+            #[cfg(windows)]
+            "--set-default-terminal" => Self::SetDefaultTerminal,
+            #[cfg(windows)]
+            "--unset-default-terminal" => Self::UnsetDefaultTerminal,
+            "--containment" => Self::Containment,
+            "--sandbox" => Self::Sandbox,
+            "--no-sandbox" => Self::NoSandbox,
+            "--control-sock" => Self::ControlSock,
+            "--no-control-sock" => Self::NoControlSock,
+            "--headless" => Self::Headless,
+            "--lifeline-fd" => Self::Lifeline,
+            "--ready-fd" => Self::Ready,
+            "-e" | "--command" => Self::Command,
+            _ => return None,
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    const fn operation(self) -> Operation {
+        match self {
+            Self::Help
+            | Self::Version
+            | Self::Diagnose
+            | Self::ListActions
+            | Self::ValidateConfig
+            | Self::ListFonts
+            | Self::ShowConfig
+            | Self::WriteConfig
+            | Self::ListKeybinds
+            | Self::ShowFace
+            | Self::ListThemes => Operation::Answer,
+            #[cfg(windows)]
+            Self::InstallContextMenu
+            | Self::UninstallContextMenu
+            | Self::SetDefaultTerminal
+            | Self::UnsetDefaultTerminal => Operation::Answer,
+            Self::Containment | Self::ControlSock | Self::Lifeline | Self::Ready => {
+                Operation::Value
+            }
+            Self::Sandbox | Self::NoSandbox | Self::NoControlSock => Operation::Flag,
+            Self::Headless => Operation::Headless,
+            Self::Command => Operation::Command,
+        }
+    }
+}
+
+/// Whether parsing will answer once, start a window, or start the engine without a window.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg(target_os = "macos")]
+pub(crate) enum LaunchBehavior {
+    Answer,
+    Window,
+    Headless,
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn launch_behavior(args: &[std::ffi::OsString]) -> LaunchBehavior {
+    let mut args = args.iter();
+    let mut behavior = LaunchBehavior::Window;
+    while let Some(arg) = args.next() {
+        if let Some(option) = arg.to_str().and_then(OrdinaryWindowOption::parse) {
+            if option.takes_value() {
+                let _ = args.next();
+            }
+            continue;
+        }
+        match LaunchOption::parse(arg).map(LaunchOption::operation) {
+            Some(Operation::Answer) => return LaunchBehavior::Answer,
+            Some(Operation::Value) => {
+                let _ = args.next();
+            }
+            Some(Operation::Headless) => behavior = LaunchBehavior::Headless,
+            Some(Operation::Command) => break,
+            Some(Operation::Flag) | None => {}
+        }
+    }
+    behavior
+}
+
 /// Whether a command line contains only ordinary window options.
 #[must_use]
 pub fn initial_setup_window_args(args: &[std::ffi::OsString]) -> bool {
@@ -869,8 +1010,8 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
             }
             continue;
         }
-        match &*arg.to_string_lossy() {
-            "-h" | "--help" => {
+        match LaunchOption::parse(&arg) {
+            Some(LaunchOption::Help) => {
                 let help = format!(
                     "{HELP_TITLE}{}\n{HELP_HEAD}{}{}",
                     aterm_types::identity::ORIGIN_LINE,
@@ -881,15 +1022,15 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
                 let help = help + WINDOWS_HELP_TAIL;
                 answer_and_exit(&argv, &help, 0);
             }
-            "-V" | "--version" => {
+            Some(LaunchOption::Version) => {
                 let version = format!("aterm-gui {}\n", crate::build_info::version_display());
                 answer_and_exit(&argv, &version, 0);
             }
-            "--diagnose" => {
+            Some(LaunchOption::Diagnose) => {
                 crate::launch::install(launch.clone());
                 answer_and_exit(&argv, &crate::diagnostics::collect().render(), 0);
             }
-            "--list-actions" => {
+            Some(LaunchOption::ListActions) => {
                 let names: String = crate::keybinding::ACTION_NAMES
                     .iter()
                     .flat_map(|name| match name.split_once("..") {
@@ -901,19 +1042,19 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
                     .collect();
                 answer_and_exit(&argv, &names, 0);
             }
-            "--validate-config" => {
+            Some(LaunchOption::ValidateConfig) => {
                 crate::launch::install(launch.clone());
                 let (msg, ok) = crate::diagnostics::validate_config();
                 answer_and_exit(&argv, &format!("{msg}\n"), i32::from(!ok));
             }
-            "--list-fonts" => {
+            Some(LaunchOption::ListFonts) => {
                 answer_and_exit(&argv, &crate::diagnostics::list_fonts(), 0);
             }
-            "--show-config" => {
+            Some(LaunchOption::ShowConfig) => {
                 crate::launch::install(launch.clone());
                 answer_and_exit(&argv, &crate::diagnostics::show_config(), 0);
             }
-            "--write-config" => {
+            Some(LaunchOption::WriteConfig) => {
                 let said = match crate::app_config::config_path() {
                     Some(path) if path.exists() => format!(
                         "config already exists: {} (left unchanged)\n",
@@ -940,10 +1081,10 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
                 };
                 answer_and_exit(&argv, &said, 0);
             }
-            "--list-keybinds" => {
+            Some(LaunchOption::ListKeybinds) => {
                 answer_and_exit(&argv, &crate::diagnostics::list_keybinds(), 0);
             }
-            "--show-face" => {
+            Some(LaunchOption::ShowFace) => {
                 crate::launch::install(launch.clone());
                 let family = args
                     .next()
@@ -952,7 +1093,7 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
                 let (msg, ok) = crate::diagnostics::show_face(&family);
                 answer_and_exit(&argv, &msg, i32::from(!ok));
             }
-            "--list-themes" => {
+            Some(LaunchOption::ListThemes) => {
                 let report = crate::diagnostics::theme_list_report(
                     None,
                     crate::diagnostics::ThemeListFormat::Text,
@@ -960,7 +1101,7 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
                 answer_and_exit(&argv, &report, 0);
             }
             #[cfg(windows)]
-            "--install-context-menu" => {
+            Some(LaunchOption::InstallContextMenu) => {
                 if let Err(e) = crate::explorer_win::install() {
                     eprintln!("aterm-gui: context-menu install failed: {e}");
                     std::process::exit(1);
@@ -974,7 +1115,7 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
                 );
             }
             #[cfg(windows)]
-            "--uninstall-context-menu" => {
+            Some(LaunchOption::UninstallContextMenu) => {
                 let _ = crate::explorer_win::uninstall();
                 answer_and_exit(
                     &argv,
@@ -983,39 +1124,41 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
                 );
             }
             #[cfg(windows)]
-            "--set-default-terminal" => match crate::defterm_win::set_default_terminal() {
-                Ok(()) => answer_and_exit(
-                    &argv,
-                    "aterm-gui: registered aterm as the Windows default terminal. \
+            Some(LaunchOption::SetDefaultTerminal) => {
+                match crate::defterm_win::set_default_terminal() {
+                    Ok(()) => answer_and_exit(
+                        &argv,
+                        "aterm-gui: registered aterm as the Windows default terminal. \
                          New consoles (a double-clicked .bat, `Win+R cmd`, an installer's \
                          console) will open in aterm. Undo with --unset-default-terminal.\n",
-                    0,
-                ),
-                Err(e) => {
-                    eprintln!("aterm-gui: cannot become the default terminal: {e}");
-                    let (console, terminal) =
-                        crate::defterm_win::current_delegation().unwrap_or((None, None));
-                    eprintln!(
-                        "  current HKCU\\{}: {}={} {}={}{}",
-                        crate::defterm_win::STARTUP_KEY,
-                        crate::defterm_win::VALUE_CONSOLE,
-                        console.as_deref().unwrap_or("(unset)"),
-                        crate::defterm_win::VALUE_TERMINAL,
-                        terminal.as_deref().unwrap_or("(unset)"),
-                        if crate::defterm_win::is_aterm_default(terminal.as_deref()) {
-                            "  <- already aterm"
-                        } else {
-                            ""
-                        },
-                    );
-                    eprintln!(
-                        "  set the default terminal in Settings > System > For developers > Terminal."
-                    );
-                    std::process::exit(1);
+                        0,
+                    ),
+                    Err(e) => {
+                        eprintln!("aterm-gui: cannot become the default terminal: {e}");
+                        let (console, terminal) =
+                            crate::defterm_win::current_delegation().unwrap_or((None, None));
+                        eprintln!(
+                            "  current HKCU\\{}: {}={} {}={}{}",
+                            crate::defterm_win::STARTUP_KEY,
+                            crate::defterm_win::VALUE_CONSOLE,
+                            console.as_deref().unwrap_or("(unset)"),
+                            crate::defterm_win::VALUE_TERMINAL,
+                            terminal.as_deref().unwrap_or("(unset)"),
+                            if crate::defterm_win::is_aterm_default(terminal.as_deref()) {
+                                "  <- already aterm"
+                            } else {
+                                ""
+                            },
+                        );
+                        eprintln!(
+                            "  set the default terminal in Settings > System > For developers > Terminal."
+                        );
+                        std::process::exit(1);
+                    }
                 }
-            },
+            }
             #[cfg(windows)]
-            "--unset-default-terminal" => {
+            Some(LaunchOption::UnsetDefaultTerminal) => {
                 use crate::defterm_win::UnsetOutcome;
                 let said = match crate::defterm_win::unset_default_terminal() {
                     Ok(UnsetOutcome::Removed) => "aterm-gui: removed aterm's default-terminal \
@@ -1043,21 +1186,27 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
                 };
                 answer_and_exit(&argv, &said, 0);
             }
-            "--containment" => {
+            Some(LaunchOption::Containment) => {
                 let mode = flag_value("--containment", &mut args);
                 set_launch_flag(|f| f.containment = Some(mode));
             }
-            "--sandbox" => set_launch_flag(|f| f.containment = Some("containment".into())),
-            "--no-sandbox" => set_launch_flag(|f| f.containment = Some("user".into())),
-            "--control-sock" => {
+            Some(LaunchOption::Sandbox) => {
+                set_launch_flag(|f| f.containment = Some("containment".into()))
+            }
+            Some(LaunchOption::NoSandbox) => {
+                set_launch_flag(|f| f.containment = Some("user".into()))
+            }
+            Some(LaunchOption::ControlSock) => {
                 let sock = flag_value("--control-sock", &mut args);
                 set_launch_flag(|f| f.control_sock = Some(sock));
             }
-            "--no-control-sock" => set_launch_flag(|f| f.no_control_sock = true),
-            "--headless" => headless = true,
-            "--lifeline-fd" => lifeline_fd = Some(flag_value("--lifeline-fd", &mut args)),
-            "--ready-fd" => ready_fd = Some(flag_value("--ready-fd", &mut args)),
-            "-e" | "--command" => {
+            Some(LaunchOption::NoControlSock) => set_launch_flag(|f| f.no_control_sock = true),
+            Some(LaunchOption::Headless) => headless = true,
+            Some(LaunchOption::Lifeline) => {
+                lifeline_fd = Some(flag_value("--lifeline-fd", &mut args))
+            }
+            Some(LaunchOption::Ready) => ready_fd = Some(flag_value("--ready-fd", &mut args)),
+            Some(LaunchOption::Command) => {
                 let cmd: Vec<std::ffi::OsString> = args.by_ref().collect();
                 if cmd.is_empty() {
                     eprintln!("aterm: -e/--command requires a command (try --help)");
@@ -1066,7 +1215,8 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
                 exec_command = Some(cmd);
                 break;
             }
-            other => {
+            None => {
+                let other = arg.to_string_lossy();
                 let noun = if other.starts_with('-') {
                     "option"
                 } else {

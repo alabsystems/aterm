@@ -55,6 +55,7 @@ fn pair() -> (Prepare, Prepare) {
         account_intent: Some(stored(Some(at!("/model/old")), "34")),
     };
     let old = Prepare {
+        asked_upgrade: None,
         id: "ab".repeat(16),
         host_epoch: "cd".repeat(16),
         holder: "model-holder".into(),

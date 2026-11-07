@@ -984,7 +984,7 @@ struct AnnouncedPrompt {
     id: String,
     session: u64,
     /// Whether this prompt still marks its tab and is kept from eviction, from its announcement
-    /// until macOS's result or [`ObserverState::stop`] ends that.
+    /// until macOS's result or the end of its stream ([`ObserverState::end_marks`]) ends that.
     pending: bool,
 }
 
@@ -1122,9 +1122,7 @@ impl ObserverState {
         self.rx = None;
         self.requested = ObserverMode::Off;
         self.running = ObserverMode::Off;
-        for prompt in &mut self.announced {
-            self.attention_dirty |= std::mem::take(&mut prompt.pending);
-        }
+        self.end_marks();
         if self.availability.is_live() {
             self.availability = ObserverAvailability::Unavailable(UnavailableReason::StreamEnded);
         }
@@ -1157,6 +1155,7 @@ impl ObserverState {
         self.settle(now);
         if disconnected {
             self.running = ObserverMode::Off;
+            self.end_marks();
             if self.availability.is_live() {
                 self.availability =
                     ObserverAvailability::Unavailable(UnavailableReason::StreamEnded);
@@ -1193,6 +1192,7 @@ impl ObserverState {
             }
             ObserverEvent::Unavailable(reason) => {
                 self.availability = ObserverAvailability::Unavailable(reason);
+                self.end_marks();
             }
             #[cfg(any(target_os = "macos", test))]
             ObserverEvent::Line(line) => {
@@ -1233,7 +1233,18 @@ impl ObserverState {
                     self.availability =
                         ObserverAvailability::Unavailable(UnavailableReason::StreamEnded);
                 }
+                self.end_marks();
             }
+        }
+    }
+
+    /// Ends every announced prompt's pending state, so no tab stays marked by a stream that has
+    /// stopped: with no stream left, no result can answer the prompt. A stop, the worker's
+    /// `Ended` or `Unavailable` (each the last thing it posts) and the channel's disconnect each
+    /// call it.
+    fn end_marks(&mut self) {
+        for prompt in &mut self.announced {
+            self.attention_dirty |= std::mem::take(&mut prompt.pending);
         }
     }
 
@@ -2279,30 +2290,62 @@ mod tests {
     }
 
     #[test]
-    fn a_stopped_stream_leaves_no_prompt_marking_its_tab() {
-        let t0 = Instant::now();
-        let mut observer = ObserverState::inert();
-        observer.feed_for_test(ObserverEvent::Started, t0);
-        for line in [REC_CTX, REC_ATTRIBUTION] {
-            let event = parse_line(line).expect("recorded line parses");
-            observer.feed_for_test(ObserverEvent::Line(event), t0);
+    fn a_stream_that_ends_leaves_no_prompt_marking_its_tab() {
+        type End = fn(&mut ObserverState);
+        fn silent_worker(_: &StreamSink, _: ObserverMode) {}
+        let ends: [(&str, End); 4] = [
+            ("a stop", |observer| observer.stop()),
+            ("the worker's end", |observer| {
+                observer.feed_for_test(ObserverEvent::Ended, Instant::now());
+            }),
+            ("the worker's unavailable", |observer| {
+                observer.feed_for_test(
+                    ObserverEvent::Unavailable(UnavailableReason::NoLogAccess),
+                    Instant::now(),
+                );
+            }),
+            ("the channel's disconnect", |observer| {
+                let deadline = Instant::now() + Duration::from_secs(60);
+                while observer.running() != ObserverMode::Off && Instant::now() < deadline {
+                    observer.drain(Instant::now());
+                    aterm_uds::deadline::poll_yield();
+                }
+                assert_eq!(observer.running(), ObserverMode::Off, "the worker returned");
+            }),
+        ];
+        for (end, run) in ends {
+            let t0 = Instant::now();
+            let mut observer = ObserverState::inert();
+            observer.set_arm_for_test(silent_worker);
+            assert_eq!(
+                observer.start(ObserverMode::Full, || {}),
+                StartOutcome::Started
+            );
+            observer.feed_for_test(ObserverEvent::Started, t0);
+            for line in [REC_CTX, REC_ATTRIBUTION] {
+                let event = parse_line(line).expect("recorded line parses");
+                observer.feed_for_test(ObserverEvent::Line(event), t0);
+            }
+            let later = t0 + PENDING_PROMPT_THRESHOLD + Duration::from_secs(1);
+            let first = observer.take_new_verdicts(
+                later,
+                1,
+                || vec![(4, 4711)],
+                |pid| (pid == 18584).then_some(4711),
+            );
+            assert_eq!(first, [4], "{end}");
+            assert!(observer.marks_session(4), "{end}");
+            assert!(observer.take_attention_changed(), "{end}");
+            run(&mut observer);
+            assert!(
+                !observer.marks_session(4),
+                "after {end} no stream is left to answer it"
+            );
+            assert!(
+                observer.take_attention_changed(),
+                "after {end} the host hears that the mark moved"
+            );
         }
-        let later = t0 + PENDING_PROMPT_THRESHOLD + Duration::from_secs(1);
-        let first = observer.take_new_verdicts(
-            later,
-            1,
-            || vec![(4, 4711)],
-            |pid| (pid == 18584).then_some(4711),
-        );
-        assert_eq!(first, [4]);
-        assert!(observer.marks_session(4));
-        assert!(observer.take_attention_changed());
-        observer.stop();
-        assert!(!observer.marks_session(4), "no stream is left to answer it");
-        assert!(
-            observer.take_attention_changed(),
-            "and the host hears that the mark moved"
-        );
     }
 
     #[test]

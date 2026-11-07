@@ -21,7 +21,7 @@ use super::types::SearchResult;
 use super::types::{DirectedFind, LineFrame, SearchDirection, SearchMatch, SearchResults};
 use crate::cells::LineCells;
 use crate::grapheme::{
-    ColumnMap, LowerByteCursors, LowerNeed, MapSource, lower_fold, lower_fold_char,
+    ColumnMap, LowerByteCursors, LowerNeed, MapSource, SearchColumns, lower_fold, lower_fold_char,
     lower_fold_into, lower_need,
 };
 
@@ -160,16 +160,20 @@ pub(crate) struct MatchVisit {
 fn visit_occurrences<const REV: bool>(
     line_num: usize,
     query_len: usize,
-    col_map: &ColumnMap,
+    col_map: &impl SearchColumns,
     mut byte_map: Option<&mut LowerByteCursors<'_, REV>>,
-    positions: impl Iterator<Item = usize>,
+    mut positions: impl Iterator<Item = usize>,
     mut visit: impl FnMut(SearchMatch) -> bool,
 ) -> MatchVisit {
     let mut result = MatchVisit {
         completed: true,
         had_occurrence: false,
     };
-    for abs_pos in positions {
+    let Some(mut abs_pos) = positions.next() else {
+        return result;
+    };
+    let col_map = col_map.get();
+    loop {
         #[cfg(test)]
         CASE_INSENSITIVE_MATCH_VISITS.with(|count| count.set(count.get() + 1));
         result.had_occurrence = true;
@@ -183,6 +187,10 @@ fn visit_occurrences<const REV: bool>(
             result.completed = false;
             break;
         }
+        let Some(next) = positions.next() else {
+            break;
+        };
+        abs_pos = next;
     }
     result
 }
@@ -211,7 +219,7 @@ impl CaseInsensitiveMatcher {
         &mut self,
         line_num: usize,
         text: &str,
-        col_map: &ColumnMap,
+        col_map: &impl SearchColumns,
         visit: impl FnMut(SearchMatch) -> bool,
     ) -> MatchVisit {
         self.visit_matches_anchored::<REV>(line_num, text, col_map, None, visit)
@@ -223,7 +231,7 @@ impl CaseInsensitiveMatcher {
         &mut self,
         line_num: usize,
         text: &str,
-        col_map: &ColumnMap,
+        col_map: &impl SearchColumns,
         anchor: Option<(usize, bool)>,
         visit: impl FnMut(SearchMatch) -> bool,
     ) -> MatchVisit {
@@ -242,7 +250,7 @@ impl CaseInsensitiveMatcher {
             let searcher = self.lower_query.searcher_ascii();
             let window = anchor
                 .and_then(|(col, inclusive)| {
-                    col_map.identity_match_window::<REV>(
+                    col_map.get().identity_match_window::<REV>(
                         text.len(),
                         col,
                         inclusive,

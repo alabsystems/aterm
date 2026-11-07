@@ -3815,6 +3815,9 @@ fn here_report(
     if plain && let Some(developer) = baseline.developer.as_mut() {
         developer.retained_root_run = true;
     }
+    if plain && let Some(lan) = baseline.lan.as_mut() {
+        lan.retained_root_run = true;
+    }
     if baseline
         .keyboard
         .as_ref()
@@ -3872,14 +3875,12 @@ fn here_report(
         Err(refused) => refuse!(ExitCode::FAILURE, "aterm machines here: {refused}"),
     };
     if plain {
-        // Done once the tools' row is not left short of what the baseline asks: a row that stood
-        // aside, or whose probe was blocked, did not finish either. The elevation's other root
-        // steps (the names, the rule, developer mode) go to the journal alone, so a step macOS
-        // refused never reads as tools that did not install, and the next launch that reads it
-        // still owed asks again (`crate::root_steps::owed`).
+        // The tools and an applicable broker must finish before accepted root custody
+        // ends successfully. Optional naming and debugger failures remain journaled;
+        // they cannot cause another automatic administrator episode.
         let unfinished = rows
             .iter()
-            .filter(|row| row.id == crate::items::github::CLT_ITEM)
+            .filter(|row| row.id == crate::items::github::CLT_ITEM || row.id == "lan.broker")
             .find(|row| {
                 !matches!(
                     row.outcome,
@@ -6556,28 +6557,31 @@ mod tests {
         let plain = |sys: &Fake| here_report(sys, Mode::Apply, None, None, HereOutput::Plain);
         let class = |why: Unfinished| Some(ExitCode::from(why.code().unwrap()));
 
+        let with_tools = |sys: &Fake| {
+            for executable in [
+                crate::items::developer::CLT_GIT,
+                crate::items::developer::CLT_CLANG,
+            ] {
+                sys.stat_of(
+                    executable,
+                    crate::port::Stat {
+                        uid: 0,
+                        gid: 0,
+                        mode: 0o755,
+                        dir: false,
+                        symlink: false,
+                        len: 1,
+                    },
+                );
+            }
+            sys.on(
+                "/usr/bin/xcode-select -p",
+                Ran::ok("/Library/Developer/CommandLineTools\n"),
+            );
+        };
         // Installed and selected already: done, and nothing to print.
         let done = mac();
-        for executable in [
-            crate::items::developer::CLT_GIT,
-            crate::items::developer::CLT_CLANG,
-        ] {
-            done.stat_of(
-                executable,
-                crate::port::Stat {
-                    uid: 0,
-                    gid: 0,
-                    mode: 0o755,
-                    dir: false,
-                    symlink: false,
-                    len: 1,
-                },
-            );
-        }
-        done.on(
-            "/usr/bin/xcode-select -p",
-            Ran::ok("/Library/Developer/CommandLineTools\n"),
-        );
+        with_tools(&done);
         assert!(matches!(plain(&done), Ok(None)));
 
         // Apple's catalog out of reach waits in the same process until an explicit Stop.
@@ -6636,6 +6640,481 @@ mod tests {
         );
         let unread = Fake::root();
         assert!(plain(&unread).err() == class(Unfinished::Other));
+
+        // The accepted root episode must retain the broker after publishing
+        // its files. Completed tools cannot turn a transient bootstrap failure
+        // into a successful root transaction with no helper to reach the LAN.
+        let source = Path::new("/Applications/aterm.app");
+        let image = aterm_uds::lan::install::test_image(0x0100_000c, &[b"this build"]);
+        let broker_case = || {
+            let mut sys = mac();
+            with_tools(&sys);
+            sys.running_app = Some(source.to_path_buf());
+            sys.file("/Applications/aterm.app/Contents/MacOS/aterm", &image);
+            sys.stat_of(
+                source.to_str().unwrap(),
+                crate::port::Stat {
+                    uid: 501,
+                    gid: 20,
+                    mode: 0o755,
+                    dir: true,
+                    symlink: false,
+                    len: 0,
+                },
+            );
+            sys.app_check(|_, _| Ok(()));
+            for (path, ino) in [
+                (aterm_uds::lan::IMAGE_BUNDLE, 1),
+                (aterm_uds::lan::PLIST_PATH, 2),
+            ] {
+                sys.file_id_of(
+                    Path::new(path),
+                    crate::port::FileId {
+                        dev: 1,
+                        ino,
+                        born_ns: None,
+                    },
+                );
+            }
+            sys
+        };
+        let broker = broker_case();
+        const BROKER_PRINT: &str = "/bin/launchctl print system/systems.alab.aterm-lan";
+        const BROKER_BOOTSTRAP: &str =
+            "/bin/launchctl bootstrap system /Library/LaunchDaemons/systems.alab.aterm-lan.plist";
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        broker.simulate({
+            let attempts = std::sync::Arc::clone(&attempts);
+            move |_, command| match command.display().as_str() {
+                BROKER_PRINT => Some(if attempts.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+                    Ran::exit(113, "Could not find service")
+                } else {
+                    Ran::ok("system/systems.alab.aterm-lan = {\n\tpid = 77\n}\n")
+                }),
+                BROKER_BOOTSTRAP => Some(
+                    if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        Ran::exit(5, "transient bootstrap failure")
+                    } else {
+                        Ran::ok("")
+                    },
+                ),
+                _ => None,
+            }
+        });
+        broker
+            .on_lan_broker(Err("the published broker is still starting".into()))
+            .on_lan_broker(Ok(aterm_uds::lan::BrokerHello {
+                protocol: aterm_uds::lan::PROTOCOL,
+                build: aterm_stamp::build_id(),
+                direct: Some("a direct path is not the installed helper".into()),
+            }))
+            .on_lan_broker(Ok(aterm_uds::lan::BrokerHello {
+                protocol: aterm_uds::lan::PROTOCOL,
+                build: "a valid newer source build".into(),
+                direct: None,
+            }))
+            .on(
+                "/usr/bin/xcode-select -p",
+                Ran::ok("/Library/Developer/CommandLineTools\n"),
+            )
+            .on(
+                "/bin/launchctl enable system/systems.alab.aterm-lan",
+                Ran::ok(""),
+            )
+            .on(
+                "/bin/launchctl kickstart system/systems.alab.aterm-lan",
+                Ran::ok(""),
+            );
+        let ended = plain(&broker);
+        let reported_success = matches!(ended, Ok(None));
+        let published = crate::items::lan::reading(&broker).unwrap().unwrap();
+        assert!(published.current());
+        assert!(!published.owed());
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the same accepted root episode must retry bootstrap before reporting success={reported_success}; \
+             files are current but the first bootstrap failed; journal={:?}",
+            broker.written(Fake::JOURNAL)
+        );
+        assert!(reported_success);
+        assert_eq!(
+            broker
+                .calls()
+                .iter()
+                .filter(|call| call.starts_with("clone "))
+                .count(),
+            1,
+            "launch/readiness recovery keeps the already published image"
+        );
+
+        // Already healthy: neither image publication nor launchd mutation is owed.
+        let healthy = broker_case();
+        healthy
+            .file(aterm_uds::lan::IMAGE_EXECUTABLE, &image)
+            .file(
+                aterm_uds::lan::PLIST_PATH,
+                aterm_uds::lan::install::plist_text(source).as_bytes(),
+            )
+            .on(
+                BROKER_PRINT,
+                Ran::ok("system/systems.alab.aterm-lan = {\n\tpid = 77\n}\n"),
+            )
+            .on_lan_broker(Ok(aterm_uds::lan::BrokerHello {
+                protocol: aterm_uds::lan::PROTOCOL,
+                build: "a valid already-serving build".into(),
+                direct: None,
+            }));
+        assert!(matches!(plain(&healthy), Ok(None)));
+        assert!(
+            !healthy.calls().iter().any(|call| call.starts_with("clone ")
+                || call.starts_with("/bin/launchctl bootstrap")
+                || call.starts_with("/bin/launchctl bootout")
+                || call.starts_with("/bin/launchctl kickstart"))
+        );
+
+        for replaced in [false, true] {
+            let interrupted = broker_case();
+            interrupted
+                .on(BROKER_PRINT, Ran::exit(113, "Could not find service"))
+                .on(
+                    "/bin/launchctl enable system/systems.alab.aterm-lan",
+                    Ran::ok(""),
+                )
+                .on(
+                    BROKER_BOOTSTRAP,
+                    Ran::exit(5, "bootstrap still unavailable"),
+                );
+            interrupted.on_sleep(move |sys, _| {
+                if replaced {
+                    sys.file(
+                        aterm_uds::lan::IMAGE_EXECUTABLE,
+                        &aterm_uds::lan::install::test_image(
+                            0x0100_000c,
+                            &[b"a newer root owner's image"],
+                        ),
+                    );
+                } else {
+                    sys.stop_now();
+                }
+            });
+            assert!(
+                plain(&interrupted).err()
+                    == class(if replaced {
+                        Unfinished::Other
+                    } else {
+                        Unfinished::Stopped
+                    })
+            );
+            assert_eq!(
+                interrupted
+                    .calls()
+                    .iter()
+                    .filter(|call| *call == BROKER_BOOTSTRAP)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                interrupted
+                    .calls()
+                    .iter()
+                    .filter(|call| call.starts_with("clone "))
+                    .count(),
+                1
+            );
+        }
+
+        // Another root owner can publish after our final ownership operation,
+        // before any post-publication read. It must never become our receipt.
+        let overwritten = broker_case();
+        let other_image =
+            aterm_uds::lan::install::test_image(0x0100_000c, &[b"another root owner's code"]);
+        let other_plist = aterm_uds::lan::install::plist_text(Path::new("/Applications/other.app"));
+        overwritten.on_chown({
+            let (other_image, other_plist) = (other_image.clone(), other_plist.clone());
+            move |sys, path| {
+                if path == Path::new(aterm_uds::lan::PLIST_PATH) {
+                    sys.file(aterm_uds::lan::IMAGE_EXECUTABLE, &other_image)
+                        .file(aterm_uds::lan::PLIST_PATH, other_plist.as_bytes());
+                }
+            }
+        });
+        overwritten
+            .on(
+                BROKER_PRINT,
+                Ran::ok("system/systems.alab.aterm-lan = {\n\tpid = 77\n}\n"),
+            )
+            .on_lan_broker(Ok(aterm_uds::lan::BrokerHello {
+                protocol: aterm_uds::lan::PROTOCOL,
+                build: "another-build".into(),
+                direct: None,
+            }))
+            .on(
+                "/bin/launchctl bootout system/systems.alab.aterm-lan",
+                Ran::ok(""),
+            )
+            .on(
+                "/bin/launchctl enable system/systems.alab.aterm-lan",
+                Ran::ok(""),
+            )
+            .on(
+                BROKER_BOOTSTRAP,
+                Ran::exit(5, "the other owner's job must not be restarted"),
+            );
+        overwritten.on_sleep(|sys, _| {
+            sys.stop_now();
+        });
+        let ended = plain(&overwritten);
+        assert!(
+            !overwritten
+                .calls()
+                .iter()
+                .any(|call| call.starts_with("/bin/launchctl bootout")
+                    || call.starts_with("/bin/launchctl bootstrap")),
+            "another owner's publication is never adopted as our own: {:?}",
+            overwritten.calls()
+        );
+        assert!(ended.err() == class(Unfinished::Other));
+        assert_eq!(
+            overwritten.written(aterm_uds::lan::IMAGE_EXECUTABLE),
+            Some(other_image)
+        );
+        assert_eq!(
+            overwritten.written(aterm_uds::lan::PLIST_PATH),
+            Some(other_plist.into_bytes())
+        );
+
+        // Strict code refusal is terminal before either publication or launch.
+        let refused = broker_case();
+        refused.app_check(|_, _| {
+            Err(aterm_keeper::identity::CheckError::Refused(
+                "different designated identity".into(),
+            ))
+        });
+        assert!(plain(&refused).err() == class(Unfinished::Other));
+        assert!(refused.written(aterm_uds::lan::IMAGE_EXECUTABLE).is_none());
+        assert!(
+            !refused
+                .calls()
+                .iter()
+                .any(|call| call.starts_with("exchange ")
+                    || call.starts_with("/bin/launchctl bootstrap"))
+        );
+
+        let serves = |sys: &Fake| {
+            sys.on(BROKER_PRINT, Ran::exit(113, "Could not find service"))
+                .on(BROKER_PRINT, Ran::exit(113, "Could not find service"))
+                .on(
+                    BROKER_PRINT,
+                    Ran::ok("system/systems.alab.aterm-lan = {\n\tpid = 77\n}\n"),
+                )
+                .on(
+                    "/bin/launchctl enable system/systems.alab.aterm-lan",
+                    Ran::ok(""),
+                )
+                .on(BROKER_BOOTSTRAP, Ran::ok(""))
+                .on(
+                    "/bin/launchctl kickstart system/systems.alab.aterm-lan",
+                    Ran::ok(""),
+                )
+                .on_lan_broker(Ok(aterm_uds::lan::BrokerHello {
+                    protocol: aterm_uds::lan::PROTOCOL,
+                    build: "a valid staged build".into(),
+                    direct: None,
+                }));
+        };
+        let payload = "Contents/Resources/payload";
+        for unanswered in [false, true] {
+            let recovering = broker_case();
+            recovering.file(source.join(payload).to_str().unwrap(), b"initial");
+            let checks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            recovering.app_check({
+                let checks = std::sync::Arc::clone(&checks);
+                move |sys, candidate| {
+                    let first = checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                    if unanswered && first {
+                        return Err(aterm_keeper::identity::CheckError::Unanswered(
+                            "signing service silent".into(),
+                        ));
+                    }
+                    if !unanswered
+                        && sys.read_file(&candidate.join(payload)).unwrap() != b"repaired"
+                    {
+                        return Err(aterm_keeper::identity::CheckError::Unchecked(
+                            "resource check incomplete (-67054)".into(),
+                        ));
+                    }
+                    Ok(())
+                }
+            });
+            recovering.on_sleep(move |sys, _| {
+                if !unanswered {
+                    sys.file(source.join(payload).to_str().unwrap(), b"repaired");
+                }
+            });
+            serves(&recovering);
+            assert!(matches!(plain(&recovering), Ok(None)));
+            assert_eq!(
+                recovering
+                    .read_file(&source.join(aterm_uds::lan::install::BUNDLE_EXECUTABLE))
+                    .unwrap(),
+                image
+            );
+            assert_eq!(
+                recovering.written(&format!("{}/{payload}", aterm_uds::lan::IMAGE_BUNDLE)),
+                Some(if unanswered {
+                    b"initial".to_vec()
+                } else {
+                    b"repaired".to_vec()
+                })
+            );
+            assert_eq!(
+                recovering
+                    .calls()
+                    .iter()
+                    .filter(|call| call.starts_with("clone "))
+                    .count(),
+                if unanswered { 1 } else { 2 }
+            );
+            assert_eq!(checks.load(std::sync::atomic::Ordering::SeqCst), 2);
+        }
+
+        let moved_source = broker_case();
+        let successor = aterm_uds::lan::install::test_image(0x0100_000c, &[b"valid successor"]);
+        let checks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        moved_source.app_check({
+            let checks = std::sync::Arc::clone(&checks);
+            move |_, _| {
+                if checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    Err(aterm_keeper::identity::CheckError::Unanswered(
+                        "service silent while source updates".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        });
+        moved_source.on_sleep({
+            let successor = successor.clone();
+            move |sys, _| {
+                sys.file(
+                    source
+                        .join(aterm_uds::lan::install::BUNDLE_EXECUTABLE)
+                        .to_str()
+                        .unwrap(),
+                    &successor,
+                );
+            }
+        });
+        serves(&moved_source);
+        assert!(matches!(plain(&moved_source), Ok(None)));
+        assert_eq!(
+            moved_source.written(aterm_uds::lan::IMAGE_EXECUTABLE),
+            Some(successor)
+        );
+        assert_eq!(
+            moved_source
+                .calls()
+                .iter()
+                .filter(|call| call.starts_with("clone "))
+                .count(),
+            2
+        );
+        assert_eq!(
+            checks.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the obsolete first candidate is not checked again"
+        );
+
+        // An unreadable prior code directory is repairable; it need not be valid
+        // code merely to bind its inode before replacing the old bundle.
+        let malformed = broker_case();
+        malformed.stat_of(
+            aterm_uds::lan::IMAGE_BUNDLE,
+            crate::port::Stat {
+                uid: 0,
+                gid: 0,
+                mode: 0o755,
+                dir: true,
+                symlink: false,
+                len: 0,
+            },
+        );
+        malformed.file(aterm_uds::lan::IMAGE_EXECUTABLE, b"malformed old image");
+        serves(&malformed);
+        assert!(matches!(plain(&malformed), Ok(None)));
+        assert_eq!(
+            malformed.written(aterm_uds::lan::IMAGE_EXECUTABLE),
+            Some(image.clone())
+        );
+
+        // A foreign root publication during a slow code check must not be
+        // overwritten by the now-obsolete unadmitted candidate.
+        let overtaken = broker_case();
+        let replacement = aterm_uds::lan::install::test_image(0x0100_000c, &[b"foreign root"]);
+        overtaken.app_check({
+            let replacement = replacement.clone();
+            move |sys, _| {
+                sys.stat_of(
+                    aterm_uds::lan::IMAGE_BUNDLE,
+                    crate::port::Stat {
+                        uid: 0,
+                        gid: 0,
+                        mode: 0o755,
+                        dir: true,
+                        symlink: false,
+                        len: 0,
+                    },
+                );
+                sys.file(aterm_uds::lan::IMAGE_EXECUTABLE, &replacement)
+                    .file(aterm_uds::lan::PLIST_PATH, b"foreign job");
+                sys.file_id_of(
+                    Path::new(aterm_uds::lan::IMAGE_BUNDLE),
+                    crate::port::FileId {
+                        dev: 1,
+                        ino: 99,
+                        born_ns: None,
+                    },
+                );
+                sys.file_id_of(
+                    Path::new(aterm_uds::lan::PLIST_PATH),
+                    crate::port::FileId {
+                        dev: 1,
+                        ino: 100,
+                        born_ns: None,
+                    },
+                );
+                Ok(())
+            }
+        });
+        assert!(plain(&overtaken).err() == class(Unfinished::Other));
+        assert_eq!(
+            overtaken.written(aterm_uds::lan::IMAGE_EXECUTABLE),
+            Some(replacement)
+        );
+        assert_eq!(
+            overtaken.written(aterm_uds::lan::PLIST_PATH),
+            Some(b"foreign job".to_vec())
+        );
+        assert!(
+            !overtaken
+                .calls()
+                .iter()
+                .any(|call| call.starts_with("exchange ")
+                    || call.starts_with("/bin/launchctl bootstrap"))
+        );
+
+        let stopped_check = broker_case();
+        stopped_check.app_check(|sys, _| {
+            sys.stop_now();
+            Ok(())
+        });
+        assert!(plain(&stopped_check).err() == class(Unfinished::Stopped));
+        assert!(
+            stopped_check
+                .written(aterm_uds::lan::IMAGE_EXECUTABLE)
+                .is_none()
+        );
     }
 
     /// `--name` gives the Mac its swarm label as Computer Name, Local hostname and host name

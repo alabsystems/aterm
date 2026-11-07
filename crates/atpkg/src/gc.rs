@@ -613,9 +613,9 @@ fn run_in(
             let Some(native_gate) = lease_clear(layout, &program, b, &mut leased) else {
                 continue;
             };
-            // A build a tree's trust.lock resolved lately is that tree's compiler, current or not:
-            // read under the gate, which a resolver marks under its lease before it runs the build
-            // (`trust_lock::shim_target`), so a mark made after this pass began is seen.
+            // An explicit named install or trust.lock resolution retains its build for the
+            // existing keep window. Read under the gate: installs mark under the store lock,
+            // and resolvers under their lease, so a mark made after this pass began is seen.
             if crate::trust_lock::locked_within_keep(&layout.build_dir(&program, b), now) {
                 continue;
             }

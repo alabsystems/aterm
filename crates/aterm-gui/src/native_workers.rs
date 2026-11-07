@@ -1095,6 +1095,7 @@ mod tests {
             started: now,
             entered: 1,
             agent: None,
+            program: None,
             trusted_cwd: None,
             fact: None,
             program_block: None,

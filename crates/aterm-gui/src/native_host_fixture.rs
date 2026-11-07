@@ -464,7 +464,7 @@ fn run_native_host_fixture_inner(
             // Shipping cold relaunch was qualified on Apple Silicon; generic
             // constructors and sealed renewal discovery stay disabled.
             if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-                vec![Constructor::ColdRestart]
+                vec![Constructor::ColdRestart, Constructor::AskedUpgrade]
             } else {
                 Vec::new()
             }

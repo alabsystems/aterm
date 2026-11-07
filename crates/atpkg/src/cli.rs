@@ -8124,8 +8124,9 @@ fn parse_install_argv(rest: &[String]) -> Result<InstallArgs<'_>, ExitCode> {
 
 /// `aterm pkg install <trust|lean4> --build <N>`: a build verified under the head index and staged
 /// beside `current`, which stays ([`crate::flow::install_build`]); held to the tree a `trust.lock`
-/// above this directory names when it names that build, and marked so gc keeps it
-/// ([`crate::trust_lock::mark_locked`]). A named Lean build supplies an exact import world;
+/// above this directory names when it names that build. Every successful named install records
+/// recent use before releasing the store lock, so gc cannot collect it before a later lease
+/// within the existing keep window. A named Lean build supplies an exact import world;
 /// its consumer holds a named prerequisite lease while using it. It never acquires a Trust lock.
 /// With `retry` ([`RETRY_FLAG`]) the build's stage refusal memo goes first, so a build a refusal
 /// holds back is downloaded again now.
@@ -8164,9 +8165,6 @@ fn cmd_install_build(program: &str, build: u64, retry: bool) -> ExitCode {
     );
     match got {
         Ok(named) => {
-            if program == crate::trust_lock::PROGRAM {
-                let _ = crate::trust_lock::mark_locked(&layout.prefix, build);
-            }
             let (said, root) = match &named {
                 crate::flow::NamedBuild::Present { tree_root } => ("is in the store", tree_root),
                 crate::flow::NamedBuild::Staged { tree_root } => ("staged", tree_root),

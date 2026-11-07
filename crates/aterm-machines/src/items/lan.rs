@@ -7,7 +7,8 @@
 //! As root, [`LanBroker`] clones the app bundle the elevation runs from (the **source**: the
 //! `.app` around the root half's canonical executable, which runs as
 //! `<app>/Contents/MacOS/aterm machines here apply`) into a root-only staging folder, seals the
-//! clone `root:wheel` with no group or other write bit, swaps it over
+//! clone `root:wheel`, strips shared grants, confines its links, and strictly checks it against
+//! the loaded root process's designated requirement before swapping it over
 //! [`aterm_uds::lan::IMAGE_BUNDLE`] (removing the image it replaced), writes
 //! [`aterm_uds::lan::PLIST_PATH`] (`0644 root:wheel`, [`aterm_uds::lan::install::plist_text`]),
 //! and (re)starts the job with `launchctl bootout`/`enable`/`bootstrap`/`kickstart`, as
@@ -28,11 +29,14 @@
 
 use super::{Ctx, Item};
 use crate::model::{Effect, Probe};
-use crate::port::{Cloned, System};
+use crate::port::{Cloned, FileId, Scratch, System};
+use aterm_keeper::identity::CheckError;
+use aterm_uds::app_image;
 use aterm_uds::lan::{self, install};
 use serde::Deserialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Duration;
 
 /// The `[lan]` table.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -41,6 +45,9 @@ pub struct Table {
     /// `true` installs the root LAN broker from the app bundle this aterm runs from
     /// ([`LanBroker`]).
     pub broker: Option<bool>,
+    /// Only the built-in accepted root transaction retains launch/readiness custody.
+    #[serde(skip)]
+    pub(crate) retained_root_run: bool,
 }
 
 /// The items `table` asks for.
@@ -51,7 +58,10 @@ pub fn expand(table: &Table, ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
     let _ = ctx;
     let mut items: Vec<Box<dyn Item>> = Vec::new();
     if table.broker == Some(true) {
-        items.push(Box::new(LanBroker::default()));
+        items.push(Box::new(LanBroker {
+            retained_root_run: table.retained_root_run,
+            ..LanBroker::default()
+        }));
     }
     Ok(items)
 }
@@ -100,10 +110,472 @@ pub fn reading(sys: &dyn System) -> Option<Result<install::Reading, String>> {
 pub struct LanBroker {
     /// How the last apply made the image, for the row's detail.
     made: Mutex<Option<Cloned>>,
+    retained_root_run: bool,
+    unfinished: Mutex<Option<crate::init_clt::Unfinished>>,
 }
 
 fn io(what: &Path, e: &std::io::Error) -> String {
     format!("{}: {e}", what.display())
+}
+
+enum Readiness {
+    Ready(u32),
+    Start,
+    Pending(String),
+}
+
+/// Replacement freshness for this transaction, never a signature verdict.
+struct Publication<'a> {
+    code: install::CodeDirectories,
+    plist: Vec<u8>,
+    prior_plist: Option<FileId>,
+    complete: bool,
+    retired: Option<Scratch<'a>>,
+}
+
+struct Prepared<'a> {
+    owner: Scratch<'a>,
+    path: PathBuf,
+    code: install::CodeDirectories,
+}
+
+/// An installed-file generation, including a proved absence. This is replacement
+/// freshness only: a malformed old image can still be repaired.
+#[derive(PartialEq, Eq)]
+struct Before {
+    image: Option<FileId>,
+    plist: Option<FileId>,
+}
+
+enum StageError {
+    Files(app_image::Error),
+    Check(CheckError),
+    SourceChanged,
+    Lost(String),
+}
+
+impl std::fmt::Display for StageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Files(error) => error.fmt(f),
+            Self::Check(error) => error.fmt(f),
+            Self::SourceChanged => f.write_str("the source changed before image publication"),
+            Self::Lost(why) => f.write_str(why),
+        }
+    }
+}
+
+impl From<app_image::Error> for StageError {
+    fn from(error: app_image::Error) -> Self {
+        Self::Files(error)
+    }
+}
+
+fn stage_io(path: &Path, error: std::io::Error) -> StageError {
+    app_image::Error::Io(std::io::Error::new(error.kind(), io(path, &error))).into()
+}
+
+fn file_generation(sys: &dyn System, path: &Path) -> Result<Option<FileId>, StageError> {
+    match sys.stat(path) {
+        Ok(_) => sys
+            .file_id(path)
+            .map(Some)
+            .map_err(|error| stage_io(path, error)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(stage_io(path, error)),
+    }
+}
+
+impl Before {
+    fn read(sys: &dyn System) -> Result<Self, StageError> {
+        Ok(Self {
+            image: file_generation(sys, Path::new(lan::IMAGE_BUNDLE))?,
+            plist: file_generation(sys, Path::new(lan::PLIST_PATH))?,
+        })
+    }
+
+    fn check(&self, sys: &dyn System) -> Result<(), StageError> {
+        if Self::read(sys)? != *self {
+            return Err(StageError::Lost(
+                "another root transaction replaced the LAN broker installation".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Prepared<'_> {
+    fn source_current(&self, sys: &dyn System, source: &Path) -> Result<(), StageError> {
+        let shape = sys.stat(source).map_err(|error| stage_io(source, error))?;
+        if !shape.dir || shape.symlink {
+            return Err(
+                app_image::Error::Refused("the source is not a real app directory".into()).into(),
+            );
+        }
+        let exe = source.join(install::BUNDLE_EXECUTABLE);
+        let code = sys
+            .code_directories(&exe)
+            .map_err(|error| stage_io(&exe, error))?;
+        if code != self.code {
+            return Err(StageError::SourceChanged);
+        }
+        Ok(())
+    }
+}
+
+impl Publication<'_> {
+    fn check_image(&self, sys: &dyn System) -> Result<(), StageError> {
+        let image = Path::new(lan::IMAGE_EXECUTABLE);
+        if sys
+            .code_directories(image)
+            .map_err(|error| stage_io(image, error))?
+            != self.code
+        {
+            return Err(StageError::Lost(
+                "another root transaction replaced the LAN broker image".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn check(&self, sys: &dyn System) -> Result<(), StageError> {
+        self.check_image(sys)?;
+        let path = Path::new(lan::PLIST_PATH);
+        if sys.read_file(path).map_err(|error| stage_io(path, error))? != self.plist {
+            return Err(StageError::Lost(
+                "another root transaction replaced the LAN broker job".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self, sys: &dyn System) -> Result<(), StageError> {
+        if self.complete {
+            return Ok(());
+        }
+        self.check_image(sys)?;
+        let plist = Path::new(lan::PLIST_PATH);
+        // An earlier write may have landed before its error. Only our intended
+        // bytes or the original generation may be completed, never a foreign job.
+        if file_generation(sys, plist)? != self.prior_plist {
+            let shape = sys.stat(plist).map_err(|error| stage_io(plist, error))?;
+            let ours = !shape.dir
+                && !shape.symlink
+                && sys.read_file(plist).is_ok_and(|bytes| bytes == self.plist);
+            if !ours {
+                return Err(StageError::Lost(
+                    "another root transaction replaced the LAN broker job".into(),
+                ));
+            }
+        }
+        let log = log_dir();
+        sys.create_dir_all(log, 0o755)
+            .map_err(|error| stage_io(log, error))?;
+        if let Some(parent) = plist.parent() {
+            sys.create_dir_all(parent, 0o755)
+                .map_err(|error| stage_io(parent, error))?;
+        }
+        sys.write_file(plist, &self.plist, 0o644)
+            .map_err(|error| stage_io(plist, error))?;
+        sys.chown(plist, 0, 0)
+            .map_err(|error| stage_io(plist, error))?;
+        self.check(sys)?;
+        self.complete = true;
+        if let Some(retired) = &mut self.retired {
+            if let Err(error) = retired.close() {
+                aterm_log::warn!("LAN broker retired image cleanup: {error}");
+            } else {
+                self.retired = None;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Local custody of one accepted root run, not saved authorization. Only a
+/// successful strict check moves an owned candidate to the publication phase.
+#[derive(Default)]
+struct Installing<'a> {
+    before: Option<Before>,
+    prepared: Option<Prepared<'a>>,
+    published: Option<Publication<'a>>,
+    launched: bool,
+}
+
+impl<'a> Installing<'a> {
+    fn round(
+        &mut self,
+        item: &LanBroker,
+        sys: &'a dyn System,
+        source: &Path,
+        current: &dyn Fn() -> Result<(), String>,
+    ) -> Result<Option<String>, StageError> {
+        current().map_err(StageError::Lost)?;
+        if self.published.is_none() {
+            if self.before.is_none() {
+                self.before = Some(Before::read(sys)?);
+            }
+            let before = self.before.as_ref().expect("read installed generations");
+            before.check(sys)?;
+            if self.prepared.is_none() {
+                self.prepared = Some(item.prepare(sys, source, current)?);
+            }
+            let prepared = self.prepared.as_ref().expect("owned candidate");
+            current().map_err(StageError::Lost)?;
+            before.check(sys)?;
+            prepared.source_current(sys, source)?;
+            sys.check_app_copy(&prepared.path)
+                .map_err(StageError::Check)?;
+            current().map_err(StageError::Lost)?;
+            prepared.source_current(sys, source)?;
+            before.check(sys)?;
+            let prepared = self.prepared.take().expect("strictly checked candidate");
+            self.published = Some(item.publish(sys, source, prepared, before)?);
+        }
+        let published = self.published.as_mut().expect("an owned publication");
+        current().map_err(StageError::Lost)?;
+        published.finish(sys)?;
+        current().map_err(StageError::Lost)?;
+        published.check(sys)?;
+        let observed = readiness(sys);
+        current().map_err(StageError::Lost)?;
+        published.check(sys)?;
+        let why = match observed {
+            Readiness::Ready(_) => return Ok(None),
+            Readiness::Pending(why) if self.launched => why,
+            Readiness::Start | Readiness::Pending(_) => {
+                current().map_err(StageError::Lost)?;
+                published.check(sys)?;
+                match super::aterm::start_system_job(sys, Path::new(lan::PLIST_PATH), lan::LABEL) {
+                    Ok(()) => {
+                        self.launched = true;
+                        current().map_err(StageError::Lost)?;
+                        published.check(sys)?;
+                        let observed = readiness(sys);
+                        current().map_err(StageError::Lost)?;
+                        published.check(sys)?;
+                        match observed {
+                            Readiness::Ready(_) => return Ok(None),
+                            Readiness::Start => "the broker job has not started yet".into(),
+                            Readiness::Pending(why) => why,
+                        }
+                    }
+                    Err(why) => why,
+                }
+            }
+        };
+        Ok(Some(why))
+    }
+
+    fn retry(&mut self, error: &StageError) -> bool {
+        match error {
+            StageError::Check(CheckError::Refused(_))
+            | StageError::Files(app_image::Error::Refused(_))
+            | StageError::Lost(_) => false,
+            StageError::Check(CheckError::Unanswered(_)) => true,
+            StageError::Check(CheckError::Unchecked(_))
+            | StageError::Files(app_image::Error::Io(_))
+            | StageError::SourceChanged => {
+                // A resource-only source repair can keep the executable unchanged.
+                // Refresh the unadmitted snapshot rather than caching a negative.
+                self.prepared = None;
+                true
+            }
+        }
+    }
+}
+
+/// A loaded pid alone is not proof that the broker's protocol is serving.
+fn readiness(sys: &dyn System) -> Readiness {
+    let pid = match super::aterm::system_job_pid(sys, lan::LABEL) {
+        Ok(Some(Some(pid))) => pid,
+        Ok(_) => return Readiness::Start,
+        Err(why) => return Readiness::Pending(why),
+    };
+    match sys.installed_lan_broker() {
+        Ok(hello) if hello.direct.is_some() || hello.protocol != lan::PROTOCOL => {
+            Readiness::Pending("the installed root broker has not answered this protocol".into())
+        }
+        Ok(_) => Readiness::Ready(pid),
+        Err(why) => Readiness::Pending(why),
+    }
+}
+
+/// Full effect-boundary readiness for a root result that otherwise looks short.
+/// The GUI's ordinary `reading` remains metadata-only.
+pub(crate) fn ready(sys: &dyn System) -> Result<bool, String> {
+    let Some(files) = reading(sys) else {
+        return Ok(true);
+    };
+    Ok(files?.current() && matches!(readiness(sys), Readiness::Ready(_)))
+}
+
+impl LanBroker {
+    fn note(&self, why: Option<crate::init_clt::Unfinished>) {
+        *self
+            .unfinished
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = why;
+    }
+
+    fn retained(&self, sys: &dyn System, source: &Path) -> Result<(), String> {
+        use aterm_secrets::converge::{Last, RunnerRetry};
+        let pid = std::process::id();
+        let start = sys
+            .process_started(pid)
+            .filter(|start| *start != 0)
+            .ok_or("the accepted root process's generation could not be read")?;
+        let _stops = sys.defer_stops();
+        let current = || -> Result<(), String> {
+            if sys.stopped().is_some() {
+                self.note(Some(crate::init_clt::Unfinished::Stopped));
+                return Err("the accepted root setup was stopped".into());
+            }
+            if sys.euid() != 0 || sys.process_started(pid) != Some(start) {
+                return Err("the accepted root setup no longer owns its process generation".into());
+            }
+            Ok(())
+        };
+        current()?;
+        let mut installing = Installing::default();
+        let mut retry = RunnerRetry::default();
+        let clock = std::time::Instant::now();
+        let mut said = None;
+        loop {
+            let why = match installing.round(self, sys, source, &current) {
+                Ok(None) => return Ok(()),
+                Ok(Some(why)) => why,
+                Err(error) => {
+                    if !installing.retry(&error) {
+                        return Err(error.to_string());
+                    }
+                    error.to_string()
+                }
+            };
+            if said.as_ref() != Some(&why) {
+                aterm_log::warn!(
+                    "LAN broker: {why}; retaining the accepted root setup for recovery"
+                );
+                said = Some(why);
+            }
+            // RunnerRetry supplies the existing capped rate. The wait is local
+            // to this accepted process, with no saved authorization or new timer.
+            let elapsed = || u64::try_from(clock.elapsed().as_millis()).unwrap_or(u64::MAX);
+            retry.reaped(Last::Failed, elapsed());
+            let mut left = retry
+                .remaining(elapsed())
+                .expect("failed retry has a deadline");
+            while !left.is_zero() {
+                current()?;
+                let tick = left.min(Duration::from_secs(2));
+                sys.sleep(tick);
+                left = left.saturating_sub(tick);
+            }
+            retry.started();
+        }
+    }
+
+    fn prepare<'a>(
+        &self,
+        sys: &'a dyn System,
+        source: &Path,
+        current: &dyn Fn() -> Result<(), String>,
+    ) -> Result<Prepared<'a>, StageError> {
+        current().map_err(StageError::Lost)?;
+        let image_dir = Path::new(lan::IMAGE_DIR);
+        // Every folder on the image's way is root's with no shared write, so no
+        // other account can move the image or put another in its place.
+        for dir in image_dir
+            .ancestors()
+            .take(2)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
+            sys.create_dir_all(dir, 0o755)
+                .map_err(|error| stage_io(dir, error))?;
+            sys.root_own(dir, false)?;
+        }
+        let owner = Scratch::new_in(sys, image_dir, "lan-image")
+            .map_err(|error| stage_io(image_dir, error))?;
+        sys.root_own(owner.path(), false)?;
+        let staged = owner.path().join("aterm.app");
+        current().map_err(StageError::Lost)?;
+        let made = sys.clone_tree(source, &staged)?;
+        *self
+            .made
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(made);
+        current().map_err(StageError::Lost)?;
+        sys.root_own(&staged, true)?;
+        let staged_exe = staged.join(install::BUNDLE_EXECUTABLE);
+        Ok(Prepared {
+            owner,
+            path: staged,
+            code: sys
+                .code_directories(&staged_exe)
+                .map_err(|error| stage_io(&staged_exe, error))?,
+        })
+    }
+
+    fn publish<'a>(
+        &self,
+        sys: &'a dyn System,
+        source: &Path,
+        prepared: Prepared<'a>,
+        before: &Before,
+    ) -> Result<Publication<'a>, StageError> {
+        let Prepared { owner, path, code } = prepared;
+        let plist = install::plist_text(source).into_bytes();
+        let image = Path::new(lan::IMAGE_BUNDLE);
+        match sys.exchange(&path, image) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                sys.rename(&path, image)
+                    .map_err(|error| stage_io(image, error))?;
+            }
+            Err(error) => return Err(stage_io(image, error)),
+        }
+        // No fallible operation follows the image rename before custody moves
+        // into Publication. A later plist/readiness retry never clones it again.
+        Ok(Publication {
+            code,
+            plist,
+            prior_plist: before.plist,
+            complete: false,
+            retired: Some(owner),
+        })
+    }
+
+    fn single(&self, sys: &dyn System, source: &Path) -> Result<(), StageError> {
+        let current = || {
+            if sys.stopped().is_some() {
+                self.note(Some(crate::init_clt::Unfinished::Stopped));
+                return Err("root setup was stopped".into());
+            }
+            if sys.euid() != 0 {
+                return Err("the LAN broker image needs root custody".into());
+            }
+            Ok(())
+        };
+        current().map_err(StageError::Lost)?;
+        let before = Before::read(sys)?;
+        let prepared = self.prepare(sys, source, &current)?;
+        before.check(sys)?;
+        prepared.source_current(sys, source)?;
+        sys.check_app_copy(&prepared.path)
+            .map_err(StageError::Check)?;
+        current().map_err(StageError::Lost)?;
+        prepared.source_current(sys, source)?;
+        before.check(sys)?;
+        let mut published = self.publish(sys, source, prepared, &before)?;
+        current().map_err(StageError::Lost)?;
+        published.finish(sys)?;
+        current().map_err(StageError::Lost)?;
+        published.check(sys)?;
+        super::aterm::start_system_job(sys, Path::new(lan::PLIST_PATH), lan::LABEL)
+            .map_err(StageError::Lost)
+    }
 }
 
 impl Item for LanBroker {
@@ -135,85 +607,49 @@ impl Item for LanBroker {
             Ok(reading) => reading,
             Err(why) => return Probe::Unusable { why },
         };
-        let loaded = match super::aterm::system_job_pid(sys, lan::LABEL) {
-            Ok(loaded) => loaded,
-            Err(why) => return Probe::Unusable { why },
-        };
         let to = format!(
             "{} running in system from a root-owned clone of {}",
             lan::LABEL,
             source.display()
         );
-        match (reading.current(), loaded) {
-            (true, Some(Some(pid))) => Probe::Ok {
-                now: format!("{} running in system (pid {pid})", lan::LABEL),
-            },
-            (true, Some(None)) => Probe::Change {
-                from: "installed and loaded in system, not running".to_owned(),
-                to,
-            },
-            (true, None) => Probe::Change {
-                from: "installed, not loaded in system".to_owned(),
-                to,
-            },
-            (false, _) => Probe::Change {
+        if !reading.current() {
+            return Probe::Change {
                 from: reading.words(),
                 to,
+            };
+        }
+        match readiness(sys) {
+            Readiness::Ready(pid) => Probe::Ok {
+                now: format!("{} running in system (pid {pid})", lan::LABEL),
             },
+            Readiness::Start => Probe::Change {
+                from: "installed, not serving".into(),
+                to,
+            },
+            Readiness::Pending(why) if self.retained_root_run => Probe::Change { from: why, to },
+            Readiness::Pending(why) => Probe::Unusable { why },
         }
     }
 
     fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
+        self.note(Some(crate::init_clt::Unfinished::Other));
         let source = sys.running_app().ok_or(NO_BUNDLE)?;
-        let image_dir = Path::new(lan::IMAGE_DIR);
-        // Every folder on the image's way is root's with no shared write, so no other account
-        // can move the image or put another in its place.
-        for dir in image_dir
-            .ancestors()
-            .take(2)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-        {
-            sys.create_dir_all(dir, 0o755).map_err(|e| io(dir, &e))?;
-            sys.root_own(dir, false).map_err(|e| io(dir, &e))?;
+        let result = if self.retained_root_run {
+            self.retained(sys, &source)
+        } else {
+            self.single(sys, &source).map_err(|error| error.to_string())
+        };
+        if result.is_ok() {
+            self.note(None);
         }
-        let staging = Path::new(install::STAGING_DIR);
-        crate::agent::remove_tree(sys, staging).map_err(|e| io(staging, &e))?;
-        sys.create_dir_all(staging, 0o700)
-            .map_err(|e| io(staging, &e))?;
-        sys.root_own(staging, false).map_err(|e| io(staging, &e))?;
-        let staged = staging.join("aterm.app");
-        let made = sys
-            .clone_tree(&source, &staged)
-            .map_err(|e| format!("clone {} to {}: {e}", source.display(), staged.display()))?;
+        result
+    }
+
+    fn unfinished(&self) -> Option<crate::init_clt::Unfinished> {
         *self
-            .made
+            .unfinished
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(made);
-        sys.root_own(&staged, true).map_err(|e| io(&staged, &e))?;
-        let image = Path::new(lan::IMAGE_BUNDLE);
-        match sys.exchange(&staged, image) {
-            // `staged` now names the image it replaced.
-            Ok(()) => crate::agent::remove_tree(sys, &staged).map_err(|e| io(&staged, &e))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                sys.rename(&staged, image).map_err(|e| io(image, &e))?;
-            }
-            Err(e) => return Err(io(image, &e)),
-        }
-        let _ = sys.remove(staging);
-        let log = log_dir();
-        sys.create_dir_all(log, 0o755).map_err(|e| io(log, &e))?;
-        let plist = Path::new(lan::PLIST_PATH);
-        if let Some(daemons) = plist.parent() {
-            sys.create_dir_all(daemons, 0o755)
-                .map_err(|e| io(daemons, &e))?;
-        }
-        sys.write_file(plist, install::plist_text(&source).as_bytes(), 0o644)
-            .map_err(|e| io(plist, &e))?;
-        sys.chown(plist, 0, 0)
-            .map_err(|e| format!("chown {}: {e}", plist.display()))?;
-        super::aterm::start_system_job(sys, plist, lan::LABEL)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn revert(&self) -> Option<String> {
@@ -265,6 +701,33 @@ mod tests {
         let mut sys = Fake::root();
         sys.running_app = Some(PathBuf::from(SOURCE));
         sys.file(SOURCE_EXE, &this_build());
+        sys.stat_of(
+            SOURCE,
+            crate::port::Stat {
+                uid: 501,
+                gid: 20,
+                mode: 0o755,
+                dir: true,
+                symlink: false,
+                len: 0,
+            },
+        );
+        sys.app_check(|_, _| Ok(()));
+        for (path, ino) in [(lan::IMAGE_BUNDLE, 1), (lan::PLIST_PATH, 2)] {
+            sys.file_id_of(
+                Path::new(path),
+                FileId {
+                    dev: 1,
+                    ino,
+                    born_ns: None,
+                },
+            );
+        }
+        sys.on_lan_broker(Ok(lan::BrokerHello {
+            protocol: lan::PROTOCOL,
+            build: aterm_stamp::build_id(),
+            direct: None,
+        }));
         sys
     }
 
@@ -276,9 +739,9 @@ mod tests {
     #[test]
     fn the_broker_is_cloned_sealed_swapped_then_started() {
         let sys = from_app();
-        // Not loaded for the probe and the apply, then running for the probe after it.
+        // The missing files need no launchctl read; apply finds no loaded job,
+        // then the post-probe hears the running broker's strict hello.
         sys.on(PRINT, Ran::exit(113, "Could not find service"))
-            .on(PRINT, Ran::exit(113, "Could not find service"))
             .on(PRINT, Ran::ok("system/systems.alab.aterm-lan = {\n\tpid = 77\n}\n"))
             .on("/bin/launchctl enable system/systems.alab.aterm-lan", Ran::ok(""))
             .on(
@@ -300,12 +763,16 @@ mod tests {
                 .position(|c| c.starts_with(prefix))
                 .unwrap_or_else(|| panic!("{prefix}: {calls:?}"))
         };
-        let staged = "/Library/Application Support/aterm/lan/.staging/aterm.app";
+        let parent = Path::new(lan::IMAGE_DIR);
+        let scratch = Fake::scratch_path(Some(parent), "lan-image", 0);
+        let staged = scratch.join("aterm.app");
+        let staged = staged.display();
         let order = [
             at("root-own /Library/Application Support/aterm/lan"),
-            at("mkdir /Library/Application Support/aterm/lan/.staging 700"),
+            at(&format!("scratch allocated {}", scratch.display())),
             at(&format!("clone {SOURCE} {staged}")),
             at(&format!("root-own -R {staged}")),
+            at(&format!("check staged app {staged}")),
             at(&format!("exchange {staged} {}", lan::IMAGE_BUNDLE)),
             at(&format!("rename {staged} {}", lan::IMAGE_BUNDLE)),
             at(&format!("write {} 644", lan::PLIST_PATH)),
@@ -340,12 +807,52 @@ mod tests {
         ));
         assert!(LanBroker::default().apply(&dev, &ctx).is_err());
         assert!(dev.calls().is_empty(), "{:?}", dev.calls());
+
+        let refused = from_app();
+        refused.app_check(|_, _| Err(CheckError::Refused("another designated image".into())));
+        assert!(LanBroker::default().apply(&refused, &ctx).is_err());
+        assert!(refused.written(lan::IMAGE_EXECUTABLE).is_none());
+        assert!(
+            !refused
+                .calls()
+                .iter()
+                .any(|call| call.starts_with("exchange ") || call.starts_with("/bin/launchctl"))
+        );
+
+        // Published files are not a running broker: a transient bootstrap
+        // failure leaves the files current, while the actual item still owes
+        // launchd work to the root run that owns this installation.
+        let failed = from_app();
+        failed
+            .on(PRINT, Ran::exit(113, "Could not find service"))
+            .on("/bin/launchctl enable system/systems.alab.aterm-lan", Ran::ok(""))
+            .on(
+                "/bin/launchctl bootstrap system /Library/LaunchDaemons/systems.alab.aterm-lan.plist",
+                Ran::exit(5, "transient bootstrap failure"),
+            );
+        let why = LanBroker::default().apply(&failed, &ctx).unwrap_err();
+        assert!(why.contains("transient bootstrap failure"), "{why}");
+        let published = reading(&failed).unwrap().unwrap();
+        assert!(published.current());
+        assert!(
+            !published.owed(),
+            "file currency alone sees no remaining work"
+        );
+        assert!(matches!(
+            LanBroker::default().probe(&failed, &ctx),
+            Probe::Change { .. }
+        ));
     }
 
     /// The elevation's own baseline installs the broker before the Command Line Tools, whose
     /// download can take minutes while the vault look waits on the broker.
     #[test]
     fn the_elevation_installs_the_broker_before_the_tools() {
+        assert!(
+            crate::baseline::parse("schema = 1\n[lan]\nbroker = true\nretained_root_run = true\n")
+                .is_err(),
+            "a user baseline cannot claim accepted root custody"
+        );
         let baseline =
             crate::baseline::parse(&crate::init_clt::CommandLineTools::baseline()).unwrap();
         let ids: Vec<String> = crate::items::expand(&baseline, &ctx(&[]))
@@ -369,6 +876,17 @@ mod tests {
     #[test]
     fn a_running_broker_is_replaced_by_exchange_and_restarted() {
         let sys = from_app();
+        sys.stat_of(
+            lan::IMAGE_BUNDLE,
+            crate::port::Stat {
+                uid: 0,
+                gid: 0,
+                mode: 0o755,
+                dir: true,
+                symlink: false,
+                len: 0,
+            },
+        );
         sys.file(
             lan::IMAGE_EXECUTABLE,
             &install::test_image(0x0100_000c, &[b"old"]),

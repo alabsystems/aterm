@@ -29,6 +29,9 @@ mod tests;
 mod closed_restart;
 use closed_restart::ClosedRestart;
 
+#[path = "native_asked_upgrade.rs"]
+mod asked_upgrade;
+
 #[path = "native_account_continuation.rs"]
 mod account_continuation;
 use account_continuation::AccountContinuation;
@@ -264,6 +267,7 @@ impl Clock {
 
 #[derive(Debug, Default)]
 pub(crate) struct Operations {
+    asked_binding: asked_upgrade::CurrentBinding,
     #[cfg(unix)]
     exec_prepare: Option<Arc<exec_handoff::Preparation>>,
     #[cfg(unix)]
@@ -325,6 +329,9 @@ impl Operations {
     )]
     fn reclaim(&mut self, now_us: u64) -> Vec<Arc<Mutex<Operation>>> {
         let mut retired = self.compact_account_lineages();
+        // Compaction can release the committed current root's final account pin.
+        // Preserve its positive settlement before expiry removes the operation.
+        let _settlement = self.settle_asked_binding();
         let expired_seals = self
             .cancelled
             .iter()
@@ -536,6 +543,10 @@ impl<'a> PrepareSlot<'a> {
     }
 
     fn publish(&mut self, table: &mut Operations, operation: Arc<Mutex<Operation>>) {
+        {
+            let op = operation.lock().unwrap_or_else(|p| p.into_inner());
+            table.admitted_binding(&op);
+        }
         table.reservations.remove(&self.id);
         table.by_id.insert(self.id.clone(), operation);
         self.published = true;
@@ -559,6 +570,7 @@ impl Drop for PrepareSlot<'_> {
 
 #[derive(Clone, Debug)]
 struct Authority {
+    asked: Option<asked_upgrade::Qualification>,
     snapshot: SupervisorAuthority,
     caller: SupervisorInputCaller,
     builtin: bool,
@@ -569,6 +581,14 @@ struct Authority {
 }
 
 impl Authority {
+    fn asked_matches(&self, request: &Prepare) -> bool {
+        request.asked_upgrade.is_none()
+            || self
+                .asked
+                .as_ref()
+                .is_some_and(|qualified| qualified.admits(request))
+    }
+
     fn continuation(&self) -> Option<&Arc<ClosedRestart>> {
         self.account
             .as_ref()
@@ -626,6 +646,7 @@ fn current_conversation(ctx: &crate::SessionCtx) -> Option<String> {
 
 #[derive(Debug)]
 struct Operation {
+    terminal_acknowledged: Option<Decision>,
     request: Prepare,
     binding: Binding,
     authority: Authority,
@@ -650,6 +671,7 @@ struct Operation {
     observation: Option<Arc<crate::native_observe::Evidence>>,
     outcome_slot: Option<crate::native_observe::OutcomeSlot>,
     completed_observation: Option<aterm_agent::harness::native_observe::SavedObservation>,
+    committed_image: Option<ImageOutcome>,
     source_death: Option<Arc<SharedDeath>>,
     closed_restart: Option<Arc<ClosedRestart>>,
     resume_only: bool,
@@ -1672,6 +1694,7 @@ fn capture_native_authority(
     }
     let _ = ctx;
     Ok(Authority {
+        asked: None,
         snapshot,
         caller: caller.clone(),
         builtin,
@@ -1689,6 +1712,9 @@ fn validate_plan(
     kernel: &dyn Kernel,
     crash_proven: bool,
 ) -> bool {
+    if request.asked_upgrade.is_some() && !asked_upgrade::shape(request) {
+        return false;
+    }
     match &request.plan {
         NativePlan::OwnImage {
             child,
@@ -2127,7 +2153,7 @@ fn prepare_inner(
     if renewal.as_ref().is_some_and(|seal| !seal.preflight()) {
         return DENIED.into();
     }
-    if !kernel.constructor_enabled(request.plan.constructor()) {
+    if !kernel.constructor_enabled(request.constructor()) {
         return "ERR native constructor disabled\n".into();
     }
     let clock = kernel.clock();
@@ -2289,8 +2315,24 @@ fn prepare_inner(
         Ok(guard) => guard,
         Err(()) => return DENIED.into(),
     };
+    // A fresh asked move must not retire the current vendor on stale account authority.
+    // Acquire outside Meta/native predicates and retain through accepted publication.
+    let _asked_account_guard = if request.asked_upgrade.is_some() {
+        let NativePlan::Restart {
+            process, forward, ..
+        } = &request.plan
+        else {
+            return DENIED.into();
+        };
+        match kernel.account_execution(forward, process.pid, None) {
+            Ok(guard) => guard,
+            Err(()) => return DENIED.into(),
+        }
+    } else {
+        None
+    };
     let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
-    let authority = match capture_native_authority(
+    let mut authority = match capture_native_authority(
         ctx,
         &meta,
         &request,
@@ -2346,7 +2388,7 @@ fn prepare_inner(
     if clock.remaining(request.deadline_us).is_none() {
         return "ERR native operation deadline\n".into();
     }
-    if !kernel.constructor_enabled(request.plan.constructor()) {
+    if !kernel.constructor_enabled(request.constructor()) {
         return "ERR native constructor disabled\n".into();
     }
     if table.by_id.contains_key(&request.id) {
@@ -2358,6 +2400,20 @@ fn prepare_inner(
         .is_some_and(|seal| !seal.intent_active())
     {
         return DENIED.into();
+    }
+    if request.asked_upgrade.is_some() {
+        let qualified = match table.qualify_asked(ctx, &request, &authority, master, kernel) {
+            Ok(qualified) => qualified,
+            Err(reason) => {
+                drop(table);
+                drop(meta);
+                drop(account_guard);
+                drop(_asked_account_guard);
+                aterm_log::debug!("asked native admission refused stage={reason}");
+                return DENIED.into();
+            }
+        };
+        authority.asked = Some(qualified);
     }
     let continuation = authority.continuation().cloned();
     let mut noexec_predecessor = None;
@@ -2444,6 +2500,7 @@ fn prepare_inner(
         noexec_predecessor,
     );
     let operation = Arc::new(Mutex::new(Operation {
+        terminal_acknowledged: None,
         request,
         binding,
         authority,
@@ -2470,6 +2527,7 @@ fn prepare_inner(
         observation,
         outcome_slot,
         completed_observation: None,
+        committed_image: None,
         source_death,
         closed_restart: None,
         resume_only,
@@ -2493,6 +2551,7 @@ fn prepare_inner(
     drop(table);
     drop(meta);
     drop(account_guard);
+    drop(_asked_account_guard);
     let attempt = Preparing {
         operation,
         serial: 1,
@@ -2535,51 +2594,97 @@ fn same_actor(op: &Operation, caller: &SupervisorInputCaller, kernel: &dyn Kerne
     }
 }
 
+/// Data from the same positive kernel evaluation that permits completion. It owns no
+/// watch or mutation capability and does not prove subsequent process/policy liveness.
+#[derive(Debug)]
+struct ImageOutcome {
+    process: Process,
+}
+
 fn image_outcome(op: &Operation, master: i32, phase: ImagePhase, kernel: &dyn Kernel) -> bool {
+    observe_image_outcome(op, master, phase, kernel).is_ok()
+}
+
+fn observe_image_outcome(
+    op: &Operation,
+    master: i32,
+    phase: ImagePhase,
+    kernel: &dyn Kernel,
+) -> Result<ImageOutcome, &'static str> {
     if let NativePlan::Restart { process, shell, .. } = &op.request.plan {
-        if (!op.signal_sent && op.observation.is_none() && !op.resume_only)
-            || !op.resume_sent
-            || op.resume_phase != Some(phase)
-            || kernel.birth_alive(process) != Some(false)
-        {
-            return false;
+        if !op.signal_sent && op.observation.is_none() && !op.resume_only {
+            return Err("restart-source-unissued");
+        }
+        if !op.resume_sent {
+            return Err("restart-resume-unissued");
+        }
+        if op.resume_phase != Some(phase) {
+            return Err("restart-resume-phase");
+        }
+        match kernel.birth_alive(process) {
+            Some(false) => {}
+            Some(true) => return Err("restart-source-alive"),
+            None => return Err("restart-source-unread"),
         }
         let Some(child) = op.children[phase_index(phase)].as_ref() else {
-            return false;
+            return Err("restart-child-absent");
         };
         let Some(command) = command_for(op, phase) else {
-            return false;
+            return Err("restart-command-absent");
         };
         let Some(actual) = kernel.process(child.process.pid) else {
-            return false;
+            return Err("restart-child-unread");
         };
-        return child.execute_sent
-            && actual.pid == child.process.pid
-            && actual.birth == child.process.birth
-            && actual.parent == shell.pid
-            && actual.group == child.process.group
-            && actual.session == child.process.session
-            && actual.image == *command.settled()
-            && kernel.process(shell.pid).as_ref() == Some(shell)
-            && kernel.foreground(master) == Some(actual.group);
+        if !child.execute_sent {
+            return Err("restart-execute-unissued");
+        }
+        if actual.pid != child.process.pid {
+            return Err("restart-child-pid");
+        }
+        if actual.birth != child.process.birth {
+            return Err("restart-child-birth");
+        }
+        if actual.parent != shell.pid {
+            return Err("restart-child-parent");
+        }
+        if actual.group != child.process.group {
+            return Err("restart-child-group");
+        }
+        if actual.session != child.process.session {
+            return Err("restart-child-session");
+        }
+        if actual.image != *command.settled() {
+            return Err("restart-child-image");
+        }
+        if kernel.process(shell.pid).as_ref() != Some(shell) {
+            return Err("restart-shell");
+        }
+        if kernel.foreground(master) != Some(actual.group) {
+            return Err("restart-foreground");
+        }
+        return Ok(ImageOutcome { process: actual });
     }
     let NativePlan::OwnImage { child, target, .. } = &op.request.plan else {
-        return false;
+        return Err("own-plan");
     };
     let Some(original) = op.authority.actor.as_ref() else {
-        return false;
+        return Err("own-actor-absent");
     };
     let Some(actual) = kernel.process(original.pid) else {
-        return false;
+        return Err("own-actor-unread");
     };
     let image = match phase {
         ImagePhase::Forward => target,
         ImagePhase::Rollback => &original.image,
     };
-    own_actor_matches(&actual, original)
+    if !(own_actor_matches(&actual, original)
         && actual.image == *image
         && kernel.foreground(master) == Some(original.group)
-        && kernel.process(child.pid).as_ref() == Some(child)
+        && kernel.process(child.pid).as_ref() == Some(child))
+    {
+        return Err("own-image-or-child");
+    }
+    Ok(ImageOutcome { process: actual })
 }
 
 fn own_actor_matches(actual: &Process, original: &Process) -> bool {
@@ -2709,8 +2814,10 @@ fn finish_restart(
     if capture.is_some() {
         let observations = observe_control::store(ctx);
         let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+        let mut capture_stage = "finish-context";
         let published = if let Some(context) = observe_control::context(ctx, &meta, caller, kernel)
         {
+            capture_stage = "finish-publication";
             let (published, retired) = observations
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -2738,7 +2845,9 @@ fn finish_restart(
                     registration: published.registration,
                     binding: published.binding,
                 });
+            capture_stage = "finish-published";
         }
+        aterm_log::debug!("native completion observation stage={capture_stage}");
     }
     drop(capture);
     finish(ctx, operation, completion)
@@ -2786,7 +2895,8 @@ fn launcher_guards_current(
     kernel: &dyn Kernel,
 ) -> bool {
     op.clock.remaining(op.request.deadline_us).is_some()
-        && kernel.constructor_enabled(op.request.plan.constructor())
+        && op.authority.asked_matches(&op.request)
+        && kernel.constructor_enabled(op.request.constructor())
         && op.authority.account.as_ref().is_none_or(|account| {
             account.current(ctx, &op.request, &op.authority.caller, kernel)
                 && account.proof().claimed_by(&op.request)
@@ -3884,6 +3994,22 @@ fn serve_with_publication(
             .map(|custody| custody.handoff_guard())
     });
     let reply = execute(request);
+    if matches!(&saved, Request::Prepare(prepare) if prepare.asked_upgrade.is_some()) {
+        let class = if reply == DENIED {
+            "denied"
+        } else if reply == UNKNOWN {
+            "unknown"
+        } else if reply.starts_with("ERR busy") {
+            "busy"
+        } else if reply.starts_with("OK native-act state=admitted ") {
+            "admitted"
+        } else if reply.starts_with("OK native-act state=pending ") {
+            "pending"
+        } else {
+            "other"
+        };
+        aterm_log::debug!("asked native prepare result={class}");
+    }
     if reply == UNKNOWN
         || reply == ROLLBACK_SAFE
         || reply.starts_with("OK native-act state=committed ")
@@ -3892,8 +4018,12 @@ fn serve_with_publication(
         let operation = operation.or_else(|| request_operation(ctx, &saved));
         let evidence = operation.as_ref().and_then(|operation| {
             let op = operation.lock().unwrap_or_else(|p| p.into_inner());
-            terminal_record(&op, &reply)
-                .map(|record| (op.request.clone(), op.binding.clone(), record))
+            terminal_record(&op, &reply).and_then(|record| {
+                let Phase::Completed(decision) = op.phase else {
+                    return None;
+                };
+                Some((op.request.clone(), op.binding.clone(), record, decision))
+            })
         });
         if reply == UNKNOWN && evidence.is_none() {
             return reply;
@@ -3922,17 +4052,27 @@ fn serve_with_publication(
         if receipt_handoff.is_none() {
             return UNKNOWN.into();
         }
-        return publish_terminal(
+        let mut acknowledged = false;
+        let published = publish_terminal(
             reply,
-            evidence.as_ref().map(|(_, _, record)| *record),
+            evidence.as_ref().map(|(_, _, record, _)| *record),
             |record| {
-                let (prepare, binding, _) = evidence.as_ref().expect("selected terminal evidence");
-                match record {
+                let (prepare, binding, _, _) =
+                    evidence.as_ref().expect("selected terminal evidence");
+                acknowledged = match record {
                     TerminalRecord::NoExec(phase) => kernel.record_noexec(prepare, binding, phase),
                     TerminalRecord::Sealed => kernel.record_sealed(prepare, binding),
-                }
+                };
+                acknowledged
             },
         );
+        if acknowledged
+            && let (Some(operation), Some((prepare, binding, _, decision))) =
+                (&operation, &evidence)
+        {
+            asked_upgrade::acknowledge_terminal(ctx, operation, prepare, binding, *decision);
+        }
+        return published;
     }
     // Keep the request pin through this read too. Account relations need their
     // own durable envelope before they can use ordinary historical fallback.
@@ -4051,6 +4191,32 @@ fn serve_request(
             return DENIED.into();
         }
     }
+    let asked_signal = if matches!(request, Request::Signal(_)) {
+        let op = operation.lock().unwrap_or_else(|p| p.into_inner());
+        if op.request.asked_upgrade.is_some() && !op.signal_sent {
+            let NativePlan::Restart {
+                process, forward, ..
+            } = &op.request.plan
+            else {
+                return DENIED.into();
+            };
+            Some((forward.clone(), process.pid))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    // A recorded signal is observed, never re-authorized as a second effect. Fresh asked
+    // signals recheck canonical execution before taking Meta/operation predicates.
+    let _asked_account_guard = match asked_signal
+        .as_ref()
+        .map(|(command, pid)| kernel.account_execution(command, *pid, None))
+        .transpose()
+    {
+        Ok(guard) => guard,
+        Err(()) => return DENIED.into(),
+    };
     // Retry disposal is deferred beyond both predicates, including early refusal paths.
     let mut retired_children = Vec::new();
     let mut retired_witnesses = Vec::new();
@@ -4062,6 +4228,13 @@ fn serve_request(
     .then(|| ctx.meta.lock().unwrap_or_else(|p| p.into_inner()));
     let mut op = operation.lock().unwrap_or_else(|p| p.into_inner());
     if !same_actor(&op, &caller, kernel) {
+        let asked = op.request.asked_upgrade.is_some();
+        drop(op);
+        drop(mutation_meta);
+        drop(_asked_account_guard);
+        if asked {
+            aterm_log::debug!("asked native completion refused stage=caller");
+        }
         return DENIED.into();
     }
     match request {
@@ -4142,29 +4315,53 @@ fn serve_request(
                     op.resume_phase.unwrap().word()
                 )
             }
-            Phase::Started
-                if op.authority.builtin
-                    && op
-                        .resume_phase
-                        .is_some_and(|phase| image_outcome(&op, master, phase, kernel)) =>
-            {
-                format!(
-                    "OK native-act state=resumed phase={}\n",
-                    op.resume_phase.unwrap().word()
-                )
+            Phase::Started if op.authority.builtin => {
+                let outcome = op
+                    .resume_phase
+                    .ok_or("query-resume-phase")
+                    .and_then(|phase| observe_image_outcome(&op, master, phase, kernel));
+                match outcome {
+                    Ok(_) => format!(
+                        "OK native-act state=resumed phase={}\n",
+                        op.resume_phase.unwrap().word()
+                    ),
+                    Err(reason) => {
+                        let asked = op.request.asked_upgrade.is_some();
+                        drop(op);
+                        drop(mutation_meta);
+                        drop(_asked_account_guard);
+                        if asked {
+                            aterm_log::debug!("asked native query refused stage={reason}");
+                        }
+                        UNKNOWN.into()
+                    }
+                }
             }
             Phase::Queued | Phase::Started | Phase::Precommitted(_) | Phase::Committing(_) => {
                 UNKNOWN.into()
             }
         },
         Request::Precommit(_, phase) => {
-            if matches!(op.phase, Phase::Started | Phase::Precommitted(_))
-                && image_outcome(&op, master, phase, kernel)
-            {
-                op.phase = Phase::Precommitted(phase);
-                "OK native-act state=precommitted\n".into()
+            let outcome = if matches!(op.phase, Phase::Started | Phase::Precommitted(_)) {
+                observe_image_outcome(&op, master, phase, kernel)
             } else {
-                UNKNOWN.into()
+                Err("precommit-phase")
+            };
+            match outcome {
+                Ok(_) => {
+                    op.phase = Phase::Precommitted(phase);
+                    "OK native-act state=precommitted\n".into()
+                }
+                Err(reason) => {
+                    let asked = op.request.asked_upgrade.is_some();
+                    drop(op);
+                    drop(mutation_meta);
+                    drop(_asked_account_guard);
+                    if asked {
+                        aterm_log::debug!("asked native precommit refused stage={reason}");
+                    }
+                    UNKNOWN.into()
+                }
             }
         }
         Request::Commit(_, phase, version) => {
@@ -4173,23 +4370,55 @@ fn serve_request(
                 return completed_reply(&operation);
             }
             if op.authority.builtin {
-                if !matches!(op.phase, Phase::Precommitted(p) if p == phase)
-                    || !image_outcome(&op, master, phase, kernel)
-                {
+                if !matches!(op.phase, Phase::Precommitted(p) if p == phase) {
+                    let asked = op.request.asked_upgrade.is_some();
+                    drop(op);
+                    drop(mutation_meta);
+                    drop(_asked_account_guard);
+                    if asked {
+                        aterm_log::debug!("asked native commit refused stage=commit-phase");
+                    }
                     return UNKNOWN.into();
                 }
+                let outcome = match observe_image_outcome(&op, master, phase, kernel) {
+                    Ok(outcome) => outcome,
+                    Err(reason) => {
+                        let asked = op.request.asked_upgrade.is_some();
+                        drop(op);
+                        drop(mutation_meta);
+                        drop(_asked_account_guard);
+                        if asked {
+                            aterm_log::debug!("asked native commit refused stage={reason}");
+                        }
+                        return UNKNOWN.into();
+                    }
+                };
                 let Some(meta) = mutation_meta.as_ref() else {
                     return UNKNOWN.into();
                 };
                 let mut capture = None;
-                if let Some(context) = observe_control::context(ctx, meta, &caller, kernel)
-                    && op
-                        .authority
-                        .conversation
-                        .as_ref()
-                        .is_some_and(|guard| guard.current(ctx))
-                    && op.outcome_slot.as_ref().is_some_and(|slot| {
-                        slot.is_current(&context, op.clock.now_us().unwrap_or(u64::MAX))
+                let mut capture_stage = "commit-context";
+                if let Some(context) =
+                    observe_control::context(ctx, meta, &caller, kernel).filter(|context| {
+                        capture_stage = "commit-conversation";
+                        if !op
+                            .authority
+                            .conversation
+                            .as_ref()
+                            .is_some_and(|guard| guard.current(ctx))
+                        {
+                            return false;
+                        }
+                        match op.outcome_slot.as_ref() {
+                            Some(slot) => {
+                                capture_stage = "commit-slot-stale";
+                                slot.is_current(context, op.clock.now_us().unwrap_or(u64::MAX))
+                            }
+                            None => {
+                                capture_stage = "commit-slot-absent";
+                                false
+                            }
+                        }
                     })
                 {
                     let Some(slot) = op.outcome_slot.take() else {
@@ -4219,7 +4448,10 @@ fn serve_request(
                         death,
                         &ObservationKernel(kernel),
                     ) {
-                        Ok(captured) => capture = Some(captured),
+                        Ok(captured) => {
+                            capture = Some(captured);
+                            capture_stage = "commit-captured";
+                        }
                         Err(refused) => {
                             op.outcome_slot = Some(refused.slot);
                             retired_witnesses.push(refused.death);
@@ -4229,11 +4461,19 @@ fn serve_request(
                 }
                 op.commit_version = Some(version);
                 let mut completion = op.seal_completion(Decision::Committed);
+                if completion.is_some()
+                    && phase == ImagePhase::Forward
+                    && (matches!(op.request.plan, NativePlan::Restart { cold: Some(_), .. })
+                        || op.request.asked_upgrade.is_some())
+                {
+                    op.committed_image = Some(outcome);
+                }
                 if let Some(completion) = &mut completion {
                     completion.outcome_capture = capture;
                 }
                 drop(op);
                 drop(mutation_meta);
+                aterm_log::debug!("native completion observation stage={capture_stage}");
                 kernel.completion_sealed();
                 return finish_restart(ctx, master, &operation, completion, &caller, kernel);
             }
@@ -4297,6 +4537,9 @@ fn serve_request(
             reply
         }
         Request::Signal(_) => {
+            if !op.authority.asked_matches(&op.request) {
+                return DENIED.into();
+            }
             if op.resume_only || !op.authority.builtin || op.phase != Phase::Started {
                 return DENIED.into();
             }

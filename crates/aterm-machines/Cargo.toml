@@ -17,6 +17,8 @@ zeroize = { version = "1", default-features = false, features = ["alloc"] }
 aterm-tempfile = { workspace = true }
 # Child processes (spawnfd::command), bounded runs (deadline), this process's euid (peer).
 aterm-uds = { workspace = true }
+# The staged root image is checked against this loaded process's designated code requirement.
+aterm-keeper = { workspace = true }
 # The aterm window's front door: a sign-out's Accessibility ask goes to the window's permission
 # walk when that window is the app macOS holds responsible for the run.
 aterm-ctl = { path = "../aterm-ctl" }

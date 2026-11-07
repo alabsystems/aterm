@@ -16,6 +16,10 @@
 use crate::which_copy::InstallPosture;
 use std::path::{Path, PathBuf};
 
+/// Native macOS installation and first-launch succession.
+#[cfg(target_os = "macos")]
+pub mod native;
+
 /// Whether setup, the subscriber, Dock pins and login items may run from `posture`. Only an
 /// installed copy lasts; every other copy goes away, so none of those run there. A platform
 /// without a bundle posture is not gated by this (its caller passes [`InstallPosture::Installed`]
@@ -134,6 +138,14 @@ pub enum FirstLaunchOutcome {
     },
 }
 
+/// What preparation found at the final installation boundary.
+pub enum CopyDisposition {
+    /// The verified running bundle was installed.
+    Installed,
+    /// A newly observed, verified same-or-newer copy is retained and should be opened.
+    UseExisting,
+}
+
 /// The side effects a first launch needs, injected so the decision is testable with fakes. Every
 /// method that touches a bundle names the bundle it acts on.
 pub trait FirstLaunchHost {
@@ -142,15 +154,18 @@ pub trait FirstLaunchHost {
     /// Verify `app`'s code signature against the team pin and its notarization — `verify.rs`'s
     /// gate. `Ok(())` means it passed.
     fn verify(&self, app: &Path) -> Result<(), String>;
-    /// Copy the running bundle to `dest` (a complete, isolated-then-promoted copy).
-    fn install_copy(&self, dest: &Path) -> Result<(), String>;
+    /// Copy and verify the running bundle in isolation before promoting it to `dest`.
+    /// An existing `replace` is retained only after that candidate passed verification;
+    /// a failed copy or gate must leave the existing installed copy untouched.
+    fn install_copy(&self, dest: &Path, replace: Option<&Path>) -> Result<CopyDisposition, String>;
     /// Move `app` out of the way; returns where it went.
     fn move_aside(&self, app: &Path) -> Result<PathBuf, String>;
     /// Clear `app`'s `com.apple.quarantine` — called only after [`FirstLaunchHost::verify`]
     /// passed on it.
     fn clear_quarantine(&self, app: &Path) -> Result<(), String>;
     /// Relaunch from `app` and return once it has shown it ran, by a line it wrote. `Ok(())`
-    /// means the successor is up; the original may now quit.
+    /// means the successor is up; the original may now quit. Recheck its authenticity at
+    /// native dispatch, including an existing copy admitted by the initial facts.
     fn relaunch(&self, app: &Path) -> Result<(), String>;
 }
 
@@ -164,24 +179,28 @@ pub fn install_and_relaunch<H: FirstLaunchHost>(host: &H) -> FirstLaunchOutcome 
         FirstLaunchPlan::AlreadyInstalled => FirstLaunchOutcome::ProceedInstalled,
         FirstLaunchPlan::OpenInstalled(app) => match host.relaunch(&app) {
             // The plan reaches this arm only for a same-or-newer copy whose gate passed in the
-            // probe, so no copy is made and nothing unverified is opened.
+            // probe, and the native dispatch rechecks it before execution.
             Ok(()) => FirstLaunchOutcome::Relaunched { from: app },
             Err(reason) => FirstLaunchOutcome::Refused {
                 reason: open_refusal(&app, &reason),
             },
         },
         FirstLaunchPlan::Install { dest, move_aside } => {
-            if let Some(existing) = move_aside
-                && let Err(reason) = host.move_aside(&existing)
-            {
-                return FirstLaunchOutcome::Refused {
-                    reason: install_refusal(&dest, &reason),
-                };
-            }
-            if let Err(reason) = host.install_copy(&dest) {
-                return FirstLaunchOutcome::Refused {
-                    reason: install_refusal(&dest, &reason),
-                };
+            match host.install_copy(&dest, move_aside.as_deref()) {
+                Err(reason) => {
+                    return FirstLaunchOutcome::Refused {
+                        reason: install_refusal(&dest, &reason),
+                    };
+                }
+                Ok(CopyDisposition::UseExisting) => {
+                    return match host.relaunch(&dest) {
+                        Ok(()) => FirstLaunchOutcome::Relaunched { from: dest },
+                        Err(reason) => FirstLaunchOutcome::Refused {
+                            reason: open_refusal(&dest, &reason),
+                        },
+                    };
+                }
+                Ok(CopyDisposition::Installed) => {}
             }
             // Verify the copy before clearing quarantine or running it. A copy that fails is
             // moved aside, and the move-to-Applications remedy stays with the reason.
@@ -292,12 +311,19 @@ mod tests {
             self.calls.borrow_mut().verified.push(app.to_path_buf());
             self.verify.clone()
         }
-        fn install_copy(&self, dest: &Path) -> Result<(), String> {
+        fn install_copy(
+            &self,
+            dest: &Path,
+            replace: Option<&Path>,
+        ) -> Result<CopyDisposition, String> {
             self.calls
                 .borrow_mut()
                 .installed_to
                 .push(dest.to_path_buf());
-            Ok(())
+            if let Some(replace) = replace {
+                self.move_aside(replace)?;
+            }
+            Ok(CopyDisposition::Installed)
         }
         fn move_aside(&self, app: &Path) -> Result<PathBuf, String> {
             self.calls.borrow_mut().moved_aside.push(app.to_path_buf());

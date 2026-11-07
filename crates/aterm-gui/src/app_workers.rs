@@ -299,16 +299,15 @@ impl App {
                 }
             },
         );
-        // Once its agent has gone, a worker's tab title is its shell's folder: the row names the
-        // agent instead, unless a role or a pinned title names the session.
+        // Once its agent has gone, a worker's tab title is its shell's folder: the row names what
+        // it ran instead (its agent, or a program worker's program), unless a role or a pinned
+        // title names the session.
         let gone = record
             .as_ref()
             .filter(|task| crate::native_workers::agent_gone(task))
-            .and_then(|task| task.agent);
+            .and_then(crate::app_take_over::worker_label);
         let title = match gone {
-            Some(agent) if self.named_label_of_session(handle.local_id).is_none() => {
-                agent.product().to_owned()
-            }
+            Some(name) if self.named_label_of_session(handle.local_id).is_none() => name,
             _ => chip.label,
         };
         WorkerRow {

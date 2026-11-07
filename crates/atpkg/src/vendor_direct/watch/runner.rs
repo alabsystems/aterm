@@ -317,11 +317,17 @@ struct Owned(std::process::Child);
 #[cfg(not(unix))]
 impl RunningPass for Owned {
     fn ended(&mut self) -> Option<bool> {
-        match self.0.try_wait() {
-            Ok(Some(status)) => Some(status.success()),
-            Ok(None) => None,
-            Err(_) => Some(true),
-        }
+        owned_pass_end(self.0.try_wait())
+    }
+}
+
+/// A failed status read is not evidence that an owned pass ended. Keep following
+/// it under the existing follow limit, as an unknown detached presence does.
+#[cfg(any(not(unix), test))]
+fn owned_pass_end(status: io::Result<Option<std::process::ExitStatus>>) -> Option<bool> {
+    match status {
+        Ok(Some(status)) => Some(status.success()),
+        Ok(None) | Err(_) => None,
     }
 }
 
@@ -1504,6 +1510,67 @@ mod tests {
             vendors.count("session") > asked + 100,
             "the watch went on each minute"
         );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    #[test]
+    fn an_unread_owned_pass_stays_followed_until_an_observed_exit() {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt as _;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt as _;
+
+        struct ObservedPass(VecDeque<io::Result<Option<std::process::ExitStatus>>>);
+        impl RunningPass for ObservedPass {
+            fn ended(&mut self) -> Option<bool> {
+                owned_pass_end(self.0.pop_front().expect("one status read per look"))
+            }
+        }
+
+        let l = layout("unread-owned-pass");
+        let time = Time::default();
+        let vendors = Vendors::new("2.1.281");
+        let passes = Passes::default();
+        let mut runner = session(&l, &time, &vendors, "session", &passes, &on());
+        for program in [Some("claude"), None] {
+            runner.following = Some(Following {
+                program,
+                index_build: None,
+                pass: Box::new(ObservedPass(VecDeque::from([
+                    Err(io::Error::other("status unavailable")),
+                    Ok(None),
+                    Ok(Some(std::process::ExitStatus::from_raw(0))),
+                ]))),
+                since: Duration::from_millis(time.mono_ms.load(Ordering::SeqCst)),
+            });
+            for _ in 0..2 {
+                assert!(!runner.follow(time.wall()), "no observed exit yet");
+                assert!(
+                    runner.following.is_some(),
+                    "retain the pass and its custody"
+                );
+            }
+            assert!(
+                runner.follow(time.wall()),
+                "an observed exit releases the follow"
+            );
+            assert!(runner.following.is_none());
+
+            runner.following = Some(Following {
+                program,
+                index_build: None,
+                pass: Box::new(ObservedPass(VecDeque::from([Err(io::Error::other(
+                    "still unread at the follow limit",
+                ))]))),
+                since: Duration::from_millis(time.mono_ms.load(Ordering::SeqCst)),
+            });
+            time.advance(PASS_FOLLOW_LIMIT);
+            assert!(
+                runner.follow(time.wall()),
+                "unknown does not extend the follow limit"
+            );
+            assert!(runner.following.is_none());
+        }
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 

@@ -34,6 +34,8 @@ dependencies = [
  "aterm-codec",
  "aterm-digest",
  "aterm-json",
+ "aterm-tempfile",
+ "aterm-uds",
 ]
 
 [[package]]
@@ -146,7 +148,7 @@ version = "0.2.0"
 
 [[package]]
 name = "aterm"
-version = "0.164.0"
+version = "0.165.0"
 dependencies = [
  "agh",
  "astream-broker",
@@ -1212,6 +1214,7 @@ dependencies = [
  "aterm-durable",
  "aterm-http",
  "aterm-json",
+ "aterm-keeper",
  "aterm-log",
  "aterm-objc",
  "aterm-pty",

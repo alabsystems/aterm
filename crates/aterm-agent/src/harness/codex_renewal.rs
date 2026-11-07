@@ -814,6 +814,26 @@ pub fn write_receipt(env: &Env, receipt: &Receipt) -> Result<(), &'static str> {
         .map_err(|_| "receipt-directory-flush")
 }
 
+/// Validate the caller's request before its ID becomes a record path.
+fn restart_wire(prepare: &super::native_act::Prepare) -> Option<String> {
+    use super::native_act;
+    if !matches!(prepare.plan, native_act::NativePlan::Restart { .. }) {
+        return None;
+    }
+    native_act::Request::prepare(prepare.clone()).encode()
+}
+
+/// A record's filename is not evidence that it belongs to this restart.
+/// Compare the complete request while retaining its supported wire spelling.
+fn matching_restart(
+    state: &super::upgrade_drive::St,
+    prepare: &super::native_act::Prepare,
+) -> bool {
+    restart_wire(prepare).is_some()
+        && super::native_restart::retained_prepare(state)
+            .is_ok_and(|retained| retained.as_ref() == prepare)
+}
+
 /// Prepare only the exact host-derived private plan. The caller owns the
 /// matching sealed native admission; neither this API nor the wire chooses it.
 pub fn prepare_restart(
@@ -822,6 +842,7 @@ pub fn prepare_restart(
     prepare: &super::native_act::Prepare,
 ) -> Result<(), &'static str> {
     use super::{native_act, upgrade_drive};
+    let encoded = restart_wire(prepare).ok_or("restart-plan")?;
     let key = format!("renewal-{}", prepare.id);
     let native_act::NativePlan::Restart {
         process,
@@ -850,12 +871,13 @@ pub fn prepare_restart(
                 .as_ref()
                 .and_then(|back| back.legacy_line())
                 .unwrap_or_default(),
-            native_prepare: native_act::Request::prepare(prepare.clone())
-                .encode()
-                .unwrap_or_default(),
+            native_prepare: encoded,
             native_coordination: true,
             ..Default::default()
         });
+    if !matching_restart(&state, prepare) {
+        return Err("restart-plan");
+    }
     upgrade_drive::save_checked(opts, &key, &state).map_err(|_| "restart-record")?;
     let mut client = upgrade_drive::connect(opts, sid).map_err(|_| "private-client")?;
     let recovery = super::native_restart::recover(opts, &key, &mut client, sid, &mut state);
@@ -901,10 +923,16 @@ pub fn reconcile_restart(
     prepare: &super::native_act::Prepare,
 ) {
     use super::{native_restart, upgrade_drive};
+    if restart_wire(prepare).is_none() || opts.dry_run {
+        return;
+    }
     let key = format!("renewal-{}", prepare.id);
     let Ok(Some(mut state)) = upgrade_drive::load_record(opts, &key) else {
         return;
     };
+    if !matching_restart(&state, prepare) {
+        return;
+    }
     let Ok(mut client) = upgrade_drive::connect(opts, sid) else {
         return;
     };
@@ -939,13 +967,28 @@ fn drive_admitted(
     signal_original: bool,
 ) -> Option<RestartCompletion> {
     use super::{native_restart, upgrade_drive};
+    restart_wire(prepare)?;
+    if opts.dry_run {
+        return None;
+    }
     let key = format!("renewal-{}", prepare.id);
     let mut state = upgrade_drive::load_record(opts, &key).ok()??;
+    if !matching_restart(&state, prepare) {
+        return None;
+    }
     let mut client = upgrade_drive::connect(opts, sid).ok()?;
     native_restart::recover(opts, &key, &mut client, sid, &mut state).ok()?;
     drive_connection(opts, sid, prepare, state, client, signal_original)
 }
 
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeReplayPublication",
+        action = "Attempt",
+        project = "aterm_agent::harness::native_restart::transport_tests::replay_model::renewal_transition"
+    )
+)]
 pub(super) fn drive_connection(
     opts: &super::upgrade_drive::Opts,
     sid: &str,
@@ -956,6 +999,9 @@ pub(super) fn drive_connection(
 ) -> Option<RestartCompletion> {
     use super::{native_act, native_restart, upgrade_drive};
     let key = format!("renewal-{}", prepare.id);
+    if !matching_restart(&state, prepare) || opts.dry_run {
+        return None;
+    }
     if state.native_retired_unissued {
         upgrade_drive::save_checked(opts, &key, &state).ok()?;
         return None;
@@ -964,6 +1010,9 @@ pub(super) fn drive_connection(
     let native_act::NativePlan::Restart { process, .. } = &prepare.plan else {
         return None;
     };
+    // A loaded or previously checked record can follow an unacknowledged
+    // rename or a newer writer. This attempt needs its own durable save.
+    upgrade_drive::save_checked(opts, &key, &state).ok()?;
     if signal_original {
         let signal = native_restart::signal(&mut client, sid, &binding);
         // An unread/truncated response makes this connection unusable, not evidence
@@ -1879,6 +1928,7 @@ mod tests {
             dialect: super::super::upgrade::Dialect::Zsh,
         };
         let mut prepare = Prepare {
+            asked_upgrade: None,
             id: "ab".repeat(16),
             host_epoch: "cd".repeat(16),
             holder: "fixture".into(),

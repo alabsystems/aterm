@@ -5,11 +5,12 @@
 //! Budgeted, resumable full-buffer search.
 
 use std::borrow::Cow;
+use std::cell::OnceCell;
 
 use aterm_types::text_shaping::AmbiguousWidth;
 
 use crate::cells::LineCells;
-use crate::grapheme::ColumnMap;
+use crate::grapheme::{ColumnMap, SearchColumns};
 use crate::index::{
     CaseInsensitiveMatcher, MAX_SEARCH_MATCHES, SearchIndex, SearchOptionsError, scan_line,
 };
@@ -20,6 +21,29 @@ enum RowMatcher {
     Literal(crate::bytesearch::OwnedSearcher),
     CaseInsensitive(CaseInsensitiveMatcher),
     Regex(aterm_regex::Regex),
+}
+
+/// A consumed row needs column projection only if its text has an occurrence.
+struct DeferredColumns<'a> {
+    text: &'a str,
+    cells: Option<&'a LineCells>,
+    ambiguous_width: AmbiguousWidth,
+    map: OnceCell<ColumnMap>,
+}
+
+impl SearchColumns for DeferredColumns<'_> {
+    #[inline]
+    fn is_ascii(&self) -> bool {
+        self.text.is_ascii()
+    }
+
+    #[inline]
+    fn get(&self) -> &ColumnMap {
+        self.map.get_or_init(|| match self.cells {
+            Some(cells) => ColumnMap::with_cells(self.text, cells),
+            None => ColumnMap::new(self.text, self.ambiguous_width),
+        })
+    }
 }
 
 /// A budgeted, resumable search over the absolute rows `[base_row, base_row + total_rows)`, fed
@@ -215,22 +239,32 @@ impl BudgetedSearch {
         if empty {
             return;
         }
-        let col_map = match cells {
-            Some(cells) => ColumnMap::with_cells(text, cells),
-            None => ColumnMap::new(text, self.ambiguous_width),
+        let col_map = DeferredColumns {
+            text,
+            cells,
+            ambiguous_width: self.ambiguous_width,
+            map: OnceCell::new(),
         };
         match &mut self.matcher {
             RowMatcher::Literal(owned) => {
                 let searcher = owned.searcher();
-                for at in searcher.matches_in::<false>(text.as_bytes()) {
-                    let found = literal_occurrence(abs_row, at, searcher.needle().len(), &col_map);
-                    if found.start_col == found.end_col {
-                        continue;
+                let mut positions = searcher.matches_in::<false>(text.as_bytes());
+                let Some(mut at) = positions.next() else {
+                    return;
+                };
+                let col_map = col_map.get();
+                loop {
+                    let found = literal_occurrence(abs_row, at, searcher.needle().len(), col_map);
+                    if found.start_col != found.end_col {
+                        self.matches.push(found);
+                        if self.matches.len() >= MAX_SEARCH_MATCHES {
+                            break;
+                        }
                     }
-                    self.matches.push(found);
-                    if self.matches.len() >= MAX_SEARCH_MATCHES {
+                    let Some(next) = positions.next() else {
                         break;
-                    }
+                    };
+                    at = next;
                 }
             }
             RowMatcher::CaseInsensitive(matcher) => {
@@ -242,19 +276,19 @@ impl BudgetedSearch {
             }
             RowMatcher::Regex(re) => {
                 let mut scan = scan_line(re, text);
+                let mut ready = None;
                 for cap in scan.by_ref() {
-                    // Skip empty spans and zero-column spans, as the batch path does.
                     if cap.start() == cap.end() {
                         continue;
                     }
-                    let (start_col, end_col) = col_map.span(cap.start(), cap.end());
-                    if start_col == end_col {
-                        continue;
-                    }
-                    self.matches
-                        .push(SearchMatch::new(abs_row, start_col, end_col));
-                    if self.matches.len() >= MAX_SEARCH_MATCHES {
-                        break;
+                    let columns = ready.get_or_insert_with(|| col_map.get());
+                    let (start_col, end_col) = columns.span(cap.start(), cap.end());
+                    if start_col != end_col {
+                        self.matches
+                            .push(SearchMatch::new(abs_row, start_col, end_col));
+                        if self.matches.len() >= MAX_SEARCH_MATCHES {
+                            break;
+                        }
                     }
                 }
                 if scan.step_limit_exceeded() && !truncated {
@@ -268,6 +302,83 @@ impl BudgetedSearch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deferred_projection_preserves_stored_cells_and_width_policy() {
+        for ambiguous in [AmbiguousWidth::Single, AmbiguousWidth::Double] {
+            let mut cells = LineCells::new();
+            cells.push(0..1, 4, 1);
+            cells.push(1..3, 9, 2);
+            cells.push(3..4, 20, 0);
+            for (query, sensitive, regex, expected) in [
+                ("a", true, false, vec![(4, 5)]),
+                ("É", false, false, vec![(9, 11)]),
+                ("é", true, true, vec![(9, 11)]),
+                ("aé", true, false, vec![(4, 11)]),
+                ("B", true, false, vec![]),
+                ("b", false, false, vec![]),
+                ("B", true, true, vec![]),
+                ("absent", false, true, vec![]),
+            ] {
+                let mut search = BudgetedSearch::new(query, sensitive, regex, 0, 1)
+                    .unwrap()
+                    .with_ambiguous_width(ambiguous);
+                search.feed_row_cells("aéB".into(), &cells);
+                assert_eq!(
+                    search
+                        .results()
+                        .matches
+                        .iter()
+                        .map(|m| (m.start_col, m.end_col))
+                        .collect::<Vec<_>>(),
+                    expected,
+                    "{query:?} {ambiguous:?}"
+                );
+            }
+            let mut merged = LineCells::new();
+            merged.push(0..2, 7, 3);
+            for (sensitive, regex) in [(true, false), (false, false), (true, true)] {
+                let query = if regex { "a|b" } else { "a" };
+                let mut search = BudgetedSearch::new(query, sensitive, regex, 0, 1).unwrap();
+                search.feed_row_cells("ab".into(), &merged);
+                assert!(
+                    search
+                        .results()
+                        .matches
+                        .iter()
+                        .all(|m| (m.start_col, m.end_col) == (7, 10))
+                );
+                assert_eq!(search.result_count(), if regex { 2 } else { 1 });
+            }
+            let mut omitted = LineCells::new();
+            omitted.push(0..1, 4, 1);
+            omitted.mark_truncated();
+            for (query, sensitive, regex) in
+                [("b", true, false), ("B", false, false), ("b|z", true, true)]
+            {
+                let mut search = BudgetedSearch::new(query, sensitive, regex, 0, 1).unwrap();
+                search.feed_row_cells("abc".into(), &omitted);
+                assert_eq!(search.result_count(), 0);
+                assert_eq!(search.results().cut_short_lines, 1);
+            }
+            let mut text = BudgetedSearch::new("a", true, false, 0, 1)
+                .unwrap()
+                .with_ambiguous_width(ambiguous);
+            text.feed_row_owned("→a".into());
+            let start = if ambiguous == AmbiguousWidth::Double {
+                2
+            } else {
+                1
+            };
+            assert_eq!(
+                (
+                    text.results().matches[0].start_col,
+                    text.results().matches[0].end_col
+                ),
+                (start, start + 1)
+            );
+        }
+    }
 
     fn one_shot(
         rows: &[&str],

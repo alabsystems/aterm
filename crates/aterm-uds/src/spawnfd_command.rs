@@ -389,10 +389,10 @@ impl Command {
         #[cfg(not(target_vendor = "apple"))]
         {
             let _ = guards;
-            return Err(io::Error::new(
+            Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "exact exec guards require the native Apple launch boundary",
-            ));
+            ))
         }
         #[cfg(target_vendor = "apple")]
         {

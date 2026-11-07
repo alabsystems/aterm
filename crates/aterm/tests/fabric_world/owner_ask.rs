@@ -2424,6 +2424,7 @@ fn a_cold_relaunch_onto_a_newer_twin_execs_the_build_and_settles() {
     let prefix = atpkg::store::default_prefix(&root.join("home"));
     let twin = prefix.join("agents/claude");
     let build = prefix.join("store/claude/1000002000001000318/bin/claude");
+    let next_build = prefix.join("store/claude/1000002000001000319/bin/claude");
     let foreign = root.join("foreign/claude");
     let opts = Opts {
         shell: Some(
@@ -2431,13 +2432,16 @@ fn a_cold_relaunch_onto_a_newer_twin_execs_the_build_and_settles() {
                 .to_string_lossy()
                 .into_owned(),
         ),
-        env: vec![(
-            aterm_agent::harness::agent_image::STANDINS_SEAM.to_string(),
-            std::env::join_paths([&twin, &build, &foreign])
-                .unwrap()
-                .into_string()
-                .unwrap(),
-        )],
+        env: vec![
+            (
+                aterm_agent::harness::agent_image::STANDINS_SEAM.to_string(),
+                std::env::join_paths([&twin, &build, &next_build, &foreign])
+                    .unwrap()
+                    .into_string()
+                    .unwrap(),
+            ),
+            ("ATERM_LOG".into(), "debug".into()),
+        ],
         ..Opts::default()
     };
     let a = Inst::boot(&owner, "a", NODE_A, opts);
@@ -2517,6 +2521,82 @@ fn a_cold_relaunch_onto_a_newer_twin_execs_the_build_and_settles() {
             .is_some_and(|v| v.starts_with("aterm-harness"))
             .then_some(())
     });
+
+    // The second operation is an asked upgrade of the adopted process, not another
+    // cold restart or a raw signal exempted from native coordination.
+    std::fs::create_dir_all(next_build.parent().unwrap()).unwrap();
+    std::fs::write(next_build.with_file_name("fixture-version"), "2.1.319").unwrap();
+    aterm_uds::deadline::ad_hoc_copy(
+        &aterm_tempfile::bin_exe("aterm-claude-fixture"),
+        &next_build,
+    );
+    let mut proof = aterm_uds::spawnfd::command(&next_build)
+        .arg("--version")
+        .stdout(OwnedStdio::piped())
+        .spawn()
+        .expect("run the second build in place");
+    aterm_uds::deadline::prints(
+        &mut proof,
+        "2.1.319 (Claude Code)",
+        aterm_uds::deadline::ECHO_HANG,
+    );
+    assert!(proof.wait().unwrap().success());
+    until_on(&a, &s, DEADLINE, "activation wake is armed", || {
+        host_log(&a)
+            .contains("activation wake is armed")
+            .then_some(())
+    });
+    let staged_twin = twin.with_file_name(".claude-next");
+    let mut prelude = atpkg::platform::twin_prelude(
+        "claude",
+        &prefix,
+        None,
+        atpkg::selfupdate::verbs_of("claude"),
+        &atpkg::yolo::policy_of("claude"),
+    );
+    prelude.push_str(&atpkg::launch_tap::sh_prelude("claude", None));
+    let exports = atpkg::shim_env::ShimEnv::admit(&[
+        "DISABLE_AUTOUPDATER=1".into(),
+        "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1".into(),
+    ])
+    .unwrap();
+    atpkg::platform::install_twin_to_env(&staged_twin, &next_build, &exports, &prelude).unwrap();
+    std::fs::rename(&staged_twin, &twin).unwrap();
+    let notices = prefix.join(atpkg::activation_notice::NOTICE_DIR);
+    std::fs::create_dir_all(&notices).unwrap();
+    std::fs::write(notices.join(".m.tmp"), "1\n").unwrap();
+    std::fs::rename(
+        notices.join(".m.tmp"),
+        notices.join(atpkg::activation_notice::CLAUDE_MARKER),
+    )
+    .unwrap();
+    let upgraded = until_on(&a, &s, DEADLINE, "the asked second build", || {
+        launches(&a).get(2).cloned()
+    });
+    assert_eq!(upgraded.1, format!("--resume {CONVERSATION}"));
+    assert_eq!(
+        aterm_uds::process::read_process_path(i32::try_from(upgraded.0).unwrap()),
+        Some(std::fs::canonicalize(&next_build).unwrap()),
+    );
+    until_on(&a, &s, DEADLINE, "the second build adopted", || {
+        (kv(&status_of(&a, &s), "supervisor").is_some_and(|v| v.starts_with("aterm-harness"))
+            && host_log(&a).lines().any(|line| {
+                line.contains("upgrade pid=")
+                    && line
+                        .split_whitespace()
+                        .any(|word| word == format!("tab={s}"))
+                    && line
+                        .split_whitespace()
+                        .any(|word| word == format!("session={CONVERSATION}"))
+                    && line.split_whitespace().any(|word| word == "from=2.1.318")
+                    && line
+                        .split_whitespace()
+                        .any(|word| word == "to=2.1.319(managed)")
+                    && line.split_whitespace().any(|word| word == "step=adopted")
+            }))
+        .then_some(())
+    });
+    assert_eq!(launches(&a).len(), 3, "one launch of each actual image");
 }
 
 /// A stored route is admitted from the owned helper, without a parent-kernel environment prerequisite.

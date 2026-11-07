@@ -1193,6 +1193,10 @@ pub trait Checks {
     fn waiting(&self) -> Option<String> {
         None
     }
+    /// The run was interrupted ([`Checks::interrupted`]): the check that waits at the launch
+    /// gate, if one does, is given up, its admission row naming the signal that interrupted the
+    /// run ([`Admission::stopped`]). [`run_slots`] calls it once, as it stops.
+    fn given_up(&mut self);
 }
 
 /// A check's admitted memory claim in the capacity ledger ([`aterm_capacity::Claim`]), held for
@@ -1620,9 +1624,9 @@ pub fn run_slots(
     loop {
         if checks.interrupted() {
             stop_all(&mut running, checks, done);
-            return Err(Stopped::Interrupted(
-                gated.then(|| checks.waiting()).flatten(),
-            ));
+            let waiting = gated.then(|| checks.waiting()).flatten();
+            checks.given_up();
+            return Err(Stopped::Interrupted(waiting));
         }
         gated = false;
         while running.len() < slots && (running.is_empty() || checks.trustd_held()) {
@@ -1999,32 +2003,23 @@ impl Bench for Machine {
             prep.logdir.join(".trustd-grants"),
             prep.logdir.join(".trustd-seen"),
         );
-        let mut real = RealChecks {
-            driver: &prep.driver,
-            repo: &cfg.repo,
-            root: &prep.root,
-            env: lane_env(&prep.driver.bin, &host_var),
-            keeper: &keeper,
-            sock: &sock,
-            want: &want,
-            t0: Instant::now(),
-            locks: BTreeMap::new(),
-            serial: aterm_uds::process::process_serial,
-            sweep: || aterm_sysprobe::procs::processes().map(|s| s.procs),
-            admission: Admission::new(
+        let mut real = RealChecks::new(
+            &prep.driver,
+            &cfg.repo,
+            &prep.root,
+            &keeper,
+            &sock,
+            &want,
+            Admission::new(
                 aterm_capacity::Ledger::user(),
                 &aterm_capacity::Live,
                 cfg.admit,
                 aterm_capacity::Pace::default(),
             )
             .held_to(prep.bound),
-            out: Box::new(&mut *out),
-        };
+            Box::new(&mut *out),
+        );
         let ran = run_slots(jobs, slots, cfg.budget, &mut real, done);
-        // Only an interrupt ends a run while a check waits at the gate.
-        if matches!(ran, Err(Stopped::Interrupted(_))) {
-            real.admission.stopped(crate::interrupt::caught());
-        }
         let locks = std::mem::take(&mut real.locks);
         drop(real);
         drop(keeper);
@@ -4298,12 +4293,52 @@ struct RealChecks<'a> {
     locks: BTreeMap<PathBuf, bool>,
     /// Reads a spawned root's serial ([`aterm_uds::process::process_serial`]).
     serial: fn(i32) -> Option<u64>,
+    /// The signal that interrupted the run, once one has ([`crate::interrupt::caught`]).
+    caught: fn() -> Option<i32>,
     /// Reads the process table, for a running check's times ([`TreeTimes`]).
     sweep: fn() -> Option<Vec<aterm_sysprobe::procs::ProcessReading>>,
     /// Each check's memory claim, admitted at the launch gate.
     admission: Admission<'a>,
     /// Where the gate says what a check waits for.
     out: Box<dyn Write + 'a>,
+}
+
+impl<'a> RealChecks<'a> {
+    /// The lane's backend for a run in this process, the one way a run builds it: what it reads
+    /// of the process is this process's own (its roots' serials, its process table, and the
+    /// signal that interrupted it, [`crate::interrupt::caught`]), and its clock starts now. A
+    /// test replaces what it injects once this has built it.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the run's places the backend borrows, each a field it keeps"
+    )]
+    fn new(
+        driver: &'a Driver,
+        repo: &'a Path,
+        root: &'a Path,
+        keeper: &'a trustd::Keeper,
+        sock: &'a Path,
+        want: &'a str,
+        admission: Admission<'a>,
+        out: Box<dyn Write + 'a>,
+    ) -> Self {
+        Self {
+            driver,
+            repo,
+            root,
+            env: lane_env(&driver.bin, &host_var),
+            keeper,
+            sock,
+            want,
+            t0: Instant::now(),
+            locks: BTreeMap::new(),
+            serial: aterm_uds::process::process_serial,
+            caught: crate::interrupt::caught,
+            sweep: || aterm_sysprobe::procs::processes().map(|s| s.procs),
+            admission,
+            out,
+        }
+    }
 }
 
 impl Checks for RealChecks<'_> {
@@ -4317,6 +4352,10 @@ impl Checks for RealChecks<'_> {
 
     fn waiting(&self) -> Option<String> {
         self.admission.waiting()
+    }
+
+    fn given_up(&mut self) {
+        self.admission.stopped((self.caught)());
     }
 
     fn start(&mut self, job: &mut Job) -> std::io::Result<Box<dyn Check>> {
@@ -4454,7 +4493,7 @@ impl Checks for RealChecks<'_> {
     }
 
     fn interrupted(&self) -> bool {
-        crate::interrupt::caught().is_some()
+        (self.caught)().is_some()
     }
 
     fn now(&self) -> Duration {
@@ -7463,6 +7502,11 @@ c	100	100	{GIB}	2026-11-01T00:00:00Z		failed
         fn waiting(&self) -> Option<String> {
             self.gate.as_ref().and_then(Admission::waiting)
         }
+        fn given_up(&mut self) {
+            if let Some(gate) = &mut self.gate {
+                gate.stopped(Some(INTERRUPTED_BY));
+            }
+        }
         fn trustd_held(&self) -> bool {
             let w = self.w.borrow();
             w.starts.len() >= self.held_after && self.trustd_until.is_none_or(|t| w.now < t)
@@ -7743,6 +7787,9 @@ c	100	100	{GIB}	2026-11-01T00:00:00Z		failed
     }
 
     const GIB: u64 = 1 << 30;
+
+    /// The signal a fake run's interrupt is (`SIGTERM`), as its gate's row names it.
+    const INTERRUPTED_BY: i32 = 15;
 
     /// A scratch capacity ledger, removed when the test ends.
     fn ledger() -> (aterm_tempfile::TempDir, aterm_capacity::Ledger) {
@@ -8322,11 +8369,13 @@ c	100	100	{GIB}	2026-11-01T00:00:00Z		failed
     /// was asked, so its row is owed however its wait ends. A run stopped by a signal while the
     /// check waits ends that wait, its row `outcome=fail` with the signal ([`Admission::stopped`]),
     /// and neither a second stop nor the gate's drop after writes another. A run interrupted
-    /// through the slots, its gate dropped with the check waiting, writes one with no signal; so
-    /// does a check the gate gave up for another, and that other as the gate drops. A check whose
+    /// through the slots writes one as they stop, with the backend's signal ([`Checks::given_up`]),
+    /// and the gate's drop after none. A check the gate gave up for another writes one with no
+    /// signal, and so does that other as the gate drops. A check whose
     /// claim file was removed while it waited (it starts unclaimed) writes one, its ledger's
-    /// failure. NEGATIVE CONTROL (by hand: a wait given up writing no row, as before): none for
-    /// each but the last.
+    /// failure. NEGATIVE CONTROLS (by hand): a wait given up writing no row, as before: none for
+    /// each but the last; the slots not giving the gate up as they stop: none until the gate's
+    /// drop, and that one with no signal.
     #[cfg(unix)]
     #[test]
     fn a_check_given_up_at_the_gate_writes_one_row() {
@@ -8376,10 +8425,24 @@ c	100	100	{GIB}	2026-11-01T00:00:00Z		failed
         let ((), rows) = capture(l.clone(), || {
             let (r, _) = slots(&mut f, vec![needing("a", 20)], 1, 100);
             assert!(matches!(r, Err(Stopped::Interrupted(Some(_)))), "{r:?}");
-            f.gate = None;
         });
-        assert_eq!(rows.len(), 1, "{rows:?}");
-        assert_eq!(admission_words(&rows[0]), given_up);
+        assert_eq!(
+            rows.len(),
+            1,
+            "the slots gave it up as they stopped: {rows:?}"
+        );
+        assert_eq!(
+            admission_words(&rows[0]),
+            (
+                Kind::Admission,
+                Outcome::Fail,
+                Stop::Signal,
+                Some(INTERRUPTED_BY),
+                Meter::Stamped
+            )
+        );
+        let ((), rows) = capture(l.clone(), || f.gate = None);
+        assert!(rows.is_empty(), "the gate's drop after: {rows:?}");
 
         let mut g = gate(&l, &m, aterm_capacity::Admit::Wait);
         let ((), rows) = capture(l.clone(), || {
@@ -9281,6 +9344,11 @@ c	100	100	{GIB}	2026-11-01T00:00:00Z		failed
             };
             let said = &mut self.said;
             gate.admit(job, self.now, &mut |line| said.push(line.to_string()))
+        }
+        fn given_up(&mut self) {
+            if let Some(gate) = &mut self.gate {
+                gate.stopped(Some(INTERRUPTED_BY));
+            }
         }
     }
 
@@ -14374,7 +14442,7 @@ c	100	100	{GIB}	2026-11-01T00:00:00Z		failed
     }
 
     /// The lane's own `RealChecks` over a script `targo` in `d`, its root's serial read with
-    /// `serial`.
+    /// `serial`, with no gate, no environment, no process table and no interrupt caught.
     fn real_checks<'a>(
         d: &'a Path,
         root: &'a Path,
@@ -14383,26 +14451,26 @@ c	100	100	{GIB}	2026-11-01T00:00:00Z		failed
         sock: &'a Path,
         serial: fn(i32) -> Option<u64>,
     ) -> RealChecks<'a> {
-        RealChecks {
+        let mut real = RealChecks::new(
             driver,
-            repo: d,
+            d,
             root,
-            env: Vec::new(),
             keeper,
             sock,
-            want: "aa",
-            t0: Instant::now(),
-            locks: BTreeMap::new(),
-            serial,
-            sweep: || None,
-            admission: Admission::new(
+            "aa",
+            Admission::new(
                 None,
                 &aterm_capacity::Live,
                 aterm_capacity::Admit::Wait,
                 aterm_capacity::Pace::default(),
             ),
-            out: Box::new(std::io::sink()),
-        }
+            Box::new(std::io::sink()),
+        );
+        real.env = Vec::new();
+        real.serial = serial;
+        real.sweep = || None;
+        real.caught = || None;
+        real
     }
 
     /// A script `targo` under `d` that runs `body`.
@@ -14425,6 +14493,170 @@ c	100	100	{GIB}	2026-11-01T00:00:00Z		failed
         let keeper =
             trustd::Keeper::start(sock.clone(), "aa".into(), d.join("grants"), d.join("seen"));
         (sock, keeper)
+    }
+
+    /// A REAL RUN INTERRUPTED GIVES ITS GATE UP WITH THE SIGNAL IT CAUGHT (TM-1 review): the
+    /// lane's own backend reads the run's interrupt from its `caught` (the process's latch,
+    /// [`crate::interrupt::caught`], in a run), both for whether the run was interrupted and for
+    /// the signal its waiting check's admission row names. NEGATIVE CONTROLS (by hand):
+    /// `given_up` doing nothing: no row until the backend drops, and that one with no signal;
+    /// `interrupted` reading the process's latch instead: not interrupted.
+    #[test]
+    fn a_real_run_interrupted_gives_its_gate_up_with_the_signal_it_caught() {
+        use aterm_capacity::telemetry::capture;
+        use aterm_telemetry::{Kind, Meter, Outcome, Stop};
+        let d = tmp("trust-lane-given-up");
+        let (_l, l) = ledger();
+        let m = aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(48, 40, 14));
+        let hold = held_by_another(&l, &m, 30);
+        let root = d.path().join("root");
+        let driver = script_driver(d.path(), "exit 0");
+        let (sock, keeper) = quiet_keeper(d.path());
+        let mut real = real_checks(
+            d.path(),
+            &root,
+            &driver,
+            &keeper,
+            &sock,
+            aterm_uds::process::process_serial,
+        );
+        assert!(!real.interrupted(), "no signal caught");
+        real.caught = || Some(15);
+        assert!(real.interrupted(), "a signal caught");
+        real.admission = gate(&l, &m, aterm_capacity::Admit::Wait);
+        let ((), rows) = capture(l.clone(), || {
+            assert!(
+                real.admit(&needing("a", 20)).is_none(),
+                "20 GiB beside 30 waits"
+            );
+            real.given_up();
+            drop(real);
+        });
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(
+            admission_words(&rows[0]),
+            (
+                Kind::Admission,
+                Outcome::Fail,
+                Stop::Signal,
+                Some(15),
+                Meter::Stamped
+            )
+        );
+        drop(hold);
+        assert!(l.list().expect("the ledger").is_empty());
+    }
+
+    /// A REAL BACKEND READS THE INTERRUPT THIS PROCESS CAUGHT (TM-1 review): the backend a run
+    /// builds ([`RealChecks::new`]) reads the process's own latch ([`crate::interrupt::caught`]),
+    /// both for whether the run was interrupted and for the signal its waiting check's admission
+    /// row names. The latch is the process's, so this runs in a process of its own (its
+    /// directory named by `ATERM_RELEASE_TRUST_LANE_LATCH`), which catches a `SIGTERM` it sends
+    /// itself and reaches no other test. NEGATIVE CONTROL (by hand): `new` binding no latch
+    /// (`|| None`): not interrupted once the signal is caught.
+    #[cfg(unix)]
+    #[test]
+    fn a_real_backend_reads_the_interrupt_this_process_caught() {
+        const LATCH_ENV: &str = "ATERM_RELEASE_TRUST_LANE_LATCH";
+        const LATCH: &str =
+            "trust_lane::tests::a_real_backend_reads_the_interrupt_this_process_caught";
+        if let Some(dir) = std::env::var_os(LATCH_ENV) {
+            the_interrupt_this_process_caught(Path::new(&dir));
+            return;
+        }
+        let d = tmp("trust-lane-latch");
+        let out = command(std::env::current_exe().unwrap())
+            .args(["--exact", "--nocapture", "--test-threads=1", LATCH])
+            .env(LATCH_ENV, d.path())
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let said = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "the probe: {said}");
+        assert!(
+            d.path().join("caught").exists(),
+            "the probe never ran: {said}"
+        );
+    }
+
+    /// Run by [`a_real_backend_reads_the_interrupt_this_process_caught`] in a process of its
+    /// own: a backend built as a run builds it, its gate in a scratch ledger under `d`, reads no
+    /// interrupt; once this process, its handler installed from the default dispositions, has
+    /// caught the `SIGTERM` it sends itself, the backend is
+    /// interrupted, and its waiting check's row names that signal. Writes `caught` in `d` once
+    /// all of it held.
+    #[cfg(unix)]
+    fn the_interrupt_this_process_caught(d: &Path) {
+        use aterm_capacity::telemetry::capture;
+        use aterm_telemetry::{Kind, Meter, Outcome, Stop};
+        let l = aterm_capacity::Ledger::at(d.join("ledger"));
+        let m = aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(48, 40, 14));
+        let hold = held_by_another(&l, &m, 30);
+        let root = d.join("root");
+        let driver = script_driver(d, "exit 0");
+        let (sock, keeper) = quiet_keeper(d);
+        let mut real = RealChecks::new(
+            &driver,
+            d,
+            &root,
+            &keeper,
+            &sock,
+            "aa",
+            gate(&l, &m, aterm_capacity::Admit::Wait),
+            Box::new(std::io::sink()),
+        );
+        assert!(!real.interrupted(), "no signal caught yet");
+        unsafe extern "C" {
+            fn signal(sig: i32, handler: usize) -> usize;
+        }
+        // The handler is installed as a run installs it, from the default dispositions, whatever
+        // the test inherited: a `SIGTERM` the binary was started ignoring is caught here too.
+        for sig in [
+            crate::interrupt::SIGHUP,
+            crate::interrupt::SIGINT,
+            crate::interrupt::SIGTERM,
+        ] {
+            // SAFETY: SIG_DFL (0) for a signal no handler of this process holds yet.
+            unsafe {
+                signal(sig, 0);
+            }
+        }
+        crate::interrupt::install();
+        crate::interrupt::send(
+            i32::try_from(std::process::id()).expect("a pid"),
+            crate::interrupt::SIGTERM,
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while crate::interrupt::caught().is_none() {
+            assert!(Instant::now() < deadline, "the SIGTERM was never caught");
+            aterm_uds::deadline::poll_yield();
+        }
+        assert!(real.interrupted(), "this process caught a signal");
+        let ((), rows) = capture(l.clone(), || {
+            assert!(
+                real.admit(&needing("a", 20)).is_none(),
+                "20 GiB beside 30 waits"
+            );
+            real.given_up();
+            drop(real);
+        });
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(
+            admission_words(&rows[0]),
+            (
+                Kind::Admission,
+                Outcome::Fail,
+                Stop::Signal,
+                Some(crate::interrupt::SIGTERM),
+                Meter::Stamped
+            )
+        );
+        drop(hold);
+        fs::write(d.join("caught"), "").expect("the probe's mark");
     }
 
     /// Starting a check removes its slot's spent stamp, so the first stamp a reap of its record

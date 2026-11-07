@@ -146,9 +146,9 @@ pub(crate) fn resolved_terminal_title_rung(
 pub(crate) struct CapturedTitle {
     /// The terminal's rungs of its label ([`resolved_terminal_title_rung`]).
     pub(crate) title: String,
-    /// Its shell gave the title ([`crate::app_take_over::shell_titled`]), read in the same
-    /// snapshot.
-    pub(crate) shell: bool,
+    /// Nothing the tab runs gave the title ([`crate::app_take_over::untitled_by_its_program`]),
+    /// read in the same snapshot.
+    pub(crate) untitled: bool,
 }
 
 /// Make the keep-stale tab-title cache agree with the exact snapshot that caused an effective chrome refresh.
@@ -156,7 +156,7 @@ pub(crate) fn synchronize_captured_title_cache(
     cache: &mut std::collections::HashMap<u64, CapturedTitle>,
     session: u64,
     resolved_rung: Option<&str>,
-    shell: bool,
+    untitled: bool,
     needs_refresh: bool,
 ) {
     if !needs_refresh {
@@ -167,7 +167,7 @@ pub(crate) fn synchronize_captured_title_cache(
             session,
             CapturedTitle {
                 title: title.to_owned(),
-                shell,
+                untitled,
             },
         );
     } else {
@@ -287,9 +287,9 @@ mod background_title_tests {
 
     #[test]
     fn captured_drift_snapshot_wins_a_contended_refresh_read() {
-        let captured = |title: &str, shell: bool| super::CapturedTitle {
+        let captured = |title: &str, untitled: bool| super::CapturedTitle {
             title: title.to_owned(),
-            shell,
+            untitled,
         };
         let mut cache = std::collections::HashMap::from([(7, captured("stale", false))]);
 
@@ -1495,7 +1495,7 @@ impl App {
                 if user_title.is_some() {
                     let pinned = user_title.map(|title| CapturedTitle {
                         title,
-                        shell: false,
+                        untitled: false,
                     });
                     return (fallback, Some(view.session), pinned);
                 }
@@ -1505,7 +1505,7 @@ impl App {
                     CapturedTitle {
                         title: resolved_terminal_title_rung(None, t.title(), cwd.as_deref())
                             .unwrap_or_default(),
-                        shell: crate::app_take_over::shell_titled(t),
+                        untitled: crate::app_take_over::untitled_by_its_program(t),
                     }
                 };
                 let fresh = match s.term.try_lock() {

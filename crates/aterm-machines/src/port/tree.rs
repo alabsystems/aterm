@@ -15,48 +15,13 @@ fn c_path(path: &Path) -> io::Result<std::ffi::CString> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a path holds a NUL"))
 }
 
-/// `clonefile(2)` of the folder (or file) `from` to the new name `to`, never following a link at
-/// `from`, and owned by the caller (`CLONE_NOOWNERCOPY`: a root caller's clone is root's, never
-/// the source owner's). Off macOS it refuses (`Unsupported`).
+/// Clone the real directory held open at `from` to the new name `to`, owned by the caller.
+/// Source links are refused and a replacement pathname cannot redirect the clone.
 ///
 /// # Errors
-/// The call's error: `EXDEV` when the two are on different volumes, `EEXIST` when `to` exists.
-pub(super) fn clone(from: &Path, to: &Path) -> io::Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        /// `<sys/clonefile.h>`: do not follow a link at the source.
-        const CLONE_NOFOLLOW: u32 = 0x0001;
-        /// `<sys/clonefile.h>`: do not copy the source's owner when the caller is root.
-        const CLONE_NOOWNERCOPY: u32 = 0x0002;
-        unsafe extern "C" {
-            /// `<sys/clonefile.h>`: `int clonefile(const char *src, const char *dst, uint32_t)`.
-            fn clonefile(
-                src: *const std::ffi::c_char,
-                dst: *const std::ffi::c_char,
-                flags: u32,
-            ) -> i32;
-        }
-        let (src, dst) = (c_path(from)?, c_path(to)?);
-        // SAFETY: both pointers are NUL-terminated strings that outlive the call, which reads
-        // them and writes nothing of ours.
-        let done = unsafe {
-            clonefile(
-                src.as_ptr(),
-                dst.as_ptr(),
-                CLONE_NOFOLLOW | CLONE_NOOWNERCOPY,
-            )
-        };
-        if done == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (from, to);
-        Err(io::ErrorKind::Unsupported.into())
-    }
+/// Unsafe source shape, or the original filesystem error (`EXDEV` remains distinguishable).
+pub(super) fn clone(from: &Path, to: &Path) -> Result<(), aterm_uds::app_image::Error> {
+    aterm_uds::app_image::clone(from, to)
 }
 
 /// Exchange the names `a` and `b` atomically (`renamex_np` with `RENAME_SWAP`): each then names
@@ -85,98 +50,20 @@ pub(super) fn exchange(a: &Path, b: &Path) -> io::Result<()> {
 
 /// Make `path` (and, with `tree`, everything below it) `uid:gid` with mode bits no wider than
 /// `0755`, never following a link: the group and other write bits, setuid, setgid and sticky are
-/// cleared, and any extended ACL is removed ([`strip_acl`]), so a bundle the person's account
+/// cleared, and any extended ACL is removed, so a bundle the person's account
 /// made can carry no grant of its own into a root-owned clone (`ditto`'s copy keeps ACLs and set-id
-/// bits). A link itself is re-owned (`lchown`), stripped of any ACL and never entered, and its mode
-/// (which macOS ignores) is left.
+/// bits). The outer image must be a real directory. Internal links must stay within it;
+/// they are re-owned and stripped of ACLs without following them.
 ///
 /// # Errors
-/// The first failing `lstat`, `lchown`, ACL removal, `chmod` or listing.
-pub(super) fn own(path: &Path, uid: u32, gid: u32, tree: bool) -> io::Result<()> {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-    let meta = std::fs::symlink_metadata(path)?;
-    std::os::unix::fs::lchown(path, Some(uid), Some(gid))?;
-    strip_acl(path, meta.file_type().is_symlink())?;
-    if meta.file_type().is_symlink() {
-        return Ok(());
-    }
-    let mode = meta.mode() & 0o755;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
-    if tree && meta.is_dir() {
-        for entry in std::fs::read_dir(path)? {
-            own(&entry?.path(), uid, gid, true)?;
-        }
-    }
-    Ok(())
-}
-
-/// `<sys/acl.h>`: macOS's NFSv4-style ACL, the only kind it keeps.
-#[cfg(target_os = "macos")]
-const ACL_TYPE_EXTENDED: u32 = 0x0000_0100;
-
-/// `<sys/fcntl.h>`: open a link at the end of the path itself, not what it names.
-#[cfg(target_os = "macos")]
-const O_SYMLINK: i32 = 0x0020_0000;
-
-#[cfg(target_os = "macos")]
-unsafe extern "C" {
-    /// `<sys/acl.h>`: `acl_t acl_init(int count)`, an empty ACL.
-    fn acl_init(count: i32) -> *mut std::ffi::c_void;
-    /// `<sys/acl.h>`: `int acl_set_link_np(const char *, acl_type_t, acl_t)`, never following a
-    /// link at the end of the path (and refusing a link itself, `ENOTSUP`).
-    fn acl_set_link_np(path: *const std::ffi::c_char, kind: u32, acl: *mut std::ffi::c_void)
-    -> i32;
-    /// `<sys/acl.h>`: `int acl_set_fd_np(int fd, acl_t, acl_type_t)`.
-    fn acl_set_fd_np(fd: i32, acl: *mut std::ffi::c_void, kind: u32) -> i32;
-    /// `<sys/acl.h>`: `int acl_free(void *)`.
-    fn acl_free(obj: *mut std::ffi::c_void) -> i32;
-}
-
-/// Replace `path`'s extended ACL with an empty one, never following a link at its end: a `link`
-/// is opened itself (`O_SYMLINK`), since `acl_set_link_np` refuses one. Off macOS there is
-/// nothing to remove (the clone is made only on macOS).
-///
-/// # Errors
-/// The `acl_init`, `open` or `acl_set_*` error.
-fn strip_acl(path: &Path, link: bool) -> io::Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        use std::os::fd::AsRawFd as _;
-        let held = if link {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            Some(
-                std::fs::OpenOptions::new()
-                    .read(true)
-                    .custom_flags(O_SYMLINK | libc::O_NONBLOCK | libc::O_CLOEXEC)
-                    .open(path)?,
-            )
-        } else {
-            None
-        };
-        let path = c_path(path)?;
-        // SAFETY: `acl_init` takes a count and returns an owned ACL or NULL with errno set.
-        let empty = unsafe { acl_init(0) };
-        if empty.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        let set = match &held {
-            // SAFETY: the descriptor is open for the call, and `empty` is the live ACL
-            // `acl_init` returned, which the call only reads.
-            Some(file) => unsafe { acl_set_fd_np(file.as_raw_fd(), empty, ACL_TYPE_EXTENDED) },
-            // SAFETY: `path` is a NUL-terminated string that outlives the call and `empty` is
-            // the live ACL `acl_init` returned, which the call only reads.
-            None => unsafe { acl_set_link_np(path.as_ptr(), ACL_TYPE_EXTENDED, empty) },
-        };
-        let error = io::Error::last_os_error();
-        // SAFETY: `empty` came from `acl_init` and is freed once, here, after its last use.
-        unsafe { acl_free(empty) };
-        if set == 0 { Ok(()) } else { Err(error) }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (path, link);
-        Ok(())
-    }
+/// Unsafe shape or escaping link, or the first failing filesystem/ACL operation.
+pub(super) fn own(
+    path: &Path,
+    uid: u32,
+    gid: u32,
+    tree: bool,
+) -> Result<(), aterm_uds::app_image::Error> {
+    aterm_uds::app_image::seal(path, uid, gid, tree)
 }
 
 #[cfg(test)]
@@ -198,7 +85,7 @@ mod tests {
         std::fs::write(&exe, b"").unwrap();
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o777)).unwrap();
         std::fs::set_permissions(&app, std::fs::Permissions::from_mode(0o777)).unwrap();
-        std::os::unix::fs::symlink(&outside, app.join("Contents/link")).unwrap();
+        std::os::unix::fs::symlink("MacOS/aterm", app.join("Contents/link")).unwrap();
         let mode = |p: &Path| std::fs::symlink_metadata(p).unwrap().mode() & 0o7777;
         let (uid, gid) = {
             let meta = std::fs::metadata(dir.path()).unwrap();
@@ -209,6 +96,23 @@ mod tests {
         assert_eq!((mode(&app), mode(&exe)), (0o755, 0o777));
         own(&app, uid, gid, true).unwrap();
         assert_eq!((mode(&app), mode(&exe)), (0o755, 0o755));
+        assert_eq!(mode(&outside), 0o666);
+        std::os::unix::fs::symlink(&outside, app.join("Contents/escaped")).unwrap();
+        assert!(
+            own(&app, uid, gid, true).is_err(),
+            "a sealed root image cannot keep a link into another account's writable files"
+        );
+        assert_eq!(mode(&outside), 0o666);
+        std::fs::remove_file(app.join("Contents/escaped")).unwrap();
+        std::os::unix::fs::symlink("missing/target", app.join("Contents/dangling")).unwrap();
+        own(&app, uid, gid, true).unwrap();
+        std::os::unix::fs::symlink(".", app.join("x")).unwrap();
+        std::fs::create_dir(app.join("d")).unwrap();
+        std::os::unix::fs::symlink("../x/..", app.join("d/composed")).unwrap();
+        assert!(
+            own(&app, uid, gid, true).is_err(),
+            "relative links cannot compose an outside traversal"
+        );
         assert_eq!(mode(&outside), 0o666);
     }
 
@@ -271,6 +175,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_folder_clones_and_two_folders_swap() {
+        use crate::port::System as _;
+        use std::os::unix::fs::MetadataExt as _;
+
         let dir = aterm_tempfile::tempdir().unwrap();
         let (a, b, c) = (
             dir.path().join("a.app"),
@@ -283,12 +190,75 @@ mod tests {
         std::fs::write(c.join("y"), b"c").unwrap();
         clone(&a, &b).unwrap();
         assert_eq!(std::fs::read(b.join("Contents/x")).unwrap(), b"a");
-        assert_eq!(
-            clone(&a, &b).unwrap_err().kind(),
-            io::ErrorKind::AlreadyExists
+        assert!(
+            matches!(clone(&a, &b), Err(aterm_uds::app_image::Error::Io(error)) if error.kind() == io::ErrorKind::AlreadyExists)
         );
         exchange(&b, &c).unwrap();
         assert_eq!(std::fs::read(b.join("y")).unwrap(), b"c");
         assert_eq!(std::fs::read(c.join("Contents/x")).unwrap(), b"a");
+
+        // The real strict checker accepts an intact owned clone and keeps a
+        // modified resource unverified. Capturing this requirement precedes
+        // either copy or mutation; candidate bytes never choose their own policy.
+        aterm_uds::deadline::require_trust_service();
+        let signed = dir.path().join("signed.app");
+        let executable = signed.join("Contents/MacOS/aterm");
+        let resource = Path::new("Contents/Resources/payload");
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(signed.join(resource).parent().unwrap()).unwrap();
+        std::fs::copy("/usr/bin/true", &executable).unwrap();
+        std::fs::write(
+            signed.join("Contents/Info.plist"),
+            b"<plist version=\"1.0\"><dict>\
+              <key>CFBundleExecutable</key><string>aterm</string>\
+              <key>CFBundleIdentifier</key><string>com.aterm.stage-fixture</string>\
+              <key>CFBundlePackageType</key><string>APPL</string>\
+              </dict></plist>",
+        )
+        .unwrap();
+        std::fs::write(signed.join(resource), b"intact").unwrap();
+        let signed_result = aterm_uds::spawnfd::command("/usr/bin/codesign")
+            .args(["--force", "--sign", "-", "--timestamp=none"])
+            .arg(&signed)
+            .output()
+            .unwrap();
+        assert!(signed_result.status.success(), "{signed_result:?}");
+        let identity = aterm_keeper::identity::Identity::for_code_at(&signed).unwrap();
+        let staged = dir.path().join("staged.app");
+        clone(&signed, &staged).unwrap();
+        let metadata = std::fs::metadata(dir.path()).unwrap();
+        own(&staged, metadata.uid(), metadata.gid(), true).unwrap();
+        identity
+            .admits_code_at_strictly(&staged)
+            .expect("the intact staged clone satisfies the previously captured requirement");
+        let foreign = crate::port::Live::new().check_app_copy(&staged);
+        assert!(
+            matches!(foreign, Err(aterm_keeper::identity::CheckError::Refused(_))),
+            "the System checker uses its loaded identity, never the candidate's: {foreign:?}"
+        );
+        std::fs::write(staged.join(resource), b"modified after copying").unwrap();
+        let verdict = identity.admits_code_at_strictly(&staged);
+        eprintln!("owned staged resource after mutation: {verdict:?}");
+        assert!(
+            matches!(
+                verdict,
+                Err(aterm_keeper::identity::CheckError::Refused(_)
+                    | aterm_keeper::identity::CheckError::Unchecked(_))
+            ),
+            "a modified staged resource is never admitted: {verdict:?}"
+        );
+
+        // This is the exact pathname the caller canonicalized. A replacement
+        // before cloning cannot turn the root image into an outer symlink.
+        let captured = std::fs::canonicalize(&a).unwrap();
+        let moved = dir.path().join("moved.app");
+        std::fs::rename(&a, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &a).unwrap();
+        let rebound = dir.path().join("rebound.app");
+        assert!(
+            clone(&captured, &rebound).is_err(),
+            "a canonical source pathname rebound to a link is not a real bundle snapshot"
+        );
+        assert!(!rebound.exists());
     }
 }

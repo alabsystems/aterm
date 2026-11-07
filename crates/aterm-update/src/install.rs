@@ -1675,7 +1675,7 @@ fn swap_fixed_candidate(
     Ok(prepared.fixed.clone())
 }
 
-fn checked_bundle_exchange(
+pub(crate) fn checked_bundle_exchange(
     a: &Path,
     b: &Path,
     operation: &str,

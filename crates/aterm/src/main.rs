@@ -51,6 +51,26 @@ fn package_entry(args: Vec<OsString>) -> ExitCode {
     package_entry_with(
         args,
         a_person_at_their_own_account(),
+        |forwarded| {
+            #[cfg(target_os = "macos")]
+            {
+                match aterm_update::first_launch::native::prepare(
+                    forwarded,
+                    aterm_update::first_launch::native::Entry::Init,
+                ) {
+                    Ok(code) => code,
+                    Err(reason) => {
+                        eprintln!("aterm pkg: {reason}");
+                        Some(ExitCode::FAILURE)
+                    }
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = forwarded;
+                None
+            }
+        },
         |args| {
             #[cfg(target_os = "macos")]
             if aterm_machines::cli::pkg_retires(&args) {
@@ -122,19 +142,32 @@ fn a_person_at_their_own_account_from(
     typed && uid != 0 && live && var("CI").is_none()
 }
 
-/// [`package_entry`] with whether a person runs it (`person`), the package pass (`packages`,
+/// [`package_entry`] with whether a person runs it (`person`), native launch preparation
+/// (`prepare`, handed canonical `pkg` arguments), the package pass (`packages`,
 /// which answers its status and whether it ended settled, [`atpkg::cli::pass_ended_settled`])
 /// and the follow-up (`setup`). The follow-up runs only after a pass a person ran whose words
 /// setup follows ([`atpkg::cli::pass_finishes_setup`]), and only once that pass ended settled.
 /// The command's exit status is the pass's, unless a stop ends the follow-up: a follow-up that
-/// panics says [`FOLLOW_UP_UNFINISHED`] and the pass's status stands.
+/// panics says [`FOLLOW_UP_UNFINISHED`] and the pass's status stands. A native handoff returns
+/// its installed command's status before this original process runs a package pass.
 fn package_entry_with(
     args: Vec<OsString>,
     person: bool,
+    prepare: impl FnOnce(Vec<OsString>) -> Option<ExitCode>,
     packages: impl FnOnce(Vec<OsString>) -> (ExitCode, bool),
     setup: impl FnOnce() -> ExitCode,
 ) -> ExitCode {
     let finish = person && atpkg::cli::pass_finishes_setup(&args);
+    if finish {
+        // argv0 aliases supply only package operands. The installed composed image
+        // receives the canonical verb plus those exact bytes, and runs the pass once.
+        let forwarded = std::iter::once(OsString::from("pkg"))
+            .chain(args.iter().cloned())
+            .collect();
+        if let Some(code) = prepare(forwarded) {
+            return code;
+        }
+    }
     let (code, settled) = packages(args);
     if finish && settled {
         // The follow-up's rows and summary on the person's terminal, and its line in aterm.log,
@@ -192,6 +225,22 @@ impl InitEntry {
 /// permission walk. The run's phase totals go to aterm.log, never to this terminal.
 #[cfg(unix)]
 fn run_init(entry: InitEntry) -> ExitCode {
+    #[cfg(target_os = "macos")]
+    if let InitEntry::Typed(words) = &entry
+        && aterm_machines::init::launches_setup(words)
+    {
+        match aterm_update::first_launch::native::prepare(
+            [vec![OsString::from("init")], words.clone()].concat(),
+            aterm_update::first_launch::native::Entry::Init,
+        ) {
+            Ok(Some(code)) => return code,
+            Ok(None) => {}
+            Err(reason) => {
+                eprintln!("aterm init: {reason}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
     aterm_gui::install_session_log();
     #[cfg(target_os = "macos")]
     let host = aterm_machines::init::Host {
@@ -668,6 +717,11 @@ pub(crate) fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    #[cfg(target_os = "macos")]
+    if let Err(reason) = aterm_update::first_launch::native::acknowledge_relaunch(&argv[1..]) {
+        eprintln!("aterm: {reason}");
+        return ExitCode::FAILURE;
+    }
     let code = front_door_main(argv, lab_window_guard.is_present());
     // A pass the lab's mailbox discovery started on its own thread finishes before a
     // short-lived invocation returns (a bounded wait; nothing runs in most processes).
@@ -1165,6 +1219,12 @@ fn front_door_main(argv: Vec<OsString>, lab_window_guarded: bool) -> ExitCode {
     let windowish = is_windowish(scan, force_session, stdin_is_terminal());
     let mode_args = take_no_reroute(&strip_mode_flags(&rest));
     if windowish {
+        #[cfg(target_os = "macos")]
+        if let Some(code) =
+            aterm_gui::prepare_window_launch(&mode_args, std::env::args_os().skip(1).collect())
+        {
+            return code;
+        }
         if lab_window_guarded {
             // The actual guarded image must retain its original description.
             // Forwarding a plain launch would leave that custody in this short-
@@ -1570,6 +1630,12 @@ fn window_host_for(scan: &[OsString]) -> WindowHost {
 }
 
 fn run_window(args: Vec<OsString>, host: WindowHost, handoff: &[OsString]) -> ExitCode {
+    #[cfg(target_os = "macos")]
+    if let Some(code) =
+        aterm_gui::prepare_window_launch(&args, std::env::args_os().skip(1).collect())
+    {
+        return code;
+    }
     #[cfg(windows)]
     if host == WindowHost::WindowedSibling {
         aterm_gui::check_window_args(args.clone());
@@ -14939,6 +15005,13 @@ fn window_verb(verb: &str, args: &[OsString], host: WindowHost) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    #[cfg(target_os = "macos")]
+    if let Some(code) = aterm_gui::prepare_window_launch(
+        &request.window_args(),
+        std::env::args_os().skip(1).collect(),
+    ) {
+        return code;
+    }
     let why = match route_and_maybe_forward(&request) {
         ControlFlow::Break(code) => return code,
         ControlFlow::Continue(why) => why,
@@ -15959,22 +16032,38 @@ mod tests {
                 None,
             ] {
                 let events = RefCell::new(Vec::new());
+                let prepares = person
+                    && atpkg::cli::pass_finishes_setup(
+                        &words.iter().map(OsString::from).collect::<Vec<_>>(),
+                    );
                 let code = super::package_entry_with(
                     words.iter().map(OsString::from).collect(),
                     person,
+                    |forwarded| {
+                        assert_eq!(
+                            forwarded,
+                            std::iter::once(OsString::from("pkg"))
+                                .chain(words.iter().map(OsString::from))
+                                .collect::<Vec<_>>()
+                        );
+                        events.borrow_mut().push("prepare");
+                        None
+                    },
                     |args| {
                         assert_eq!(args, words.iter().map(OsString::from).collect::<Vec<_>>());
                         events.borrow_mut().push("packages");
                         (package_code, settled)
                     },
                     || {
-                        assert_eq!(*events.borrow(), ["packages"]);
+                        assert_eq!(*events.borrow(), ["prepare", "packages"]);
                         events.borrow_mut().push("setup");
                         setup_code.unwrap_or_else(|| panic!("setup panicked"))
                     },
                 );
                 let want: &[&str] = if follows {
-                    &["packages", "setup"]
+                    &["prepare", "packages", "setup"]
+                } else if prepares {
+                    &["prepare", "packages"]
                 } else {
                     &["packages"]
                 };
@@ -15982,6 +16071,40 @@ mod tests {
                 assert_eq!(code, package_code, "{words:?} then {setup_code:?}");
             }
         }
+        let events = RefCell::new(Vec::new());
+        let words = vec![
+            OsString::from("update"),
+            OsString::from("--aterm-front-door-routing-probe"),
+        ];
+        let code = super::package_entry_with(
+            words.clone(),
+            true,
+            |forwarded| {
+                assert_eq!(
+                    forwarded,
+                    [vec![OsString::from("pkg")], words.clone()].concat()
+                );
+                events.borrow_mut().push("prepare");
+                None
+            },
+            |args| {
+                assert_eq!(*events.borrow(), ["prepare"]);
+                events.borrow_mut().push("parser");
+                let code = atpkg::cli::main_entry(args);
+                (code, atpkg::cli::pass_ended_settled(code))
+            },
+            || panic!("a rejected package operand cannot enter setup"),
+        );
+        assert_eq!(code, ExitCode::from(2));
+        assert_eq!(*events.borrow(), ["prepare", "parser"]);
+        let code = super::package_entry_with(
+            words,
+            true,
+            |_| Some(ExitCode::from(2)),
+            |_| panic!("the original must not run a handed-off pass again"),
+            || panic!("the original must not enter setup after handoff"),
+        );
+        assert_eq!(code, ExitCode::from(2));
     }
 
     /// The follow-up's person ([`super::a_person_at_their_own_account_from`]): typed at a

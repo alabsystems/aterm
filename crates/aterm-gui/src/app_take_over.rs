@@ -236,14 +236,28 @@ pub(crate) fn shell_titled(t: &aterm_core::terminal::Terminal) -> bool {
     })
 }
 
-/// The agent `ctx`'s session runs, by its product's name (`Claude Code`): the one in front, else
-/// the one its worker's task started; `None` for a program that is no agent, or none.
-fn agent_name(ctx: &crate::SessionCtx) -> Option<&'static str> {
+/// Whether nothing `t` runs has titled its tab: its shell gave the title ([`shell_titled`]), or the
+/// title says nothing a label reads (empty, or only the glyph and blank an agent leads it with,
+/// [`title_without_agent_glyph`], or what [`crate::tab_label::informative`] sheds), so its label
+/// would fall to its folder.
+pub(crate) fn untitled_by_its_program(t: &aterm_core::terminal::Terminal) -> bool {
+    shell_titled(t)
+        || crate::tab_label::informative(title_without_agent_glyph(t.title())).is_empty()
+}
+
+/// What `ctx`'s session runs, by name: the agent in front by its product's name (`Claude Code`),
+/// else what its worker's task started ([`worker_label`]); `None` for none.
+fn worker_name(ctx: &crate::SessionCtx) -> Option<String> {
     let timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
     crate::harness_host::identified_agent(timeline.agent())
-        .or_else(|| timeline.task().and_then(|task| task.agent))
-        .filter(|program| program.agent().is_some())
-        .map(aterm_phase::Program::product)
+        .map(|agent| agent.product().to_owned())
+        .or_else(|| timeline.task().and_then(worker_label))
+}
+
+/// What `record`'s worker runs ([`crate::task_record::TaskRecord::worker_name`]: its agent, or a
+/// program worker's program) as one line of a label; `None` where it names neither.
+pub(crate) fn worker_label(record: &crate::task_record::TaskRecord) -> Option<String> {
+    record.worker_name().and_then(label_line)
 }
 
 const CLAUDE_IDLE_MARK: char = '\u{2733}';
@@ -1230,16 +1244,17 @@ impl App {
     /// A session's tab label as every Agents row names it (the Overview, a manager's Workers
     /// rows, `Go to <manager>`, the long-hold entry): the words the person can find on the strip
     /// (`docs/DESIGN-owner-surfaces-2026-10-16.md` §3, §6). A worker's one chip is the Workers
-    /// chip, which reads this label, so while its shell titles its tab ([`shell_titled`]) the
-    /// agent it runs names it ([`agent_name`]).
+    /// chip, which reads this label, so while nothing it runs has titled its tab
+    /// ([`untitled_by_its_program`]: its shell titled it, or its title says nothing) what it runs
+    /// names it ([`worker_name`]): its agent, or a program worker's program.
     pub(crate) fn tab_label_of_session(&self, session: u64) -> String {
         let clip = |t: &str| label_line(title_without_agent_glyph(t));
         if let Some(label) = self.named_label_of_session(session) {
             return label;
         }
         if let Some(s) = self.pool.get(session) {
-            // The live title, and whether the tab's shell gave it; a busy terminal's, as the strip
-            // last read both.
+            // The live title, and whether nothing the tab runs gave it; a busy terminal's, as the
+            // strip last read both.
             let rung = |t: &aterm_core::terminal::Terminal| {
                 use crate::cwd_native::ReportedCwd as _;
                 let cwd = t.native_working_directory();
@@ -1248,9 +1263,9 @@ impl App {
                     title_without_agent_glyph(t.title()),
                     cwd.as_deref(),
                 );
-                (title, shell_titled(t))
+                (title, untitled_by_its_program(t))
             };
-            let (live, shell) = match s.term.try_lock() {
+            let (live, untitled) = match s.term.try_lock() {
                 Ok(t) => rung(&t),
                 Err(std::sync::TryLockError::Poisoned(p)) => rung(&p.into_inner()),
                 Err(std::sync::TryLockError::WouldBlock) => self
@@ -1258,17 +1273,18 @@ impl App {
                     .values()
                     .find_map(|ws| ws.tab_title_cache.get(&session))
                     .map_or((None, false), |cached| {
-                        (Some(cached.title.clone()), cached.shell)
+                        (Some(cached.title.clone()), cached.untitled)
                     }),
             };
             // A shell titles its tab by its folder and by each line it starts, and a worker's
-            // line opens with environment words: the agent names the worker until it titles the
+            // line opens with environment words or its program's path and words, and a title that
+            // says nothing leaves its folder: what it runs names the worker until that titles the
             // tab itself.
-            if shell
+            if untitled
                 && self.session_is_parked(session)
-                && let Some(agent) = agent_name(&s.ctx)
+                && let Some(name) = worker_name(&s.ctx)
             {
-                return agent.to_owned();
+                return name;
             }
             if let Some(label) = live.as_deref().and_then(clip) {
                 return label;

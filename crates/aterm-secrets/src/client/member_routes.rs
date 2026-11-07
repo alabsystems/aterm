@@ -33,6 +33,10 @@ pub(super) enum ProjectionEvent {
 /// What the worker waits on: whether a change of network came within `most`. A wait may end
 /// early with none (`also` ready); the worker then runs no round for it.
 pub(super) trait Changes: Send {
+    /// Check retained observation custody before another readiness source is consumed.
+    fn check(&self) -> std::io::Result<()> {
+        Ok(())
+    }
     fn wait(&mut self, most: Duration, also: Option<BorrowedFd<'_>>) -> bool;
     fn reset(&mut self) {}
 }
@@ -46,21 +50,45 @@ impl<F: FnMut(Duration) -> bool + Send> Changes for F {
 
 pub(super) struct NativeChanges {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    route: Option<crate::network::RouteChanges>,
+    route: std::io::Result<crate::network::RouteChanges>,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    open: Box<dyn FnMut() -> std::io::Result<crate::network::RouteChanges> + Send>,
 }
 
 impl NativeChanges {
     pub(super) fn new() -> Self {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        return Self::opening(crate::network::RouteChanges::open);
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        Self {}
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(super) fn opening(
+        mut open: impl FnMut() -> std::io::Result<crate::network::RouteChanges> + Send + 'static,
+    ) -> Self {
         Self {
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
-            route: crate::network::RouteChanges::open().ok(),
+            route: open(),
+            open: Box::new(open),
         }
     }
 }
 
 impl Changes for NativeChanges {
+    fn check(&self) -> std::io::Result<()> {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        self.route
+            .as_ref()
+            .map(|_| ())
+            .map_err(|error| std::io::Error::new(error.kind(), error.to_string()))?;
+        Ok(())
+    }
+
     fn reset(&mut self) {
-        *self = Self::new();
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            self.route = (self.open)();
+        }
     }
 
     /// A change of network ends the wait as one; `also`'s readiness and the deadline end it as
@@ -72,7 +100,7 @@ impl Changes for NativeChanges {
     fn wait(&mut self, most: Duration, also: Option<BorrowedFd<'_>>) -> bool {
         let deadline = Instant::now().checked_add(most);
         #[cfg(any(target_os = "macos", target_os = "linux"))]
-        if let Some(route) = &self.route {
+        if let Ok(route) = &self.route {
             match route.wait_beside(most, also) {
                 aterm_uds::network::RouteWake::Change => return true,
                 aterm_uds::network::RouteWake::Also | aterm_uds::network::RouteWake::Timeout => {
@@ -211,7 +239,11 @@ impl<C: Changes> Listener<C> {
         log: &(dyn Fn(&str) + Sync),
         project: &(dyn Fn(ProjectionEvent) + Sync),
         ending: &AtomicBool,
-    ) {
+    ) -> std::io::Result<()> {
+        // Do not consume a broker generation while this round cannot observe routes.
+        // The ordinary retry owns reopening, and reset owes one current observation
+        // because a move may already have happened before the subscription returned.
+        self.changed.check()?;
         let wait = self
             .due
             .map_or(self.look, |at| at.min(self.look))
@@ -239,7 +271,7 @@ impl<C: Changes> Listener<C> {
             });
         }
         if ending.load(Ordering::Acquire) {
-            return;
+            return Ok(());
         }
         if broker_ready {
             project(ProjectionEvent::BrokerReady);
@@ -262,7 +294,7 @@ impl<C: Changes> Listener<C> {
             }
         }
         if self.due.is_none_or(|at| at > Instant::now()) {
-            return;
+            return Ok(());
         }
         self.due = None;
         // The round and route worker share both the backoff and the actual ask.
@@ -283,6 +315,7 @@ impl<C: Changes> Listener<C> {
             }
         }
         self.last = Some(Instant::now());
+        Ok(())
     }
 }
 
@@ -367,10 +400,11 @@ fn retry_rounds(
     clock: Instant,
     ending: &AtomicBool,
     log: &(dyn Fn(&str) + Sync),
-    mut round: impl FnMut(),
+    mut round: impl FnMut() -> std::io::Result<()>,
     mut reset: impl FnMut(),
 ) {
     let mut retry = RunnerRetry::default();
+    let mut last_error = None;
     while !ending.load(Ordering::Acquire) {
         if let Some(left) = retry
             .remaining(elapsed(clock))
@@ -380,12 +414,24 @@ fn retry_rounds(
             continue;
         }
         retry.started();
-        if catch_unwind(AssertUnwindSafe(&mut round)).is_ok() {
-            retry.reaped(Last::Ended, elapsed(clock));
-        } else {
-            reset();
-            retry.reaped(Last::Failed, elapsed(clock));
-            log("member readiness round panicked; retrying with fresh observations");
+        let why = match catch_unwind(AssertUnwindSafe(&mut round)) {
+            Ok(Ok(())) => {
+                retry.reaped(Last::Ended, elapsed(clock));
+                last_error = None;
+                continue;
+            }
+            Ok(Err(error)) => {
+                format!(
+                    "member readiness source unavailable: {error}; retrying with fresh observations"
+                )
+            }
+            Err(_) => "member readiness round panicked; retrying with fresh observations".into(),
+        };
+        reset();
+        retry.reaped(Last::Failed, elapsed(clock));
+        if last_error.as_ref() != Some(&why) {
+            log(&why);
+            last_error = Some(why);
         }
     }
 }
@@ -439,7 +485,7 @@ pub(super) fn while_hearing<T>(
                                         listener
                                             .lock()
                                             .unwrap_or_else(PoisonError::into_inner)
-                                            .round(paths, members, ask, log, project, ending);
+                                            .round(paths, members, ask, log, project, ending)
                                     },
                                     || {
                                         listener
@@ -837,8 +883,14 @@ mod tests {
         kernel
             .set_nonblocking(true)
             .expect("a writer that never blocks");
-        let route = Some(crate::network::RouteChanges::over(heard.into()));
-        (NativeChanges { route }, kernel)
+        let route = Ok(crate::network::RouteChanges::over(heard.into()));
+        (
+            NativeChanges {
+                route,
+                open: Box::new(crate::network::RouteChanges::open),
+            },
+            kernel,
+        )
     }
 
     /// Kernel events that name no change of network, as fast as the stand-in takes them, never
@@ -906,7 +958,8 @@ mod tests {
         let (heard, peer) = std::os::unix::net::UnixStream::pair().expect("a stream pair");
         drop(peer);
         let mut changes = NativeChanges {
-            route: Some(crate::network::RouteChanges::over(heard.into())),
+            route: Ok(crate::network::RouteChanges::over(heard.into())),
+            open: Box::new(crate::network::RouteChanges::open),
         };
         let (quiet, _writer) = std::io::pipe().expect("a broker descriptor nobody writes");
         let most = Duration::from_millis(300);
@@ -942,7 +995,8 @@ mod tests {
             "the premise: the refusal is waiting"
         );
         let mut changes = NativeChanges {
-            route: Some(crate::network::RouteChanges::over(heard.into())),
+            route: Ok(crate::network::RouteChanges::over(heard.into())),
+            open: Box::new(crate::network::RouteChanges::open),
         };
         let (quiet, _writer) = std::io::pipe().expect("a broker descriptor nobody writes");
         assert!(!changes.wait(Duration::from_millis(300), Some(quiet.as_fd())));
@@ -993,7 +1047,8 @@ mod tests {
         let (heard, peer) = std::os::unix::net::UnixStream::pair().expect("a stream pair");
         drop(peer);
         let mut failed = NativeChanges {
-            route: Some(crate::network::RouteChanges::over(heard.into())),
+            route: Ok(crate::network::RouteChanges::over(heard.into())),
+            open: Box::new(crate::network::RouteChanges::open),
         };
         let began = Instant::now();
         assert!(

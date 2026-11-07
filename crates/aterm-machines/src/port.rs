@@ -1173,9 +1173,10 @@ pub trait System: Sync {
     }
 
     /// Acquire an exclusive `flock` on `path` within `limit`, held until the returned guard drops.
+    /// A backend without locking support refuses rather than returning an unlocked guard.
     fn exclusive(&self, path: &Path, limit: Duration) -> io::Result<Box<dyn std::any::Any>> {
         let _ = (path, limit);
-        Ok(Box::new(()))
+        Err(io::ErrorKind::Unsupported.into())
     }
 
     /// Listen on a loopback port and spawn `cmd` per connection with stdio bound to the socket.
@@ -1235,6 +1236,26 @@ pub trait System: Sync {
         None
     }
 
+    /// The installed root LAN broker's checked protocol hello, with no direct
+    /// fallback. This is an effect-boundary read, not the GUI's metadata probe.
+    ///
+    /// # Errors
+    /// The strict exchange failed, or this platform supplies no broker reader.
+    fn installed_lan_broker(&self) -> Result<aterm_uds::lan::BrokerHello, String> {
+        Err("this system reads no installed LAN broker".into())
+    }
+
+    /// Judge a staged app against the designated requirement of this loaded process,
+    /// checking all architectures, nested code and resources before root publication.
+    ///
+    /// # Errors
+    /// A typed code refusal, unread check or unanswered system signing service.
+    fn check_app_copy(&self, _path: &Path) -> Result<(), aterm_keeper::identity::CheckError> {
+        Err(aterm_keeper::identity::CheckError::Unchecked(
+            "this system checks no staged app copies".into(),
+        ))
+    }
+
     /// The code identity of the executable at `path`
     /// ([`aterm_uds::lan::install::CodeDirectories`]), read without root. The default reads the
     /// whole file through [`System::stat`] and [`System::read_file`]; the live system reads only
@@ -1255,20 +1276,20 @@ pub trait System: Sync {
     /// volumes (`EXDEV`), Apple's `ditto` copies it instead ([`Cloned::Copied`]).
     ///
     /// # Errors
-    /// The clone's error, or the copy's in one line.
-    fn clone_tree(&self, from: &Path, to: &Path) -> io::Result<Cloned> {
+    /// Unsafe source shape, the clone's error, or the copy's in one line.
+    fn clone_tree(&self, from: &Path, to: &Path) -> Result<Cloned, aterm_uds::app_image::Error> {
         let _ = (from, to);
-        Err(io::ErrorKind::Unsupported.into())
+        Err(io::Error::from(io::ErrorKind::Unsupported).into())
     }
 
     /// Make `path` (with `tree`, everything below it too) owned by `root:wheel` with no group or
     /// other write bit, never following a link.
     ///
     /// # Errors
-    /// The first I/O error.
-    fn root_own(&self, path: &Path, tree: bool) -> io::Result<()> {
+    /// Unsafe directory/link shape, or the first I/O error.
+    fn root_own(&self, path: &Path, tree: bool) -> Result<(), aterm_uds::app_image::Error> {
         let _ = (path, tree);
-        Err(io::ErrorKind::Unsupported.into())
+        Err(io::Error::from(io::ErrorKind::Unsupported).into())
     }
 
     /// Exchange the names `a` and `b` atomically (APFS `RENAME_SWAP`).
@@ -2547,6 +2568,20 @@ impl System for Live {
             .map(Path::to_path_buf)
     }
 
+    fn installed_lan_broker(&self) -> Result<aterm_uds::lan::BrokerHello, String> {
+        #[cfg(target_os = "macos")]
+        return aterm_uds::lan::broker::installed_hello().map_err(|error| error.to_string());
+        #[cfg(not(target_os = "macos"))]
+        Err("only macOS installs a root LAN broker".into())
+    }
+
+    fn check_app_copy(&self, path: &Path) -> Result<(), aterm_keeper::identity::CheckError> {
+        use aterm_keeper::identity::{CheckError, Identity, IdentityPolicy};
+        Identity::for_self(IdentityPolicy::Designated)
+            .map_err(CheckError::Unchecked)?
+            .admits_code_at_strictly(path)
+    }
+
     fn code_directories(
         &self,
         path: &Path,
@@ -2554,10 +2589,12 @@ impl System for Live {
         aterm_uds::lan::install::CodeDirectories::of_file(path)
     }
 
-    fn clone_tree(&self, from: &Path, to: &Path) -> io::Result<Cloned> {
+    fn clone_tree(&self, from: &Path, to: &Path) -> Result<Cloned, aterm_uds::app_image::Error> {
         match tree::clone(from, to) {
             Ok(()) => Ok(Cloned::Cloned),
-            Err(error) if error.raw_os_error() == Some(libc::EXDEV) => {
+            Err(aterm_uds::app_image::Error::Io(error))
+                if error.raw_os_error() == Some(libc::EXDEV) =>
+            {
                 // No ACL or quarantine of the person's comes along, and the seal
                 // ([`tree::own`]) removes any ACL and set-id bit all the same. Extended
                 // attributes stay: they grant no access, and a signed non-Mach-O file keeps its
@@ -2568,19 +2605,20 @@ impl System for Live {
                     .arg(to);
                 match self.run(&cmd) {
                     Ok(ran) if ran.success() => Ok(Cloned::Copied),
-                    Ok(ran) => Err(io::Error::other(format!(
-                        "{}: {}",
-                        cmd.display(),
-                        ran.describe()
-                    ))),
-                    Err(e) => Err(io::Error::other(format!("{}: {e}", cmd.display()))),
+                    Ok(ran) => {
+                        Err(
+                            io::Error::other(format!("{}: {}", cmd.display(), ran.describe()))
+                                .into(),
+                        )
+                    }
+                    Err(e) => Err(io::Error::other(format!("{}: {e}", cmd.display())).into()),
                 }
             }
             Err(error) => Err(error),
         }
     }
 
-    fn root_own(&self, path: &Path, tree: bool) -> io::Result<()> {
+    fn root_own(&self, path: &Path, tree: bool) -> Result<(), aterm_uds::app_image::Error> {
         tree::own(path, 0, 0, tree)
     }
 
@@ -2796,12 +2834,15 @@ mod fake {
     #[derive(Default)]
     pub struct Fake {
         repository_record: Arc<crate::sync::repository_refresh::Memory>,
+        exclusive_paths: Arc<Mutex<std::collections::BTreeSet<PathBuf>>>,
+        exclusive_errors: Mutex<BTreeMap<PathBuf, io::ErrorKind>>,
         /// The tools a test models instead of scripting ([`Fake::simulate`]).
         model: Mutex<Option<Model>>,
         scroll_natural: Mutex<Option<bool>>,
         scroll_set_error: Mutex<Option<String>>,
         scroll_set_readback: Mutex<Option<bool>>,
         replies: Mutex<BTreeMap<String, Vec<Ran>>>,
+        broker_hellos: Mutex<Vec<Result<aterm_uds::lan::BrokerHello, String>>>,
         github_replies: Mutex<BTreeMap<String, Vec<Result<GithubResponse, GithubError>>>>,
         /// What each [`System::bonjour`] request hears, by its [`Bonjour::key`]
         /// ([`Fake::on_bonjour`]).
@@ -2888,6 +2929,8 @@ mod fake {
         /// What a [`System::sleep`] does besides recording itself ([`Fake::on_sleep`]).
         on_sleep: Mutex<Option<SleepHook>>,
         on_owned_read: Mutex<Option<OwnedReadHook>>,
+        on_chown: Mutex<Option<OwnedReadHook>>,
+        app_check: Mutex<Option<AppCheckHook>>,
         /// What [`System::low_data_mode`] answers: unknown unless a test sets it.
         pub low_data: Option<bool>,
         install_path: Mutex<Option<super::InstallNetworkReading>>,
@@ -2942,12 +2985,25 @@ mod fake {
 
     type SleepHook = Arc<dyn Fn(&Fake, std::time::Duration) + Send + Sync>;
     type OwnedReadHook = Arc<dyn Fn(&Fake, &Path) + Send + Sync>;
+    type AppCheckHook =
+        Arc<dyn Fn(&Fake, &Path) -> Result<(), aterm_keeper::identity::CheckError> + Send + Sync>;
 
     #[derive(Clone)]
     enum Output {
         File(PathBuf, Vec<u8>),
         Stat(PathBuf, Stat),
         Running(Vec<String>),
+    }
+
+    struct FakeExclusive {
+        held: Arc<Mutex<std::collections::BTreeSet<PathBuf>>>,
+        path: PathBuf,
+    }
+
+    impl Drop for FakeExclusive {
+        fn drop(&mut self) {
+            self.held.lock().unwrap().remove(&self.path);
+        }
     }
 
     struct Journaled<'a>(&'a Fake);
@@ -3131,6 +3187,24 @@ mod fake {
         /// Interleave a filesystem change after an admitted read snapshot was copied.
         pub fn on_owned_read(&self, hook: impl Fn(&Fake, &Path) + Send + Sync + 'static) -> &Self {
             *self.on_owned_read.lock().unwrap() = Some(Arc::new(hook));
+            self
+        }
+
+        /// Interleave another filesystem owner after a real ownership operation.
+        pub fn on_chown(&self, hook: impl Fn(&Fake, &Path) + Send + Sync + 'static) -> &Self {
+            *self.on_chown.lock().unwrap() = Some(Arc::new(hook));
+            self
+        }
+
+        /// Model the actual typed staged-copy check, with candidate bytes available to it.
+        pub fn app_check(
+            &self,
+            check: impl Fn(&Fake, &Path) -> Result<(), aterm_keeper::identity::CheckError>
+            + Send
+            + Sync
+            + 'static,
+        ) -> &Self {
+            *self.app_check.lock().unwrap() = Some(Arc::new(check));
             self
         }
 
@@ -3440,6 +3514,12 @@ mod fake {
             self
         }
 
+        /// Script a strict installed-broker exchange; the last result repeats.
+        pub fn on_lan_broker(&self, hello: Result<aterm_uds::lan::BrokerHello, String>) -> &Self {
+            self.broker_hellos.lock().unwrap().push(hello);
+            self
+        }
+
         /// Exact HID service changes requested through [`System::set_keyboard_maps`].
         pub fn keyboard_changes(&self) -> Vec<super::KeyboardMapChange> {
             self.keyboard_changes.lock().unwrap().clone()
@@ -3559,6 +3639,15 @@ mod fake {
                 .lock()
                 .unwrap()
                 .insert(path.to_owned(), identity);
+            self
+        }
+
+        /// Make exclusive lock acquisition at `path` fail with `kind`.
+        pub fn exclusive_fails(&self, path: &Path, kind: io::ErrorKind) -> &Self {
+            self.exclusive_errors
+                .lock()
+                .unwrap()
+                .insert(path.to_owned(), kind);
             self
         }
 
@@ -3721,6 +3810,25 @@ mod fake {
     }
 
     impl System for Fake {
+        /// Deterministic per-path exclusion: contention reports a spent wait budget without
+        /// sleeping. Each fake owns an independent filesystem and lock table.
+        fn exclusive(
+            &self,
+            path: &Path,
+            _limit: std::time::Duration,
+        ) -> io::Result<Box<dyn std::any::Any>> {
+            if let Some(kind) = self.exclusive_errors.lock().unwrap().get(path).copied() {
+                return Err(kind.into());
+            }
+            if !self.exclusive_paths.lock().unwrap().insert(path.to_owned()) {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            Ok(Box::new(FakeExclusive {
+                held: Arc::clone(&self.exclusive_paths),
+                path: path.to_owned(),
+            }))
+        }
+
         fn keyboard_service_ids(&self) -> Result<Vec<u64>, String> {
             self.calls
                 .lock()
@@ -4036,7 +4144,38 @@ mod fake {
             self.running_app.clone()
         }
 
-        fn clone_tree(&self, from: &Path, to: &Path) -> io::Result<super::Cloned> {
+        fn installed_lan_broker(&self) -> Result<aterm_uds::lan::BrokerHello, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push("installed LAN broker hello".into());
+            let mut hellos = self.broker_hellos.lock().unwrap();
+            match hellos.len() {
+                0 => Err("fake: no installed broker hello scripted".into()),
+                1 => hellos[0].clone(),
+                _ => hellos.remove(0),
+            }
+        }
+
+        fn check_app_copy(&self, path: &Path) -> Result<(), aterm_keeper::identity::CheckError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("check staged app {}", path.display()));
+            let check = self.app_check.lock().unwrap().clone();
+            match check {
+                Some(check) => check(self, path),
+                None => Err(aterm_keeper::identity::CheckError::Unchecked(
+                    "fake: no staged app check modeled".into(),
+                )),
+            }
+        }
+
+        fn clone_tree(
+            &self,
+            from: &Path,
+            to: &Path,
+        ) -> Result<super::Cloned, aterm_uds::app_image::Error> {
             self.calls
                 .lock()
                 .unwrap()
@@ -4051,13 +4190,13 @@ mod fake {
                 })
                 .collect();
             if below.is_empty() {
-                return Err(io::ErrorKind::NotFound.into());
+                return Err(io::Error::from(io::ErrorKind::NotFound).into());
             }
             files.extend(below);
             Ok(super::Cloned::Cloned)
         }
 
-        fn root_own(&self, path: &Path, tree: bool) -> io::Result<()> {
+        fn root_own(&self, path: &Path, tree: bool) -> Result<(), aterm_uds::app_image::Error> {
             self.calls.lock().unwrap().push(format!(
                 "root-own{} {}",
                 if tree { " -R" } else { "" },
@@ -4448,6 +4587,10 @@ mod fake {
                 .lock()
                 .unwrap()
                 .push(format!("chown {uid}:{gid} {}", path.display()));
+            let hook = self.on_chown.lock().unwrap().clone();
+            if let Some(hook) = hook {
+                hook(self, path);
+            }
             Ok(())
         }
 
@@ -5015,6 +5158,41 @@ mod fake {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_exclusive_guards_serialize_independent_opens_and_preserve_the_inode() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join("claim.lock");
+        let live = Live::new();
+        let held = live.exclusive(&path, Duration::ZERO).unwrap();
+        let identity = live.file_id(&path).unwrap();
+        let Err(error) = Live::new().exclusive(&path, Duration::ZERO) else {
+            panic!("independent open must not acquire the held inode");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        drop(held);
+        let _reclaimed = Live::new().exclusive(&path, Duration::ZERO).unwrap();
+        assert_eq!(live.file_id(&path).unwrap(), identity);
+    }
+
+    #[test]
+    fn a_fake_exclusive_guard_excludes_until_drop_without_blocking_other_paths() {
+        let sys = Fake::default();
+        let path = Path::new("/state/claim.lock");
+        let held = sys.exclusive(path, Duration::ZERO).unwrap();
+        let Err(refused) = sys.exclusive(path, Duration::ZERO) else {
+            panic!("the path is held");
+        };
+        assert_eq!(refused.kind(), io::ErrorKind::TimedOut);
+        let other = sys
+            .exclusive(Path::new("/state/other.lock"), Duration::ZERO)
+            .unwrap();
+        drop(held);
+        let reclaimed = sys.exclusive(path, Duration::ZERO).unwrap();
+        assert!(sys.exclusive(path, Duration::ZERO).is_err());
+        drop((reclaimed, other));
+        assert!(sys.exclusive(path, Duration::ZERO).is_ok());
+    }
 
     /// A user file is written only at a plain path strictly inside the user's home with
     /// permission bits alone: `..` out of the home, the home itself, a `/` home and a setuid

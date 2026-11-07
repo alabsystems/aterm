@@ -398,6 +398,127 @@ fn incremental_source(world: &World) -> (PathBuf, PathBuf, String, String) {
     (remote, source, before, after)
 }
 
+#[test]
+fn native_push_phase_observation_preserves_success_refusal_and_failure() {
+    use agh::git::NativePushPhase::{Connectivity, MetadataPack, MetadataVerify};
+    use agh::policy::{RouteRequest, RouteTarget};
+    use std::sync::{Mutex, PoisonError};
+    use std::time::Instant;
+
+    let world = World::canonical("native-phase-observation");
+    common::canonical_repos(&world.fake);
+    let (remote, source, before, after) = incremental_source(&world);
+    let slug = common::slug("fixture-dev/app");
+    let batch = push_batch(&[("refs/heads/main", &before, &after)]);
+    let source_config = std::fs::read(source.join(".git/config")).unwrap();
+    let spans = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&spans);
+    let fx = Fx::simulated(live_start()).with_native_push_observer_for_tests(move |span| {
+        observed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(span);
+    });
+    let gh = world
+        .client(git_env())
+        .fx(Arc::new(fx))
+        .git_remote_for_tests("fixture-dev/app", &remote)
+        .build();
+    let permit = common::permit(&gh, &RouteRequest::write(RouteTarget::Repo(slug.clone())));
+    // The observer persists across calls, and each call has three distinct real spans.
+    for call in 0..2 {
+        let began = Instant::now();
+        gh.refs(&slug).check_push(&permit, &source, &batch).unwrap();
+        let finished = Instant::now();
+        let spans = spans.lock().unwrap();
+        assert_eq!(spans.len(), (call + 1) * 3);
+        let current = &spans[call * 3..];
+        assert_eq!(
+            current.iter().map(|s| s.phase).collect::<Vec<_>>(),
+            [MetadataPack, MetadataVerify, Connectivity]
+        );
+        assert!(current.iter().all(|s| s.success
+            && began <= s.started
+            && s.started <= s.finished
+            && s.finished <= finished));
+        assert!(current.windows(2).all(|p| p[0].finished <= p[1].started));
+    }
+    let wrong_before = host_git(&source, &["rev-parse", &format!("{before}^")]);
+    let error = gh
+        .refs(&slug)
+        .check_push(
+            &permit,
+            &source,
+            &push_batch(&[("refs/heads/main", &wrong_before, &after)]),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind, Kind::Conflict);
+    assert_eq!(
+        spans.lock().unwrap().len(),
+        6,
+        "refusal precedes metadata work"
+    );
+
+    let command = gh
+        .fx()
+        .children_run()
+        .into_iter()
+        .find(|child| child.args.iter().any(|a| a == "--connectivity-only"))
+        .unwrap();
+    let failed_spans = Arc::new(Mutex::new(Vec::new()));
+    let failed_observed = Arc::clone(&failed_spans);
+    let failed = Fx::simulated(live_start())
+        .with_native_push_observer_for_tests(move |span| {
+            failed_observed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(span);
+        })
+        .with_git_intercept_once_for_tests(
+            command.program,
+            command.args,
+            || {},
+            |result| {
+                result.as_mut().unwrap().code = Some(17);
+            },
+        );
+    let failed = world
+        .client(git_env())
+        .fx(Arc::new(failed))
+        .git_remote_for_tests("fixture-dev/app", &remote)
+        .build();
+    let error = failed
+        .refs(&slug)
+        .check_push(&permit, &source, &batch)
+        .unwrap_err();
+    assert_eq!(error.side_effect, SideEffect::None);
+    let failed_spans = failed_spans.lock().unwrap();
+    assert_eq!(
+        failed_spans
+            .iter()
+            .map(|s| (s.phase, s.success))
+            .collect::<Vec<_>>(),
+        [
+            (MetadataPack, true),
+            (MetadataVerify, true),
+            (Connectivity, false)
+        ]
+    );
+    assert_eq!(host_git(&source, &["rev-parse", "main"]), after);
+    assert_eq!(host_git(&remote, &["rev-parse", "main"]), before);
+    assert_eq!(
+        std::fs::read(source.join(".git/config")).unwrap(),
+        source_config
+    );
+    assert!(!world.dirs.journal().exists());
+}
+
+#[test]
+#[should_panic]
+fn native_push_phase_observation_cannot_be_installed_on_a_live_client() {
+    let _ = Fx::live().with_native_push_observer_for_tests(|_| {});
+}
+
 /// Unlink before writing: a local clone can share the old loose inode with its
 /// fixture remote, whose authenticated bytes must stay independent.
 fn replace_loose(source: &Path, wanted: &str, substitute: &str) {
@@ -2786,6 +2907,213 @@ fn a_leased_delete_pushes_as_the_writer() {
             .any(|(name, _)| name == "refs/tags/v1")
     );
     assert!(files(&world.dirs.grants()).is_empty());
+}
+
+#[test]
+fn native_http_objects_atomic_refusal_and_lost_reply_use_real_git_and_helper() {
+    use agh::journal::IntentStore as _;
+    use agh::policy::{RouteRequest, RouteTarget};
+    use agh_fake::git_backend::{GitHttpBackend, Identity, Service};
+
+    let world = reader_world("native-http-objects");
+    let seed = bare_repo(world.path(), "seed");
+    let before = host_git(&seed, &["rev-parse", "main"]);
+    let source = world.path().join("source");
+    host_git(
+        world.path(),
+        &[
+            "clone",
+            "--quiet",
+            &seed.to_string_lossy(),
+            &source.to_string_lossy(),
+        ],
+    );
+    std::fs::write(source.join("record"), b"synthetic object body\n").unwrap();
+    host_git(&source, &["add", "record"]);
+    host_git(&source, &["commit", "--quiet", "-m", "new object"]);
+    host_git(&source, &["tag", "-a", "v1", "-m", "exact annotated tag"]);
+    let after = host_git(&source, &["rev-parse", "main"]);
+    let tag = host_git(&source, &["rev-parse", "v1"]);
+    let tag_bytes = host_git(&source, &["cat-file", "tag", &tag]);
+    let config = std::fs::read(source.join(".git/config")).unwrap();
+    let source_refs = host_git(&source, &["show-ref"]);
+    let backend = GitHttpBackend::start(
+        "fixture-dev/app",
+        &seed,
+        &agh_fake::token("reader"),
+        &agh_fake::token("dev"),
+    )
+    .unwrap();
+    let ports = world.fake.ports();
+    let gh = git_builder(
+        world.router.clone(),
+        Endpoints::loopback(ports.api, ports.uploads, backend.port(), ports.cdn),
+        &world.dirs,
+        git_env(),
+        live_start(),
+    )
+    .build();
+    let slug = common::slug("fixture-dev/app");
+    let read = gh.run_git(&GitRun::ls_remote(&slug, None)).unwrap();
+    assert_eq!(read.as_.as_deref(), Some("reader"));
+    assert!(read.stdout.contains(&before));
+    let permit = common::permit(&gh, &RouteRequest::write(RouteTarget::Repo(slug.clone())));
+    let batch = push_batch(&[
+        ("refs/heads/main", &before, &after),
+        ("refs/tags/v1", ABSENT, &tag),
+    ]);
+    gh.refs(&slug)
+        .check_push(&permit, &source, &batch)
+        .expect("real atomic capability");
+    let journal = gh.journal(&slug).unwrap();
+    assert!(journal.open().unwrap().is_empty());
+    assert_eq!(
+        host_git(backend.repository(), &["show-ref"]),
+        host_git(&seed, &["show-ref"])
+    );
+
+    // Force an actual receive-pack transaction failure after object transfer. A
+    // client-side stale lease alone cannot prove server-side atomic rollback.
+    let lock = backend.repository().join("refs/heads/main.lock");
+    std::fs::write(&lock, b"owned fixture lock\n").unwrap();
+    let refused = gh
+        .refs(&slug)
+        .push_atomic(&permit, &source, &batch, &journal)
+        .unwrap()
+        .into_result()
+        .expect_err("atomic transaction refused");
+    assert_eq!(refused.kind, Kind::Refused);
+    assert_eq!(
+        host_git(backend.repository(), &["show-ref"]),
+        host_git(&seed, &["show-ref"])
+    );
+    assert!(journal.open().unwrap().is_empty());
+    assert!(
+        backend
+            .seen()
+            .iter()
+            .any(|r| r.post && r.service == Some(Service::Receive) && r.backend_attempted)
+    );
+    std::fs::remove_file(&lock).unwrap();
+
+    gh.refs(&slug)
+        .push_atomic(&permit, &source, &batch, &journal)
+        .unwrap()
+        .into_result()
+        .expect("acknowledged real atomic push");
+    assert_eq!(
+        host_git(backend.repository(), &["rev-parse", "main"]),
+        after
+    );
+    assert_eq!(
+        host_git(backend.repository(), &["cat-file", "tag", &tag]),
+        tag_bytes
+    );
+    assert!(journal.open().unwrap().is_empty());
+    let received = world.path().join("received");
+    let clone = gh
+        .run_git(&GitRun::new_clone(&slug, &received))
+        .expect("real upload-pack objects");
+    assert_eq!(clone.as_.as_deref(), Some("reader"));
+    assert_eq!(
+        std::fs::read(received.join("record")).unwrap(),
+        b"synthetic object body\n"
+    );
+    assert_eq!(host_git(&received, &["cat-file", "tag", &tag]), tag_bytes);
+    let refs_before_stale = host_git(backend.repository(), &["show-ref"]);
+    let posts = || {
+        backend
+            .seen()
+            .iter()
+            .filter(|r| r.post && r.service == Some(Service::Receive))
+            .count()
+    };
+    let posts_before = posts();
+    let stale = gh
+        .run_git(&GitRun::push_refs(
+            &slug,
+            &source,
+            push_batch(&[
+                ("refs/heads/main", &before, &after),
+                ("refs/attest/unwanted", ABSENT, &after),
+            ]),
+            false,
+        ))
+        .expect_err("stale lease");
+    assert_eq!(stale.kind, Kind::Conflict);
+    assert_eq!(posts(), posts_before);
+    assert_eq!(
+        host_git(backend.repository(), &["show-ref"]),
+        refs_before_stale
+    );
+    assert_eq!(host_git(&source, &["show-ref"]), source_refs);
+    assert_eq!(std::fs::read(source.join(".git/config")).unwrap(), config);
+    assert!(!source.join(".git/FETCH_HEAD").exists());
+
+    std::fs::write(source.join("record"), b"second synthetic body\n").unwrap();
+    host_git(&source, &["commit", "--quiet", "-am", "next object"]);
+    let next = host_git(&source, &["rev-parse", "main"]);
+    let next_batch = push_batch(&[
+        ("refs/heads/main", &after, &next),
+        ("refs/attest/next", ABSENT, &next),
+    ]);
+    backend.lose_next_receive_response();
+    let outcome = gh
+        .refs(&slug)
+        .push_atomic(&permit, &source, &next_batch, &journal)
+        .unwrap();
+    let agh::write::Outcome::Unknown { intent, error } = outcome else {
+        panic!("lost HTTP response must stay unknown");
+    };
+    assert_eq!(error.side_effect, SideEffect::Unknown);
+    assert_eq!(journal.open().unwrap().len(), 1);
+    let after_loss_posts = posts();
+    let blocked = gh
+        .refs(&slug)
+        .push_atomic(&permit, &source, &next_batch, &journal)
+        .expect_err("unknown cannot be retried");
+    assert_eq!(blocked.kind, Kind::OutcomeUnknown);
+    assert_eq!(posts(), after_loss_posts);
+
+    // Reconcile from fresh authenticated HTTP ref discovery, without replaying
+    // the write. Only an exact match of every AFTER value closes this intent.
+    let discovered = gh.run_git(&GitRun::ls_remote(&slug, None)).unwrap();
+    assert_eq!(discovered.as_.as_deref(), Some("reader"));
+    let refs: std::collections::BTreeMap<_, _> = discovered
+        .stdout
+        .lines()
+        .filter_map(|line| line.split_once('\t').map(|(oid, name)| (name, oid)))
+        .collect();
+    for update in next_batch.updates() {
+        assert_eq!(
+            refs.get(update.reference.as_str()).copied(),
+            Some(update.after.as_str())
+        );
+    }
+    journal
+        .observe(&intent, Some(0))
+        .expect("record confirmed atomic refs");
+    assert!(journal.open().unwrap().is_empty());
+    assert_eq!(posts(), after_loss_posts);
+    assert_eq!(host_git(&seed, &["rev-parse", "main"]), before);
+    assert!(files(&world.dirs.grants()).is_empty());
+    let seen = backend.seen();
+    assert!(
+        seen.iter().any(|r| r.post
+            && r.service == Some(Service::Upload)
+            && r.identity == Identity::Reader)
+    );
+    assert!(
+        seen.iter()
+            .filter(|r| r.backend_attempted && r.service == Some(Service::Receive))
+            .all(|r| r.identity == Identity::Writer)
+    );
+    assert_eq!(seen.iter().filter(|r| r.response_dropped).count(), 1);
+    assert!(
+        seen.iter()
+            .filter(|r| r.identity == Identity::Anonymous)
+            .all(|r| !r.backend_attempted && r.status == 401)
+    );
 }
 
 #[test]

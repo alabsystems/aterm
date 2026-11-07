@@ -2911,8 +2911,9 @@ type TaskExitedFn = dyn Fn(&str) + Send + Sync;
 type WindowEndingFn = dyn Fn() -> bool + Send + Sync;
 /// Every session with a task record, as the startup deadline reads it ([`Acts::startups`]).
 type StartupsFn = dyn Fn(&std::collections::HashSet<String>) -> Vec<Startup> + Send + Sync;
-/// The startup deadline's mark on session `sid` ([`Acts::startup_mark`]).
-type StartupMarkFn = dyn Fn(&str, &StartupMark<'_>) + Send + Sync;
+/// The startup deadline's mark for the task observation it judged ([`Acts::startup_mark`]).
+/// True when it landed; false keeps the decision's next look armed.
+type StartupMarkFn = dyn Fn(&Startup, &StartupMark<'_>) -> bool + Send + Sync;
 /// The limit row the conversation of a tab's agent stands at, by its transcript.
 type StandingLimitFn =
     dyn Fn(&str, &Snapshot) -> Option<aterm_agent::harness::upgrade::StandingLimit> + Send + Sync;
@@ -7505,7 +7506,16 @@ impl WorkerIdle {
 
     /// The host's step at an idle point ([`Self::idle_point`], which sets a look after it while the conversation is unnamed).
     fn idle_step(&self, point: IdlePoint) -> Option<HostStep> {
+        aterm_log::debug!(
+            "harness @{}: idle upgrade point carry_only={}",
+            self.sid,
+            point.carry_only
+        );
         if self.native_stands_down() {
+            aterm_log::debug!(
+                "harness @{}: idle upgrade point stands down for native coordination",
+                self.sid
+            );
             return None;
         }
         let upgraded = upgrades(self.agent);
@@ -7532,11 +7542,13 @@ impl WorkerIdle {
             due_moved(&self.kept);
         }
         let due = || {
-            if upgraded && self.switches.upgrade() {
+            let due = if upgraded && self.switches.upgrade() {
                 due_at_point(&self.sid, &self.kept, hooks, hooks.acts.due_read)
             } else {
                 Due::No
-            }
+            };
+            aterm_log::debug!("harness @{}: idle upgrade due={due:?}", self.sid);
+            due
         };
         let only = carries_only(self.agent);
         let owed = (hooks.acts.owed)(&self.sid, only);
@@ -7642,27 +7654,34 @@ impl WorkerIdle {
         } else {
             run.after(&step, self.grace)
         };
-        match after {
+        aterm_log::debug!(
+            "harness @{}: idle action={what} step={step} after={after:?}",
+            self.sid
+        );
+        let relook = match after {
             After::NextIdle => {
                 self.upgrade_runs(&mut run);
                 self.park.store(true, Ordering::SeqCst);
+                // A completed carry consumed this idle point and its activation. Its
+                // delivered input may leave the same idle screen, so preserve any move
+                // still due as a fresh guarded look rather than requiring another event.
+                what == "carry-on"
+                    && step.split_once(':').map_or(step.as_str(), |(head, _)| head) == "continued"
+                    && due() != Due::No
             }
             After::Later(pause) => {
                 self.upgrade_runs(&mut run);
                 *self.look_at.lock().unwrap_or_else(PoisonError::into_inner) =
                     Some(Instant::now() + (hooks.pause)(pause));
                 ring();
+                false
             }
             After::Finished => {
                 self.upgrade_runs(&mut run);
                 // A carry-on that finished took this point from a move due beside it: the record
                 // it settled can outlive its agent (a press restarted it with no supervisor to
                 // close its look), and no later point may come to an agent left idle.
-                if (hooks.acts.owed)(&self.sid, only) || (what == "carry-on" && due() != Due::No) {
-                    *self.look_at.lock().unwrap_or_else(PoisonError::into_inner) =
-                        Some(Instant::now() + (hooks.pause)(upgrade_drive::first_look()));
-                    ring();
-                }
+                (hooks.acts.owed)(&self.sid, only) || (what == "carry-on" && due() != Due::No)
             }
             After::Broken => {
                 if !std::mem::replace(&mut run.broken, true) {
@@ -7677,8 +7696,15 @@ impl WorkerIdle {
                         dir: harness_state().map(|state| state.join("upgrade")),
                     });
                 }
+                false
             }
+        };
+        if relook {
+            *self.look_at.lock().unwrap_or_else(PoisonError::into_inner) =
+                Some(Instant::now() + (hooks.pause)(upgrade_drive::first_look()));
+            ring();
         }
+        aterm_log::debug!("harness @{}: idle action={what} relook={relook}", self.sid);
         Some(HostStep {
             line: format!("{what} step={step}"),
             moved: upgrade_drive::moved(&step),
@@ -15835,7 +15861,7 @@ impl InstallWork {
 pub(crate) struct Startup {
     pub(crate) sid: String,
     pub(crate) state: StartupState,
-    /// The task revision this look read; an install stall applies only to that record.
+    /// The task revision this look read; a deadline decision applies only to that record.
     pub(crate) record_rev: u64,
     /// When the record entered its state (its `since_ms=`): where the deadline counts from.
     pub(crate) since: Instant,
@@ -16499,7 +16525,6 @@ pub(crate) enum StartupMark<'a> {
     /// An install's quiet deadline, bound to the task and launcher episode read by the look.
     InstallStalled {
         hold: &'a StartupHold,
-        record_rev: u64,
         install_mark: u64,
     },
     /// `working` again, and the attention the startup stall set taken down.
@@ -16632,7 +16657,7 @@ fn look_at_startups(
         match (w.state, &w.seen) {
             (StartupState::Other, _) => {}
             (StartupState::StallOver, _) => {
-                (hooks.acts.startup_mark)(&w.sid, &StartupMark::Over);
+                (hooks.acts.startup_mark)(w, &StartupMark::Over);
                 soonest(now + STARTUP_UNREAD_LOOK);
             }
             (StartupState::StalledHeld, _) => {
@@ -16656,7 +16681,9 @@ fn look_at_startups(
                 books.started.insert(w.sid.clone());
                 books.hands.remove(&w.sid);
                 if w.state == StartupState::StalledAtStartup {
-                    (hooks.acts.startup_mark)(&w.sid, &StartupMark::Started);
+                    if !(hooks.acts.startup_mark)(w, &StartupMark::Started) {
+                        soonest(now + HELD_RELOOK);
+                    }
                 } else if let Some(at) = judge_held(books, w, now, from.max(back), hooks) {
                     soonest(at);
                 }
@@ -16716,11 +16743,15 @@ fn look_at_startups(
                     });
                     continue;
                 }
-                (hooks.acts.startup_mark)(&w.sid, &StartupMark::Stalled { hold });
+                if !(hooks.acts.startup_mark)(w, &StartupMark::Stalled { hold }) {
+                    soonest(now + HELD_RELOOK);
+                }
             }
             (StartupState::StalledAtStartup, StartupSeen::Holds(hold)) => {
-                if restates(w.standing.as_deref(), hold) {
-                    (hooks.acts.startup_mark)(&w.sid, &StartupMark::Restated { hold });
+                if restates(w.standing.as_deref(), hold)
+                    && !(hooks.acts.startup_mark)(w, &StartupMark::Restated { hold })
+                {
+                    soonest(now + HELD_RELOOK);
                 }
             }
         }
@@ -16768,10 +16799,9 @@ fn judge_install_startup(
         Some(limit.min(now + HELD_RELOOK))
     } else {
         (hooks.acts.startup_mark)(
-            &w.sid,
+            w,
             &StartupMark::InstallStalled {
                 hold,
-                record_rev: w.record_rev,
                 install_mark: w.install_mark,
             },
         );
@@ -16825,7 +16855,7 @@ fn judge_held(
         return Some(now + STARTUP_UNREAD_LOOK);
     }
     let held_for = now.saturating_duration_since(clock.since);
-    (hooks.acts.startup_mark)(&w.sid, &StartupMark::Held { read, held_for });
+    (hooks.acts.startup_mark)(w, &StartupMark::Held { read, held_for });
     Some(now + HELD_RELOOK)
 }
 
@@ -16854,8 +16884,8 @@ fn look_at_held_stall(
     }
     books.held.remove(&w.sid);
     books.started.insert(w.sid.clone());
-    (hooks.acts.startup_mark)(&w.sid, &StartupMark::Moved);
-    None
+    let landed = (hooks.acts.startup_mark)(w, &StartupMark::Moved);
+    (!landed).then_some(now + HELD_RELOOK)
 }
 
 /// What screen read `seen` says of a worker of kind `expected` that no proven claim carries.
@@ -19582,9 +19612,7 @@ fn live_acts(
             WINDOW_ENDING.load(Ordering::SeqCst) || crate::owned_endpoint::quit_signalled()
         }),
         startups: Arc::new(move |judged| startups_of(&startups_store, judged)),
-        startup_mark: Arc::new(move |sid, mark| {
-            startup_mark_live(&startup_store, sid, mark);
-        }),
+        startup_mark: Arc::new(move |worker, mark| startup_mark_live(&startup_store, worker, mark)),
         standing_limit: Arc::new(move |sid, snap| {
             let tail = upgrade_drive::snapshot_transcript_tail(snap)?;
             relaunch::standing_limit(&standing_opts(sid, 0)?, snap, &tail)
@@ -20358,11 +20386,14 @@ fn startups_on(
 }
 
 /// The product's [`Acts::startup_mark`].
-fn startup_mark_live(store: &Store, sid: &str, mark: &StartupMark<'_>) {
-    if let Some((local, marked)) = startup_mark_with(store, sid, mark)
-        && marked.attention_moved
-    {
-        crate::presence::post_meta_changed(local);
+fn startup_mark_live(store: &Store, worker: &Startup, mark: &StartupMark<'_>) -> bool {
+    if let Some((local, marked)) = startup_mark_with(store, &worker.sid, worker.record_rev, mark) {
+        if marked.attention_moved {
+            crate::presence::post_meta_changed(local);
+        }
+        true
+    } else {
+        false
     }
 }
 
@@ -20401,19 +20432,21 @@ fn refused_stall(why: &str) -> bool {
 }
 
 /// The deadlines' marks, made in-process and conditional on the record still reading what the look
-/// read (`task_record::mark_session_task_with`, read under the locks the mark takes).
+/// read (`task_record::mark_session_task_with_timeline`, read under the locks the mark takes).
 pub(crate) fn startup_mark_with(
     store: &Store,
     sid: &str,
+    record_rev: u64,
     mark: &StartupMark<'_>,
 ) -> Option<(u64, crate::task_record::MarkedWith)> {
-    startup_mark_named(store, sid, mark, member_label)
+    startup_mark_named(store, sid, record_rev, mark, member_label)
 }
 
 /// [`startup_mark_with`], its stall naming the member `member` reads.
 fn startup_mark_named(
     store: &Store,
     sid: &str,
+    record_rev: u64,
     mark: &StartupMark<'_>,
     member: impl FnOnce() -> Option<String>,
 ) -> Option<(u64, crate::task_record::MarkedWith)> {
@@ -20492,15 +20525,11 @@ fn startup_mark_named(
         fence,
         |timeline, standing| {
             timeline.task().is_some_and(|r| {
-                when(r, standing)
+                r.rev == record_rev
+                    && when(r, standing)
                     && match mark {
-                        StartupMark::InstallStalled {
-                            record_rev,
-                            install_mark,
-                            ..
-                        } => {
-                            r.rev == *record_rev
-                                && timeline.worker_installing()
+                        StartupMark::InstallStalled { install_mark, .. } => {
+                            timeline.worker_installing()
                                 && timeline.worker_install_mark() == *install_mark
                         }
                         _ => true,
@@ -27694,7 +27723,7 @@ impl Acts {
             task_exited: Arc::new(|_| {}),
             window_ending: Arc::new(|| false),
             startups: Arc::new(|_| Vec::new()),
-            startup_mark: Arc::new(|_, _| {}),
+            startup_mark: Arc::new(|_, _| false),
             standing_limit: Arc::new(|_, _| None),
             account_wall: Arc::new(|_, _, _| ("inert", None)),
             accounts_upkeep: AccountsUpkeep::Inert,

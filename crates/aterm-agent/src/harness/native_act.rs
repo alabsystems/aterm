@@ -815,11 +815,18 @@ pub enum Constructor {
     PrivateRestart,
     /// A sealed built-in cold relaunch with owned-helper account resolution.
     ColdRestart,
+    /// A fresh built-in Upgrade qualified by the host's settled current native binding.
+    AskedUpgrade,
 }
 
 impl Constructor {
     /// The canonical discovery order. A capability is not an action ticket.
-    pub const ALL: [Self; 3] = [Self::OwnImage, Self::PrivateRestart, Self::ColdRestart];
+    pub const ALL: [Self; 4] = [
+        Self::OwnImage,
+        Self::PrivateRestart,
+        Self::ColdRestart,
+        Self::AskedUpgrade,
+    ];
 
     /// This constructor's strict wire word.
     #[must_use]
@@ -828,6 +835,7 @@ impl Constructor {
             Self::OwnImage => "own-image",
             Self::PrivateRestart => "private-restart",
             Self::ColdRestart => "cold-restart",
+            Self::AskedUpgrade => "asked-upgrade",
         }
     }
 }
@@ -880,6 +888,14 @@ impl NativePlan {
 
 /// A preparation's authority expectation. The server independently derives principal,
 /// connection and kernel peer, and checks its immutable claim under the metadata lock.
+/// An exact predecessor name is data: only the host can qualify a fresh asked operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AskedUpgradeIntent {
+    /// The completed predecessor in the same host epoch; never a mutation capability.
+    pub predecessor: String,
+}
+
+/// A preparation's complete data-only expectation; the host independently derives authority.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Prepare {
     /// Caller-generated idempotency key, exactly 32 lowercase hexadecimal digits.
@@ -899,8 +915,22 @@ pub struct Prepare {
     pub deadline_us: u64,
     /// Explicit native semantic duty, Upgrade or Relaunch only.
     pub duty: Scope,
+    /// A typed request for fresh asked admission, distinct from cold/crash continuation.
+    pub asked_upgrade: Option<AskedUpgradeIntent>,
     /// The complete planned mutation.
     pub plan: NativePlan,
+}
+
+impl Prepare {
+    /// Required constructor capability; this is not an admission qualification.
+    #[must_use]
+    pub const fn constructor(&self) -> Constructor {
+        if self.asked_upgrade.is_some() {
+            Constructor::AskedUpgrade
+        } else {
+            self.plan.constructor()
+        }
+    }
 }
 
 /// The exact original preparation and the supervisor image captured BEFORE sending it.
@@ -1200,6 +1230,26 @@ impl Request {
                     },
                     _ => return None,
                 };
+                let asked_upgrade = match words.remove("asked-predecessor") {
+                    None => None,
+                    Some(predecessor)
+                        if aterm_codec::hex::is_lower(predecessor, 32)
+                            && duty == Scope::Upgrade
+                            && matches!(
+                                &plan,
+                                NativePlan::Restart {
+                                    observation: None,
+                                    cold: None,
+                                    ..
+                                }
+                            ) =>
+                    {
+                        Some(AskedUpgradeIntent {
+                            predecessor: predecessor.to_owned(),
+                        })
+                    }
+                    Some(_) => return None,
+                };
                 if holder.is_empty() {
                     return None;
                 }
@@ -1220,6 +1270,7 @@ impl Request {
                     expected_human_seq,
                     deadline_us,
                     duty,
+                    asked_upgrade,
                     plan,
                 };
                 if verb == "cancel-prepare" {
@@ -1344,6 +1395,9 @@ impl Request {
                 .ok()?;
                 if let Some(seq) = p.expected_human_seq {
                     write!(out, " human-seq={seq}").ok()?;
+                }
+                if let Some(asked) = &p.asked_upgrade {
+                    write!(out, " asked-predecessor={}", asked.predecessor).ok()?;
                 }
                 match &p.plan {
                     NativePlan::OwnImage {
@@ -1887,6 +1941,10 @@ pub fn monotonic_us() -> Option<u64> {
 }
 
 #[cfg(test)]
+#[path = "native_asked_upgrade_wire_tests.rs"]
+mod asked_upgrade_wire_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1897,6 +1955,7 @@ mod tests {
             inode: 19,
         };
         Request::prepare(Prepare {
+            asked_upgrade: None,
             id: "12".repeat(16),
             host_epoch: "34".repeat(16),
             holder: "grok-alab@4242".into(),
@@ -2019,12 +2078,21 @@ mod tests {
             ("own-image", vec![Constructor::OwnImage]),
             ("private-restart", vec![Constructor::PrivateRestart]),
             ("cold-restart", vec![Constructor::ColdRestart]),
+            ("asked-upgrade", vec![Constructor::AskedUpgrade]),
             (
                 "own-image,private-restart",
                 vec![Constructor::OwnImage, Constructor::PrivateRestart],
             ),
             (
                 "own-image,private-restart,cold-restart",
+                vec![
+                    Constructor::OwnImage,
+                    Constructor::PrivateRestart,
+                    Constructor::ColdRestart,
+                ],
+            ),
+            (
+                "own-image,private-restart,cold-restart,asked-upgrade",
                 Constructor::ALL.to_vec(),
             ),
         ] {

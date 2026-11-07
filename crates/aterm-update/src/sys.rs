@@ -23,6 +23,17 @@ pub fn rename_swap(a: &Path, b: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Promote a directory only into an absent name; never replace a raced destination.
+pub(crate) fn rename_exclusive(from: &Path, to: &Path) -> io::Result<()> {
+    let (from, to) = (cpath(from)?, cpath(to)?);
+    // SAFETY: both paths are live NUL-terminated strings; RENAME_EXCL refuses an occupied name.
+    if unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 /// Build a NUL-terminated C string from a path, rejecting embedded NULs.
 fn cpath(p: &Path) -> io::Result<CString> {
     use std::os::unix::ffi::OsStrExt;

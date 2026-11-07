@@ -39,6 +39,7 @@ fn fixture() -> (aterm_tempfile::TempDir, Env, Receipt, Prepare) {
         dialect: crate::harness::upgrade::Dialect::Zsh,
     };
     let prepare = Prepare {
+        asked_upgrade: None,
         id: "ab".repeat(16),
         host_epoch: "cd".repeat(16),
         holder: "fixture".into(),
@@ -101,6 +102,7 @@ fn fixture() -> (aterm_tempfile::TempDir, Env, Receipt, Prepare) {
 
 fn child(parent: &Prepare, id: &str) -> Prepare {
     Prepare {
+        asked_upgrade: None,
         id: id.repeat(16),
         revision: parent.revision + 1,
         expected_human_seq: Some(parent.expected_human_seq.unwrap() + 1),

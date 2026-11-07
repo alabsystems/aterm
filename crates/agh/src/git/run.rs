@@ -2093,40 +2093,50 @@ mod unix {
             let prefix = scratch
                 .map_or_else(|| PathBuf::from("scratch.git"), Path::to_path_buf)
                 .join("objects/pack/pack");
-            let metadata = checked_input(
-                "metadata-pack",
-                vec![
-                    os("-c"),
-                    os("core.commitGraph=false"),
-                    os("-c"),
-                    os("pack.useBitmaps=false"),
-                    os("pack-objects"),
-                    os("--quiet"),
-                    os("--revs"),
-                    os("--filter=blob:none"),
-                    os("--threads=8"),
-                    os("--no-use-bitmap-index"),
-                    prefix.as_os_str().to_owned(),
-                ],
-                metadata_roots.as_bytes(),
+            let metadata = children.gh.fx().native_push_phase(
+                crate::git::NativePushPhase::MetadataPack,
+                || {
+                    checked_input(
+                        "metadata-pack",
+                        vec![
+                            os("-c"),
+                            os("core.commitGraph=false"),
+                            os("-c"),
+                            os("pack.useBitmaps=false"),
+                            os("pack-objects"),
+                            os("--quiet"),
+                            os("--revs"),
+                            os("--filter=blob:none"),
+                            os("--threads=8"),
+                            os("--no-use-bitmap-index"),
+                            prefix.as_os_str().to_owned(),
+                        ],
+                        metadata_roots.as_bytes(),
+                    )
+                },
             )?;
             let hash = std::str::from_utf8(&metadata.stdout)
                 .ok()
                 .and_then(|s| s.strip_suffix('\n'))
                 .filter(|s| crate::path::is_sha(s))
                 .ok_or_else(|| Error::protocol("metadata pack ID is malformed"))?;
-            checked(
-                "metadata-verify",
-                vec![
-                    os("index-pack"),
-                    os("--verify"),
-                    os("--strict"),
-                    os("--threads=8"),
-                    prefix
-                        .with_file_name(format!("pack-{hash}.pack"))
-                        .into_os_string(),
-                ],
-                scratch,
+            children.gh.fx().native_push_phase(
+                crate::git::NativePushPhase::MetadataVerify,
+                || {
+                    checked(
+                        "metadata-verify",
+                        vec![
+                            os("index-pack"),
+                            os("--verify"),
+                            os("--strict"),
+                            os("--threads=8"),
+                            prefix
+                                .with_file_name(format!("pack-{hash}.pack"))
+                                .into_os_string(),
+                        ],
+                        scratch,
+                    )
+                },
             )?;
             let mut args = vec![
                 os("-c"),
@@ -2145,7 +2155,12 @@ mod unix {
             // their original index IDs before any old closure is excluded.
             // This extra walk checks referenced blob presence. New blob bytes
             // are checked below; old blob bytes are already held by BEFORE.
-            checked("connectivity", args, scratch)?;
+            children
+                .gh
+                .fx()
+                .native_push_phase(crate::git::NativePushPhase::Connectivity, || {
+                    checked("connectivity", args, scratch)
+                })?;
         }
         for (i, u) in batch.updates().iter().enumerate() {
             let kind = checked(

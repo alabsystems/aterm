@@ -2588,7 +2588,7 @@ impl HarnessCard {
     ) -> Option<Clock> {
         self.palette = scene.palette;
         if !scene.dark {
-            self.inks.solve(scene.palette, scene.ground & 0x00FF_FFFF);
+            self.inks.solve(scene.palette, scene.ground);
         }
         let animate = animate && drawable;
         self.still = !animate || scene.serious;
@@ -5601,6 +5601,25 @@ mod tests {
         assert_eq!(replayed.inks.key, Some((CardPalette::Land, cream)));
         let _ = take_line_ink_solves();
         let _ = replayed.line_ink(t0, 4, 2, 9, cream, false);
+        assert_eq!(take_line_ink_solves(), 0);
+
+        let flow_at = t0 + ms(EPISODE_MS + 1);
+        let mut flow_frames = CardFrames::default();
+        let mut flow_drawn = HarnessCard::default();
+        flow_drawn.arm(t0, 7);
+        let _ = flow_drawn.draw(flow_at, &page, true, &mut flow_frames);
+        let mut flow_replayed = HarnessCard::default();
+        flow_replayed.arm(t0, 7);
+        let _ = flow_replayed.draw(flow_at, &scene(), true, &mut CardFrames::default());
+        assert_eq!(flow_replayed.inks.key, None);
+        assert!(
+            flow_replayed
+                .replay_step(&page, true, &flow_frames, flow_at + ms(10))
+                .is_some()
+        );
+        assert_eq!(flow_replayed.inks.key, Some((CardPalette::Land, cream)));
+        let _ = take_line_ink_solves();
+        let _ = flow_replayed.line_ink(flow_at + ms(10), 4, 2, 9, cream, true);
         assert_eq!(take_line_ink_solves(), 0);
     }
 

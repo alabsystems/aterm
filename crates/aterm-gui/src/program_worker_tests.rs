@@ -707,3 +707,78 @@ fn a_program_workers_block_is_carried() {
         "a malformed block refuses the row"
     );
 }
+
+/// A PROGRAM IS NAMED BY ITS FILE NAME: a path's last part, a `PATH` word as given, never its
+/// folder or a word beside it. NEGATIVE CONTROL: a program with no file name (`/`, `..`), or one
+/// no file can have, has no name.
+#[test]
+fn a_program_is_named_by_its_file_name() {
+    let named = |program: &str| {
+        ProgramRun {
+            program: program.to_string(),
+            args: vec!["--quick".to_string()],
+        }
+        .name()
+        .map(str::to_owned)
+    };
+    assert_eq!(named("/opt/lab/bench").as_deref(), Some("bench"));
+    assert_eq!(named("bench").as_deref(), Some("bench"));
+    assert_eq!(named("./tools/run.sh").as_deref(), Some("run.sh"));
+    assert_eq!(named("/opt/my tools/run it").as_deref(), Some("run it"));
+    assert_eq!(named("/"), None);
+    assert_eq!(named("/opt/.."), None);
+    assert_eq!(named(&"x".repeat(256)), None, "longer than any file name");
+    assert_eq!(named(&"x".repeat(255)).map(|name| name.len()), Some(255));
+}
+
+/// THE PROGRAM'S NAME CROSSES A SEAMLESS UPDATE AND A RESTORE: a carry row holds `program=`,
+/// percent-encoded, read back as it was. NEGATIVE CONTROLS: an agent's worker carries none, and a
+/// `program=` that is no program's name (a path, empty) or sits on an agent's record is dropped
+/// while the row reads; a program worker's row with none (an older build's) names it `the
+/// program`.
+#[test]
+fn a_program_workers_name_is_carried() {
+    let now = std::time::Instant::now();
+    let (_, agents) = worker_of(7902, Program::Claude);
+    assert!(!agents.carry_row(now).contains(" program="), "CONTROL");
+    let (session, _) = program_worker(7903);
+    session
+        .ctx
+        .timeline
+        .lock()
+        .unwrap()
+        .set_task_program(Some("run it"));
+    let named = record_of(&session);
+    let row = named.carry_row(now);
+    assert!(row.contains(" program=run%20it"), "{row}");
+    let back = TaskRecord::from_carry_row(&row, None, now, named.since_unix_ms).expect("reads");
+    assert_eq!(back.program.as_deref(), Some("run it"));
+    assert_eq!(back.worker_name(), Some("run it"));
+    for (malformed, why) in [
+        (" program=%2Fopt%2Frun", "a path"),
+        (" program=", "empty"),
+        (" program=..", "no file name"),
+    ] {
+        let row = row.replace(" program=run%20it", malformed);
+        let back = TaskRecord::from_carry_row(&row, None, now, named.since_unix_ms)
+            .unwrap_or_else(|| panic!("{why}: the row reads"));
+        assert_eq!(back.program, None, "{why}");
+        assert_eq!(
+            back.worker_name(),
+            Some(Program::Generic.product()),
+            "{why}"
+        );
+    }
+    let older = row.replace(" program=run%20it", "");
+    let back = TaskRecord::from_carry_row(&older, None, now, named.since_unix_ms).expect("reads");
+    assert_eq!(
+        (back.program.as_deref(), back.worker_name()),
+        (None, Some(Program::Generic.product())),
+        "a program worker's row an older build carried"
+    );
+    let agents = row.replace(" agent=generic", " agent=claude");
+    assert!(agents.contains(" agent=claude"), "PRECONDITION: {agents}");
+    let back = TaskRecord::from_carry_row(&agents, None, now, named.since_unix_ms).expect("reads");
+    assert_eq!(back.program, None, "an agent's record names no program");
+    assert_eq!(back.worker_name(), Some("Claude Code"));
+}

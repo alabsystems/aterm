@@ -13,13 +13,17 @@ extern "C" fn stop(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
 }
 
-/// Whether this run was the harness probing a copy laid as a managed build: `fixture-version` beside
-/// it names the version it answers, and a probe's environment carries no fixture root.
-fn answered_build_probe() -> bool {
-    let Some(version) = std::env::current_exe()
+/// The version of this managed copy, shared by its probe and session record.
+fn managed_version() -> Option<String> {
+    std::env::current_exe()
         .ok()
         .and_then(|exe| std::fs::read_to_string(exe.with_file_name("fixture-version")).ok())
-    else {
+        .map(|version| version.trim().to_owned())
+}
+
+/// Whether this run was the harness probing a managed copy without a fixture root.
+fn answered_build_probe() -> bool {
+    let Some(version) = managed_version() else {
         return false;
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -198,7 +202,8 @@ pub(super) fn run_if_selected() -> bool {
         .unwrap()
         .as_millis();
     let record = aterm_json::json!({"pid":pid,"sessionId":conversation,
-        "cwd":std::env::current_dir().unwrap().to_string_lossy().into_owned(),"version":"2.1.281",
+        "cwd":std::env::current_dir().unwrap().to_string_lossy().into_owned(),
+        "version":managed_version().unwrap_or_else(|| "2.1.281".into()),
         "status":"idle","statusUpdatedAt":u64::try_from(now).unwrap(),
         "procStart":start_word(pid),"kind":"interactive","entrypoint":"cli"});
     let session = sessions.join(format!("{pid}.json"));
@@ -242,6 +247,25 @@ pub(super) fn run_if_selected() -> bool {
             pending.clear();
             if text == "/exit" {
                 break;
+            }
+            if !text.is_empty() {
+                // This owned stand-in answers the submitted turn, not its startup.
+                // Explicit launch selection wins; claude-test is the same synthetic
+                // default used by the other private host fixture.
+                let model = aterm_agent::harness::upgrade::launch_model(&args)
+                    .unwrap_or_else(|| "claude-test".into());
+                let response = aterm_json::json!({
+                    "type": "assistant",
+                    "version": managed_version().unwrap_or_else(|| "2.1.281".into()),
+                    "message": {
+                        "role": "assistant", "model": model,
+                        "content": [{"type": "text", "text": "fixture response"}],
+                    },
+                });
+                append(
+                    &project.join(format!("{conversation}.jsonl")),
+                    format!("{response}\n").as_bytes(),
+                );
             }
             restored = false;
             paint(&root, "idle", true);

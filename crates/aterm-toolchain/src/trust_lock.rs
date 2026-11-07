@@ -47,12 +47,12 @@ pub const TREE_ROOT_SUFFIX: &str = ".tree_root";
 /// The record's first line.
 const TREE_ROOT_HEADER: &str = "tree_root v1";
 
-/// The suffix of the mark beside a store build that a tree's lock resolved: its modification
-/// time is the last resolution ([`mark_locked`]), and gc keeps a build marked within
+/// The suffix of the mark beside a store build explicitly installed or resolved by a tree's
+/// lock: its modification time is the last use ([`mark_used`]), and gc keeps a build marked within
 /// [`LOCKED_KEEP`], current or not.
 pub const LOCKED_SUFFIX: &str = ".locked";
 
-/// How long after a lock last resolved a build gc keeps it ([`LOCKED_SUFFIX`]).
+/// How long after explicit installation or lock resolution gc keeps a build ([`LOCKED_SUFFIX`]).
 pub const LOCKED_KEEP: std::time::Duration = std::time::Duration::from_secs(14 * 24 * 3600);
 
 /// How stale a mark may be before a resolution rewrites it: one write an hour, not one per build.
@@ -445,20 +445,42 @@ pub fn locked_mark(prefix: &Path, build: u64) -> PathBuf {
 /// # Errors
 /// When the mark cannot be created or its time set.
 pub fn mark_locked(prefix: &Path, build: u64) -> std::io::Result<()> {
-    let mark = locked_mark(prefix, build);
+    mark_used(&build_dir(prefix, build))
+}
+
+/// Retain an explicitly installed or resolved store build through the existing keep window.
+/// The sidecar is outside its signed payload; it grants no executable or signature authority.
+/// Callers hold the store mutation lock or the build's lease while recording the use.
+///
+/// # Errors
+/// When the mark cannot be created or its time set.
+pub fn mark_used(build_dir: &Path) -> std::io::Result<()> {
+    let mark = beside(build_dir, LOCKED_SUFFIX);
     let now = std::time::SystemTime::now();
-    if std::fs::metadata(&mark)
-        .and_then(|m| m.modified())
-        .is_ok_and(|at| now.duration_since(at).is_ok_and(|age| age < MARK_FRESH))
-    {
-        return Ok(());
+    match std::fs::symlink_metadata(&mark) {
+        Ok(metadata) => {
+            if !metadata.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "the build retention mark is not a regular file",
+                ));
+            }
+            if metadata
+                .modified()
+                .is_ok_and(|at| now.duration_since(at).is_ok_and(|age| age < MARK_FRESH))
+            {
+                return Ok(());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
     let file = record_options(false).open(&mark)?;
     file.set_modified(now)
 }
 
-/// Whether the store build at `build_dir` was resolved by a tree's lock within [`LOCKED_KEEP`] of
-/// `now` ([`mark_locked`]): gc keeps it.
+/// Whether the store build at `build_dir` was explicitly installed or resolved within
+/// [`LOCKED_KEEP`] of `now` ([`mark_used`]): gc keeps it.
 #[must_use]
 pub fn locked_within_keep(build_dir: &Path, now: std::time::SystemTime) -> bool {
     std::fs::symlink_metadata(beside(build_dir, LOCKED_SUFFIX))

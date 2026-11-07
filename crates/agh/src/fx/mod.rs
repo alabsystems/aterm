@@ -16,6 +16,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+/// A real elapsed native validation phase, observed only on a simulated client.
+/// The span includes dispatch and result checking; it is not CPU time inside Git.
+/// It exposes no command, environment, output or mutable child result.
+#[cfg(all(unix, any(test, debug_assertions)))]
+#[derive(Clone, Copy, Debug)]
+pub struct NativePushTiming {
+    /// The explicit native runner callsite.
+    pub phase: crate::git::NativePushPhase,
+    /// Real monotonic time immediately before the phase invocation.
+    pub started: std::time::Instant,
+    /// Real monotonic time immediately after the invocation returns.
+    pub finished: std::time::Instant,
+    /// The phase returned success, including its child exit-status check.
+    pub success: bool,
+}
+
 use astream_effects::{
     EffectRecord, EffectSeam, EffectsLog, LiveSeam, OsEffects, RecordingSeam, ReplayDivergence,
     ReplaySeam,
@@ -1471,6 +1487,54 @@ impl Fx {
             after: Box::new(after),
         });
         self
+    }
+
+    /// Observe the real metadata and connectivity phases of native admission on
+    /// this simulated client. The observer cannot read or change the child result.
+    /// Every invocation is reported, including a failed phase; later phases need
+    /// not run. No live, recording or replaying client accepts this observer.
+    ///
+    /// # Panics
+    /// Unless this is simulated, or if an observer is already installed.
+    #[cfg(all(unix, any(test, debug_assertions)))]
+    #[must_use]
+    pub fn with_native_push_observer_for_tests(
+        self,
+        observer: impl Fn(NativePushTiming) + Send + Sync + 'static,
+    ) -> Self {
+        let Seam::Simulated(clock) = &self.seam else {
+            panic!("native push observation requires simulated Fx");
+        };
+        clock.set_native_push_observer(Arc::new(observer));
+        self
+    }
+
+    /// Run a named native phase unchanged. Only an explicitly observed simulated
+    /// client reads a real clock; shipped builds simply invoke `action`.
+    #[cfg(unix)]
+    pub(crate) fn native_push_phase<T>(
+        &self,
+        _phase: crate::git::NativePushPhase,
+        action: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        #[cfg(any(test, debug_assertions))]
+        let observer = match &self.seam {
+            Seam::Simulated(clock) => clock.native_push_observer(),
+            _ => None,
+        };
+        #[cfg(any(test, debug_assertions))]
+        let started = observer.as_ref().map(|_| std::time::Instant::now());
+        let result = action();
+        #[cfg(any(test, debug_assertions))]
+        if let (Some(observer), Some(started)) = (observer, started) {
+            observer(NativePushTiming {
+                phase: _phase,
+                started,
+                finished: std::time::Instant::now(),
+                success: result.is_ok(),
+            });
+        }
+        result
     }
 
     /// Tests: the same simulated `Fx`, answering `child` from `children` in order.

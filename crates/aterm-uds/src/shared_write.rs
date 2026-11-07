@@ -563,6 +563,13 @@ pub fn grant_group_class_by_acl(path: &std::path::Path, uid: u32) -> std::io::Re
     acl::grant_group_class(path, uid)
 }
 
+/// The type of the filesystem `path` is on (`statfs`'s `f_type`), as the judge reads it, or
+/// `None` when it cannot be read.
+#[cfg(target_os = "linux")]
+pub(crate) fn filesystem_at(path: &std::path::Path) -> Option<u32> {
+    filesystem::at_path(path)
+}
+
 /// Test seam (Linux): the type of the filesystem `path` is on, as the judge reads it.
 #[cfg(all(target_os = "linux", any(test, debug_assertions)))]
 #[must_use]

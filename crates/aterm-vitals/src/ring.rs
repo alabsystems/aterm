@@ -386,7 +386,7 @@ impl Recent {
                 let rw = f64::from(r.w_ms.max(1));
                 (s + r.v * rw, w + rw)
             });
-        (w > 0.0).then(|| sum / w)
+        (w > 0.0).then_some(sum / w)
     }
 
     /// Largest of the readings [`Self::mean`] averages.

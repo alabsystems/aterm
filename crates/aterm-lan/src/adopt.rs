@@ -11,7 +11,7 @@
 use aterm_keeper::identity::{CheckError, Identity};
 use std::io::{self, Read as _};
 use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -92,6 +92,15 @@ impl From<CheckError> for Failure {
     }
 }
 
+impl From<aterm_uds::app_image::Error> for Failure {
+    fn from(error: aterm_uds::app_image::Error) -> Self {
+        match error {
+            aterm_uds::app_image::Error::Refused(why) => Self::Refused(why),
+            aterm_uds::app_image::Error::Io(error) => Self::Io(error),
+        }
+    }
+}
+
 impl std::fmt::Display for Failure {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -146,7 +155,10 @@ impl Adoption {
         let key = (error.class(), error.to_string());
         let report = self.said.as_ref() != Some(&key);
         self.said = Some(key);
-        if error.class() == FailureClass::Refused && stable {
+        // Filesystem shape can be repaired without touching the executable
+        // (a resource link restored to its signed target). Only a definitive
+        // code-identity refusal can settle this executable generation.
+        if matches!(error, Failure::Check(CheckError::Refused(_))) && stable {
             self.settled = true;
         } else {
             self.failures = self.failures.saturating_add(1);
@@ -279,67 +291,9 @@ pub(crate) fn watch(source: PathBuf, checker: Option<Arc<Identity>>) -> io::Resu
     Ok(())
 }
 
-/// `CLONE_NOFOLLOW`: a link inside the bundle is cloned as the link.
-const CLONE_NOFOLLOW: u32 = 0x1;
-/// `CLONE_NOOWNERCOPY`: the clone is the caller's (root's), not the source's owner's.
-const CLONE_NOOWNERCOPY: u32 = 0x2;
-
-unsafe extern "C" {
-    /// `<sys/clonefile.h>`:
-    /// `int fclonefileat(int srcfd, int dst_dirfd, const char *dst, uint32_t flags)`.
-    fn fclonefileat(srcfd: i32, dst_dirfd: i32, dst: *const std::ffi::c_char, flags: u32) -> i32;
-}
-
 fn c_path(path: &Path) -> io::Result<std::ffi::CString> {
     std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a path holding a NUL"))
-}
-
-/// `from` opened as the folder it is: `ENOTDIR` or `ELOOP` (`O_NOFOLLOW`) for anything else, a
-/// link to a folder included.
-fn open_folder(from: &Path) -> io::Result<std::os::fd::OwnedFd> {
-    let path = c_path(from)?;
-    // SAFETY: `path` is a NUL-terminated path live for the call; the flags take no mode.
-    let fd = unsafe {
-        libc::open(
-            path.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `fd` was just opened here and nothing else owns it.
-    Ok(unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) })
-}
-
-/// Clone the bundle `from` (a real folder, recursively; never through a link) to the new name
-/// `to`, owned by this process's user. The clone is made from the folder's descriptor, so what
-/// is cloned is the folder that was opened, whatever is renamed over `from` meanwhile.
-fn clone(from: &Path, to: &Path) -> Result<(), Failure> {
-    if !std::fs::symlink_metadata(from)?.is_dir() {
-        return Err(Failure::Refused(format!(
-            "{} is not a real bundle folder (a link is never adopted)",
-            from.display()
-        )));
-    }
-    let folder = open_folder(from)?;
-    let to = c_path(to)?;
-    // SAFETY: `folder` is a live descriptor and `to` a NUL-terminated path, both live for the
-    // call.
-    if unsafe {
-        fclonefileat(
-            std::os::fd::AsRawFd::as_raw_fd(&folder),
-            libc::AT_FDCWD,
-            to.as_ptr(),
-            CLONE_NOFOLLOW | CLONE_NOOWNERCOPY,
-        )
-    } == 0
-    {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error().into())
-    }
 }
 
 /// `Ok` when `path` is a real folder (no link) owned by this process's user.
@@ -356,53 +310,6 @@ fn owned_folder(path: &Path) -> Result<(), Failure> {
             meta.file_type(),
             meta.uid()
         )));
-    }
-    Ok(())
-}
-
-/// Whether the link target `target`, of a link `depth` folders below the bundle's root, stays
-/// inside the bundle: relative, and never climbing above the root.
-fn stays_inside(target: &Path, depth: usize) -> bool {
-    use std::path::Component;
-    let mut at = depth;
-    for part in target.components() {
-        match part {
-            Component::Normal(_) => at += 1,
-            Component::CurDir => {}
-            Component::ParentDir => match at.checked_sub(1) {
-                Some(up) => at = up,
-                None => return false,
-            },
-            Component::RootDir | Component::Prefix(_) => return false,
-        }
-    }
-    true
-}
-
-/// Take the group and other write bits off everything under `root` (`depth` folders below the
-/// bundle's root), and refuse a link that leads out of the bundle.
-fn strip_write(root: &Path, depth: usize) -> Result<(), Failure> {
-    let meta = std::fs::symlink_metadata(root)?;
-    if meta.file_type().is_symlink() {
-        let target = std::fs::read_link(root)?;
-        // A link's own depth is its folder's.
-        if !stays_inside(&target, depth.saturating_sub(1)) {
-            return Err(Failure::Refused(format!(
-                "{} leads out of the bundle ({})",
-                root.display(),
-                target.display()
-            )));
-        }
-        return Ok(());
-    }
-    let mode = meta.mode() & 0o7777;
-    if mode & 0o022 != 0 {
-        std::fs::set_permissions(root, std::fs::Permissions::from_mode(mode & !0o022))?;
-    }
-    if meta.is_dir() {
-        for entry in std::fs::read_dir(root)? {
-            strip_write(&entry?.path(), depth + 1)?;
-        }
     }
     Ok(())
 }
@@ -435,39 +342,55 @@ fn adopt(
     image: &Path,
     check: impl FnOnce(&Path) -> Result<(), CheckError>,
 ) -> Result<(), Failure> {
+    adopt_allocating(source, image, check, |parent| {
+        aterm_tempfile::Builder::new()
+            .prefix(".adopting-")
+            .tempdir_in(parent)
+    })
+}
+
+fn adopt_allocating(
+    source: &Path,
+    image: &Path,
+    check: impl FnOnce(&Path) -> Result<(), CheckError>,
+    allocate: impl FnOnce(&Path) -> io::Result<aterm_tempfile::TempDir>,
+) -> Result<(), Failure> {
     let dir = image
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "an image with no folder"))?;
-    let staging = dir.join(format!(".adopting-{}.app", std::process::id()));
-    if std::fs::symlink_metadata(&staging).is_ok() {
-        std::fs::remove_dir_all(&staging)?;
-    }
-    clone(source, &staging)?;
+    // The private parent exists before cloning. An inherited source ACL can
+    // grant no account access to candidate files before the seal removes it.
+    let owner = allocate(dir)?;
+    let staging = owner.path().join("aterm.app");
+    aterm_uds::app_image::clone(source, &staging)?;
+    // SAFETY: getegid reads the caller's group and cannot fail or mutate state.
+    let gid = unsafe { libc::getegid() };
     let judged = owned_folder(&staging)
-        .and_then(|()| strip_write(&staging, 0))
+        .and_then(|()| {
+            aterm_uds::app_image::seal(&staging, aterm_uds::peer::our_uid(), gid, true)
+                .map_err(Failure::from)
+        })
         .and_then(|()| check(&staging).map_err(Failure::Check));
-    if let Err(error) = judged {
-        let _ = std::fs::remove_dir_all(&staging);
-        return Err(error);
-    }
+    judged?;
     if std::fs::symlink_metadata(image).is_ok() {
         if let Err(error) = swap(&staging, image) {
-            let _ = std::fs::remove_dir_all(&staging);
             return Err(error.into());
-        }
-        // `staging` now names the image that was replaced.
-        if let Err(error) = std::fs::remove_dir_all(&staging) {
-            return Err(Failure::Published(Box::new(error.into())));
         }
     } else {
         std::fs::rename(&staging, image)?;
     }
+    // `staging` is now the retired image (or absent after a first rename).
+    // Preserve the post-publication result even if Drop later manages cleanup.
+    std::fs::remove_dir_all(owner.path())
+        .map_err(|error| Failure::Published(Box::new(error.into())))?;
+    let _ = owner.keep();
     owned_folder(image).map_err(|error| Failure::Published(Box::new(error)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
 
     fn bundle(at: &Path, bytes: &[u8]) {
         let exe = executable_of(at);
@@ -518,11 +441,8 @@ mod tests {
         bundle(&image, b"old");
         let image_exe = executable_of(&image);
         let original = stamp(&source).unwrap();
-        let staging = image
-            .parent()
-            .unwrap()
-            .join(format!(".adopting-{}.app", std::process::id()));
-        std::fs::write(&staging, b"temporary obstruction").unwrap();
+        let staging_parent = root.path().join("unavailable-staging-parent");
+        std::fs::write(&staging_parent, b"temporary obstruction").unwrap();
         let mut observation = Adoption::default();
         let now = std::cell::Cell::new(Duration::ZERO);
         let first = observation.round(
@@ -530,9 +450,12 @@ mod tests {
             &source,
             &image,
             || {
-                adopt(&source, &image, |_| {
-                    panic!("the failed staging cleanup precedes code verification")
-                })
+                adopt_allocating(
+                    &source,
+                    &image,
+                    |_| panic!("failed private allocation precedes code verification"),
+                    |_| aterm_tempfile::TempDir::new_in(&staging_parent),
+                )
             },
         );
         assert!(matches!(
@@ -543,13 +466,21 @@ mod tests {
             }
         ));
         assert_eq!(std::fs::read(&image_exe).unwrap(), b"old");
-        std::fs::remove_file(&staging).unwrap();
+        std::fs::remove_file(&staging_parent).unwrap();
+        std::fs::create_dir(&staging_parent).unwrap();
         now.set(LOOK_EVERY);
         let retried = observation.round(
             || now.get(),
             &source,
             &image,
-            || adopt(&source, &image, |_| Ok(())),
+            || {
+                adopt_allocating(
+                    &source,
+                    &image,
+                    |_| Ok(()),
+                    |_| aterm_tempfile::TempDir::new_in(&staging_parent),
+                )
+            },
         );
         assert_eq!(
             stamp(&source).unwrap(),
@@ -562,6 +493,64 @@ mod tests {
             "the ordinary round must retry the same source after transient failure"
         );
         assert!(matches!(retried, Round::Applied));
+
+        // Resource-only repair leaves the executable stamp unchanged. The
+        // actual signed bundle becomes admissible again at the existing retry.
+        aterm_uds::deadline::require_trust_service();
+        let resources = source.join("Contents/Resources");
+        std::fs::create_dir_all(&resources).unwrap();
+        let resource = resources.join("restored-link");
+        std::os::unix::fs::symlink("../MacOS/aterm", &resource).unwrap();
+        std::fs::copy("/usr/bin/true", executable_of(&source)).unwrap();
+        std::fs::write(source.join("Contents/Info.plist"), b"<plist version=\"1.0\"><dict><key>CFBundleExecutable</key><string>aterm</string><key>CFBundleIdentifier</key><string>com.aterm.adoption-fixture</string><key>CFBundlePackageType</key><string>APPL</string></dict></plist>").unwrap();
+        let signed = aterm_uds::spawnfd::command("/usr/bin/codesign")
+            .args(["--force", "--sign", "-", "--timestamp=none"])
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(signed.status.success(), "{signed:?}");
+        let identity = Identity::for_code_at(&source).unwrap();
+        let signed_stamp = stamp(&source).unwrap();
+        std::fs::remove_file(&resource).unwrap();
+        std::os::unix::fs::symlink("../../../outside", &resource).unwrap();
+        let damaged = observation.round(
+            || now.get(),
+            &source,
+            &image,
+            || {
+                adopt(&source, &image, |candidate| {
+                    identity.admits_code_at_strictly(candidate)
+                })
+            },
+        );
+        assert!(matches!(
+            damaged,
+            Round::Failed {
+                error: Failure::Refused(_),
+                ..
+            }
+        ));
+        assert!(!observation.settled);
+        assert_eq!(std::fs::read(&image_exe).unwrap(), b"new");
+        std::fs::remove_file(&resource).unwrap();
+        std::os::unix::fs::symlink("../MacOS/aterm", &resource).unwrap();
+        assert_eq!(stamp(&source).unwrap(), signed_stamp);
+        now.set(now.get() + LOOK_EVERY);
+        let repaired = observation.round(
+            || now.get(),
+            &source,
+            &image,
+            || {
+                adopt(&source, &image, |candidate| {
+                    identity.admits_code_at_strictly(candidate)
+                })
+            },
+        );
+        assert!(matches!(repaired, Round::Applied));
+        assert_eq!(
+            std::fs::read(&image_exe).unwrap(),
+            std::fs::read(executable_of(&source)).unwrap()
+        );
 
         bundle(&source, b"refused");
         let denied = observation.round(
@@ -723,7 +712,7 @@ mod tests {
         adopt(&real, &image, |_| Ok(())).unwrap();
         assert_eq!(std::fs::read(executable_of(&image)).unwrap(), b"new");
 
-        for out in ["../../../outside", "/Users//someone/evil"] {
+        for out in ["../../../outside", "/Users//someone/evil", "../x/../../.."] {
             let escape = resources.join("escape");
             let _ = std::fs::remove_file(&escape);
             std::os::unix::fs::symlink(out, &escape).unwrap();
@@ -740,15 +729,6 @@ mod tests {
             .unwrap()
             .collect();
         assert_eq!(entries.len(), 1, "no staging left beside the image");
-    }
-
-    #[test]
-    fn a_link_stays_inside_only_while_it_never_climbs_past_the_root() {
-        assert!(stays_inside(Path::new("A"), 3));
-        assert!(stays_inside(Path::new("../../.."), 3));
-        assert!(!stays_inside(Path::new("../../../.."), 3));
-        assert!(!stays_inside(Path::new("../x/../../.."), 1));
-        assert!(!stays_inside(Path::new("/etc"), 3));
     }
 
     #[test]

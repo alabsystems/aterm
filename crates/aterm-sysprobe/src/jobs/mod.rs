@@ -695,8 +695,8 @@ pub fn judge_start(f: &StartFacts) -> AtStart {
 /// How long the syspolicyd running now must have run before a program whose check was sent
 /// before its start reads [`stranded`]: the bound on a first exec (aterm-uds'
 /// `deadline::FIRST_EXEC_HANG`, 10 min). A check sent before a crash that waited in the service's
-/// queue goes to the new daemon, which answers it as any other, so until then nothing tells it
-/// from one the dead daemon took with it.
+/// queue goes to the new daemon, which answers it as any other (leftover U17), so until then
+/// nothing tells it from one the dead daemon took with it.
 pub const STRANDED_AFTER_US: u64 = 600_000_000;
 
 /// Whether a held process whose check was sent by `sent_by_us` sent it to a syspolicyd that is no

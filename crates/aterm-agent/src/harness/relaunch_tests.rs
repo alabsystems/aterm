@@ -6122,6 +6122,25 @@ fn budget_stages_unsetting(stored: bool, served_unset: Option<&[&str]>) -> (Vec<
         stored,
     };
     let argv = words(&["claude", "--verbose"]);
+    assert!(matches!(
+        line_tap_selected(
+            Dialect::Zsh,
+            None,
+            None,
+            build,
+            &argv,
+            Some(LOGIN_ID),
+            None,
+            None,
+            &[],
+            Some(&token_route::TOKEN_STATE_ENV),
+            served_unset,
+            Some(&tap),
+            true,
+            Some(&serve),
+        ),
+        Err(NoPlan::Wait("native-token-policy"))
+    ));
     let selected = |cd: &str| {
         line_tap_selected(
             Dialect::Zsh,
@@ -6136,6 +6155,7 @@ fn budget_stages_unsetting(stored: bool, served_unset: Option<&[&str]>) -> (Vec<
             Some(&token_route::TOKEN_STATE_ENV),
             served_unset,
             Some(&tap),
+            false,
             Some(&serve),
         )
     };

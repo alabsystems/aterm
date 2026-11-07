@@ -17,6 +17,8 @@ aterm-uds = { workspace = true }
 # requirement (regardless of uid), the strict static check of a bundle before adoption, and the
 # running image's signing team.
 aterm-keeper = { workspace = true }
+# Exclusive private staging before copied source ACLs can be inspected or stripped.
+aterm-tempfile = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 # chmod/chown of the socket and its folder, poll, clonefile and renamex_np's swap.
@@ -26,9 +28,6 @@ libc = { workspace = true }
 # The allowed direct path (src/direct.rs): the app macOS holds responsible for this process,
 # whose Local Network answer it applies.
 aterm-containment = { workspace = true }
-
-[dev-dependencies]
-aterm-tempfile = { workspace = true }
 
 [lints]
 workspace = true

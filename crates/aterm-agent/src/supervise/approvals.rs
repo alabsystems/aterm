@@ -2572,15 +2572,21 @@ pub fn short_streak_of(reason: &str) -> Option<u32> {
 }
 
 /// CRUISE'S CARRIES IN THE BOOKS: when each of `sid`'s carries at a break of its own background
-/// work ([`RULE_BACKGROUND`](super::policy::cruise_carry::RULE_BACKGROUND)) was typed (unix ms,
-/// oldest first) since its books last started again on a row, so a loop after the ones that typed
-/// them replays their ladder ([`super::policy::cruise_carry::BackgroundCarries::replayed`]). The
-/// run ends, newest first, at an act of another rule typed, a point judged or a turn read running
-/// past one, a person's own exchange left to them, the session lifted off Off, or a carry that
-/// names no time. Empty with none since.
+/// work was typed (unix ms, oldest first) and the streak its row names
+/// ([`background_carry_reason`]), since its books last started again on a row, so a loop after
+/// the ones that typed them replays their ladder
+/// ([`super::policy::cruise_carry::BackgroundCarries::replayed`]). A carry is any act typed whose
+/// row names its streak (the go-ahead or the continuation owed typed in the carry's place at a
+/// break goes on its ladder), or a [`RULE_BACKGROUND`](super::policy::cruise_carry::RULE_BACKGROUND) row written before rows
+/// named it (no streak). The run ends, newest first, at an act of another rule typed, a point
+/// judged, the books started again in memory
+/// ([`RULE_BACKGROUND_RESET`](super::policy::cruise_carry::RULE_BACKGROUND_RESET)), a person's own
+/// exchange left to them, the session lifted off Off, or a carry that names no time. A turn read
+/// running after a point ([`RULE_TURN_RAN`]) starts no books: the point's own row ends the run,
+/// and a loop's first live read writes one with no point before it. Empty with none since.
 #[must_use]
-pub fn background_carries_in(body: &str, sid: Option<&str>) -> Vec<i64> {
-    use super::policy::cruise_carry::RULE_BACKGROUND;
+pub fn background_carries_in(body: &str, sid: Option<&str>) -> Vec<(i64, Option<u32>)> {
+    use super::policy::cruise_carry::{RULE_BACKGROUND, RULE_BACKGROUND_RESET};
     use super::policy::turn_end::RULE_LEFT;
     let want = sid.map(|s| s.trim_start_matches('@'));
     let mut run = Vec::new();
@@ -2593,20 +2599,42 @@ pub fn background_carries_in(body: &str, sid: Option<&str>) -> Vec<i64> {
             continue;
         }
         match (text("rule_id").unwrap_or(""), text("decision")) {
-            (RULE_BACKGROUND, Some("typed")) => {
+            (rule, Some("typed")) => {
+                let streak = text("reason").and_then(carry_streak_of);
                 let Some(ts) = v.get("ts").and_then(aterm_json::Value::as_i64) else {
                     break;
                 };
-                run.push(ts);
+                if streak.is_none() && rule != RULE_BACKGROUND {
+                    break;
+                }
+                run.push((ts, streak));
             }
-            (_, Some("typed"))
-            | (RULE_POINT | RULE_TURN_RAN | RULE_OFF_STOOD, _)
+            (RULE_POINT | RULE_OFF_STOOD | RULE_BACKGROUND_RESET, _)
             | (RULE_LEFT, Some("skipped")) => break,
             _ => {}
         }
     }
     run.reverse();
     run
+}
+
+/// The note a carry's row names its streak in ([`background_carry_reason`]).
+const CARRY_STREAK: &str = "carries in a row";
+
+/// A carry's row's reason: `why`, and the `streak` the live ladder typed it at (its books'
+/// streak with this carry counted), which a later loop's replay takes up as it stands
+/// ([`background_carries_in`]): books started again in memory alone (a turn of real work,
+/// someone else's message) show in no gap between rows. A go-ahead or a continuation owed typed
+/// in the carry's place names it too.
+#[must_use]
+pub fn background_carry_reason(why: &str, streak: u32) -> String {
+    format!("{why} ({CARRY_STREAK}: {streak})")
+}
+
+/// The streak a carry's row names ([`background_carry_reason`]).
+fn carry_streak_of(reason: &str) -> Option<u32> {
+    let (_, rest) = reason.split_once(&format!("({CARRY_STREAK}: "))?;
+    rest.split(')').next()?.parse().ok()
 }
 
 #[must_use]

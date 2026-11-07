@@ -229,6 +229,27 @@ pub trait Host: Sync + std::fmt::Debug {
     fn idle(&self) -> Option<Duration>;
     /// How many cores a child's tree can run on at once.
     fn cores(&self) -> u32;
+    /// The wall clock members' starts and the syspolicyd's are read on, µs since the epoch
+    /// ([`aterm_sysprobe::jobs::now_us`], the default).
+    fn now_us(&self) -> u64 {
+        aterm_sysprobe::jobs::now_us()
+    }
+    /// Each of `pids`, members of process group `pgid`, whose one thread never ran
+    /// ([`aterm_sysprobe::jobs::StartFacts::lone_zero`]) as its start reads at `now_us`
+    /// ([`Host::now_us`]), with its executable and its parents' chain in the group
+    /// ([`Unstarted`]); none where unread, the default.
+    fn unstarted(&self, _pgid: u32, _pids: &[u32], _now_us: u64) -> Vec<Unstarted> {
+        Vec::new()
+    }
+    /// The syspolicyd running now; [`DaemonNow::Unread`], the default, where unread.
+    fn daemon(&self) -> DaemonNow {
+        DaemonNow::Unread
+    }
+    /// Whether `d`'s pool reads full, and how many of this user's held programs forked at or
+    /// after `since_us`, its start ([`Backlog`]); both unread, the default.
+    fn backlog(&self, _d: aterm_uds::program_check::Daemon, _since_us: u64) -> Backlog {
+        Backlog::default()
+    }
 }
 
 /// The OS's answers ([`Host`]).
@@ -247,6 +268,36 @@ impl Host for LiveHost {
     fn cores(&self) -> u32 {
         std::thread::available_parallelism()
             .map_or(1, |n| u32::try_from(n.get()).unwrap_or(u32::MAX))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn unstarted(&self, pgid: u32, pids: &[u32], now_us: u64) -> Vec<Unstarted> {
+        start::read_unstarted(pgid, pids, now_us)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn daemon(&self) -> DaemonNow {
+        static KEPT: std::sync::Mutex<Option<(Instant, (), DaemonNow)>> =
+            std::sync::Mutex::new(None);
+        start::kept(&KEPT, (), || match aterm_uds::program_check::running() {
+            Ok(d) => DaemonNow::Running(d),
+            Err(aterm_uds::program_check::Look::NoneRunning) => DaemonNow::NoneRunning,
+            Err(_) => DaemonNow::Unread,
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn backlog(&self, d: aterm_uds::program_check::Daemon, since_us: u64) -> Backlog {
+        use aterm_uds::program_check::{Look, PS_HANG, look};
+        type Kept = Option<(Instant, (aterm_uds::program_check::Daemon, u64), Backlog)>;
+        static KEPT: std::sync::Mutex<Kept> = std::sync::Mutex::new(None);
+        start::kept(&KEPT, (d, since_us), || Backlog {
+            pool_full: match look(PS_HANG) {
+                Look::Read(reading) if reading.daemon == d => Some(reading.full()),
+                _ => None,
+            },
+            held_since: aterm_uds::process::held_since(since_us),
+        })
     }
 }
 
@@ -488,6 +539,9 @@ fn bounded_wait<T: Send + 'static>(
 mod memory_custody_tests;
 #[path = "exec_output.rs"]
 mod output;
+#[path = "exec_start.rs"]
+mod start;
+pub use start::{Backlog, DaemonNow, Unstarted};
 #[path = "exec_test_progress.rs"]
 mod test_progress;
 
@@ -1112,6 +1166,20 @@ impl<'a> Clock<'a> {
         self.worked >= limit
     }
 
+    /// The members of its tree whose CPU time read at most [`aterm_sysprobe::jobs::HELD_CPU_NS`]
+    /// at its last read of the tree, as a held program's does, each with that time
+    /// ([`start::Watch::stranded`]); `None` before that read, and once its host has no reading.
+    fn quiet_members(&self) -> Option<Vec<(u32, u64)>> {
+        let u = self.usage.as_ref().filter(|u| !u.seen.is_empty())?;
+        Some(
+            u.seen
+                .values()
+                .filter(|m| m.cpu_ns <= aterm_sysprobe::jobs::HELD_CPU_NS)
+                .map(|m| (m.pid, m.cpu_ns))
+                .collect(),
+        )
+    }
+
     /// What a child that waited longer than [`STARVED_SAID`] for a core says as it ends.
     fn starved_line(&self) -> Option<String> {
         (self.starved > STARVED_SAID).then(|| {
@@ -1378,7 +1446,15 @@ fn resolves(cmd: &Cmd, env: ExecEnv<'_>) -> bool {
 /// ([`ending`]) the interrupt's handler ends it, and its row says what it waited for, if it
 /// waited. A child whose tree waits behind a stuck holder ([`Clock::stuck`]) is ended
 /// (`SIGTERM`, [`STUCK_GRACE`], then `SIGKILL`) and could not run, naming the holder. A child
-/// that ends after waiting longer than [`STARVED_SAID`] for a core says so on stderr.
+/// whose tree holds a member stranded at macOS's program check ([`start::Watch::stranded`]), said
+/// at once on stderr, and, at its ceiling, one whose leader has not started or whose tree holds a
+/// member held past the bound on a first exec ([`start::Watch::at_ceiling`]) are ended unrun
+/// ([`kill_unrun`]): a failed run with `spawn_error` set, which no row reads as a finding. A
+/// leader that never ran gets `SIGKILL` alone; one that started, over a deeper member that never
+/// ran, gets `SIGTERM` and its `term_grace` first, as the stuck holder's end gives it before the
+/// ceiling ([`STUCK_GRACE`] when it has none) and as the ceiling's own kill gives it at the
+/// ceiling. A child that ends after waiting longer than [`STARVED_SAID`] for a core says so on
+/// stderr.
 fn finish(
     mut c: Command,
     cmd: &Cmd,
@@ -1451,6 +1527,7 @@ fn finish(
     });
     let begun = Instant::now();
     let mut clock = Clock::new(marks, env.host, child.id(), crate::memory::current()).owning(&own);
+    let mut starts = start::Watch::new(env.host, child.id(), &cmd.program);
     let used = |run: Run, clock: &Clock<'_>| Run {
         usage: own.usage(clock, begun.elapsed()),
         ..run
@@ -1584,9 +1661,34 @@ fn finish(
                 ),
                 read_log(log),
             );
+        } else if let Some(v) = starts.stranded(|| clock.quiet_members(), label) {
+            eprintln!("verify: {label}: {}", v.words);
+            let grace = (!v.leader).then(|| cmd.term_grace.unwrap_or(STUCK_GRACE));
+            let note = kill_unrun(
+                &mut child,
+                #[cfg(unix)]
+                &mut live,
+                grace,
+            );
+            return (
+                used(spawn_failure(cmd, &format!("{}{note}", v.words)), &clock),
+                read_log(log),
+            );
         } else if let Some(limit) = ceiling
             && clock.over(limit)
         {
+            if let Some(v) = starts.at_ceiling(clock.quiet_members(), limit) {
+                let note = kill_unrun(
+                    &mut child,
+                    #[cfg(unix)]
+                    &mut live,
+                    if v.leader { None } else { cmd.term_grace },
+                );
+                return (
+                    used(spawn_failure(cmd, &format!("{}{note}", v.words)), &clock),
+                    read_log(log),
+                );
+            }
             let killed = kill_and_reap(
                 &mut child,
                 #[cfg(unix)]
@@ -1616,10 +1718,30 @@ fn block_says(marks: crate::libtest::Marks) -> Option<&'static str> {
     }
 }
 
-/// End `child`'s group: with a `grace`, `SIGTERM` first and up to `grace` for its leader to exit;
-/// then `SIGKILL` and the leader's reap, which, for a leader still there after the grace, gives
-/// up on Unix at `reap_bound` ([`reap_killed`]). What it adds to the child's block: nothing, the
-/// grace its leader exited within, what failed, or a leader left as it is.
+/// Send `SIGTERM` to `child`'s group and wait up to `grace` for `child` to exit: `None` when the
+/// signal could not be sent, else whether it exited within the grace (it is not reaped). The
+/// ceiling's and the stuck holder's end ([`kill_and_reap`]) and the unrun end ([`kill_unrun`])
+/// share it.
+#[cfg(unix)]
+fn term_within(child: &mut Child, live: &mut group::Live, grace: Duration) -> Option<bool> {
+    live.term().ok()?;
+    let now = Instant::now();
+    let deadline = now
+        .checked_add(grace)
+        .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 3600));
+    while Instant::now() < deadline {
+        if live.exited(child, false).unwrap_or(false) {
+            return Some(true);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Some(false)
+}
+
+/// End `child`'s group: with a `grace`, `SIGTERM` first and up to `grace` for its leader to exit
+/// ([`term_within`]); then `SIGKILL` and the leader's reap, which, for a leader still there after
+/// the grace, gives up on Unix at `reap_bound` ([`reap_killed`]). What it adds to the child's
+/// block: nothing, the grace its leader exited within, what failed, or a leader left as it is.
 fn kill_and_reap(
     child: &mut Child,
     #[cfg(unix)] live: &mut group::Live,
@@ -1628,23 +1750,14 @@ fn kill_and_reap(
 ) -> String {
     #[cfg(unix)]
     if let Some(grace) = grace
-        && live.term().is_ok()
+        && term_within(child, live, grace) == Some(true)
     {
-        let now = Instant::now();
-        let deadline = now
-            .checked_add(grace)
-            .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 3600));
-        while Instant::now() < deadline {
-            if live.exited(child, false).unwrap_or(false) {
-                let _ = live.kill();
-                let _ = live.reap_stage(child, true);
-                return format!(
-                    "  (SIGTERM first, with a {:.1}s grace: the child exited within it)\n",
-                    grace.as_secs_f64()
-                );
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
+        let _ = live.kill();
+        let _ = live.reap_stage(child, true);
+        return format!(
+            "  (SIGTERM first, with a {:.1}s grace: the child exited within it)\n",
+            grace.as_secs_f64()
+        );
     }
     #[cfg(not(unix))]
     let _ = grace;
@@ -1702,6 +1815,60 @@ fn reap_killed(child: &mut Child, live: &mut group::Live, bound: Duration) -> Op
             }
             Err(_) => return None,
         }
+    }
+}
+
+/// End a child verify ends unrun ([`start`]): verify's own stage child, through the group it
+/// holds, and nothing else. With no `grace` (the program that never ran is the leader, and a
+/// program whose first instruction never ran has installed no handler) `SIGKILL` comes alone.
+/// With a `grace` (it is a deeper member, under a leader that started and may clean up on
+/// `SIGTERM`) the group gets `SIGTERM` first, and the `SIGKILL` once the leader exits or the grace
+/// ends ([`term_within`], as [`kill_and_reap`] gives it). The reap after the `SIGKILL` is bounded
+/// at [`REAP_AFTER_KILL`] ([`reap_killed`]). Its file is never touched. What it adds to the
+/// child's why: nothing, the grace's end, what failed, or a leader left as it is.
+fn kill_unrun(
+    child: &mut Child,
+    #[cfg(unix)] live: &mut group::Live,
+    grace: Option<Duration>,
+) -> String {
+    #[cfg(unix)]
+    {
+        let termed = match grace.map(|g| (g, term_within(child, live, g))) {
+            Some((g, Some(true))) => format!(
+                "; its leader, which had started, was sent SIGTERM first and exited within its \
+                 {:.1}s grace",
+                g.as_secs_f64()
+            ),
+            Some((g, Some(false))) => format!(
+                "; its leader, which had started, was sent SIGTERM first, and SIGKILL after its \
+                 {:.1}s grace",
+                g.as_secs_f64()
+            ),
+            Some((_, None)) | None => String::new(),
+        };
+        let killed = match live.kill() {
+            Ok(()) => String::new(),
+            Err(e) if live.holds(child.id()) => match child.kill() {
+                Ok(()) => {
+                    format!("; killing its process group failed ({e}), so SIGKILL reached it alone")
+                }
+                Err(k) => format!("; SIGKILL itself failed ({e}; {k})"),
+            },
+            Err(e) => format!("; its group custody was lost ({e}), so it was not signalled"),
+        };
+        let left = reap_killed(child, live, REAP_AFTER_KILL)
+            .map_or_else(String::new, |l| format!("; {l}"));
+        format!("{termed}{killed}{left}")
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = grace;
+        let killed = match child.kill() {
+            Ok(()) => String::new(),
+            Err(e) => format!("; SIGKILL itself failed ({e})"),
+        };
+        let _ = child.wait();
+        killed
     }
 }
 
@@ -4285,14 +4452,16 @@ mod tests {
         Cmd::new("/bin/sh").args(["-c", &format!("echo $$ > '{}'; {then}", pidfile.display())])
     }
 
+    /// A child [`running`] on a thread of its own, and where its run and the time it ended come.
+    #[cfg(unix)]
+    type Running = (
+        std::thread::JoinHandle<()>,
+        std::sync::mpsc::Receiver<(Run, Instant)>,
+    );
+
     /// `cmd` run on a thread of its own under `ceiling` on `host`.
     #[cfg(unix)]
-    fn running(
-        cmd: Cmd,
-        dir: &Path,
-        ceiling: Duration,
-        host: &'static dyn Host,
-    ) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Receiver<Run>) {
+    fn running(cmd: Cmd, dir: &Path, ceiling: Duration, host: &'static dyn Host) -> Running {
         let (tx, rx) = std::sync::mpsc::channel();
         let dir = dir.to_path_buf();
         let thread = std::thread::spawn(move || {
@@ -4300,19 +4469,23 @@ mod tests {
                 host,
                 ..ceiled(&dir, Some(ceiling))
             };
-            let _ = tx.send(run(&cmd, env));
+            let out = run(&cmd, env);
+            let _ = tx.send((out, Instant::now()));
         });
         (thread, rx)
     }
 
-    /// The run `rx` answers, once its ceiling ends its child: the one-minute hang detector, past
-    /// which the child's group (by the pid it wrote) is killed and the test fails.
+    /// The run `running` answers, once its ceiling ends its child ([`ended_at`]).
     #[cfg(unix)]
-    fn ended(
-        (thread, rx): (std::thread::JoinHandle<()>, std::sync::mpsc::Receiver<Run>),
-        pidfile: &Path,
-        what: &str,
-    ) -> Run {
+    fn ended(running: Running, pidfile: &Path, what: &str) -> Run {
+        ended_at(running, pidfile, what).0
+    }
+
+    /// The run `rx` answers and when it ended, once its ceiling ends its child: the one-minute
+    /// hang detector, past which the child's group (by the pid it wrote) is killed and the test
+    /// fails.
+    #[cfg(unix)]
+    fn ended_at((thread, rx): Running, pidfile: &Path, what: &str) -> (Run, Instant) {
         let Ok(out) = rx.recv_timeout(HANG_DETECTOR) else {
             if let Some(pid) = written_pid(pidfile) {
                 let _ = std::process::Command::new("/bin/kill")
@@ -4324,6 +4497,620 @@ mod tests {
         };
         let _ = thread.join();
         out
+    }
+
+    /// What a [`HeldAt`] host counts: its answers to `unstarted`, `daemon` and `backlog`.
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Debug)]
+    enum Asked {
+        Unstarted,
+        Daemon,
+        Backlog,
+    }
+
+    /// A stand-in host for a child's tree held at macOS's program check: the child's group as one
+    /// member with no CPU and no I/O, beside `member` when that is a deeper one. Its clock reads
+    /// `made_us` at a watch's first look and moves `step` at each look after (each `unstarted`),
+    /// so a test spans the minutes a syspolicyd's grace takes in a few seconds. The held one forked
+    /// `held` before `made_us` (`None`: nothing unrun), reads unrun from look `unrun_from` on and,
+    /// when `runs`, at another CPU at each look (it ran between them), and when `stopped`, stopped
+    /// as a start-suspended spawn reads (`StoppedUnstarted`, never held); it waits under the
+    /// syspolicyd `daemon` (pid [`HeldAt::DAEMON`]) and the backlog it is told. It counts what it
+    /// is asked, and keeps the child's pgid.
+    #[cfg(unix)]
+    #[derive(Debug)]
+    struct HeldAt {
+        made_us: u64,
+        step: Duration,
+        held: Option<Duration>,
+        unrun_from: u64,
+        runs: bool,
+        stopped: bool,
+        /// A deeper member's pid, executable and chain; `None` holds the leader.
+        member: Option<(u32, PathBuf, Option<Vec<PathBuf>>)>,
+        daemon: DaemonNow,
+        backlog: Backlog,
+        asked: [AtomicU64; 3],
+        pgid: AtomicU64,
+    }
+
+    #[cfg(unix)]
+    impl HeldAt {
+        const DAEMON: u32 = 4242;
+
+        /// A leader held `held` before the first look, under a syspolicyd that started
+        /// `daemon_at` seconds after that look (before it, when negative; `None`: none runs), its
+        /// pool read `pool_full` and `held_since` held programs forked since it started; its
+        /// clock moves 11 min a look, past the daemon's grace by the second.
+        fn leader(
+            held: Duration,
+            daemon_at: Option<i64>,
+            pool_full: Option<bool>,
+            held_since: Option<usize>,
+        ) -> HeldAt {
+            let made_us = aterm_sysprobe::jobs::now_us();
+            let daemon = daemon_at.map_or(DaemonNow::NoneRunning, |at| {
+                let s = made_us
+                    .checked_add_signed(at * 1_000_000)
+                    .expect("in range");
+                DaemonNow::Running(aterm_uds::program_check::Daemon {
+                    pid: Self::DAEMON,
+                    start_s: s / 1_000_000,
+                    start_us: u32::try_from(s % 1_000_000).expect("under a second"),
+                })
+            });
+            HeldAt {
+                made_us,
+                step: Duration::from_secs(11 * 60),
+                held: Some(held),
+                unrun_from: 0,
+                runs: false,
+                stopped: false,
+                member: None,
+                daemon,
+                backlog: Backlog {
+                    pool_full,
+                    held_since,
+                },
+                asked: Default::default(),
+                pgid: AtomicU64::new(0),
+            }
+        }
+
+        /// The stranded shape (2026-10-29's band): held 31 min, seen held by the first look, under
+        /// a syspolicyd that started a second after it and answers alone.
+        fn stranded() -> HeldAt {
+            Self::leader(Duration::from_secs(31 * 60), Some(1), Some(false), Some(0))
+        }
+
+        fn leaked(self) -> &'static HeldAt {
+            Box::leak(Box::new(self))
+        }
+
+        fn asked(&self, what: Asked) -> u64 {
+            self.asked[what as usize].load(Ordering::SeqCst)
+        }
+
+        fn ask(&self, what: Asked) -> u64 {
+            self.asked[what as usize].fetch_add(1, Ordering::SeqCst)
+        }
+
+        /// The held one's pid in group `pgid`.
+        fn held_pid(&self, pgid: u32) -> u32 {
+            self.member.as_ref().map_or(pgid, |(pid, _, _)| *pid)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Host for HeldAt {
+        fn group_usage(&self, pgid: u32) -> Option<Vec<aterm_sysprobe::MemberUsage>> {
+            self.pgid.store(u64::from(pgid), Ordering::SeqCst);
+            let held = self.held_pid(pgid);
+            let cpu = if self.runs {
+                1000 * self.asked(Asked::Unstarted)
+            } else {
+                0
+            };
+            let quiet = |pid| aterm_sysprobe::MemberUsage {
+                pid,
+                start: 1,
+                cpu_ns: if pid == held { cpu } else { 0 },
+                ..aterm_sysprobe::MemberUsage::default()
+            };
+            Some(
+                std::iter::once(pgid)
+                    .chain(self.member.as_ref().map(|(pid, _, _)| *pid))
+                    .map(quiet)
+                    .collect(),
+            )
+        }
+
+        fn idle(&self) -> Option<Duration> {
+            None
+        }
+
+        fn cores(&self) -> u32 {
+            1
+        }
+
+        fn now_us(&self) -> u64 {
+            let looks = u32::try_from(self.asked(Asked::Unstarted)).expect("few looks");
+            self.made_us + u64::try_from((self.step * looks).as_micros()).expect("small")
+        }
+
+        fn unstarted(&self, pgid: u32, pids: &[u32], now_us: u64) -> Vec<Unstarted> {
+            let look = self.ask(Asked::Unstarted);
+            let Some(held) = self.held else {
+                return Vec::new();
+            };
+            let (pid, exe, chain) = match &self.member {
+                None => (pgid, None, Some(Vec::new())),
+                Some((pid, exe, chain)) => (*pid, Some(exe.clone()), chain.clone()),
+            };
+            if look < self.unrun_from || !pids.contains(&pid) {
+                return Vec::new();
+            }
+            let start_us = self.made_us - u64::try_from(held.as_micros()).expect("small");
+            vec![Unstarted {
+                pid,
+                facts: aterm_sysprobe::jobs::StartFacts {
+                    lone_zero: true,
+                    stopped: self.stopped,
+                    local: Some(true),
+                    age_ms: Some(now_us.saturating_sub(start_us) / 1000),
+                    start_us: Some(start_us),
+                    ..aterm_sysprobe::jobs::StartFacts::default()
+                },
+                exe,
+                chain,
+            }]
+        }
+
+        fn daemon(&self) -> DaemonNow {
+            self.ask(Asked::Daemon);
+            self.daemon
+        }
+
+        fn backlog(&self, _: aterm_uds::program_check::Daemon, _: u64) -> Backlog {
+            self.ask(Asked::Backlog);
+            self.backlog
+        }
+    }
+
+    /// 2026-10-29's band: a stage child seen held at its first exec before the syspolicyd running
+    /// now started, which has then run past the bound on a first exec and answers alone, ends
+    /// within the hang detector under a 3 h ceiling: unrun, naming its pid and the daemon's, a
+    /// COULD NOT RUN row and no ceiling finding, its group gone. Negative controls: the ones
+    /// beside it (a daemon its check may still reach) wait to their ceiling.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_held_since_before_the_running_syspolicyd_ends_could_not_run_within_a_minute() {
+        let tmp = crate::mktemp_dir("atv-stranded").expect("mktemp");
+        let pidfile = tmp.join("stranded.pid");
+        let host = HeldAt::stranded().leaked();
+        let out = ended(
+            running(
+                stand_in(&pidfile, "exec sleep 600"),
+                &tmp,
+                DEFAULT_CHILD_CEILING,
+                host,
+            ),
+            &pidfile,
+            "a child its syspolicyd stranded",
+        );
+        let pid = host.pgid.load(Ordering::SeqCst);
+        assert!(!out.ok && out.code.is_none(), "{out:?}");
+        let why = out.spawn_error.as_deref().expect("ended unrun");
+        assert!(
+            why.contains(&format!("(pid {pid})"))
+                && why.contains(&format!("(pid {})", HeldAt::DAEMON)),
+            "{why}"
+        );
+        assert_eq!(out.environment_failure().as_deref(), Some(why));
+        assert!(
+            !out.output.contains(crate::findings::CEILING_KILL),
+            "{}",
+            out.output
+        );
+        let mut r = crate::Report::new("stranded");
+        r.decide_child(&out, "band");
+        assert!(
+            r.outcomes()
+                .all(|(o, _)| o == crate::Outcome::Fail(crate::Severity::CouldNotRun)),
+            "{}",
+            r.render()
+        );
+        assert!(gone_within(&pid.to_string(), HANG_DETECTOR), "pid {pid}");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Negative controls for the stranded rule, each a leader held 31 min under a 9 s ceiling,
+    /// over which its watch looks twice, 11 min apart on its host's clock: a syspolicyd older than
+    /// its first look (its check went to the one running now); one that started after it but has
+    /// run only 9 min by the second, short of the bound on a first exec (a check queued for it
+    /// may still be answered); a full pool, an unread pool, a backlog (a held program forked
+    /// since that daemon started); no syspolicyd and an unread one; a leader first read unrun at
+    /// the second look (its fork predates the daemon, but its exec, in the same pid, does not);
+    /// one whose CPU moved between the looks (it ran, and may have exec'd again); a leader that
+    /// reads stopped before its first instruction (`StoppedUnstarted`, never held, so the daemon
+    /// is never asked of it). Each waits to its ceiling and ends there unrun, not as a finding,
+    /// with the leader still unstarted, its words saying how; the backlog is read only once the
+    /// leader's check was sent before a daemon past its grace. A tree with nothing unrun ends at
+    /// its ceiling as the finding it was.
+    #[cfg(unix)]
+    #[test]
+    fn a_held_child_its_syspolicyd_may_still_answer_is_waited_for_to_its_ceiling() {
+        let tmp = crate::mktemp_dir("atv-held-waits").expect("mktemp");
+        let ceiling = Duration::from_secs(9);
+        let held = Duration::from_secs(31 * 60);
+        let leader = |at, pool_full, held_since| HeldAt::leader(held, at, pool_full, held_since);
+        let mut in_grace = HeldAt::stranded();
+        in_grace.step = Duration::from_secs(9 * 60);
+        let mut unread = HeldAt::stranded();
+        unread.daemon = DaemonNow::Unread;
+        let mut exec_later = HeldAt::stranded();
+        exec_later.unrun_from = 1;
+        let mut ran = HeldAt::stranded();
+        ran.runs = true;
+        let mut nothing = HeldAt::stranded();
+        nothing.held = None;
+        let mut stopped = HeldAt::stranded();
+        stopped.stopped = true;
+        let cases = [
+            (
+                "an older daemon",
+                leader(Some(-32 * 60), Some(false), Some(0)),
+                false,
+            ),
+            ("a daemon short of its grace", in_grace, false),
+            ("a full pool", leader(Some(1), Some(true), Some(0)), true),
+            ("an unread pool", leader(Some(1), None, Some(0)), true),
+            ("a backlog", leader(Some(1), Some(false), Some(1)), true),
+            ("no daemon", leader(None, Some(false), Some(0)), false),
+            ("an unread daemon", unread, false),
+            ("an exec after the daemon started", exec_later, false),
+            ("a CPU that moved", ran, false),
+            ("a leader stopped before it ran", stopped, false),
+            ("nothing unrun", nothing, false),
+        ]
+        .map(|(what, host, backlog)| {
+            let host = host.leaked();
+            let pidfile = tmp.join(format!("{what}.pid"));
+            let begun = Instant::now();
+            let run = running(stand_in(&pidfile, "exec sleep 600"), &tmp, ceiling, host);
+            (what, host, backlog, pidfile, begun, run)
+        });
+        for (what, host, backlog, pidfile, begun, run) in cases {
+            let (out, at) = ended_at(run, &pidfile, what);
+            assert!(
+                at.saturating_duration_since(begun) >= ceiling,
+                "{what}: ended before its ceiling: {out:?}"
+            );
+            assert!(!out.ok && out.code.is_none(), "{what}: {out:?}");
+            assert!(host.asked(Asked::Unstarted) >= 3, "{what}: {host:?}");
+            if host.held.is_none() {
+                assert!(
+                    out.spawn_error.is_none() && out.output.contains(crate::findings::CEILING_KILL),
+                    "{what}: {out:?}"
+                );
+                continue;
+            }
+            let why = out
+                .spawn_error
+                .as_deref()
+                .expect("ended unrun at its ceiling");
+            assert!(!why.contains("stranded"), "{what}: {why}");
+            assert_eq!(
+                why.contains("it read stopped"),
+                host.stopped,
+                "{what}: {why}"
+            );
+            if host.stopped {
+                assert_eq!(host.asked(Asked::Daemon), 0, "{what}: never held");
+            }
+            assert!(
+                !out.output.contains(crate::findings::CEILING_KILL),
+                "{what}: {}",
+                out.output
+            );
+            assert_eq!(
+                host.asked(Asked::Backlog) > 0,
+                backlog,
+                "{what}: backlog asked {} times",
+                host.asked(Asked::Backlog)
+            );
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The slow, healthy first exec: a leader held 9 min 59 s at the first look, seen held past
+    /// the 10 min line by the second, under a syspolicyd older than it whose pool answers, runs
+    /// on and passes. Its start is asked again, its backlog never.
+    #[cfg(unix)]
+    #[test]
+    fn a_slow_first_exec_under_the_running_syspolicyd_runs_on_and_passes() {
+        let tmp = crate::mktemp_dir("atv-slow-exec").expect("mktemp");
+        let pidfile = tmp.join("slow.pid");
+        let host = HeldAt::leader(
+            Duration::from_secs(10 * 60 - 1),
+            Some(-20 * 60),
+            Some(false),
+            Some(0),
+        )
+        .leaked();
+        let out = ended(
+            running(
+                stand_in(&pidfile, "sleep 7"),
+                &tmp,
+                DEFAULT_CHILD_CEILING,
+                host,
+            ),
+            &pidfile,
+            "a slow first exec",
+        );
+        assert!(out.ok && out.spawn_error.is_none(), "{out:?}");
+        assert!(host.asked(Asked::Unstarted) >= 2, "{host:?}");
+        assert_eq!(host.asked(Asked::Backlog), 0, "{host:?}");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A held deeper member, as cargo's `build-script-build` under `cargo` and `targo`.
+    #[cfg(unix)]
+    fn member_of(mut host: HeldAt, chain: &[&str]) -> &'static HeldAt {
+        host.member = Some((
+            999_999,
+            PathBuf::from("/r/target/debug/build/x-1/build-script-build"),
+            Some(chain.iter().map(PathBuf::from).collect()),
+        ));
+        host.leaked()
+    }
+
+    #[cfg(unix)]
+    const UNDER_CARGO: [&str; 2] = ["/store/bin/cargo", "/store/bin/targo"];
+
+    /// Only a member no test binary started is its child's to judge: a deeper member stranded
+    /// under a test binary (`deps/`) is that test's to bound, so its child, whose leader started,
+    /// ends at its ceiling as the finding it was; the same member under cargo ends unrun as the
+    /// stranded leader does, named by its own executable.
+    #[cfg(unix)]
+    #[test]
+    fn a_member_under_a_test_binary_is_the_tests_to_bound() {
+        let tmp = crate::mktemp_dir("atv-stranded-member").expect("mktemp");
+        let under_test = tmp.join("under-test.pid");
+        let out = ended(
+            running(
+                stand_in(&under_test, "exec sleep 600"),
+                &tmp,
+                Duration::from_secs(9),
+                member_of(HeldAt::stranded(), &["/r/target/debug/deps/band-1"]),
+            ),
+            &under_test,
+            "a member under a test binary",
+        );
+        assert!(
+            out.spawn_error.is_none() && out.output.contains(crate::findings::CEILING_KILL),
+            "{out:?}"
+        );
+        let under_cargo = tmp.join("under-cargo.pid");
+        let out = ended(
+            running(
+                stand_in(&under_cargo, "exec sleep 600"),
+                &tmp,
+                DEFAULT_CHILD_CEILING,
+                member_of(HeldAt::stranded(), &UNDER_CARGO),
+            ),
+            &under_cargo,
+            "a member under cargo",
+        );
+        let why = out.spawn_error.as_deref().expect("ended unrun");
+        assert!(
+            why.contains("build-script-build")
+                && why.contains("(pid 999999)")
+                && why.contains(&format!("(pid {})", HeldAt::DAEMON)),
+            "{why}"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// At its ceiling, a member under cargo that its watch has seen held for the bound on a first
+    /// exec (11 min by the look the ceiling takes) decided nothing, though its leader started, so
+    /// the child ends unrun, naming it, with no ceiling finding: its syspolicyd is older than its
+    /// first exec, so it was never stranded. Negative controls: the same member seen held 1 min
+    /// (a first exec within the bound is work in line), and one under a test binary, end at the
+    /// ceiling as the finding they were.
+    #[cfg(unix)]
+    #[test]
+    fn a_member_held_past_the_first_exec_bound_at_its_ceiling_ends_unrun() {
+        let tmp = crate::mktemp_dir("atv-held-member").expect("mktemp");
+        let older = || {
+            HeldAt::leader(
+                Duration::from_secs(60),
+                Some(-40 * 60),
+                Some(false),
+                Some(0),
+            )
+        };
+        let mut within = older();
+        within.step = Duration::from_secs(60);
+        let cases = [
+            ("past the bound", member_of(older(), &UNDER_CARGO), true),
+            ("within the bound", member_of(within, &UNDER_CARGO), false),
+            (
+                "under a test binary",
+                member_of(older(), &["/r/target/debug/deps/band-1"]),
+                false,
+            ),
+        ]
+        .map(|(what, host, unrun)| {
+            let pidfile = tmp.join(format!("{what}.pid"));
+            let run = running(
+                stand_in(&pidfile, "exec sleep 600"),
+                &tmp,
+                Duration::from_secs(3),
+                host,
+            );
+            (what, host, unrun, pidfile, run)
+        });
+        for (what, host, unrun, pidfile, run) in cases {
+            let out = ended(run, &pidfile, what);
+            assert!(!out.ok && out.code.is_none(), "{what}: {out:?}");
+            assert_eq!(host.asked(Asked::Backlog), 0, "{what}: never stranded");
+            if !unrun {
+                assert!(
+                    out.spawn_error.is_none() && out.output.contains(crate::findings::CEILING_KILL),
+                    "{what}: {out:?}"
+                );
+                continue;
+            }
+            let why = out.spawn_error.as_deref().expect("ended unrun");
+            assert!(
+                why.contains("build-script-build")
+                    && why.contains("(pid 999999)")
+                    && !why.contains("stranded"),
+                "{what}: {why}"
+            );
+            assert!(
+                !out.output.contains(crate::findings::CEILING_KILL),
+                "{what}: {}",
+                out.output
+            );
+            let mut r = crate::Report::new("held");
+            r.decide_child(&out, "targo test --no-run");
+            assert!(
+                r.outcomes()
+                    .all(|(o, _)| o == crate::Outcome::Fail(crate::Severity::CouldNotRun)),
+                "{what}: {}",
+                r.render()
+            );
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A stranded member under a leader that started ends its child as the stuck holder's end
+    /// does before the ceiling: its group gets `SIGTERM` first, and the leader's handler runs
+    /// within its `term_grace`, or [`STUCK_GRACE`] when it has none, before the `SIGKILL`.
+    /// Negative control: the same leader read as the stranded program itself, which never ran and
+    /// so has no handler, gets `SIGKILL` alone, its grace notwithstanding.
+    #[cfg(unix)]
+    #[test]
+    fn a_started_leader_over_a_stranded_member_gets_its_term_grace_first() {
+        let tmp = crate::mktemp_dir("atv-stranded-grace").expect("mktemp");
+        let twenty = Duration::from_secs(20);
+        let cases = [
+            (
+                "a member",
+                member_of(HeldAt::stranded(), &UNDER_CARGO),
+                Some(twenty),
+                true,
+            ),
+            (
+                "a member under a leader with no grace of its own",
+                member_of(HeldAt::stranded(), &UNDER_CARGO),
+                None,
+                true,
+            ),
+            (
+                "the leader",
+                HeldAt::stranded().leaked(),
+                Some(twenty),
+                false,
+            ),
+        ]
+        .map(|(what, host, grace, termed)| {
+            let pidfile = tmp.join(format!("{what}.pid"));
+            let marker = tmp.join(format!("{what}.term"));
+            let cmd = stand_in(
+                &pidfile,
+                &format!(
+                    "trap 'echo term > \"{}\"; exit 0' TERM; while :; do sleep 1; done",
+                    marker.display()
+                ),
+            );
+            let cmd = match grace {
+                Some(g) => cmd.term_grace(g),
+                None => cmd,
+            };
+            let run = running(cmd, &tmp, DEFAULT_CHILD_CEILING, host);
+            (what, termed, pidfile, marker, run)
+        });
+        for (what, termed, pidfile, marker, run) in cases {
+            let out = ended(run, &pidfile, what);
+            let why = out.spawn_error.as_deref().expect("ended unrun");
+            assert!(why.contains("stranded"), "{what}: {why}");
+            assert_eq!(
+                std::fs::read_to_string(&marker).ok().as_deref(),
+                termed.then_some("term\n"),
+                "{what}: {why}"
+            );
+            let pid = written_pid(&pidfile).expect("its pid");
+            assert!(gone_within(&pid, HANG_DETECTOR), "{what}: pid {pid}");
+        }
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The scope of the stranded rule: a member's chain judged ([`start::in_scope`]) is read
+    /// whole and holds no executable run from a `deps` directory, at any depth; the walk up the
+    /// group ([`start::chain_of`]) reads each parent to the leader, and gives none when a record
+    /// or a path is unread or a parent is outside the group.
+    #[test]
+    fn only_a_member_no_test_binary_started_is_its_childs_to_judge() {
+        let p = |s: &str| PathBuf::from(s);
+        let cargo = [p("/store/bin/cargo"), p("/store/bin/targo")];
+        assert!(start::in_scope(Some(&[])));
+        assert!(start::in_scope(Some(&cargo)));
+        assert!(start::in_scope(Some(&[p("/deps/bin/cargo")])));
+        assert!(!start::in_scope(Some(&[p("/r/target/debug/deps/band-1")])));
+        assert!(!start::in_scope(Some(&[
+            p("/bin/sh"),
+            p("/r/target/debug/deps/band-1"),
+            p("/store/bin/cargo"),
+        ])));
+        assert!(!start::in_scope(None));
+        // pid: (parent, group); 10 leads group 10, 30 is in group 30.
+        let record = |pid| match pid {
+            10 => Some((1, 10)),
+            11 => Some((10, 10)),
+            12 => Some((11, 10)),
+            13 => Some((30, 10)),
+            14 => Some((15, 10)),
+            30 => Some((1, 30)),
+            _ => None,
+        };
+        let path = |pid| match pid {
+            10 => Some(p("/store/bin/targo")),
+            11 => Some(p("/store/bin/cargo")),
+            _ => None,
+        };
+        let chain = |pid| start::chain_of(pid, 10, record, path);
+        assert_eq!(chain(10), Some(Vec::new()));
+        assert_eq!(
+            chain(12),
+            Some(vec![p("/store/bin/cargo"), p("/store/bin/targo")])
+        );
+        assert_eq!(chain(13), None, "a parent outside the group");
+        assert_eq!(chain(14), None, "an unread parent");
+        let unread_path = |pid| (pid != 11).then(|| p("/x"));
+        assert_eq!(start::chain_of(12, 10, record, unread_path), None);
+    }
+
+    /// The live host reads this test process as started, and the syspolicyd running now as one
+    /// with a pid, or none.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_live_host_reads_this_process_started_and_a_daemon_or_none() {
+        let me = std::process::id();
+        let pgid = aterm_sysprobe::kproc::record(me)
+            .and_then(|r| u32::try_from(r.pgid).ok())
+            .expect("this process's record");
+        assert_eq!(
+            LIVE_HOST.unstarted(pgid, &[me], aterm_sysprobe::jobs::now_us()),
+            Vec::new()
+        );
+        match LIVE_HOST.daemon() {
+            DaemonNow::Running(d) => assert!(d.pid > 1, "{d:?}"),
+            DaemonNow::NoneRunning => {}
+            DaemonNow::Unread => panic!("the process table reads"),
+        }
     }
 
     /// CEILING-WAIT's wait for a core: a stand-in child whose tree is given 5% of the time it is

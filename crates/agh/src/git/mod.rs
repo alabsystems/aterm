@@ -18,6 +18,18 @@ mod source_config;
 
 pub use fetch::{FetchBatch, FetchRow};
 pub use run::{GitOp, GitOut, GitRun, HelperCommand};
+
+/// One validation phase of an incremental native atomic ref admission.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativePushPhase {
+    /// Build the complete commit/tree/tag metadata pack for BEFORE and AFTER.
+    MetadataPack,
+    /// Strictly verify that metadata pack and its original object IDs.
+    MetadataVerify,
+    /// Walk AFTER's connectivity, including referenced blob presence.
+    Connectivity,
+}
 // `run` stays a private module; its runner is re-exported to the crate alone, so
 // `Github::run_git` (client.rs) calls it as `crate::git::run(self, run)`. The function and
 // the module share the name in different namespaces.

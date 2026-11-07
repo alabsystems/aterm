@@ -1447,7 +1447,9 @@ pub struct NamedAsk<'a> {
 /// does not fold, is staged over from the signed pack. A stage refusal remembered for the pack's
 /// digest refuses without a download, as the update lane's does, unless the ask's `retry` forgets
 /// it first. A sysroot bundle whose resolve check fails is refused and taken out of every
-/// reader's reach (`settle_resolve`).
+/// reader's reach (`settle_resolve`). Both successful paths refresh the existing recent-use
+/// retention mark before returning, bridging a named installation and its first consumer lease.
+/// The caller holds the store mutation lock throughout installation and retention recording.
 ///
 /// # Errors
 /// [`signed_pkg`]'s, a tree other than `ask.expect_root` ([`FlowError::NamedBuild`]), no
@@ -1488,6 +1490,8 @@ pub fn install_build(
     }
     let build_dir = layout.build_dir(program, build);
     if held_root(&build_dir).as_deref() == Some(artifact.tree_root.as_str()) {
+        crate::trust_lock::mark_used(&build_dir)
+            .map_err(|e| FlowError::Activate(format!("named build retention: {e}")))?;
         return Ok(NamedBuild::Present {
             tree_root: artifact.tree_root.clone(),
         });
@@ -1557,6 +1561,8 @@ pub fn install_build(
     settle_resolve(&build_dir, artifact, checked, was_live)?;
     let _ = crate::store::write_exposes(&build_dir, &tools);
     let _ = crate::store::write_version(&build_dir, &pkg.version);
+    crate::trust_lock::mark_used(&build_dir)
+        .map_err(|e| FlowError::Activate(format!("named build retention: {e}")))?;
     Ok(NamedBuild::Staged { tree_root })
 }
 

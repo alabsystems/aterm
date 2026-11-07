@@ -36,6 +36,10 @@ use crate::supervise::screen::HumanInput;
 #[path = "relaunch_native_gate_tests.rs"]
 mod native_gate_tests;
 
+#[cfg(all(test, unix))]
+#[path = "relaunch_native_plan_tests.rs"]
+mod native_plan_tests;
+
 /// A relaunch planned from the live process.
 pub(super) struct Plan {
     pub(super) shell: u32,
@@ -71,6 +75,33 @@ pub(super) struct PlannedCommand {
 }
 
 impl PlannedCommand {
+    /// Bind native format bytes and the mapped image to the same opened file.
+    /// Mutable aliases and a replacement between inspection and capture refuse.
+    pub(super) fn capture_native(&self) -> Option<super::native_act::RestartCommand> {
+        #[cfg(unix)]
+        {
+            use std::io::Read as _;
+            use std::os::unix::fs::MetadataExt as _;
+            let command = self.capture()?;
+            if command.program.as_bytes() != command.image.path.as_slice() {
+                return None;
+            }
+            let mut file = std::fs::File::open(&self.target).ok()?;
+            let metadata = file.metadata().ok()?;
+            let mut head = [0; 8];
+            (metadata.is_file()
+                && metadata.dev() == command.image.device
+                && metadata.ino() == command.image.inode
+                && file.read_exact(&mut head).is_ok()
+                && atpkg::macho::is_native_executable(&head))
+            .then_some(command)
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
     /// The program a native restart of this command expects it to execute
     /// (`native_restart::begin`'s target): aterm's token wrapper where the command serves the
     /// account's vault token ([`super::accounts_pool::ExecutionIntent::Token`]), else `program`,
@@ -378,12 +409,37 @@ pub(super) fn plan(
     plan_with_cold(opts, launch, shell, t, None)
 }
 
+/// An already coordinated upgrade needs an immutable mapped image, rather than a
+/// marked shell twin whose eventual exec would differ from the admitted image.
+pub(super) fn plan_native_upgrade(
+    opts: &Opts,
+    launch: &Launch<'_>,
+    shell: u32,
+    t: &[super::upgrade_drive::ProcRow],
+) -> Result<Plan, NoPlan> {
+    if !cfg!(unix) {
+        return Err(NoPlan::Wait("native-platform"));
+    }
+    plan_with_selection(opts, launch, shell, t, None, true)
+}
+
 fn plan_with_cold(
     opts: &Opts,
     launch: &Launch<'_>,
     shell: u32,
     t: &[super::upgrade_drive::ProcRow],
     cold: Option<super::native_act::ColdIntent>,
+) -> Result<Plan, NoPlan> {
+    plan_with_selection(opts, launch, shell, t, cold, false)
+}
+
+fn plan_with_selection(
+    opts: &Opts,
+    launch: &Launch<'_>,
+    shell: u32,
+    t: &[super::upgrade_drive::ProcRow],
+    cold: Option<super::native_act::ColdIntent>,
+    native_upgrade: bool,
 ) -> Result<Plan, NoPlan> {
     if shell == NO_SHELL {
         return Err(NoPlan::Refused {
@@ -471,6 +527,7 @@ fn plan_with_cold(
         unset.as_deref(),
         served_unset.as_deref(),
         tap.as_deref(),
+        native_upgrade,
         token.as_ref(),
     )?;
     // What the selected line unsets, which the command's capture renders again.
@@ -1028,7 +1085,8 @@ pub(super) fn line_tap_kept(
     tap: Option<&str>,
 ) -> Result<(String, Option<String>), NoPlan> {
     line_tap_selected(
-        dialect, heal, cd, exe, argv, session, model, mode, required, unset, unset, tap, None,
+        dialect, heal, cd, exe, argv, session, model, mode, required, unset, unset, tap, false,
+        None,
     )
     .map(|selected| (selected.line, selected.tap_dropped))
 }
@@ -1068,8 +1126,12 @@ fn line_tap_selected(
     unset: Option<&[&str]>,
     served_unset: Option<&[&str]>,
     tap: Option<&str>,
+    native_upgrade: bool,
     token: Option<&TokenServe>,
 ) -> Result<SelectedCommand, NoPlan> {
+    if native_upgrade && token.is_some() {
+        return Err(NoPlan::Wait("native-token-policy"));
+    }
     let mut flags =
         upgrade::rewrite_argv(argv, session.unwrap_or("-")).map_err(|e| NoPlan::Refused {
             why: format!("argv:{e}"),
@@ -1080,9 +1142,61 @@ fn line_tap_selected(
         flags.truncate(flags.len().saturating_sub(2));
     }
     let flags = with_permission_mode(with_model(flags, model), mode);
+    let native = if native_upgrade {
+        let twin = super::upgrade_drive::managed_agent_twin("claude");
+        if twin.as_deref() == Some(exe) {
+            let prefix = exe
+                .parent()
+                .and_then(Path::parent)
+                .ok_or(NoPlan::Wait("native-managed-layout"))?;
+            Some(
+                atpkg::platform::native_claude_restart(
+                    &atpkg::store::Layout {
+                        prefix: prefix.to_path_buf(),
+                    },
+                    &flags,
+                )
+                .map_err(|_| NoPlan::Wait("native-managed-policy"))?,
+            )
+        } else {
+            // A directly named native image has no wrapper policy to project. An
+            // opaque interpreter/script is refused before the old vendor is signalled.
+            use std::io::Read as _;
+            let mut file =
+                std::fs::File::open(exe).map_err(|_| NoPlan::Wait("native-target-unread"))?;
+            let mut head = [0; 8];
+            if !file.metadata().is_ok_and(|metadata| metadata.is_file())
+                || file.read_exact(&mut head).is_err()
+                || !atpkg::macho::is_native_executable(&head)
+            {
+                return Err(NoPlan::Wait("native-target-policy"));
+            }
+            Some(atpkg::platform::NativeClaudeRestart {
+                target: std::fs::canonicalize(exe)
+                    .map_err(|_| NoPlan::Wait("native-target-unread"))?,
+                env: atpkg::shim_env::ShimEnv::NONE,
+            })
+        }
+    } else {
+        None
+    };
     let build = past_unmarked_twin(exe, &flags);
-    let exe = build.as_deref().unwrap_or(exe);
+    let exe = native
+        .as_ref()
+        .map(|native| native.target.as_path())
+        .or(build.as_deref())
+        .unwrap_or(exe);
     let both: Vec<(&str, &str)> = required.iter().copied().chain(CLAUDE_LAUNCH_ENV).collect();
+    let both = match native.as_ref() {
+        Some(native) => {
+            upgrade::with_shim_env(&both, unset.unwrap_or_default(), native.env.entries())
+        }
+        None => both,
+    };
+    let required = native.as_ref().map_or_else(
+        || required.to_vec(),
+        |native| upgrade::with_shim_env(required, unset.unwrap_or_default(), native.env.entries()),
+    );
     let tapped = tap.map(|value| with_tap(flags.clone(), value));
     let line = |env: &[(&str, &str)], flags: &[String], served: Option<&TokenServe>| {
         // A line that serves the token unsets `served_unset`, what the wrapper does not make
@@ -1109,7 +1223,7 @@ fn line_tap_selected(
         )
     };
     let fit = |flags: &[String], served: Option<&TokenServe>| {
-        line(&both, flags, served).or_else(|_| line(required, flags, served))
+        line(&both, flags, served).or_else(|_| line(&required, flags, served))
     };
     let left = |what: &str, why: String, kept: &SelectedCommand| {
         format!(

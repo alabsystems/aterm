@@ -1235,7 +1235,22 @@ fn carried_after(
     reads: &[Then],
     earlier: Option<&Earlier>,
 ) -> (Vec<usize>, Vec<String>) {
+    let (at, noted, _) = carried_into(tag, settle, reads, earlier, None);
+    (at, noted)
+}
+
+/// [`carried_after`], and the ledger's text as the run left it. A run `from` a start of its own
+/// (unix ms; [`T0`] at `None`) keeps the virtual clock, so its rows are stamped on the clock its
+/// reads run on, as a later loop's books read them.
+fn carried_into(
+    tag: &str,
+    settle: Duration,
+    reads: &[Then],
+    earlier: Option<&Earlier>,
+    from: Option<i64>,
+) -> (Vec<usize>, Vec<String>, String) {
     let cfg = under(Autopilot::Cruise);
+    let start = from.unwrap_or(T0);
     let at_s: Vec<i64> = reads.iter().map(|&(at, ..)| at).collect();
     let mut typed = Vec::new();
     let mut gestured: Option<i64> = earlier.and_then(|e| e.touched);
@@ -1254,14 +1269,16 @@ fn carried_after(
         drawn: &drawn,
         steps: &steps,
         host: Arc::clone(&host),
-        seed: earlier.map(|e| (e.ledger.clone(), T0)),
+        seed: (earlier.is_some() || from.is_some())
+            .then(|| (earlier.map(|e| e.ledger.clone()).unwrap_or_default(), start)),
+        virtual_time: from.is_some(),
         ..Script::new(tag, Occupancy::Observe, &at_s)
     }
     .run(&mut |s, i| {
         if i == 0
             && let Some(earlier) = earlier
         {
-            s.seed_from_ledger_text(&books, &earlier.ledger, T0, earlier.lifted_off);
+            s.seed_from_ledger_text(&books, &earlier.ledger, start, earlier.lifted_off);
         }
         s.setup.background_settle = settle;
         typed.push(s.ctl.seen.iter().filter(|(r, _)| is_carry(r)).count());
@@ -1333,7 +1350,7 @@ fn carried_after(
     );
     typed.push(carries(&run));
     let at = typed.windows(2).map(|w| w[1] - w[0]).collect();
-    (at, run.noted)
+    (at, run.noted, run.ledger)
 }
 
 /// The carries Cruise typed at each of the reads `at_s` of breaks of the agent's background work,
@@ -1601,8 +1618,8 @@ fn a_wake_in_the_answers_place_opens_its_turn_at_its_first_read() {
             let now = s.fx.mono();
             s.cruise_carry.live(false, || now);
             let reader = s.reader(&screen.rows);
-            s.cruise_carry.read(reader, &screen, || now);
-            let turn = s
+            let _ = s.cruise_carry.read(reader, &screen, || now);
+            let (_, turn) = s
                 .cruise_carry
                 .at_break(&s.turn_end.timing, &screen, now, true);
             ago = turn.map(|(from, _)| now.saturating_duration_since(from));
@@ -2178,6 +2195,14 @@ fn books_of(rows: &[String]) -> Earlier {
     }
 }
 
+/// A loop before this one's ledger, its text as that loop left it.
+fn ledger_of(ledger: String) -> Earlier {
+    Earlier {
+        ledger,
+        ..Earlier::default()
+    }
+}
+
 /// THE LADDER SURVIVES A LOOP'S RESTART (a hand-over on a `[harness]` change, a roster change, a
 /// fault's restart, an app's relaunch): the carries a loop before this one typed are in the
 /// ledger, so a loop that starts at the break they carried keeps their ladder instead of carrying
@@ -2393,6 +2418,73 @@ fn a_restart_replays_the_ladder_as_its_carries_were_typed() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// EACH CARRY'S ROW SAYS THE STREAK IT WAS TYPED AT: a carry whose answer before it ran real
+/// work goes at once on books started again in memory alone, so its gap from the one before is
+/// longer than that one's rung, never shorter, and no gap tells it from the next carry of a run.
+/// A loop that restarts on carries 15, 12, 20 and 25 minutes apart, each typed at a streak of one,
+/// and the agent's 20-second answer to the last carries on the ladder's first rung, as the loop
+/// that typed them would have, never on the climbing streak their gaps read. NEGATIVE CONTROL:
+/// rows written before they said it (none of the note) still replay by their gaps, a run of five.
+#[test]
+fn a_restart_takes_the_streak_each_carry_was_typed_at() {
+    // Carries at 0, 15, 27, 47 and 72 minutes, each answer but the last running to the break
+    // the next goes at; the last answered in 20 s. The loop restarts a minute after it.
+    let mut before = vec![(0, Read::Break)];
+    for (from, to) in [(0, 15), (15, 27), (27, 47), (47, 72)] {
+        before.extend([(from * 60 + 10, Read::Live), (to * 60, Read::Break)]);
+    }
+    before.extend([(72 * 60 + 10, Read::Live), (72 * 60 + 30, Read::Break)]);
+    let (typed, typed_noted, ledger) = carried_into(
+        "carry-streak-typed",
+        Duration::ZERO,
+        &stepped(&before),
+        None,
+        Some(T0 - 73 * MIN),
+    );
+    assert_eq!(
+        typed,
+        [1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0],
+        "PRECONDITION: each carry goes at once after real work: {typed_noted:#?}"
+    );
+    let stamped: Vec<i64> = ledger
+        .lines()
+        .filter_map(|line| aterm_json::from_str::<aterm_json::Value>(line).ok())
+        .filter(|v| v.get("rule_id").and_then(aterm_json::Value::as_str) == Some(RULE_BACKGROUND))
+        .filter_map(|v| v.get("ts").and_then(aterm_json::Value::as_i64))
+        .map(|ts| (T0 - ts) / 1000)
+        .collect();
+    assert_eq!(
+        stamped,
+        [73 * 60, 58 * 60, 46 * 60, 26 * 60, 60],
+        "PRECONDITION: the carries' rows are stamped when they went, in seconds before the \
+         restart: {ledger}"
+    );
+    let restart = stepped(&[(0, Read::Break), (30, Read::Break), (90, Read::Break)]);
+    let legacy = carried_before(&[73, 58, 46, 26, 1], &[]);
+    let wrong: Vec<_> = [
+        (
+            "noted",
+            ledger_of(ledger),
+            [0, 0, 1],
+            "1 short answer(s) in a row",
+        ),
+        ("legacy", legacy, [0, 0, 0], "5 short answer(s) in a row"),
+    ]
+    .into_iter()
+    .filter_map(|(tag, earlier, carried, wait)| {
+        let (at, noted) = carried_after(
+            &format!("carry-streak-{tag}"),
+            Duration::ZERO,
+            &restart,
+            Some(&earlier),
+        );
+        let first = waits(&noted).first().cloned();
+        (at != carried || first.as_deref() != Some(wait)).then_some((tag, at, first, noted))
+    })
+    .collect();
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// A PERSON'S MESSAGE BETWEEN THE LAST CARRY AND A RESTART IS STILL SOMEONE ELSE'S: the counts the
 /// last carry was typed under were the loop's before this one, and the restart's first read stands
 /// for them only where the person's last gesture came before that carry. After it, what they sent
@@ -2400,17 +2492,18 @@ fn a_restart_replays_the_ladder_as_its_carries_were_typed() {
 /// view (none here, nor ever on Muse Code or agy). The seeded books start again whether their
 /// turn is still running or already reached its background break before the restart, and the
 /// break is carried once their grace is past. NEGATIVE CONTROL: their gesture before the last
-/// carry keeps the ladder through both readings.
+/// carry keeps the ladder at a restart on the break; a turn still running at the restart starts
+/// the books again anyway, its work unread (`a_turn_running_at_a_restart_starts_the_books_again`).
 #[test]
 fn a_persons_message_between_the_last_carry_and_a_restart_starts_the_books_again() {
     let kept = carried_before(&[67, 65, 61, 53, 37, 5], &[]);
     let mut wrong = Vec::new();
-    for (start, first, after) in [
-        ("live", Read::Live, [0, 1, 0]),
-        ("break", Read::Break, [1, 0, 0]),
+    for (start, first, after, before) in [
+        ("live", Read::Live, [0, 1, 0], [0, 1, 0]),
+        ("break", Read::Break, [1, 0, 0], [0, 0, 0]),
     ] {
         let reads = stepped(&[(0, first), (20, Read::Break), (40, Read::Break)]);
-        for (tag, touched, carried) in [("after", -180, after), ("before", -400, [0, 0, 0])] {
+        for (tag, touched, carried) in [("after", -180, after), ("before", -400, before)] {
             let earlier = Earlier {
                 touched: Some(touched),
                 ..kept.clone()
@@ -2809,6 +2902,546 @@ fn a_compactions_owed_continuation_is_typed_at_the_break() {
             ran.noted
         );
     }
+}
+
+/// A restart's case: its tag, its reads, the carries typed at each and the first wait it noted.
+type Restarted<'a> = (&'a str, &'a [(i64, Read)], &'a [usize], &'a str);
+
+/// A TURN RUNNING AT A RESTART BEGAN WHERE NO READ SAW: a loop that starts while the agent's turn
+/// runs, or in a pause inside it (a break short of its settle), reads only that turn's remainder.
+/// Its work before the restart is unknown, and so is a message another driver sent it then (no
+/// prompt row tells one on Muse Code or agy), so the settled break that ends it starts the seeded
+/// books again and goes at once, as a turn whose work went unread does, never on the ladder its
+/// short remainder keeps, and the agent's 20-second answer to that carry waits the ladder's first
+/// rung. The agent here worked from the last carry to 20 s after the restart. But a wake Claude
+/// Code draws after the restart's first read found a break opened a turn of its own there, its
+/// start read: a restart on a break that has stood for minutes looks, until it settles, as one in
+/// a pause, and the program's own short wake 5 s in keeps the ladder, as the live loop's would.
+/// A wake drawn at the first read may have opened its turn before the restart, and starts them.
+/// NEGATIVE CONTROLS: a restart on a break that settles before the program's own short wake opens
+/// a turn keeps the ladder; the wake drawn at the first read and the turn resumed after a pause
+/// start it again. Run: with no unread mark both restarts inside the turn keep the ladder, with
+/// every turn after a seed unread the settled control's wake starts it again, and with the wake's
+/// row read at any first read of a turn the first read's wake keeps it.
+#[test]
+fn a_turn_running_at_a_restart_starts_the_books_again() {
+    let kept = carried_before(&[67, 65, 61, 53, 37, 5], &[]);
+    let cases: [Restarted<'_>; 5] = [
+        (
+            "live",
+            &[
+                (0, Read::Live),
+                (20, Read::Break),
+                (40, Read::Break),
+                (50, Read::Live),
+                (60, Read::Break),
+                (80, Read::Break),
+            ],
+            &[0, 0, 1, 0, 0, 0],
+            "1 short answer(s) in a row",
+        ),
+        (
+            "paused",
+            &[
+                (0, Read::Break),
+                (5, Read::Live),
+                (25, Read::Break),
+                (45, Read::Break),
+                (55, Read::Live),
+                (65, Read::Break),
+                (85, Read::Break),
+            ],
+            &[0, 0, 0, 1, 0, 0, 0],
+            "1 short answer(s) in a row",
+        ),
+        (
+            "settled",
+            &[
+                (0, Read::Break),
+                (20, Read::Break),
+                (120, Read::Woke),
+                (140, Read::Break),
+                (160, Read::Break),
+            ],
+            &[0, 0, 0, 0, 0],
+            "6 short answer(s) in a row",
+        ),
+        (
+            "woke",
+            &[
+                (0, Read::Break),
+                (5, Read::Woke),
+                (25, Read::Break),
+                (45, Read::Break),
+            ],
+            &[0, 0, 0, 0],
+            "6 short answer(s) in a row",
+        ),
+        (
+            "woke-first",
+            &[
+                (0, Read::Woke),
+                (20, Read::Break),
+                (40, Read::Break),
+                (50, Read::Live),
+                (60, Read::Break),
+                (80, Read::Break),
+            ],
+            &[0, 0, 1, 0, 0, 0],
+            "1 short answer(s) in a row",
+        ),
+    ];
+    let wrong: Vec<_> = cases
+        .iter()
+        .filter_map(|(tag, reads, carried, wait)| {
+            let (at, noted) = carried_after(
+                &format!("carry-restart-running-{tag}"),
+                Duration::from_secs(20),
+                &stepped(reads),
+                Some(&kept),
+            );
+            let first = waits(&noted).first().cloned();
+            (at != *carried || first.as_deref() != Some(*wait)).then_some((*tag, at, first, noted))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// THE BOOKS STARTED AGAIN ARE IN THE LEDGER: books a loop starts again in memory after its last
+/// carry, no carry typed since, end a later loop's replay there, so a restart carries at once, as
+/// the live ladder would have, never on the ladder before. The agent answers a third carry with
+/// five minutes of real work, the host types its own line (an upgrade's notice) in the carry's
+/// place at the break it ends on, and the loop restarts a minute later. And a restart whose
+/// seeded books a person's gesture after the last carry started again, its carry held by their
+/// grace, leaves them started for the loop after it, whose host no longer reports that gesture
+/// (an app's relaunch). NEGATIVE CONTROLS, each keeping the ladder: a short answer to the third
+/// carry, the host's line at a break after it, and a gesture before the last carry. Run: with the
+/// walk not stopped at the row both restarts keep the old ladder, a row at every judged break
+/// carries the short answer's at once, and no row for the gesture keeps its ladder.
+#[test]
+fn a_restart_after_the_books_started_again_carries_at_once() {
+    let restart = stepped(&[(0, Read::Break), (30, Read::Break)]);
+    let replayed = |tag: &str, ledger: String| {
+        let (at, noted) = carried_after(tag, Duration::ZERO, &restart, Some(&ledger_of(ledger)));
+        let first = waits(&noted).first().cloned();
+        (at, first, noted)
+    };
+    let mut wrong = Vec::new();
+    // Carries at 0, 2 and 6 minutes, the first two answered in 20 s; the third's answer runs
+    // from 6:10 to the break the host's line goes at, at 11 minutes, or to one at 6:30.
+    for (tag, answer, wait) in [
+        ("worked", &[][..], "1 short answer(s) in a row"),
+        (
+            "short",
+            &[(390, Read::Break)][..],
+            "3 short answer(s) in a row",
+        ),
+    ] {
+        let mut before = vec![
+            (0, Read::Break),
+            (20, Read::Taken),
+            (120, Read::Break),
+            (140, Read::Taken),
+            (360, Read::Break),
+            (370, Read::Live),
+        ];
+        before.extend_from_slice(answer);
+        before.push((660, Read::Hosted));
+        let (typed, typed_noted, ledger) = carried_into(
+            &format!("carry-again-{tag}-before"),
+            Duration::ZERO,
+            &stepped(&before),
+            None,
+            Some(T0 - 12 * MIN),
+        );
+        let mut three = vec![1, 0, 1, 0, 1, 0, 0];
+        three.extend(answer.iter().map(|_| 0));
+        assert_eq!(
+            typed, three,
+            "PRECONDITION: three carries, and the host's line in the fourth's place: \
+             {typed_noted:#?}"
+        );
+        let (at, first, noted) = replayed(&format!("carry-again-{tag}"), ledger);
+        let carried = if tag == "worked" { [1, 0] } else { [0, 0] };
+        if at != carried || first.as_deref() != Some(wait) {
+            wrong.push((tag, at, first, noted));
+        }
+    }
+    // Six carries on the ladder, the last 15 minutes before the third loop's start. The second
+    // starts 5 minutes after it, and the person's gesture a minute before that start holds its
+    // carry at both its reads; the control's came before the last carry.
+    let ladder = carried_before(&[77, 75, 71, 63, 47, 15], &[]);
+    for (tag, touched, carried, wait) in [
+        ("touched", -60, [1, 0], "1 short answer(s) in a row"),
+        ("untouched", -400, [0, 0], "6 short answer(s) in a row"),
+    ] {
+        let earlier = Earlier {
+            touched: Some(touched),
+            ..ladder.clone()
+        };
+        let (held, held_noted, ledger) = carried_into(
+            &format!("carry-again-{tag}-before"),
+            Duration::ZERO,
+            &stepped(&[(0, Read::Break), (20, Read::Break)]),
+            Some(&earlier),
+            Some(T0 - 10 * MIN),
+        );
+        assert_eq!(held, [0, 0], "PRECONDITION: {held_noted:#?}");
+        let (at, first, noted) = replayed(&format!("carry-again-{tag}"), ledger);
+        if at != carried || first.as_deref() != Some(wait) {
+            wrong.push((tag, at, first, noted));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// SOMEONE ELSE'S MESSAGE AND A TURN WHOSE WORK WENT UNREAD ARE IN THE LEDGER TOO: each starts a
+/// loop's books again after its last carry, the host's own line goes in the carry's place at the
+/// break it ends on, and the loop restarts a minute later, which carries at once, as the live
+/// ladder would have, never on the ladder before. Someone else's message is Claude Code's Remote
+/// Control in the third carry's answer; the unread turn is the program's own wake under Off after
+/// the second's answer. NEGATIVE CONTROLS, each keeping the ladder: the third carry answered
+/// short by the agent itself, and the wake read on Cruise, short. Run: with the books started
+/// again there in memory alone, both restarts keep the ladder.
+#[test]
+fn a_restart_after_someone_elses_message_or_an_unread_turn_carries_at_once() {
+    let restart = stepped(&[(0, Read::Break), (30, Read::Break)]);
+    let mut wrong = Vec::new();
+    // Carries at 0, 2 and 6 minutes, the first two answered in 20 s; the third's answer runs
+    // from 6:10 to the host's line at 6:30. The loop restarts at 7:30.
+    for (tag, answer, carried, wait) in [
+        ("remote", Read::Remote, [1, 0], "1 short answer(s) in a row"),
+        ("own", Read::Live, [0, 0], "3 short answer(s) in a row"),
+    ] {
+        let before = stepped(&[
+            (0, Read::Break),
+            (20, Read::Taken),
+            (120, Read::Break),
+            (140, Read::Taken),
+            (360, Read::Break),
+            (370, answer),
+            (390, Read::Hosted),
+        ]);
+        let (typed, typed_noted, ledger) = carried_into(
+            &format!("carry-again-{tag}-before"),
+            Duration::ZERO,
+            &before,
+            None,
+            Some(T0 - 450_000),
+        );
+        assert_eq!(
+            typed,
+            [1, 0, 1, 0, 1, 0, 0],
+            "PRECONDITION: three carries, and the host's line in the fourth's place: \
+             {typed_noted:#?}"
+        );
+        let (at, noted) = carried_after(
+            &format!("carry-again-{tag}"),
+            Duration::ZERO,
+            &restart,
+            Some(&ledger_of(ledger)),
+        );
+        let first = waits(&noted).first().cloned();
+        if at != carried || first.as_deref() != Some(wait) {
+            wrong.push((tag, at, first, noted));
+        }
+    }
+    // Carries at 0 and 2 minutes, the second answered in 20 s; the program's own wake runs from
+    // 2:30 to its break at 3:00, under Off or read on Cruise, and the host's line goes at 3:20.
+    // The loop restarts at 4:20.
+    for (tag, step, carried, wait) in [
+        ("unread", Step::Off, [1, 0], "1 short answer(s) in a row"),
+        ("read", Step::Stepped, [0, 0], "2 short answer(s) in a row"),
+    ] {
+        let mut before = stepped(&[
+            (0, Read::Break),
+            (20, Read::Taken),
+            (120, Read::Break),
+            (140, Read::Taken),
+            (150, Read::Woke),
+            (170, Read::Live),
+            (180, Read::Break),
+            (200, Read::Hosted),
+        ]);
+        for read in &mut before[4..7] {
+            read.2 = step;
+        }
+        let (typed, typed_noted, ledger) = carried_into(
+            &format!("carry-again-{tag}-before"),
+            Duration::ZERO,
+            &before,
+            None,
+            Some(T0 - 260_000),
+        );
+        assert_eq!(
+            typed,
+            [1, 0, 1, 0, 0, 0, 0, 0],
+            "PRECONDITION: two carries, and the host's line in the third's place: \
+             {typed_noted:#?}"
+        );
+        let (at, noted) = carried_after(
+            &format!("carry-again-{tag}"),
+            Duration::ZERO,
+            &restart,
+            Some(&ledger_of(ledger)),
+        );
+        let first = waits(&noted).first().cloned();
+        if at != carried || first.as_deref() != Some(wait) {
+            wrong.push((tag, at, first, noted));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A TURN READ RUNNING AFTER A LOOP'S FIRST CARRY ENDS NO LADDER: a loop that no loop ran before
+/// writes a turn-ran row at its first live read, which, where it began at a break, is the first
+/// carry's answer. That row starts no books (a judged point does, and its own row ends the
+/// books' run), so a loop that restarts within the carry's rung takes the ladder up, never
+/// carrying at once. NEGATIVE CONTROL: a point before the turn-ran row still ends the run
+/// (`the_books_walk_takes_each_rung_its_row_names`).
+#[test]
+fn a_turn_read_running_after_a_loops_first_carry_ends_no_ladder() {
+    // The carry at a minute before the restart, answered in 20 s.
+    let (typed, typed_noted, ledger) = carried_into(
+        "carry-ran-before",
+        Duration::ZERO,
+        &stepped(&[(0, Read::Break), (20, Read::Taken), (40, Read::Break)]),
+        None,
+        Some(T0 - MIN),
+    );
+    assert_eq!(typed, [1, 0, 0], "PRECONDITION: {typed_noted:#?}");
+    let rules: Vec<&str> = ledger
+        .lines()
+        .filter_map(|line| line.split("\"rule_id\":\"").nth(1)?.split('"').next())
+        .filter(|rule| !approvals::is_fact_rule(rule))
+        .collect();
+    assert_eq!(
+        rules,
+        [RULE_BACKGROUND, approvals::RULE_TURN_RAN],
+        "PRECONDITION: the turn-ran row follows the carry's: {ledger}"
+    );
+    let (at, noted) = carried_after(
+        "carry-ran",
+        Duration::ZERO,
+        &stepped(&[(0, Read::Break), (30, Read::Break), (90, Read::Break)]),
+        Some(&ledger_of(ledger)),
+    );
+    assert_eq!(at, [0, 0, 1], "{noted:#?}");
+    assert_eq!(
+        waits(&noted).first().map(String::as_str),
+        Some("1 short answer(s) in a row"),
+        "{noted:#?}"
+    );
+}
+
+/// THE BOOKS' RUN TAKES EACH RUNG ITS ROW NAMES: a carry's row, and a go-ahead's typed in the
+/// carry's place at a break, name the streak each went at, and a turn-ran row after them starts no
+/// books. NEGATIVE CONTROLS, each ending the run: a go-ahead typed at a turn end, which names no
+/// streak; a point judged, before its turn-ran row or alone; the books started again.
+#[test]
+fn the_books_walk_takes_each_rung_its_row_names() {
+    use crate::supervise::policy::cruise_carry::RULE_BACKGROUND_RESET;
+    use crate::supervise::policy::go_ahead::RULE_GO_AHEAD;
+    use approvals::Outcome::{Typed, Waiting};
+    let named = |min_ago: i64, rule: &str, streak: u32| {
+        row_before(
+            min_ago,
+            rule,
+            Typed,
+            &approvals::background_carry_reason("at a break (autopilot cruise)", streak),
+        )
+    };
+    let walk = |rows: &[String]| -> Vec<(i64, Option<u32>)> {
+        approvals::background_carries_in(&books_of(rows).ledger, Some("@s-1"))
+            .into_iter()
+            .map(|(ts, streak)| ((T0 - ts) / MIN, streak))
+            .collect()
+    };
+    let ran = row_before(4, approvals::RULE_TURN_RAN, Waiting, approvals::TURN_RAN);
+    let point = approvals::point_reason(approvals::Carried::streak(0), false);
+    assert_eq!(
+        walk(&[
+            carry_before(9),
+            named(8, RULE_BACKGROUND, 2),
+            named(6, RULE_GO_AHEAD, 3),
+            ran.clone(),
+        ]),
+        [(9, None), (8, Some(2)), (6, Some(3))]
+    );
+    let wrong: Vec<_> = [
+        (
+            "go-ahead at a turn end",
+            row_before(
+                5,
+                RULE_GO_AHEAD,
+                Typed,
+                "the turn-end policy judged the point",
+            ),
+        ),
+        (
+            "point",
+            row_before(5, approvals::RULE_POINT, Waiting, &point),
+        ),
+        (
+            "started again",
+            row_before(5, RULE_BACKGROUND_RESET, Waiting, "real work"),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(tag, row)| {
+        let rows = walk(&[named(6, RULE_BACKGROUND, 1), row, ran.clone()]);
+        (!rows.is_empty()).then_some((tag, rows))
+    })
+    .collect();
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A GO-AHEAD AT A BREAK IS A RUNG OF THE CARRY'S LADDER: the owner's standing go-ahead goes in
+/// the carry's place on the carry's ladder, so its row names the streak it went at as a carry's
+/// does, and a loop that restarts after it takes the ladder up, never carrying at once. Two
+/// go-aheads 2 minutes apart, each answered in 10 s; the loop restarts a minute after the second,
+/// whose next is due 4 minutes from it. NEGATIVE CONTROL: a go-ahead typed at a turn end names no
+/// streak and ends the run (`the_books_walk_takes_each_rung_its_row_names`).
+#[test]
+fn a_restart_takes_the_ladder_up_from_a_go_ahead_at_a_break() {
+    use crate::supervise::policy::go_ahead::GO_AHEAD_ANSWER;
+    let cfg = SupervisorConfig {
+        answer_questions: true,
+        ..under(Autopilot::Cruise)
+    };
+    let drawn = |_| waiting(PARKED);
+    let parked = |tag: &str, at_s: &[i64], answered: &[usize], earlier: (String, i64)| {
+        let books = crate::supervise::test_scratch_path("carry-books", tag).join("s-1.jsonl");
+        let (ledger, start) = earlier.clone();
+        Script {
+            policy: cfg.clone(),
+            drawn: &drawn,
+            seed: Some(earlier),
+            virtual_time: true,
+            ..Script::new(tag, Occupancy::Observe, at_s)
+        }
+        .run(&mut |s, i| {
+            if i == 0 && !ledger.is_empty() {
+                s.seed_from_ledger_text(&books, &ledger, start, false);
+            }
+            if answered.contains(&i) {
+                s.took(7, Some(&cfg), &mut Heard::default());
+            }
+        })
+    };
+    let before = parked(
+        "carry-go-ahead-restart-before",
+        &[0, 10, 120, 130],
+        &[1, 3],
+        (String::new(), T0 - 3 * MIN),
+    );
+    let went = sent(&before);
+    assert!(
+        went.len() == 2 && went.iter().all(|s| s.starts_with(GO_AHEAD_ANSWER)),
+        "PRECONDITION: two go-aheads at the breaks: {went:#?} {:#?}",
+        before.noted
+    );
+    let restarted = parked(
+        "carry-go-ahead-restart",
+        &[0, 30],
+        &[],
+        (before.ledger.clone(), T0),
+    );
+    assert_eq!(
+        sent(&restarted),
+        Vec::<String>::new(),
+        "{:#?}",
+        restarted.noted
+    );
+    assert_eq!(
+        waits(&restarted.noted).first().map(String::as_str),
+        Some("2 short answer(s) in a row"),
+        "{:#?}",
+        restarted.noted
+    );
+}
+
+/// WHAT GOES IN THE CARRY'S PLACE NAMES ITS STREAK: a compaction's continuation owed at a break,
+/// under its own rule, and the change of approach once a park's routine go-aheads are spent go
+/// on the carry's ladder as the go-ahead in its place does, so each one's row names the streak it
+/// went at, and the books' walk takes every one as a rung, never ending at the continuation's
+/// other rule. The continuation and the carry after it, each answered in 10 s, are rungs one and
+/// two; the go-aheads and the changes of approach after them climb a rung each. NEGATIVE CONTROL:
+/// a row typed at a turn end names none and ends the walk
+/// (`the_books_walk_takes_each_rung_its_row_names`).
+#[test]
+fn what_goes_in_the_carrys_place_names_its_streak() {
+    use crate::supervise::policy::go_ahead::GO_AHEAD_ANSWER;
+    use crate::supervise::policy::turn_end::{RULE_COMPACT, Then};
+    let walk = |ran: &Ran| -> Vec<Option<u32>> {
+        approvals::background_carries_in(&ran.ledger, Some("@s-1"))
+            .into_iter()
+            .map(|(_, streak)| streak)
+            .collect()
+    };
+    let cfg = under(Autopilot::Cruise);
+    let plain = |_| waiting(PLAIN);
+    let owed = Script {
+        policy: cfg.clone(),
+        drawn: &plain,
+        ..Script::new("carry-owed-streak", Occupancy::Observe, &[0, 10, 200])
+    }
+    .run(&mut |s, i| {
+        if i == 0 {
+            let reading = s.turn_end_reading(&screen_at(90, ended(SAID)), None, &hosted(30));
+            let compact = TurnEndAction::TypeCommand {
+                command: "/compact".to_string(),
+                rule_id: RULE_COMPACT,
+                then: Then::Continue,
+            };
+            s.turn_end.acted(&compact, &reading, s.fx.mono());
+        }
+        if i < 2 {
+            s.took(7, Some(&cfg), &mut Heard::default());
+        }
+    });
+    let went = sent(&owed);
+    assert!(
+        went.len() == 2
+            && !is_carry(&format!("send -- {}", went[0]))
+            && is_carry(&format!("send -- {}", went[1])),
+        "PRECONDITION: the continuation, then the carry: {went:#?}\n{:#?}",
+        owed.noted
+    );
+    assert_eq!(walk(&owed), [Some(1), Some(2)], "{}", owed.ledger);
+    let cfg = SupervisorConfig {
+        answer_questions: true,
+        ..under(Autopilot::Cruise)
+    };
+    let parked = |_| waiting(PARKED);
+    let recovered = Script {
+        policy: cfg.clone(),
+        drawn: &parked,
+        // Each line is answered ten seconds on, the turn ending on the work again.
+        ..Script::new(
+            "carry-recovery-streak",
+            Occupancy::Observe,
+            &[30, 40, 160, 170, 410, 420, 890, 900, 1850, 1860, 3770],
+        )
+    }
+    .run(&mut |s, i| {
+        if i % 2 == 1 {
+            s.took(7, Some(&cfg), &mut Heard::default());
+        }
+    });
+    let went = sent(&recovered);
+    assert!(
+        went.iter().any(|s| s.starts_with(GO_AHEAD_ANSWER))
+            && went
+                .last()
+                .is_some_and(|s| s.contains("different safe approach")),
+        "PRECONDITION: go-aheads, then a change of approach: {went:#?}\n{:#?}",
+        recovered.noted
+    );
+    let climbing: Vec<Option<u32>> = (1..=u32::try_from(went.len()).expect("small"))
+        .map(Some)
+        .collect();
+    assert_eq!(walk(&recovered), climbing, "{}", recovered.ledger);
 }
 
 const PARKED: &[&str] = &[

@@ -1151,13 +1151,16 @@ fn stopped_detail(stopped: &crate::libtest_json::Stopped, log: &str) -> String {
 /// Whether a binary's run measured what it takes, so its history keeps a sample of it: it was
 /// `started` (the run's ceiling left it time: [`not_started`]), nothing outside it ended it (no
 /// [`Run::spawn_error`]: a spawn refused, an interrupt that came before it started, a stuck
-/// holder it waited behind, a wait for it that failed) and no interrupt was ending the run as it
-/// ended ([`crate::exec::ending`]), which cuts a binary short at a point that says nothing of it.
-/// A binary the run's ceiling ended keeps its sample, a lower bound of what it takes; one that
-/// never ran would keep a wall of about 0 ms, and push a measured sample out of its row. A binary
-/// verify stopped at its first red case ([`Run::stopped_at`]) is deliberately not measured: its
-/// caller keeps an outcome-only schema-1 sample with a zero wall, so the latest FAIL orders it
-/// first without replacing its last timed wall.
+/// holder it waited behind, a wait for it that failed, or an end unrun at macOS's program check,
+/// `exec::start`: a program its syspolicyd stranded, or at its ceiling a leader not yet started or
+/// a member held past a first exec's bound) and no interrupt was ending the run as it ended
+/// ([`crate::exec::ending`]), which cuts a binary short at a point that says nothing of it. A
+/// binary the run's ceiling ended keeps its sample, a lower bound of what it takes, unless verify
+/// ended it unrun there; one that never started would keep a wall of about 0 ms, and push a
+/// measured sample out of its row. A binary verify stopped at its first red case
+/// ([`Run::stopped_at`]) is deliberately not measured: its caller keeps an outcome-only schema-1
+/// sample with a zero wall, so the latest FAIL orders it first without replacing its last timed
+/// wall.
 fn measured(run: &Run, started: bool) -> bool {
     started && run.stopped_at.is_none() && run.spawn_error.is_none() && !crate::exec::ending()
 }
@@ -1456,7 +1459,9 @@ fn decide(
 
 /// The binaries whose runs carry a `spawn_error`, each with it, apart from the rest with their
 /// runs: something outside the binary ended it (a spawn refused, an interrupt, a stuck holder it
-/// waited behind, a wait for it that failed), so its run decided nothing about the tree.
+/// waited behind, a wait for it that failed, or verify's end of it unrun at macOS's program check,
+/// `exec::start`: a program its syspolicyd stranded, or at its ceiling a leader not yet started
+/// or a member held past a first exec's bound), so its run decided nothing about the tree.
 fn split_unrun<'a>(
     bins: &'a [Binary],
     runs: &'a [Run],
@@ -1909,8 +1914,8 @@ enum Probe {
     Took,
     /// A binary ran and exited without it: what libtest said, its first line.
     Refused(String),
-    /// No binary it asked answered (a spawn refused, a crash, a run already ending): why the
-    /// last one did not.
+    /// No binary it asked answered (a spawn refused, an end unrun at macOS's program check, a
+    /// crash, a run already ending): why the last one did not.
     Unanswered(String),
 }
 

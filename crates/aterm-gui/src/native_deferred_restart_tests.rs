@@ -84,6 +84,9 @@ impl Kernel for DeferredFacts {
     fn recorded_operation(&self, id: &str) -> Result<bool, ()> {
         self.base.recorded_operation(id)
     }
+    fn completion_sealed(&self) {
+        self.base.completion_sealed();
+    }
     fn record_noexec(&self, prepare: &Prepare, binding: &Binding, phase: ImagePhase) -> bool {
         self.base.record_noexec(prepare, binding, phase)
     }
@@ -170,14 +173,17 @@ fn deferred_resolution_keeps_the_prepare_and_requires_its_selected_identity_at_e
     use crate::control_input_ack::{InputMark, testing};
     use crate::input::{Delivery, EgressReceipt};
 
-    for case in 0..6 {
+    for scenario in 0..8 {
+        let case = if scenario >= 6 { 0 } else { scenario };
         let model = aterm_models_harness::deferred_restart_resolution_model();
         let mut state = model.init_state();
         let (handle, mut reader) = testing::owned_handle(7980 + case);
         let ctx = &handle.ctx;
-        install(ctx, 71, &[Scope::Upgrade]);
-        // The external holder owns Upgrade only; this private constructor must retain
-        // Relaunch with the built-in harness rather than taking another holder's duty.
+        if case != 0 {
+            install(ctx, 71, &[Scope::Upgrade]);
+        }
+        // Other cases keep Upgrade with an external holder. The succession case
+        // retains both built-in duties so it can attempt the actual next admission.
         assert!(
             ctx.meta
                 .lock()
@@ -185,7 +191,7 @@ fn deferred_resolution_keeps_the_prepare_and_requires_its_selected_identity_at_e
                 .supervisor_authority(crate::metrics::now_us())
                 .builtin_keeps(&crate::harness_host::holder(), Scope::Relaunch)
         );
-        let kernel = DeferredFacts::new();
+        let mut kernel = DeferredFacts::new();
         let source = process(4242, 400, 4242, 400, 2);
         let shell = process(400, 1, 400, 400, 4);
         kernel
@@ -249,6 +255,7 @@ fn deferred_resolution_keeps_the_prepare_and_requires_its_selected_identity_at_e
         );
         kernel.base.processes.lock().unwrap().remove(&4242);
         kernel.base.foreground.store(400, Ordering::SeqCst);
+        let mut pending_input = None;
         let resumed = serve_by(
             ctx,
             -1,
@@ -265,6 +272,9 @@ fn deferred_resolution_keeps_the_prepare_and_requires_its_selected_identity_at_e
                     true,
                 );
                 let producer = mark.native_producer();
+                if case == 0 {
+                    pending_input = Some(mark.clone().pending_supervisor());
+                }
                 let completion = mark.completion();
                 assert!(completion.start_supervised());
                 let receipt = ctx.sink.write_frame_with_prefix(b"R").unwrap();
@@ -442,5 +452,588 @@ fn deferred_resolution_keeps_the_prepare_and_requires_its_selected_identity_at_e
         }
         assert_eq!(operation.lock().unwrap().request, original);
         assert_eq!(kernel.resolution_calls.load(Ordering::SeqCst), 1);
+        if case == 0 {
+            // Complete the actual issued image, then exercise the same terminal append
+            // used by the RPC server. A completed phase alone must not mint succession.
+            kernel
+                .base
+                .processes
+                .lock()
+                .unwrap()
+                .get_mut(&600)
+                .unwrap()
+                .image = kernel.command.image.clone();
+            let completion_actor = SupervisorInputCaller {
+                principal: Principal::Harness,
+                connection: Some(8),
+                peer: Some(900),
+                proof: None,
+            };
+            assert_eq!(
+                kernel.serve(
+                    ctx,
+                    Request::Precommit(binding.clone(), ImagePhase::Forward),
+                    completion_actor.clone()
+                ),
+                "OK native-act state=precommitted\n"
+            );
+            let mut asked = original.clone();
+            asked.id = "cd".repeat(16);
+            asked.duty = Scope::Upgrade;
+            asked.revision = ctx
+                .meta
+                .lock()
+                .unwrap()
+                .supervisor_authority(crate::metrics::now_us())
+                .revision();
+            asked.asked_upgrade = Some(aterm_agent::harness::native_act::AskedUpgradeIntent {
+                predecessor: binding.id.clone(),
+            });
+            let mut asked_command = kernel.command.clone();
+            asked_command.image = image(10);
+            asked_command.program = "/image-10".into();
+            asked.plan = NativePlan::Restart {
+                process: kernel
+                    .base
+                    .processes
+                    .lock()
+                    .unwrap()
+                    .get(&600)
+                    .unwrap()
+                    .clone(),
+                shell: process(400, 1, 400, 400, 4),
+                observation: None,
+                cold: None,
+                launcher: image(20),
+                socket: "/fake-native.sock".into(),
+                forward: Box::new(asked_command.clone()),
+                rollback: Some(Box::new(kernel.command.clone())),
+            };
+            // The old host snapshot is unavailable while the cold image is being
+            // adopted. Actual kernel completion must not fabricate passive provenance.
+            assert!(operation.lock().unwrap().committed_image.is_none());
+            kernel
+                .base
+                .conversation_valid
+                .store(false, Ordering::SeqCst);
+            assert_eq!(
+                kernel.serve(
+                    ctx,
+                    Request::Commit(binding.clone(), ImagePhase::Forward, "2.1.318".into()),
+                    completion_actor.clone()
+                ),
+                UNKNOWN
+            );
+            assert!(operation.lock().unwrap().committed_image.is_some());
+            assert!(operation.lock().unwrap().completed_observation.is_none());
+            assert!(operation.lock().unwrap().terminal_acknowledged.is_none());
+            assert!(
+                !operation
+                    .lock()
+                    .unwrap()
+                    .completion_drain
+                    .as_ref()
+                    .unwrap()
+                    .is_drained()
+            );
+            assert_eq!(
+                kernel.serve(
+                    ctx,
+                    Request::prepare(asked.clone()),
+                    completion_actor.clone()
+                ),
+                DENIED
+            );
+            // Restoring a real current record permits fresh checks, but does not
+            // settle held custody or acknowledge the terminal journal by itself.
+            kernel.base.conversation_valid.store(true, Ordering::SeqCst);
+            {
+                let mut table = ctx.fenced_writes.native.lock().unwrap();
+                let _settlement = table.settle_asked_binding();
+                assert!(matches!(
+                    table.asked_binding,
+                    asked_upgrade::CurrentBinding::Unsettled { .. }
+                ));
+            }
+            // Only the real pending input's release can drain its custody. A subsequent
+            // failed durable terminal publication still cannot establish the positive slot.
+            drop(pending_input.take());
+            assert!(
+                operation
+                    .lock()
+                    .unwrap()
+                    .completion_drain
+                    .as_ref()
+                    .unwrap()
+                    .is_drained()
+            );
+            kernel
+                .base
+                .seal_journal_allowed
+                .store(false, Ordering::SeqCst);
+            assert_eq!(
+                kernel.serve(
+                    ctx,
+                    Request::Query(binding.clone()),
+                    completion_actor.clone()
+                ),
+                UNKNOWN
+            );
+            assert!(operation.lock().unwrap().terminal_acknowledged.is_none());
+            assert_eq!(
+                kernel.serve(
+                    ctx,
+                    Request::prepare(asked.clone()),
+                    completion_actor.clone()
+                ),
+                DENIED
+            );
+            kernel
+                .base
+                .seal_journal_allowed
+                .store(true, Ordering::SeqCst);
+            let reply = kernel.serve(
+                ctx,
+                Request::Query(binding.clone()),
+                completion_actor.clone(),
+            );
+            assert!(
+                matches!(
+                    Reply::parse(&reply),
+                    Some(Reply::ColdRestartCommitted { .. })
+                ),
+                "{reply}"
+            );
+            assert_eq!(
+                operation.lock().unwrap().terminal_acknowledged,
+                Some(Decision::Committed)
+            );
+            {
+                let mut table = ctx.fenced_writes.native.lock().unwrap();
+                let _settlement = table.settle_asked_binding();
+                assert!(matches!(
+                    table.asked_binding,
+                    asked_upgrade::CurrentBinding::Settled(_)
+                ));
+            }
+            // Even fully settled history cannot replace current conversation facts.
+            kernel
+                .base
+                .conversation_valid
+                .store(false, Ordering::SeqCst);
+            assert_eq!(
+                kernel.serve(
+                    ctx,
+                    Request::prepare(asked.clone()),
+                    completion_actor.clone()
+                ),
+                DENIED
+            );
+            kernel.base.conversation_valid.store(true, Ordering::SeqCst);
+            kernel.base.account_allowed.store(false, Ordering::SeqCst);
+            assert_eq!(
+                kernel.serve(
+                    ctx,
+                    Request::prepare(asked.clone()),
+                    completion_actor.clone()
+                ),
+                DENIED
+            );
+            kernel.base.account_allowed.store(true, Ordering::SeqCst);
+            let aborted = abort_retry_before_effect(ctx, &mut kernel, &asked, &completion_actor);
+            let next = admitted_binding(&kernel.serve(
+                ctx,
+                Request::prepare(asked.clone()),
+                completion_actor.clone(),
+            ));
+            assert_eq!(lookup(ctx, &next).unwrap().lock().unwrap().request, asked);
+            assert_eq!(
+                kernel.base.signals.load(Ordering::SeqCst),
+                1,
+                "new preparation neither signals nor launches another image"
+            );
+            // A late terminal replay from the old operation cannot revive its positive
+            // fact after an actually accepted successor has replaced the current slot.
+            let _old_reply = kernel.serve(
+                ctx,
+                Request::Query(binding.clone()),
+                completion_actor.clone(),
+            );
+            assert_eq!(
+                kernel.serve(ctx, Request::Query(aborted), completion_actor.clone()),
+                ROLLBACK_SAFE
+            );
+            let mut table = ctx.fenced_writes.native.lock().unwrap();
+            let _settlement = table.settle_asked_binding();
+            assert!(
+                matches!(&table.asked_binding, asked_upgrade::CurrentBinding::Unsettled { binding, .. } if *binding == next)
+            );
+            assert!(table.account_lineages.pins(&next.id));
+            drop(table);
+
+            // Drive the genuinely admitted Stored Asked root through its own helper
+            // and known kernel completion. Hold only the existing post-seal gate.
+            assert_eq!(
+                kernel.serve(ctx, Request::Signal(next.clone()), completion_actor.clone()),
+                "OK native-act state=signalled\n"
+            );
+            assert_eq!(
+                kernel.serve(ctx, Request::Abort(next.clone()), completion_actor.clone()),
+                UNKNOWN
+            );
+            {
+                let mut table = ctx.fenced_writes.native.lock().unwrap();
+                assert!(table.settle_asked_binding().is_err());
+                assert!(matches!(&table.asked_binding,
+                    asked_upgrade::CurrentBinding::Unsettled { binding, .. } if *binding == next));
+            }
+            kernel.base.processes.lock().unwrap().remove(&600);
+            kernel.base.foreground.store(400, Ordering::SeqCst);
+            if scenario == 6 {
+                assert_eq!(
+                    kernel.serve(
+                        ctx,
+                        Request::Reconcile(next.clone()),
+                        completion_actor.clone()
+                    ),
+                    NOEXEC
+                );
+                let mut table = ctx.fenced_writes.native.lock().unwrap();
+                assert!(table.settle_asked_binding().is_err());
+                assert!(matches!(&table.asked_binding,
+                    asked_upgrade::CurrentBinding::Unsettled { binding, .. } if *binding == next));
+                continue;
+            }
+            let resumed = serve_by(
+                ctx,
+                -1,
+                Request::Resume(next.clone(), ImagePhase::Forward, "1.1".into(), 0),
+                completion_actor.clone(),
+                &kernel,
+                &mut |_| {
+                    let mark = InputMark::at_epoch(
+                        ctx,
+                        handle.local_id,
+                        aterm_slog::Actor::Ctl,
+                        crate::session_log::InputVerb::Turn,
+                        None,
+                        true,
+                    );
+                    let producer = mark.native_producer();
+                    let completion = mark.completion();
+                    assert!(completion.start_supervised());
+                    let receipt = ctx.sink.write_frame_with_prefix(b"S").unwrap();
+                    assert!(
+                        ctx.sink
+                            .wait_prefix_to_kernel(receipt.kernel_prefix().unwrap())
+                    );
+                    completion.finish(EgressReceipt::from_reported_delivery(
+                        Delivery::Full,
+                        receipt.order(),
+                    ));
+                    drop(producer);
+                    "OK typed=1\n".into()
+                },
+            );
+            assert_eq!(resumed, "OK native-act state=resumed phase=forward\n");
+            assert_eq!(testing::byte(&mut reader), b'S');
+            kernel
+                .base
+                .processes
+                .lock()
+                .unwrap()
+                .insert(700, process(700, 400, 700, 400, 20));
+            kernel.base.foreground.store(700, Ordering::SeqCst);
+            let helper = SupervisorInputCaller {
+                principal: Principal::Instance,
+                connection: Some(81),
+                peer: Some(700),
+                proof: None,
+            };
+            assert!(matches!(
+                Reply::parse(&kernel.serve(
+                    ctx,
+                    Request::Attach(next.clone(), ImagePhase::Forward),
+                    helper.clone()
+                )),
+                Some(Reply::Launch { .. })
+            ));
+            if scenario == 7 {
+                kernel
+                    .base
+                    .grant_journal_allowed
+                    .store(false, Ordering::SeqCst);
+                assert_eq!(
+                    kernel.serve(
+                        ctx,
+                        Request::Execute(next.clone(), ImagePhase::Forward),
+                        helper
+                    ),
+                    UNKNOWN
+                );
+                kernel.base.processes.lock().unwrap().remove(&700);
+                kernel.base.foreground.store(400, Ordering::SeqCst);
+                assert_eq!(
+                    kernel.serve(
+                        ctx,
+                        Request::Reconcile(next.clone()),
+                        completion_actor.clone()
+                    ),
+                    UNKNOWN
+                );
+                let op = lookup(ctx, &next).unwrap();
+                assert_eq!(
+                    op.lock().unwrap().phase,
+                    Phase::Completed(Decision::Unknown)
+                );
+                let mut table = ctx.fenced_writes.native.lock().unwrap();
+                assert!(table.settle_asked_binding().is_err());
+                assert!(matches!(&table.asked_binding,
+                    asked_upgrade::CurrentBinding::Unsettled { binding, .. } if *binding == next));
+                continue;
+            }
+            assert!(matches!(
+                Reply::parse(&kernel.serve(
+                    ctx,
+                    Request::Execute(next.clone(), ImagePhase::Forward),
+                    helper
+                )),
+                Some(Reply::Execute { .. })
+            ));
+            kernel
+                .base
+                .processes
+                .lock()
+                .unwrap()
+                .get_mut(&700)
+                .unwrap()
+                .image = asked_command.image.clone();
+            assert_eq!(
+                kernel.serve(
+                    ctx,
+                    Request::Precommit(next.clone(), ImagePhase::Forward),
+                    completion_actor.clone()
+                ),
+                "OK native-act state=precommitted\n"
+            );
+            let (arrived, entered) = mpsc::sync_channel(1);
+            let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+            kernel.base.outcome_gate = Some((arrived, Arc::clone(&gate)));
+            let kernel = Arc::new(kernel);
+            let worker_kernel = Arc::clone(&kernel);
+            let worker_ctx = Arc::clone(ctx);
+            let worker_actor = completion_actor.clone();
+            let worker_binding = next.clone();
+            let (finished, returned) = mpsc::sync_channel(1);
+            let worker = std::thread::spawn(move || {
+                let reply = worker_kernel.serve(
+                    &worker_ctx,
+                    Request::Commit(worker_binding, ImagePhase::Forward, "2.1.319".into()),
+                    worker_actor,
+                );
+                let _sent = finished.send(reply);
+            });
+            let reached = entered.recv_timeout(PATIENCE);
+            let held = reached.as_ref().ok().and_then(|_| {
+                let table = ctx
+                    .fenced_writes
+                    .native
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                let operation = table.by_id.get(&next.id)?;
+                let operation = operation.lock().unwrap_or_else(|p| p.into_inner());
+                Some((
+                    operation.phase,
+                    operation.terminal_acknowledged,
+                    operation
+                        .completion_drain
+                        .as_ref()
+                        .map(|drain| drain.is_drained()),
+                    table.account_lineages.pins(&next.id),
+                ))
+            });
+            if reached.is_ok() {
+                kernel.base.clock.store(asked.deadline_us, Ordering::SeqCst);
+            }
+            {
+                let (lock, changed) = &*gate;
+                *lock.lock().unwrap_or_else(|p| p.into_inner()) = true;
+                changed.notify_all();
+            }
+            let reply = returned
+                .recv_timeout(PATIENCE)
+                .expect("late terminal worker did not return");
+            worker.join().unwrap();
+            assert!(reached.is_ok(), "the actual post-seal gate was not reached");
+            assert_eq!(
+                held,
+                Some((
+                    Phase::Completed(Decision::Committed),
+                    None,
+                    Some(false),
+                    true
+                ))
+            );
+            assert!(
+                matches!(
+                    Reply::parse(&reply),
+                    Some(Reply::RestartCommitted(_)) | Some(Reply::Committed(_))
+                ),
+                "{reply}"
+            );
+            let (retired, removed, settled) = {
+                let mut table = ctx.fenced_writes.native.lock().unwrap();
+                let retired = table.reclaim(kernel.base.clock.load(Ordering::SeqCst));
+                (
+                    retired,
+                    !table.by_id.contains_key(&next.id),
+                    matches!(
+                        &table.asked_binding,
+                        asked_upgrade::CurrentBinding::Settled(_)
+                    ),
+                )
+            };
+            drop(retired);
+            assert!(removed, "the expired operation was actually reclaimed");
+            assert!(
+                settled,
+                "compacting the Stored root must preserve its settled successor fact"
+            );
+            let mut fresh = asked;
+            fresh.id = "de".repeat(16);
+            fresh.deadline_us = kernel.base.clock.load(Ordering::SeqCst) + 60_000_000;
+            fresh.asked_upgrade.as_mut().unwrap().predecessor = next.id;
+            let NativePlan::Restart {
+                process,
+                forward,
+                rollback,
+                ..
+            } = &mut fresh.plan
+            else {
+                unreachable!();
+            };
+            *process = kernel.base.process(700).unwrap();
+            *rollback = Some(Box::new(asked_command));
+            forward.image = image(11);
+            forward.program = "/image-11".into();
+            let admitted = admitted_binding(&kernel.serve(
+                ctx,
+                Request::prepare(fresh),
+                completion_actor.clone(),
+            ));
+            assert_eq!(
+                kernel.serve(ctx, Request::Abort(admitted), completion_actor),
+                ROLLBACK_SAFE
+            );
+        }
     }
+}
+
+// Reuse the genuine completed cold predecessor and actual next admission. No terminal
+// phase, acknowledgement or settled data is supplied by this fixture.
+fn abort_retry_before_effect(
+    ctx: &Arc<crate::SessionCtx>,
+    kernel: &mut DeferredFacts,
+    asked: &Prepare,
+    actor: &SupervisorInputCaller,
+) -> Binding {
+    let mut abandoned = asked.clone();
+    abandoned.id = "ac".repeat(16);
+    let binding = admitted_binding(&kernel.serve(ctx, Request::prepare(abandoned), actor.clone()));
+    let (arrived, entered) = mpsc::sync_channel(1);
+    let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    kernel.base.outcome_gate = Some((arrived, Arc::clone(&gate)));
+    kernel
+        .base
+        .seal_journal_allowed
+        .store(false, Ordering::SeqCst);
+    let (reached, reply, joined, denied_held) = std::thread::scope(|scope| {
+        let shared = &*kernel;
+        let worker_binding = binding.clone();
+        let worker_actor = actor.clone();
+        let (finished, returned) = mpsc::sync_channel(1);
+        let worker = scope.spawn(move || {
+            let reply = shared.serve(ctx, Request::Abort(worker_binding), worker_actor);
+            let _sent = finished.send(reply);
+        });
+        let reached = entered.recv_timeout(PATIENCE);
+        let denied_held = reached.as_ref().ok().map(|_| {
+            let undrained = lookup(ctx, &binding).is_some_and(|op| {
+                op.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .completion_drain
+                    .as_ref()
+                    .is_some_and(|drain| !drain.is_drained())
+            });
+            let reply = shared.serve(ctx, Request::prepare(asked.clone()), actor.clone());
+            (undrained, reply)
+        });
+        {
+            let (lock, changed) = &*gate;
+            *lock.lock().unwrap_or_else(|p| p.into_inner()) = true;
+            changed.notify_all();
+        }
+        let reply = returned.recv_timeout(PATIENCE);
+        let joined = worker.join();
+        (reached, reply, joined, denied_held)
+    });
+    kernel.base.outcome_gate = None;
+    kernel.base.completion_seen.store(false, Ordering::SeqCst);
+    assert!(joined.is_ok(), "actual Abort worker panicked");
+    assert!(
+        reached.is_ok(),
+        "actual Abort post-seal gate was not reached"
+    );
+    assert_eq!(denied_held, Some((true, DENIED.into())));
+    assert_eq!(reply.unwrap(), UNKNOWN);
+    assert_eq!(
+        kernel.serve(ctx, Request::prepare(asked.clone()), actor.clone()),
+        DENIED
+    );
+    let op = lookup(ctx, &binding).unwrap();
+    assert_eq!(op.lock().unwrap().terminal_acknowledged, None);
+    kernel
+        .base
+        .seal_journal_allowed
+        .store(true, Ordering::SeqCst);
+    assert_eq!(
+        kernel.serve(ctx, Request::Query(binding.clone()), actor.clone()),
+        ROLLBACK_SAFE
+    );
+    assert_eq!(
+        op.lock().unwrap().terminal_acknowledged,
+        Some(Decision::ProvenNotCommittedRollbackSafe)
+    );
+    let NativePlan::Restart { process, .. } = &asked.plan else {
+        unreachable!();
+    };
+    let original = kernel
+        .base
+        .processes
+        .lock()
+        .unwrap()
+        .get(&process.pid)
+        .unwrap()
+        .clone();
+    kernel
+        .base
+        .processes
+        .lock()
+        .unwrap()
+        .get_mut(&process.pid)
+        .unwrap()
+        .birth += 1;
+    let changed = kernel.serve(ctx, Request::prepare(asked.clone()), actor.clone());
+    kernel
+        .base
+        .processes
+        .lock()
+        .unwrap()
+        .insert(process.pid, original);
+    assert_eq!(
+        changed, DENIED,
+        "restored history cannot authorize a replacement source"
+    );
+    // The caller next performs the actual fresh admission against the still-live original.
+    binding
 }

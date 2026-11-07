@@ -110,6 +110,7 @@ struct Facts {
     foreground: AtomicU32,
     signals: AtomicU32,
     constructors: AtomicBool,
+    physical_target: Option<Vec<u8>>,
     account_allowed: AtomicBool,
     reservation: Option<(Arc<Barrier>, Arc<Barrier>)>,
     completion: Option<(Arc<Barrier>, Arc<Barrier>)>,
@@ -262,6 +263,7 @@ impl Facts {
             foreground: AtomicU32::new(4242),
             signals: AtomicU32::new(0),
             constructors: AtomicBool::new(true),
+            physical_target: None,
             account_allowed: AtomicBool::new(true),
             reservation: None,
             completion: None,
@@ -786,8 +788,10 @@ impl Kernel for Facts {
     fn process(&self, pid: u32) -> Option<Process> {
         self.processes.lock().unwrap().get(&pid).cloned()
     }
-    fn image(&self, _: &Image) -> bool {
-        true
+    fn image(&self, image: &Image) -> bool {
+        self.physical_target
+            .as_ref()
+            .is_none_or(|path| *path != image.path || image_exists(image))
     }
     fn foreground(&self, _: i32) -> Option<u32> {
         Some(self.foreground.load(Ordering::SeqCst))
@@ -939,6 +943,7 @@ fn caller() -> SupervisorInputCaller {
 
 fn plan(ctx: &crate::SessionCtx, facts: &Facts) -> Prepare {
     Prepare {
+        asked_upgrade: None,
         id: "ab".repeat(16),
         host_epoch: host_epoch().unwrap().to_string(),
         holder: "grok-alab@4242".into(),
@@ -1038,6 +1043,77 @@ fn native_actual_admission_rejects_wrong_duty_revision_actor_connection_and_plan
     );
     assert!(ctx.fenced_writes.native.lock().unwrap().by_id.is_empty());
     assert_eq!(facts.signals.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn replacing_the_captured_physical_restart_target_refuses_actual_admission() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let world = aterm_tempfile::tempdir().unwrap();
+    let path = world.path().join("claude");
+    // Data-only executable entries: no process is started from either file.
+    std::fs::write(&path, b"target-before").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let captured = Image::at(&path).unwrap();
+    let (handle, mut facts, mut request, actor) = closed_restart::fixture(79991);
+    facts.physical_target = Some(captured.path.clone());
+    let NativePlan::Restart { forward, .. } = &mut request.plan else {
+        unreachable!();
+    };
+    forward.image = captured;
+    forward.program = path.to_str().unwrap().into();
+    let binding = admitted_binding(&run(
+        &handle.ctx,
+        &facts,
+        Request::prepare(request.clone()),
+        actor.clone(),
+    ));
+    assert_eq!(
+        run(&handle.ctx, &facts, Request::Abort(binding), actor.clone()),
+        ROLLBACK_SAFE
+    );
+    std::fs::rename(&path, world.path().join("original-target")).unwrap();
+    std::fs::write(&path, b"target-after").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    request.id = "ac".repeat(16);
+    assert_eq!(
+        run(
+            &handle.ctx,
+            &facts,
+            Request::prepare(request.clone()),
+            actor.clone()
+        ),
+        DENIED
+    );
+    assert!(
+        !handle
+            .ctx
+            .fenced_writes
+            .native
+            .lock()
+            .unwrap()
+            .by_id
+            .contains_key(&request.id)
+    );
+    assert_eq!(facts.signals.load(Ordering::SeqCst), 0);
+    assert_eq!(facts.grant_journal_calls.load(Ordering::SeqCst), 0);
+    request.id = "ad".repeat(16);
+    let NativePlan::Restart { forward, .. } = &mut request.plan else {
+        unreachable!();
+    };
+    forward.image = Image::at(&path).unwrap();
+    let binding = admitted_binding(&run(
+        &handle.ctx,
+        &facts,
+        Request::prepare(request),
+        actor.clone(),
+    ));
+    assert_eq!(
+        run(&handle.ctx, &facts, Request::Abort(binding), actor),
+        ROLLBACK_SAFE
+    );
+    assert_eq!(facts.signals.load(Ordering::SeqCst), 0);
+    assert_eq!(facts.grant_journal_calls.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -1216,6 +1292,7 @@ fn native_queue_input_drain_transition_and_lost_ack_conform_to_model() {
             &ctx,
             &facts,
             Request::prepare(Prepare {
+                asked_upgrade: None,
                 host_epoch: "00".repeat(16),
                 ..request.clone()
             }),

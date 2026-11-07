@@ -4,6 +4,9 @@
 #[path = "harness_snapshot_publication_tests.rs"]
 mod snapshot_publication_tests;
 
+#[path = "harness_host_carry_activation_tests.rs"]
+mod carry_activation;
+
 use super::*;
 
 use aterm_agent::harness::upgrade::SessionFile;
@@ -7995,7 +7998,7 @@ impl Acting {
                     upgrade_drive::Watched::default()
                 }),
                 startups: Arc::new(|_| Vec::new()),
-                startup_mark: Arc::new(|_, _| {}),
+                startup_mark: Arc::new(|_, _| false),
                 agent_resumed: Acts::inert().agent_resumed,
                 own_worker: Acts::inert().own_worker,
                 claim_workers: Acts::inert().claim_workers,
@@ -34775,7 +34778,7 @@ impl StartupWorld {
                 r.judged.lock().unwrap().push(judged);
                 r.reads.lock().unwrap().clone()
             }),
-            startup_mark: Arc::new(move |sid, mark| {
+            startup_mark: Arc::new(move |worker, mark| {
                 let marked = match mark {
                     StartupMark::Stalled { hold } | StartupMark::InstallStalled { hold, .. } => {
                         Marked::Stalled((*hold).clone())
@@ -34786,7 +34789,8 @@ impl StartupWorld {
                     StartupMark::Over => Marked::Over,
                     StartupMark::Restated { hold } => Marked::Restated((*hold).clone()),
                 };
-                m.marks.lock().unwrap().push((sid.to_string(), marked));
+                m.marks.lock().unwrap().push((worker.sid.clone(), marked));
+                true
             }),
             ..Acts::inert()
         };
@@ -34812,7 +34816,22 @@ fn startup_mark_nameless(
     sid: &str,
     mark: &StartupMark<'_>,
 ) -> Option<(u64, crate::task_record::MarkedWith)> {
-    startup_mark_named(store, sid, mark, || None)
+    let h = store
+        .read()
+        .unwrap()
+        .by_sid(&aterm_session::SessionId::new(sid))
+        .cloned()?;
+    let rev = h.ctx.timeline.lock().unwrap().task()?.rev;
+    startup_mark_nameless_at(store, sid, rev, mark)
+}
+
+fn startup_mark_nameless_at(
+    store: &Store,
+    sid: &str,
+    record_rev: u64,
+    mark: &StartupMark<'_>,
+) -> Option<(u64, crate::task_record::MarkedWith)> {
+    startup_mark_named(store, sid, record_rev, mark, || None)
 }
 
 fn startup(sid: &str, state: StartupState, since: Instant, seen: StartupSeen) -> Startup {
@@ -36082,7 +36101,6 @@ fn an_install_stall_is_bound_to_the_record_and_live_launcher_episode() {
             };
             let mark = StartupMark::InstallStalled {
                 hold: &hold,
-                record_rev,
                 install_mark,
             };
             {
@@ -36105,7 +36123,7 @@ fn an_install_stall_is_bound_to_the_record_and_live_launcher_episode() {
                     }
                 }
             }
-            let marked = startup_mark_nameless(&store, h.sid.as_str(), &mark);
+            let marked = startup_mark_nameless_at(&store, h.sid.as_str(), record_rev, &mark);
             let current = matches!(change, Change::None);
             assert_eq!(marked.is_some(), current, "{why:?} {change:?}");
             let tl = h.ctx.timeline.lock().unwrap();
@@ -36362,8 +36380,8 @@ fn a_launch_a_shutdown_stopped_stays_stalled_when_its_prompt_moves() {
         let (reads, marks) = (store.clone(), store.clone());
         hooks.acts = Acts {
             startups: Arc::new(move |judged| startups_of(&reads, judged)),
-            startup_mark: Arc::new(move |sid, mark| {
-                let _ = startup_mark_nameless(&marks, sid, mark);
+            startup_mark: Arc::new(move |worker, mark| {
+                startup_mark_nameless_at(&marks, &worker.sid, worker.record_rev, mark).is_some()
             }),
             ..Acts::inert()
         };
@@ -36799,9 +36817,11 @@ fn a_deadlines_stall_names_the_member_it_was_marked_on() {
     let hold = StartupHold::Trust {
         agent: Program::Claude,
     };
+    let revision = h.ctx.timeline.lock().unwrap().task().unwrap().rev;
     startup_mark_named(
         &store,
         h.sid.as_str(),
+        revision,
         &StartupMark::Stalled { hold: &hold },
         || Some("m22".to_owned()),
     )
@@ -38290,6 +38310,152 @@ fn the_startup_marks_land_only_on_the_record_the_look_read() {
 }
 
 #[test]
+fn a_deadline_decision_cannot_mutate_a_newer_record_with_the_same_state() {
+    use crate::session_timeline::{MetaEdit, write_attention_owned};
+    use crate::task_record::{TaskMark, TaskState};
+    let hold = StartupHold::Trust {
+        agent: Program::Claude,
+    };
+    let read = held_at("needs you", Progress::default());
+    for (state, why, mark) in [
+        (
+            TaskState::Working,
+            None,
+            StartupMark::Stalled { hold: &hold },
+        ),
+        (TaskState::Stalled, Some("startup"), StartupMark::Started),
+        (
+            TaskState::Working,
+            None,
+            StartupMark::Held {
+                read: &read,
+                held_for: HELD_RELOOK,
+            },
+        ),
+        (TaskState::Stalled, Some("held"), StartupMark::Moved),
+        (TaskState::Working, None, StartupMark::Over),
+        (
+            TaskState::Stalled,
+            Some("startup"),
+            StartupMark::Restated { hold: &hold },
+        ),
+    ] {
+        for replaced in [false, true] {
+            let store = crate::session_store::new_store();
+            let h = crate::session_store::test_handle(7);
+            store.write().unwrap().register(h.clone());
+            let initial = TaskMark {
+                why,
+                ..TaskMark::new(state)
+            };
+            h.ctx.timeline.lock().unwrap().mark_task(
+                &initial,
+                &Default::default(),
+                Instant::now(),
+                0,
+            );
+            let attention = format!("{STARTUP_HEAD}previous observation");
+            write_attention_owned(
+                &h.ctx,
+                ATTENTION_OWNER,
+                MetaEdit::Set(&attention),
+                aterm_slog::Actor::Harness,
+            )
+            .unwrap();
+            let revision = h.ctx.timeline.lock().unwrap().task().unwrap().rev;
+            if replaced {
+                let mut tl = h.ctx.timeline.lock().unwrap();
+                tl.mark_task(
+                    &TaskMark::new(TaskState::Done),
+                    &Default::default(),
+                    Instant::now(),
+                    0,
+                );
+                tl.mark_task(&initial, &Default::default(), Instant::now(), 0);
+            }
+            let before = h.ctx.timeline.lock().unwrap().task().unwrap().clone();
+            if replaced {
+                assert_ne!(before.rev, revision);
+            }
+            let marked = startup_mark_nameless_at(&store, h.sid.as_str(), revision, &mark);
+            assert_eq!(marked.is_some(), !replaced, "{mark:?}, replaced={replaced}");
+            if replaced {
+                assert_eq!(h.ctx.timeline.lock().unwrap().task(), Some(&before));
+                assert_eq!(
+                    h.ctx
+                        .meta
+                        .lock()
+                        .unwrap()
+                        .attention_owners
+                        .get(ATTENTION_OWNER),
+                    Some(attention.as_str()),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_rejected_deadline_decision_keeps_another_look_armed() {
+    let t0 = Instant::now();
+    let hold = no_agent();
+    let mut restated = startup(
+        "s-a",
+        StartupState::StalledAtStartup,
+        t0,
+        StartupSeen::Holds(StartupHold::Asked {
+            text: "new question".to_owned(),
+        }),
+    );
+    restated.standing = Some(format!("{STARTUP_HEAD}an earlier hold"));
+    let moved = held_worker(
+        "s-a",
+        StartupState::StalledHeld,
+        HeldRead {
+            escalated: true,
+            ..held_at("idle", Progress::default())
+        },
+    );
+    for worker in [
+        startup("s-a", StartupState::Working, t0, StartupSeen::Holds(hold)),
+        startup(
+            "s-a",
+            StartupState::StalledAtStartup,
+            t0,
+            StartupSeen::Started,
+        ),
+        restated,
+        moved,
+    ] {
+        let world = Arc::new(StartupWorld::default());
+        let mut hooks = world.hooks();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let calls = attempts.clone();
+        hooks.acts.startup_mark = Arc::new(move |_, _| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            false
+        });
+        let initial = worker.state == StartupState::Working;
+        let case = format!("{:?} {:?}", worker.state, worker.seen);
+        world.set(vec![worker]);
+        let mut books = Startups::default();
+        let none = OffSessions::default();
+        let now = if initial {
+            look_at_startups(&mut books, t0, true, &none, &hooks);
+            t0 + STARTUP_DEADLINE
+        } else {
+            t0
+        };
+        assert_eq!(
+            look_at_startups(&mut books, now, true, &none, &hooks),
+            Some(now + HELD_RELOOK),
+            "{case}",
+        );
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    }
+}
+
+#[test]
 fn the_held_marks_are_one_edge_and_land_only_on_the_record_the_look_read() {
     use crate::session_timeline::{MetaEdit, write_attention_owned};
     use crate::task_record::{TaskMark, TaskState};
@@ -38812,8 +38978,8 @@ fn store_deadline_hooks(store: &Store) -> Hooks {
     let (reads, marks) = (store.clone(), store.clone());
     hooks.acts = Acts {
         startups: Arc::new(move |judged| startups_of(&reads, judged)),
-        startup_mark: Arc::new(move |sid, mark| {
-            let _ = startup_mark_nameless(&marks, sid, mark);
+        startup_mark: Arc::new(move |worker, mark| {
+            startup_mark_nameless_at(&marks, &worker.sid, worker.record_rev, mark).is_some()
         }),
         ..Acts::inert()
     };
@@ -40452,16 +40618,39 @@ fn a_slow_upgrade_read_never_holds_the_idle_point() {
     assert_eq!(p.at(), stepped, "the next point takes the read that landed");
     assert_eq!(p.counts(), (1, 1), "and reads nothing again");
 
-    for (n, step) in (2..).zip(STEPS_THAT_MOVE) {
+    for step in STEPS_THAT_MOVE {
+        let before = p.counts().0;
         held.hold();
         assert_eq!(p.at(), unread);
-        until("its read began", || p.counts().0 == n);
+        until("its read began", || p.counts().0 > before);
         let read = p.out().expect("the read is out");
         p.step(step);
+        let current = p.out();
+        if step == "a carry-on" {
+            assert!(
+                current
+                    .as_ref()
+                    .is_some_and(|next| !Arc::ptr_eq(&read, next)),
+                "a completed carry starts a fresh read instead of retaining the old one"
+            );
+        }
         held.let_go();
         assert!(read.wait(aterm_spec::wait::MUST_HAPPEN), "the read ends");
-        assert!(!p.landed(), "a read begun before {step} never lands");
+        assert!(
+            !read.landed.load(Ordering::SeqCst),
+            "the exact read begun before {step} never lands"
+        );
+        if step == "a carry-on" {
+            let current = current.unwrap();
+            assert!(current.wait(aterm_spec::wait::MUST_HAPPEN));
+            assert!(current.landed.load(Ordering::SeqCst));
+            until("the fresh carry read lands", || p.landed());
+            due_moved(&idle.kept);
+        } else {
+            assert!(!p.landed(), "a read begun before {step} never lands");
+        }
     }
+    let before = p.counts().0;
     *says.lock().unwrap() = Due::No;
     held.hold();
     assert_eq!(p.at(), unread, "the next point reads again");
@@ -40470,7 +40659,7 @@ fn a_slow_upgrade_read_never_holds_the_idle_point() {
     // It lands before it ends: a point while it is still out joins it rather than reading anew.
     until("the newer read ends", || p.out().is_none());
     assert_eq!(p.at(), None, "the newer answer decides");
-    assert_eq!(p.counts(), (5, 1));
+    assert_eq!(p.counts(), (before + 1, 1));
 
     let old = Instant::now().checked_sub(DUE_KEPT_FOR + Duration::from_secs(1));
     with_kept_of(&idle.kept, |k| k.due.landed = old.map(|at| (Due::Yes, at)));
@@ -40478,7 +40667,7 @@ fn a_slow_upgrade_read_never_holds_the_idle_point() {
     assert_eq!(p.at(), unread, "an answer kept past its time is read again");
     held.let_go();
     until("that read ends", || p.out().is_none());
-    assert_eq!(p.counts(), (6, 1));
+    assert_eq!(p.counts(), (before + 2, 1));
 
     let control = Arc::new(HeldDue::new(aterm_spec::wait::MUST_HAPPEN));
     let waits = std::thread::spawn({
@@ -40509,9 +40698,17 @@ fn an_upgrade_answer_a_step_outdated_is_neither_taken_nor_waited_on() {
         held.let_go();
         until("the read lands", || p.landed());
         until("the read is over", || p.out().is_none());
+        held.hold();
         p.step(step);
         assert!(!p.landed(), "{step} drops the answer that landed before it");
+        if step == "a carry-on" {
+            let current = p.out().expect("the carry started a fresh read");
+            held.let_go();
+            assert!(current.wait(aterm_spec::wait::MUST_HAPPEN));
+            due_moved(&p.idle.kept);
+        }
     }
+    let read_count_before = p.counts().0;
     held.hold();
     assert_eq!(p.at(), unread, "the point after them reads again");
     p.idle.act(|| {
@@ -40519,7 +40716,11 @@ fn an_upgrade_answer_a_step_outdated_is_neither_taken_nor_waited_on() {
         until("the read lands while the step runs", || p.landed());
     });
     assert!(!p.landed(), "the step's end drops what landed while it ran");
-    assert_eq!(p.counts(), (4, 0), "no point took an outdated answer");
+    assert_eq!(
+        p.counts(),
+        (read_count_before + 1, 0),
+        "no point took an outdated answer"
+    );
 
     held.hold();
     assert_eq!(p.at(), unread);
@@ -40533,12 +40734,12 @@ fn an_upgrade_answer_a_step_outdated_is_neither_taken_nor_waited_on() {
         !Arc::ptr_eq(&before, &after),
         "the point after a step waits on no read begun before it"
     );
-    until("both reads began", || p.counts().0 == 6);
+    until("both reads began", || p.counts().0 == read_count_before + 3);
     held.let_go();
     assert!(before.wait(aterm_spec::wait::MUST_HAPPEN));
     until("the read begun after the step lands", || p.landed());
     assert_eq!(p.at(), stepped, "and decides the next point");
-    assert_eq!(p.counts(), (6, 1));
+    assert_eq!(p.counts(), (read_count_before + 3, 1));
 
     let late = UNREAD_LOOK[UNREAD_LOOK.len() - 1] + POINT_READ_BOUND + Duration::from_secs(5);
     let late = Instant::now()
@@ -40552,7 +40753,7 @@ fn an_upgrade_answer_a_step_outdated_is_neither_taken_nor_waited_on() {
         "an answer the longest look comes late to is still taken"
     );
     held.let_go();
-    assert_eq!(p.counts(), (6, 2));
+    assert_eq!(p.counts(), (read_count_before + 3, 2));
 
     let voided = Arc::new(HeldDue::new(aterm_spec::wait::MUST_HAPPEN));
     let waits = std::thread::spawn({

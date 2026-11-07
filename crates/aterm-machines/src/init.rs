@@ -455,6 +455,15 @@ impl Picks {
     }
 }
 
+/// Whether this invocation can apply setup, using the same option parser as the run.
+/// Queries remain read-only; an invalid command still reaches the normal usage refusal.
+#[must_use]
+pub fn launches_setup(args: &[OsString]) -> bool {
+    options(args).map_or(true, |options| {
+        !options.help && options.action == Action::Apply
+    })
+}
+
 fn options(args: &[OsString]) -> Result<Options, String> {
     let mut options = Options::default();
     let mut args = args.iter();
@@ -7934,6 +7943,7 @@ mod tests {
             ..ctx(&[alice])
         };
         let sys = Fake::default();
+        sys.running(&[]);
         let rows = run(&sys, &ctx, base, &[], Mode::Apply, &mut NoJournal).unwrap();
         assert_eq!(rows.len(), 1, "{rows:?}");
         let row = &rows[0];
@@ -12375,6 +12385,7 @@ mod tests {
     #[test]
     fn the_tab_installs_and_ends_on_its_one_installed_line() {
         let mut sys = alice_with_checkout(501, None);
+        sys.running(&[]);
         sys.tty = true;
         sys.answer(Some(aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_GO));
         let sudo = tab_sudo();
@@ -12462,6 +12473,7 @@ mod tests {
             (None, Unfinished::Other),
         ] {
             let mut sys = alice_with_checkout(501, None);
+            sys.running(&[]);
             sys.tty = true;
             sys.answer(Some(go));
             if let Some(ran) = ran {
@@ -12489,6 +12501,7 @@ mod tests {
 
         // So is a probe with no terminal to ask in.
         let sys = alice_with_checkout(501, None);
+        sys.running(&[]);
         sys.answer(Some(go));
         ends_on(&tab_run(&sys, true), Unfinished::Other, false);
     }
@@ -12513,6 +12526,7 @@ mod tests {
             ),
         ] {
             let mut sys = alice_with_checkout(501, None);
+            sys.running(&[]);
             sys.tty = true;
             match why {
                 Unfinished::LowData => sys.low_data = Some(true),
@@ -12589,6 +12603,7 @@ mod tests {
             (false, None),
         ] {
             let mut sys = alice_at(501);
+            sys.running(&[]);
             sys.terminal = terminal;
             sys.tty = terminal;
             sys.agent = agent;
@@ -12613,6 +12628,7 @@ mod tests {
         sys.tty = true;
         sys.agent = None;
         assert_eq!(init_presence(&sys), Presence::AtConsole);
+        sys.running(&[]);
         sys.on(&sudo, Ran::exit(1, ""));
         let rows = clt_rows(&sys);
         assert_eq!(

@@ -50,6 +50,29 @@ pub(crate) struct ProgramRun {
     pub(crate) args: Vec<String>,
 }
 
+impl ProgramRun {
+    /// The program's name ([`program_name`] of [`Self::program`]): `bench` for
+    /// `/opt/lab/bench`.
+    #[must_use]
+    pub(crate) fn name(&self) -> Option<&str> {
+        program_name(&self.program)
+    }
+}
+
+/// The longest file name a program can have (`NAME_MAX`).
+const NAME_MAX: usize = 255;
+
+/// The name of the program `program` names, a path or a word its shell finds on its `PATH`: its
+/// file name, never its folder (`bench` for `/opt/lab/bench`); `None` where it has none (`/`,
+/// `..`), or one no file can have (longer than [`NAME_MAX`], or holding a control character).
+#[must_use]
+pub(crate) fn program_name(program: &str) -> Option<&str> {
+    std::path::Path::new(program)
+        .file_name()?
+        .to_str()
+        .filter(|name| name.len() <= NAME_MAX && !name.chars().any(char::is_control))
+}
+
 /// How a program worker's program ended, as its tab's shell reported it ([`ended`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProgramEnd {

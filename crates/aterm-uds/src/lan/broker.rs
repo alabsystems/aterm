@@ -319,6 +319,16 @@ pub fn hello() -> Result<BrokerHello, LanError> {
     open(None).map(|session| session.broker)
 }
 
+/// Read the installed root broker's protocol hello, never starting or using the
+/// process-local direct server. Setup uses this before relinquishing root custody.
+///
+/// # Errors
+/// No root broker answers, its uid or protocol differs, or its exchange fails.
+#[cfg(target_os = "macos")]
+pub fn installed_hello() -> Result<BrokerHello, LanError> {
+    hello_at(&super::dialled_socket(), super::protocol())
+}
+
 /// The hello of the broker at `path` alone, never this process's own server: whether a broker
 /// answers there ([`super::Arrivals`]).
 #[cfg(target_os = "macos")]

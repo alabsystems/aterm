@@ -116,7 +116,7 @@ fn unicode_offset_translation_cost() {
 }
 
 #[cfg(target_os = "macos")]
-fn instructions() -> Option<u64> {
+pub(super) fn instructions() -> Option<u64> {
     let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::uninit();
     // SAFETY: the selected flavor initializes this complete buffer on success.
     let result = unsafe {
@@ -131,7 +131,7 @@ fn instructions() -> Option<u64> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn instructions() -> Option<u64> {
+pub(super) fn instructions() -> Option<u64> {
     None
 }
 

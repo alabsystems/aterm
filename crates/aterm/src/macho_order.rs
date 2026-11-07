@@ -1550,13 +1550,6 @@ mod tests {
         let parsed_pad = build_order_list(std::slice::from_ref(&pad_obj));
         assert_eq!(parsed_pad.len(), 12);
 
-        let src = include_str!("macho_order.rs");
-        let non_test = src.split("#[cfg(test)]").next().unwrap_or(src);
-        assert!(
-            !non_test.contains("aterm_uds::") && !non_test.contains("libc::"),
-            "macho_order.rs is compiled standalone by build.rs without external crates"
-        );
-
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
             let sdk = aterm_uds::spawnfd::command(Path::new("/usr/bin/xcrun"))

@@ -10,6 +10,8 @@ use std::collections::VecDeque;
 use std::ffi::OsString;
 #[cfg(unix)]
 use std::path::PathBuf;
+#[cfg(unix)]
+use std::sync::Arc;
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
@@ -19,6 +21,9 @@ use super::child::{ChildSpec, ScriptedChild};
 
 #[cfg(unix)]
 type AfterGit = Box<dyn FnOnce(&mut crate::error::Result<ChildOut>) + Send>;
+
+#[cfg(unix)]
+pub(super) type NativePushObserver = Arc<dyn Fn(super::NativePushTiming) + Send + Sync>;
 
 /// One exact real Git child around which a fixture changes its local world or
 /// loses an acknowledgement. It is consumed before invoking either callback.
@@ -41,6 +46,8 @@ pub(super) struct SimClock {
     run: Mutex<Vec<ChildSpec>>,
     #[cfg(unix)]
     git_hook: Mutex<Option<GitHook>>,
+    #[cfg(unix)]
+    native_push_observer: Mutex<Option<NativePushObserver>>,
 }
 
 impl SimClock {
@@ -53,6 +60,8 @@ impl SimClock {
             run: Mutex::new(Vec::new()),
             #[cfg(unix)]
             git_hook: Mutex::new(None),
+            #[cfg(unix)]
+            native_push_observer: Mutex::new(None),
         }
     }
 
@@ -132,5 +141,23 @@ impl SimClock {
         } else {
             None
         }
+    }
+
+    #[cfg(unix)]
+    pub(super) fn set_native_push_observer(&self, observer: NativePushObserver) {
+        let mut slot = self
+            .native_push_observer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        assert!(slot.is_none(), "one native push observer");
+        *slot = Some(observer);
+    }
+
+    #[cfg(unix)]
+    pub(super) fn native_push_observer(&self) -> Option<NativePushObserver> {
+        self.native_push_observer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 }

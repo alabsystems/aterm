@@ -11,6 +11,10 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 #![warn(missing_docs)]
 
+/// Object-backed smart HTTP fixture using actual Git services on Unix.
+#[cfg(unix)]
+pub mod git_backend;
+
 mod git_http;
 mod routes;
 mod server;

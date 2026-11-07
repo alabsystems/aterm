@@ -3482,8 +3482,17 @@ SLOW FIRST RUNS (macOS's first-run check, not a wall)
   3. A tab adopted across an in-place update (`attribution=adopted`) still gets scans;
      open a fresh tab for heavy builds. When `syspolicyd` deadlocks with `tccd`
      (`syspolicyd=stuck` in `status`), only a restart of the Mac clears it.
-  4. A held program gets no token and is never ended: `aterm ctl @self sys left` shows
-     what waits (`state=program-check`, `end=-`) and what waits behind it.
+  4. A held program gets no token, and nothing but what started it ends it: `targo
+     --unverified verify` ends only its own stage child (step 5), a test wait only its
+     own child. `aterm ctl @self sys left` shows what waits (`state=program-check`,
+     `end=-`) and what waits behind it.
+  5. A program held since before the `syspolicyd` running now started (it crashed and
+     launchd started another, so `status` reads `syspolicyd=ok`) most likely sent its
+     check to a `syspolicyd` that is no longer running. `targo --unverified verify`
+     ends its own such stage child COULD NOT RUN once the new one has run 10 min (the
+     bound on a first exec) with no queue. Run the check again on the same tree: no
+     restart is needed, and a build that rewrites that binary first could land on a
+     check the new one took from its queue and has not finished.
 
 GOTCHAS
   * `probe=pending` or a folder's `unknown` means unmeasured, not `denied`.

@@ -22,6 +22,10 @@ struct Faults {
 }
 
 impl System for Faults {
+    fn exclusive(&self, path: &Path, limit: Duration) -> io::Result<Box<dyn std::any::Any>> {
+        self.inner.exclusive(path, limit)
+    }
+
     fn run(&self, c: &Cmd) -> Result<Ran, RunFailed> {
         self.inner.run(c)
     }

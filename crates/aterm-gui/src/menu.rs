@@ -2383,7 +2383,7 @@ fn chrome_lines_for(
 #[cfg(target_os = "macos")]
 pub(crate) use macos::{
     MenuHandle, choose_local_file, choose_local_image, choose_save_path, confirm, confirm_owner,
-    defer_quit_for_terminate, install, open_file_in_workspace, open_help_url,
+    defer_quit_for_terminate, install, launch_error, open_file_in_workspace, open_help_url,
     order_front_regardless, reveal_file_in_workspace, show_handoff_target_version,
     update_machine_menu, update_version_menu,
 };
@@ -3211,6 +3211,37 @@ mod macos {
     /// [`confirm`] for an owner gesture that changes this Mac.
     pub(crate) fn confirm_owner(title: &str, body: &str, proceed_label: &str) -> Option<bool> {
         ask(title, body, proceed_label, AlertDefault::Cancel)
+    }
+
+    /// A launch failure has one acknowledgement and grants no permission or setup decision.
+    pub(crate) fn launch_error(_windowed: crate::platform::Windowed, title: &str, body: &str) {
+        if super::os_ui_refused(title) {
+            return;
+        }
+        let Some(mtm) = MainThread::new() else {
+            return;
+        };
+        let (Some(title), Some(body), Some(close)) = (
+            appkit::nsstring(title),
+            appkit::nsstring(body),
+            appkit::nsstring("Close"),
+        ) else {
+            return;
+        };
+        let Some(alert) = crate::app_icon::alert(mtm) else {
+            return;
+        };
+        // SAFETY: the caller holds the windowed-launch proof and all AppKit construction
+        // runs on the proved main thread. NSAlert copies its strings; runModal returns
+        // only an acknowledgement, never authorization.
+        unsafe {
+            let app = appkit::send_id(class(c"NSApplication").as_id(), sel!(sharedApplication));
+            appkit::send_v_bool(app, sel!(activateIgnoringOtherApps:), true);
+            appkit::send_v_id(alert.id(), sel!(setMessageText:), title.id());
+            appkit::send_v_id(alert.id(), sel!(setInformativeText:), body.id());
+            let _ = appkit::send_id_id(alert.id(), sel!(addButtonWithTitle:), close.id());
+            let _ = appkit::send_isize(alert.id(), sel!(runModal));
+        }
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]

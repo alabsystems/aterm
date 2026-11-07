@@ -55,6 +55,7 @@ fn fixture() -> Predecessor {
         settles: None,
     };
     let prepare = Prepare {
+        asked_upgrade: None,
         id: "ab".repeat(16),
         host_epoch: "cd".repeat(16),
         holder: "private-holder-canary".into(),

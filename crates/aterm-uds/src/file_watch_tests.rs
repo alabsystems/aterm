@@ -188,12 +188,40 @@ fn a_partial_read_batch_leaves_native_input_ready_for_another_turn() {
     assert_eq!(output, input);
 }
 
-/// An arm a test scripts: each `wait` reports what the test queued.
+/// An arm a test scripts: each `wait` reports what the test queued. Every arm the watch asks for
+/// is in `armed` once (a directory arm on a folder not there falls back to a file arm, which is
+/// the one recorded), a directory arm that took in `entries` as well, and each wait's timeout in
+/// `waits`. Where `files_only`, it hears no folder's entries, as the stat poll does not; a key in
+/// `elsewhere` is armed on a volume that does not report every writer.
 #[derive(Clone, Default)]
 struct Scripted {
+    files_only: bool,
+    elsewhere: Arc<Mutex<BTreeSet<u64>>>,
     queued: Arc<Mutex<Vec<u64>>>,
     armed: Arc<Mutex<Vec<(u64, PathBuf)>>>,
+    entries: Arc<Mutex<Vec<u64>>>,
+    waits: Arc<Mutex<Vec<Option<Duration>>>>,
     inert: InertEvents,
+}
+
+impl Scripted {
+    /// Queue a burst on `keys` and wake the watch.
+    fn burst(&self, keys: &[u64]) {
+        self.queued.lock().unwrap().extend_from_slice(keys);
+        (self.inert.waker())();
+    }
+
+    /// Wait until the watch has armed `arms` times in all and then waited again: whatever the
+    /// turn that armed it last was going to tell, it has told.
+    fn settled(&self, arms: usize) {
+        aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the watch arms", || {
+            (self.armed.lock().unwrap().len() >= arms).then_some(())
+        });
+        let waits = self.waits.lock().unwrap().len();
+        aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the watch waits", || {
+            (self.waits.lock().unwrap().len() > waits).then_some(())
+        });
+    }
 }
 
 impl FileEvents for Scripted {
@@ -202,9 +230,30 @@ impl FileEvents for Scripted {
         Ok(())
     }
 
+    fn arm_directory(&mut self, key: u64, path: &Path) -> io::Result<()> {
+        if self.files_only {
+            return Err(io::Error::from(io::ErrorKind::Unsupported));
+        }
+        match std::fs::metadata(path) {
+            Err(error) => return Err(error),
+            Ok(there) if !there.is_dir() => {
+                return Err(io::Error::from(io::ErrorKind::NotADirectory));
+            }
+            Ok(_) => {}
+        }
+        self.armed.lock().unwrap().push((key, path.to_path_buf()));
+        self.entries.lock().unwrap().push(key);
+        Ok(())
+    }
+
     fn disarm(&mut self, _key: u64) {}
 
+    fn hears_every_writer(&self, key: u64) -> bool {
+        !self.elsewhere.lock().unwrap().contains(&key)
+    }
+
     fn wait(&mut self, timeout: Option<Duration>, touched: &mut Vec<u64>) -> io::Result<()> {
+        self.waits.lock().unwrap().push(timeout);
         let queued = std::mem::take(&mut *self.queued.lock().unwrap());
         if queued.is_empty() {
             self.inert.wait(timeout.or(Some(QUIET)), touched)?;
@@ -245,6 +294,10 @@ impl FileEvents for Counted {
 
     fn disarm(&mut self, key: u64) {
         self.inner.disarm(key);
+    }
+
+    fn hears_every_writer(&self, key: u64) -> bool {
+        self.inner.hears_every_writer(key)
     }
 
     fn wait(&mut self, timeout: Option<Duration>, touched: &mut Vec<u64>) -> io::Result<()> {
@@ -955,8 +1008,8 @@ fn a_missing_file_in_a_linked_folder_arms_on_the_folder_the_link_names() {
     assert!(events.arm(2, &dangling.join("absent.txt")).is_err());
 }
 
-/// An arm a test refuses while `refuse` holds (the file's folder is gone),
-/// counting the arms it was asked for and keeping each wait's timeout.
+/// An arm a test refuses while `refuse` holds (the file's folder is gone, or a folder cannot be
+/// read), counting the arms it was asked for and keeping each wait's timeout.
 #[derive(Clone, Default)]
 struct Refusing {
     refuse: Arc<std::sync::atomic::AtomicBool>,
@@ -970,6 +1023,16 @@ impl FileEvents for Refusing {
         *self.arms.lock().unwrap() += 1;
         if self.refuse.load(std::sync::atomic::Ordering::SeqCst) {
             Err(io::Error::from(io::ErrorKind::NotFound))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Refused as a folder this user cannot read is, which no file arm stands in for.
+    fn arm_directory(&mut self, _key: u64, _path: &Path) -> io::Result<()> {
+        *self.arms.lock().unwrap() += 1;
+        if self.refuse.load(std::sync::atomic::Ordering::SeqCst) {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
         } else {
             Ok(())
         }
@@ -996,9 +1059,21 @@ fn failed_rearms_do_not_postpone_other_pending_files() {
         .refuse
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let mut pending = Unarmed::default();
-    assert!(!pending.arm(&mut events, 7, path, start));
+    assert_eq!(
+        pending.arm(&mut events, 7, path, Shape::File, start),
+        Took::No
+    );
     for part in 1..4 {
-        assert!(!pending.arm(&mut events, 9, path, start + REARM_EVERY / 4 * part));
+        assert_eq!(
+            pending.arm(
+                &mut events,
+                9,
+                path,
+                Shape::File,
+                start + REARM_EVERY / 4 * part
+            ),
+            Took::No
+        );
     }
     let now = start + REARM_EVERY;
     let due = pending.due(now);
@@ -1011,7 +1086,10 @@ fn failed_rearms_do_not_postpone_other_pending_files() {
         .refuse
         .store(false, std::sync::atomic::Ordering::SeqCst);
     for key in due {
-        assert!(pending.arm(&mut events, key, path, now));
+        assert_eq!(
+            pending.arm(&mut events, key, path, Shape::File, now),
+            Took::File
+        );
     }
     assert_eq!(pending.wait(now), None, "recovery leaves no retry timer");
 }
@@ -1025,16 +1103,25 @@ fn retry_batches_advance_and_restart_after_the_pending_set_empties() {
         .refuse
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let mut pending = Unarmed::default();
-    assert!(!pending.arm(&mut events, 7, path, start));
+    assert_eq!(
+        pending.arm(&mut events, 7, path, Shape::File, start),
+        Took::No
+    );
     let first = start + REARM_EVERY;
     assert_eq!(pending.due(first), [7]);
-    assert!(!pending.arm(&mut events, 7, path, first + REARM_EVERY / 4));
+    assert_eq!(
+        pending.arm(&mut events, 7, path, Shape::File, first + REARM_EVERY / 4),
+        Took::No
+    );
     assert_eq!(pending.wait(first + REARM_EVERY / 2), Some(REARM_EVERY / 2));
     assert_eq!(pending.due(first + REARM_EVERY), [7]);
     pending.forget(7);
     assert_eq!(pending.wait(first + REARM_EVERY), None);
     let later = first + REARM_EVERY * 4;
-    assert!(!pending.arm(&mut events, 9, path, later));
+    assert_eq!(
+        pending.arm(&mut events, 9, path, Shape::File, later),
+        Took::No
+    );
     assert_eq!(pending.wait(later), Some(REARM_EVERY));
     assert!(pending.due(later).is_empty());
     assert_eq!(pending.due(later + REARM_EVERY), [9]);
@@ -1225,6 +1312,720 @@ fn a_file_no_arm_takes_is_looked_at_each_round_and_its_change_told() {
         "still refused when it told"
     );
     drop(watch);
+}
+
+/// A folder's entries tell at every settled burst, whatever the folder's stamp says (its times
+/// need not tell two entries made inside one tick apart), while a file tells only when its stamp
+/// moved: one burst on both, with nothing changed, tells the folder alone.
+#[test]
+fn a_directory_key_tells_each_settled_burst_and_a_file_key_only_a_moved_stamp() {
+    let dir = scratch("watch-directory-burst");
+    let (file, folder) = (dir.path().join("aterm.toml"), dir.path().join("themes"));
+    std::fs::write(&file, "one\n").unwrap();
+    std::fs::create_dir(&folder).unwrap();
+    let events = Scripted::default();
+    let (told, heard) = mpsc::channel();
+    let watch = FileWatch::spawn(
+        "aterm-document-watch",
+        Box::new(events.clone()),
+        Box::new(move |key| {
+            let _ = told.send(key);
+        }),
+    )
+    .unwrap();
+    watch.watch(1, file.clone());
+    watch.watch_directory(2, folder);
+    // Each armed at its watch and again at its first look, which tells.
+    events.settled(4);
+    let mut first: Vec<u64> = heard.try_iter().collect();
+    first.sort_unstable();
+    assert_eq!(first, [1, 2], "the first looks");
+    assert_eq!(
+        *events.entries.lock().unwrap(),
+        [2, 2],
+        "armed on its entries"
+    );
+
+    events.burst(&[1, 2]);
+    events.settled(6);
+    assert_eq!(
+        heard.try_iter().collect::<Vec<_>>(),
+        [2],
+        "a burst with nothing changed tells the folder and not the file"
+    );
+
+    // The control: the file's change is told.
+    std::fs::write(&file, "two, longer\n").unwrap();
+    events.burst(&[1]);
+    events.settled(7);
+    assert_eq!(
+        heard.try_iter().collect::<Vec<_>>(),
+        [1],
+        "the file changed"
+    );
+    drop(watch);
+}
+
+/// A folder not there yet is armed as a file is (the watch then waits on events alone, with no
+/// timeout), so a burst above it that did not make it tells nothing; its making is told, and from
+/// then it is armed on its entries, each burst of which tells, until it goes again.
+#[test]
+fn a_directory_key_on_a_missing_folder_is_heard_made_and_then_on_its_entries() {
+    let dir = scratch("watch-directory-missing");
+    let folder = dir.path().join("themes");
+    let events = Scripted::default();
+    let (told, heard) = mpsc::channel();
+    let watch = FileWatch::spawn(
+        "aterm-document-watch",
+        Box::new(events.clone()),
+        Box::new(move |key| {
+            let _ = told.send(key);
+        }),
+    )
+    .unwrap();
+    watch.watch_directory(2, folder.clone());
+    events.settled(2);
+    assert_eq!(heard.try_iter().collect::<Vec<_>>(), [2], "the first look");
+    let untimed = |why: &str| {
+        assert_eq!(
+            events.waits.lock().unwrap().last(),
+            Some(&None),
+            "{why}: the watch waits on events alone"
+        );
+    };
+    untimed("armed on the folder's folder");
+    assert!(events.entries.lock().unwrap().is_empty());
+
+    events.burst(&[2]);
+    events.settled(3);
+    assert!(
+        heard.try_iter().next().is_none(),
+        "a burst that made no folder tells nothing"
+    );
+
+    std::fs::create_dir(&folder).unwrap();
+    events.burst(&[2]);
+    events.settled(4);
+    assert_eq!(heard.try_iter().collect::<Vec<_>>(), [2], "the folder made");
+    assert_eq!(*events.entries.lock().unwrap(), [2], "armed on its entries");
+    untimed("armed on its entries");
+
+    events.burst(&[2]);
+    events.settled(5);
+    assert_eq!(
+        heard.try_iter().collect::<Vec<_>>(),
+        [2],
+        "a burst on its entries"
+    );
+
+    std::fs::remove_dir(&folder).unwrap();
+    events.burst(&[2]);
+    events.settled(6);
+    assert_eq!(heard.try_iter().collect::<Vec<_>>(), [2], "the folder gone");
+    events.burst(&[2]);
+    events.settled(7);
+    assert!(
+        heard.try_iter().next().is_none(),
+        "armed as a file again, a burst that made no folder tells nothing"
+    );
+
+    // A file where the folder was is watched as a file too, and its making told.
+    std::fs::write(&folder, "not a folder\n").unwrap();
+    events.burst(&[2]);
+    events.settled(8);
+    assert_eq!(
+        heard.try_iter().collect::<Vec<_>>(),
+        [2],
+        "a file made there"
+    );
+    assert_eq!(
+        *events.entries.lock().unwrap(),
+        [2, 2],
+        "no arm on entries since the folder went"
+    );
+    untimed("armed on a file where the folder was");
+    drop(watch);
+}
+
+/// Where no arm hears a folder's entries (the stat poll), a directory key is armed as a file:
+/// the watch waits on events alone, a burst that left the folder's stamp alone tells nothing,
+/// and one that moved it tells.
+#[test]
+fn a_directory_key_with_no_directory_events_is_armed_as_a_file() {
+    let dir = scratch("watch-directory-files-only");
+    let folder = dir.path().join("themes");
+    std::fs::create_dir(&folder).unwrap();
+    let events = Scripted {
+        files_only: true,
+        ..Scripted::default()
+    };
+    let (told, heard) = mpsc::channel();
+    let watch = FileWatch::spawn(
+        "aterm-document-watch",
+        Box::new(events.clone()),
+        Box::new(move |key| {
+            let _ = told.send(key);
+        }),
+    )
+    .unwrap();
+    watch.watch_directory(3, folder.clone());
+    events.settled(2);
+    assert_eq!(heard.try_iter().collect::<Vec<_>>(), [3], "the first look");
+    assert_eq!(
+        events.waits.lock().unwrap().last(),
+        Some(&None),
+        "armed: the watch waits on events alone"
+    );
+    events.burst(&[3]);
+    events.settled(3);
+    assert!(
+        heard.try_iter().next().is_none(),
+        "a burst that left its stamp alone tells nothing"
+    );
+    std::fs::rename(&folder, dir.path().join("retired")).unwrap();
+    events.burst(&[3]);
+    events.settled(4);
+    assert_eq!(heard.try_iter().collect::<Vec<_>>(), [3], "the folder gone");
+    assert!(events.entries.lock().unwrap().is_empty());
+    drop(watch);
+}
+
+/// A folder no arm took is looked at in rounds (so a change its stamp shows is told); the round
+/// whose arm takes looks at it as a first look does, and that look on its entries tells: what
+/// changed while nothing listened need not have moved the folder's stamp.
+#[test]
+fn a_directory_key_whose_arm_takes_in_a_round_is_told_as_at_a_first_look() {
+    let dir = scratch("watch-directory-round");
+    let folder = dir.path().join("themes");
+    std::fs::create_dir(&folder).unwrap();
+    let events = Refusing::default();
+    events
+        .refuse
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (told, heard) = mpsc::channel();
+    let watch = FileWatch::spawn(
+        "aterm-document-watch",
+        Box::new(events.clone()),
+        Box::new(move |key| {
+            let _ = told.send(key);
+        }),
+    )
+    .unwrap();
+    watch.watch_directory(5, folder);
+    assert_eq!(
+        heard.recv_timeout(aterm_spec::wait::MUST_HAPPEN),
+        Ok(5),
+        "the first look"
+    );
+    aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "armed in a round", || {
+        (*events.arms.lock().unwrap() >= 3).then_some(())
+    });
+    // The wait after that round's arm comes after its look.
+    let waits = events.waits.lock().unwrap().len();
+    aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the watch waits", || {
+        (events.waits.lock().unwrap().len() > waits).then_some(())
+    });
+    assert!(
+        heard.try_recv().is_err(),
+        "a round's look at an unchanged stamp tells nothing"
+    );
+    events
+        .refuse
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        heard.recv_timeout(aterm_spec::wait::MUST_HAPPEN),
+        Ok(5),
+        "the look after the arm took"
+    );
+    drop(watch);
+}
+
+/// A directory key on the platform's own events, telling each step it is driven through.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn platform_directory_watch(key: u64, path: PathBuf) -> (FileWatch, mpsc::Receiver<u64>) {
+    let (told, heard) = mpsc::channel();
+    let watch = FileWatch::platform(
+        "aterm-document-watch",
+        Box::new(move |key| {
+            let _ = told.send(key);
+        }),
+    )
+    .unwrap();
+    watch.watch_directory(key, path);
+    assert_eq!(
+        heard.recv_timeout(aterm_spec::wait::MUST_HAPPEN),
+        Ok(key),
+        "the first look"
+    );
+    (watch, heard)
+}
+
+/// The platform's own events, through a folder's whole life under a directory key: made where it
+/// was missing, then an entry made, replaced and removed, each told. Each step is one call, so
+/// one burst: a tell left over from a step that came as two would answer the next step's.
+/// Each tell comes after the arm its burst took, so the arm hears the step after it.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn the_platform_tells_a_directory_key_its_folder_made_and_its_entries_changed() {
+    let dir = scratch("watch-directory-platform");
+    let folder = dir.path().join("themes");
+    let (watch, heard) = platform_directory_watch(4, folder.clone());
+    let step = |why: &str, act: &dyn Fn()| {
+        act();
+        assert_eq!(
+            heard.recv_timeout(aterm_spec::wait::MUST_HAPPEN),
+            Ok(4),
+            "{why}"
+        );
+    };
+    let (one, two) = (dir.path().join("one.conf"), dir.path().join("two.conf"));
+    std::fs::write(&one, "one\n").unwrap();
+    std::fs::write(&two, "two\n").unwrap();
+    let entry = folder.join("dusk.conf");
+    step("the folder made", &|| std::fs::create_dir(&folder).unwrap());
+    step("an entry made", &|| std::fs::rename(&one, &entry).unwrap());
+    step("an entry replaced", &|| {
+        std::fs::rename(&two, &entry).unwrap()
+    });
+    step("an entry removed", &|| {
+        std::fs::remove_file(&entry).unwrap()
+    });
+    drop(watch);
+}
+
+/// A directory key on a link that names no folder (a dotfiles link before its checkout, or
+/// while one is made again) is looked at in rounds, which follow the link: the folder made where
+/// it points is told, though no listener of the link's own folder could hear it, and from then
+/// its entries are. The folder it names moved away and made again is told the same way.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_directory_key_on_a_link_to_no_folder_is_told_the_folder_made_and_then_its_entries() {
+    let dir = scratch("watch-directory-dangling");
+    let (conf, dotfiles) = (dir.path().join("conf"), dir.path().join("dotfiles"));
+    std::fs::create_dir(&conf).unwrap();
+    std::fs::create_dir(&dotfiles).unwrap();
+    let target = dotfiles.join("themes");
+    let link = conf.join("themes");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let (watch, heard) = platform_directory_watch(6, link);
+    let step = |why: &str, act: &dyn Fn()| {
+        act();
+        assert_eq!(
+            heard.recv_timeout(aterm_spec::wait::MUST_HAPPEN),
+            Ok(6),
+            "{why}"
+        );
+    };
+    let entry = dir.path().join("dusk.conf");
+    std::fs::write(&entry, "one\n").unwrap();
+    step("the folder made where the link points", &|| {
+        std::fs::create_dir(&target).unwrap();
+    });
+    step("an entry made in it", &|| {
+        std::fs::rename(&entry, target.join("dusk.conf")).unwrap();
+    });
+    step("the folder moved away", &|| {
+        std::fs::rename(&target, dotfiles.join("retired")).unwrap();
+    });
+    step("the folder made again", &|| {
+        std::fs::create_dir(&target).unwrap();
+    });
+    drop(watch);
+}
+
+/// A directory arm on a link to a folder (a dotfiles `~/.config/aterm/themes`) listens on the
+/// folder the link names, and on the link itself, which hears it made to name another folder.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_directory_arm_on_a_link_hears_the_folder_it_names_and_the_link_replaced() {
+    let dir = scratch("watch-directory-link");
+    let (real, other) = (dir.path().join("real"), dir.path().join("other"));
+    std::fs::create_dir(&real).unwrap();
+    std::fs::create_dir(&other).unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let mut events = kqueue::KqueueEvents::new().unwrap();
+    events
+        .arm_directory(1, &link)
+        .expect("armed on the folder the link names");
+    let touched = heard_for(&mut events, || {
+        std::fs::write(real.join("row"), "made\n").unwrap();
+    });
+    assert_eq!(touched, [1], "an entry made where the link points");
+
+    let touched = heard_for(&mut events, || {
+        let next = dir.path().join("link.next");
+        std::os::unix::fs::symlink(&other, &next).unwrap();
+        std::fs::rename(&next, &link).unwrap();
+    });
+    assert_eq!(touched, [1], "the link made to name another folder");
+    events.arm_directory(1, &link).unwrap();
+    let touched = heard_for(&mut events, || {
+        std::fs::write(other.join("row"), "made\n").unwrap();
+    });
+    assert_eq!(touched, [1], "an entry made where it points now");
+
+    // The negative controls: a link to a file, or to nothing, is no folder.
+    let to_file = dir.path().join("to-file");
+    std::os::unix::fs::symlink(real.join("row"), &to_file).unwrap();
+    assert!(events.arm_directory(2, &to_file).is_err());
+    let dangling = dir.path().join("dangling");
+    std::os::unix::fs::symlink(dir.path().join("gone"), &dangling).unwrap();
+    assert!(events.arm_directory(2, &dangling).is_err());
+}
+
+/// Make the link `link` name `folder` instead, in one rename.
+#[cfg(target_os = "macos")]
+fn retarget(link: &Path, folder: &Path) {
+    let next = link.with_extension("next");
+    std::os::unix::fs::symlink(folder, &next).unwrap();
+    std::fs::rename(&next, link).unwrap();
+}
+
+/// A link made to name another folder after a directory arm listened on the folder it named,
+/// and before the walk above listened on the link, is caught by the arm, which arms again on the
+/// folder the link names now.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_directory_arm_through_a_link_made_to_name_another_folder_as_it_arms_arms_again() {
+    let dir = scratch("watch-directory-link-moved");
+    let (real, other) = (dir.path().join("real"), dir.path().join("other"));
+    std::fs::create_dir(&real).unwrap();
+    std::fs::create_dir(&other).unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let mut events = kqueue::KqueueEvents::new().unwrap();
+    let mut turns = 0;
+    events
+        .arm_directory_then(1, &link, |_| {
+            turns += 1;
+            if turns == 1 {
+                retarget(&link, &other);
+            }
+        })
+        .unwrap();
+    assert_eq!(turns, 2, "armed again once the link named another folder");
+    let touched = heard_for(&mut events, || {
+        std::fs::write(other.join("row"), "made\n").unwrap();
+    });
+    assert_eq!(touched, [1], "an entry made where the link points now");
+}
+
+/// The same for a file in a linked folder: the link made to name another folder after its
+/// folder's listener took, and before the walk above listened on the link, arms it again there.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_file_arm_through_a_link_made_to_name_another_folder_as_it_arms_arms_again() {
+    let dir = scratch("watch-linked-folder-moved");
+    let (real, other) = (dir.path().join("real"), dir.path().join("other"));
+    std::fs::create_dir(&real).unwrap();
+    std::fs::create_dir(&other).unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let named = std::fs::canonicalize(&real).unwrap();
+    let mut events = kqueue::KqueueEvents::new().unwrap();
+    let mut moved = false;
+    events
+        .arm_around(1, &link.join("absent.txt"), |listen, at| {
+            if listen == kqueue::Listen::Answered && at == named && !moved {
+                moved = true;
+                retarget(&link, &other);
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert!(moved);
+    let touched = heard_for(&mut events, || {
+        std::fs::write(other.join("absent.txt"), "made\n").unwrap();
+    });
+    assert_eq!(touched, [1], "made where the link points now");
+}
+
+/// A folder made unsearchable for the length of a test, searchable again when it ends however
+/// it ends, so its scratch can be removed.
+#[cfg(unix)]
+struct Locked<'a>(&'a Path);
+
+#[cfg(unix)]
+impl<'a> Locked<'a> {
+    fn new(folder: &'a Path) -> Self {
+        use std::os::unix::fs::PermissionsExt as _;
+        crate::host::could_not_run_as_root("a folder of mode 000");
+        std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o000)).unwrap();
+        Self(folder)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Locked<'_> {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// A path that goes from missing to one this user cannot look at is told (a stamp of neither
+/// cannot tell them apart); the key is then looked at in rounds, though its arm took, so the
+/// end of the refusal is told with no event to tell of it, and then the watch waits on events
+/// alone again.
+#[cfg(unix)]
+#[test]
+fn a_path_missing_then_refused_is_told_and_looked_at_until_it_reads() {
+    let dir = scratch("watch-refused");
+    let folder = dir.path().join("locked");
+    let path = folder.join("aterm.toml");
+    let events = Scripted::default();
+    let (told, heard) = mpsc::channel();
+    let watch = FileWatch::spawn(
+        "aterm-document-watch",
+        Box::new(events.clone()),
+        Box::new(move |key| {
+            let _ = told.send(key);
+        }),
+    )
+    .unwrap();
+    watch.watch(1, path.clone());
+    events.settled(2);
+    assert_eq!(heard.try_iter().collect::<Vec<_>>(), [1], "the first look");
+
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::write(&path, "one\n").unwrap();
+    let locked = Locked::new(&folder);
+    events.burst(&[1]);
+    events.settled(3);
+    assert_eq!(
+        heard.try_iter().collect::<Vec<_>>(),
+        [1],
+        "missing, then refused"
+    );
+    assert!(
+        events
+            .waits
+            .lock()
+            .unwrap()
+            .last()
+            .is_some_and(Option::is_some),
+        "a refused key is in the rounds"
+    );
+
+    drop(locked);
+    assert_eq!(
+        heard.recv_timeout(aterm_spec::wait::MUST_HAPPEN),
+        Ok(1),
+        "readable again, which no event told"
+    );
+    let arms = events.armed.lock().unwrap().len();
+    events.settled(arms);
+    assert_eq!(
+        events.waits.lock().unwrap().last(),
+        Some(&None),
+        "out of the rounds"
+    );
+    drop(watch);
+}
+
+/// The stat poll, where no file events exist, touches a key whose look moved: a path gone from
+/// missing to refused (no stamp of either) among them, and nothing where no look moved.
+#[cfg(unix)]
+#[test]
+fn the_stat_poll_touches_a_path_gone_from_missing_to_refused() {
+    let dir = scratch("watch-poll-refused");
+    let folder = dir.path().join("locked");
+    let path = folder.join("aterm.toml");
+    let mut events = PollEvents::default();
+    events.arm(1, &path).unwrap();
+    let mut touched = Vec::new();
+    events.wait(Some(Duration::ZERO), &mut touched).unwrap();
+    assert!(touched.is_empty(), "still missing");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::write(&path, "one\n").unwrap();
+    let _locked = Locked::new(&folder);
+    events.wait(Some(Duration::ZERO), &mut touched).unwrap();
+    assert_eq!(touched, [1], "missing, then refused");
+}
+
+/// A link made again to name the same file is a new link, told though the file it names is
+/// unchanged.
+#[cfg(unix)]
+#[test]
+fn a_link_made_again_to_name_the_same_file_is_told() {
+    let dir = scratch("watch-link-remade");
+    let real = dir.path().join("real.toml");
+    std::fs::write(&real, "one\n").unwrap();
+    let link = dir.path().join("aterm.toml");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let events = Scripted::default();
+    let (told, heard) = mpsc::channel();
+    let watch = FileWatch::spawn(
+        "aterm-document-watch",
+        Box::new(events.clone()),
+        Box::new(move |key| {
+            let _ = told.send(key);
+        }),
+    )
+    .unwrap();
+    watch.watch(1, link.clone());
+    events.settled(2);
+    assert_eq!(heard.try_iter().collect::<Vec<_>>(), [1], "the first look");
+
+    // The negative control: a burst with nothing changed tells nothing.
+    events.burst(&[1]);
+    events.settled(3);
+    assert!(heard.try_iter().next().is_none());
+
+    let next = dir.path().join("aterm.toml.next");
+    std::os::unix::fs::symlink(&real, &next).unwrap();
+    std::fs::rename(&next, &link).unwrap();
+    events.burst(&[1]);
+    events.settled(4);
+    assert_eq!(
+        heard.try_iter().collect::<Vec<_>>(),
+        [1],
+        "the link made again"
+    );
+    drop(watch);
+}
+
+/// A relative path is watched where it names now, so the folders above it can be walked.
+#[test]
+fn a_relative_path_is_watched_where_it_names_now() {
+    let events = Scripted::default();
+    let watch = FileWatch::spawn(
+        "aterm-document-watch",
+        Box::new(events.clone()),
+        Box::new(|_| {}),
+    )
+    .unwrap();
+    let (file, folder) = (
+        PathBuf::from("aterm-watch-relative.toml"),
+        PathBuf::from("aterm-watch-relative-themes"),
+    );
+    watch.watch(1, file.clone());
+    watch.watch_directory(2, folder.clone());
+    events.settled(4);
+    let armed = events.armed.lock().unwrap().clone();
+    for (key, path) in [(1, &file), (2, &folder)] {
+        let at = std::path::absolute(path).unwrap();
+        assert!(
+            armed
+                .iter()
+                .filter(|(armed, _)| *armed == key)
+                .all(|(_, armed)| *armed == at),
+            "key {key} armed at {at:?}: {armed:?}"
+        );
+    }
+    drop(watch);
+}
+
+/// A folder's mode changed, its own or one's above it, is heard: it can stop the lookup to the
+/// path, or let it through.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn the_platform_hears_a_folders_mode_changed_on_the_path() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = scratch("watch-folder-mode");
+    let above = dir.path().join("a");
+    let own = above.join("b");
+    std::fs::create_dir_all(&own).unwrap();
+    let path = own.join("aterm.toml");
+    std::fs::write(&path, "one\n").unwrap();
+    let mode = |folder: &Path, mode: u32| {
+        std::fs::set_permissions(folder, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    let mut events = platform_events().unwrap();
+    events.arm(1, &path).unwrap();
+    assert_eq!(
+        heard_for(events.as_mut(), || mode(&own, 0o700)),
+        [1],
+        "its own folder's mode"
+    );
+    assert_eq!(
+        heard_for(events.as_mut(), || mode(&above, 0o700)),
+        [1],
+        "the mode of a folder above"
+    );
+    events.arm_directory(2, &own).unwrap();
+    assert_eq!(
+        heard_for(events.as_mut(), || mode(&own, 0o755)),
+        [1, 2],
+        "a watched folder's own mode"
+    );
+}
+
+/// A file whose folder is made unsearchable is told, and told again once it can be read: the
+/// folder's own listener hears its mode change, and the key no arm takes while it is refused is
+/// looked at in rounds.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn the_platform_tells_a_file_its_folder_refused_and_then_let_through() {
+    let dir = scratch("watch-folder-refused");
+    let folder = dir.path().join("conf");
+    std::fs::create_dir(&folder).unwrap();
+    let path = folder.join("aterm.toml");
+    std::fs::write(&path, "one\n").unwrap();
+    let (told, heard) = mpsc::channel();
+    let watch = FileWatch::platform(
+        "aterm-document-watch",
+        Box::new(move |key| {
+            let _ = told.send(key);
+        }),
+    )
+    .unwrap();
+    watch.watch(1, path);
+    assert_eq!(
+        heard.recv_timeout(aterm_spec::wait::MUST_HAPPEN),
+        Ok(1),
+        "the first look"
+    );
+    let locked = Locked::new(&folder);
+    assert_eq!(
+        heard.recv_timeout(aterm_spec::wait::MUST_HAPPEN),
+        Ok(1),
+        "its folder refused"
+    );
+    drop(locked);
+    assert_eq!(
+        heard.recv_timeout(aterm_spec::wait::MUST_HAPPEN),
+        Ok(1),
+        "its folder let through"
+    );
+    drop(watch);
+}
+
+/// An entry's mode changed in a folder above a file's own (an atomic write's `fchmod` beside the
+/// state folder) reaches inotify's wait with the folder's own `IN_ATTRIB`, touches no key, and
+/// ends no wait: the file's write after it is what the wait answers.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_inotify_wait_goes_on_past_an_event_that_touches_no_key() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = scratch("watch-inotify-quiet");
+    let above = dir.path().join("state");
+    let own = above.join("board");
+    std::fs::create_dir_all(&own).unwrap();
+    let sibling = above.join("vitals.json");
+    std::fs::write(&sibling, "{}").unwrap();
+    let path = own.join("row");
+    std::fs::write(&path, "one").unwrap();
+    let mut events = inotify::InotifyEvents::new().unwrap();
+    events.arm(1, &path).unwrap();
+    let mut touched = Vec::new();
+    events.wait(Some(Duration::ZERO), &mut touched).unwrap();
+    touched.clear();
+    std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(0o600)).unwrap();
+    // The write comes after the wait has read the sibling's event, unless this thread is slow
+    // to wait, when both come in one read and the law holds unexercised.
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        std::fs::write(&path, "two").unwrap();
+    });
+    events
+        .wait(Some(aterm_spec::wait::MUST_HAPPEN), &mut touched)
+        .unwrap();
+    writer.join().unwrap();
+    // One write is a modify and a close, often read together.
+    touched.dedup();
+    assert_eq!(touched, [1], "the sibling's mode ended no wait");
 }
 
 /// inotify's `poll` timeout: none waits for an event, a wait already due
@@ -1703,13 +2504,14 @@ fn inotify_routes(
 fn inotify_routes_match_registration_scans_through_replacement_and_release() {
     let mut keys = BTreeMap::new();
     let mut above = BTreeMap::new();
+    let mut files: BTreeMap<u64, i32> = BTreeMap::new();
     let mut routes = InotifyRoutes::default();
     let mut seed = 0x785f_190a_u64;
     for step in 0..1024 {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
         let key = (seed >> 32) % 17;
         let wd = ((seed >> 16) % 9) as i32;
-        match seed % 3 {
+        match seed % 4 {
             0 => {
                 let name = match (seed >> 8) % 3 {
                     0 => InotifyEntry::Named(b"x".to_vec()),
@@ -1727,23 +2529,34 @@ fn inotify_routes_match_registration_scans_through_replacement_and_release() {
                 let old = above.insert(key, new.clone()).unwrap_or_default();
                 routes.replace_above(key, &old, &new);
             }
+            2 => {
+                // A file watch made again on the same file, on another, or let go.
+                let new = ((seed >> 8) % 4 != 0).then_some(wd);
+                let old = match new {
+                    Some(wd) => files.insert(key, wd),
+                    None => files.remove(&key),
+                };
+                routes.replace_file(key, old, new);
+            }
             _ => {
                 if let Some((wd, name)) = keys.remove(&key) {
                     routes.remove_own(key, wd, &name);
                 }
                 let old = above.remove(&key).unwrap_or_default();
                 routes.replace_above(key, &old, &[]);
+                routes.replace_file(key, files.remove(&key), None);
             }
         }
         for wd in 0..10 {
             assert_eq!(
                 routes.held(wd),
                 keys.values().any(|(own, _)| *own == wd)
-                    || above.values().any(|watches| watches.contains(&wd)),
+                    || above.values().any(|watches| watches.contains(&wd))
+                    || files.values().any(|file| *file == wd),
                 "watch ownership at step {step}"
             );
             for name in [b"".as_slice(), b"x", b"unwatched"] {
-                for mask in [2, INOTIFY_SELF, IN_Q_OVERFLOW] {
+                for mask in [2, 4, INOTIFY_SELF, IN_Q_OVERFLOW] {
                     let mut expected = Vec::new();
                     if mask == IN_Q_OVERFLOW {
                         expected.extend(keys.keys().copied());
@@ -1757,7 +2570,17 @@ fn inotify_routes_match_registration_scans_through_replacement_and_release() {
                                     }))
                             .then_some(*key)
                         }));
-                        if name.is_empty() && mask & INOTIFY_SELF != 0 {
+                        // A file's own watch carries no name.
+                        if name.is_empty() {
+                            expected.extend(
+                                files
+                                    .iter()
+                                    .filter_map(|(key, file)| (*file == wd).then_some(*key)),
+                            );
+                            expected.sort_unstable();
+                        }
+                        // A folder's own move, end or attributes, not an entry's, reach above.
+                        if name.is_empty() && mask & (INOTIFY_SELF | 4) != 0 {
                             expected.extend(above.iter().filter_map(|(key, watches)| {
                                 watches.contains(&wd).then_some(*key)
                             }));
@@ -1776,8 +2599,14 @@ fn inotify_routes_match_registration_scans_through_replacement_and_release() {
     for (key, watches) in above {
         routes.replace_above(key, &watches, &[]);
     }
+    for (key, file) in files {
+        routes.replace_file(key, Some(file), None);
+    }
     assert!(
-        routes.own.is_empty() && routes.directories.is_empty() && routes.above.is_empty(),
+        routes.own.is_empty()
+            && routes.directories.is_empty()
+            && routes.above.is_empty()
+            && routes.files.is_empty(),
         "no empty routes or dead registrations retained"
     );
 }
@@ -1913,11 +2742,12 @@ fn an_inotify_event_touches_its_file_and_an_overflow_touches_every_file() {
     assert_eq!(touched, [1]);
 }
 
-/// A watch on a folder above a key's own hears that folder renamed or gone, which touches the key.
-/// The same watch can be another key's own folder, whose entry events name an entry: those touch
-/// only the key watching that entry (the negative control).
+/// A watch on a folder above a key's own hears that folder renamed or gone, or its attributes
+/// changed (a `chmod` can stop the lookup through it), which touches the key. The same watch can
+/// be another key's own folder, whose entry events name an entry: those touch only the key
+/// watching that entry (the negative control), an entry's attributes included.
 #[test]
-fn an_inotify_folder_above_a_file_touches_it_only_when_it_moves_or_goes() {
+fn an_inotify_folder_above_a_file_touches_it_only_when_it_moves_goes_or_changes_mode() {
     // Key 2's own folder (watch 7) is above key 1's (watch 5); watch 8 is above both.
     let keys = BTreeMap::from([
         (1, (5, InotifyEntry::Named(b"doc.txt".to_vec()))),
@@ -1954,12 +2784,300 @@ fn an_inotify_folder_above_a_file_touches_it_only_when_it_moves_or_goes() {
     );
     assert_eq!(
         heard(inotify_event(7, 0x4, b"")),
+        [1, 2],
+        "key 2's own folder's attributes, on key 1's way"
+    );
+    assert_eq!(
+        heard(inotify_event(8, 0x4, b"")),
+        [1, 2],
+        "the folder above both, its attributes"
+    );
+    assert_eq!(
+        heard(inotify_event(7, 0x4, b"notes.txt")),
         [2],
-        "key 2's own folder changed in place"
+        "an entry's attributes"
+    );
+    assert_eq!(
+        heard(inotify_event(8, 0x4, b"other")),
+        Vec::<u64>::new(),
+        "another entry's attributes, in the folder above both"
     );
     assert_eq!(
         heard(inotify_event(8, 0x8000, b"")),
         Vec::<u64>::new(),
         "the folder above both let go"
     );
+}
+
+/// A file key hears a write and a change of mode made through another of the file's names (a
+/// hard link in another folder), which its folder, which names only its own entries, does not.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn the_platform_hears_a_file_written_through_another_link() {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = scratch("watch-hard-link");
+    let own = dir.path().join("conf");
+    let other = dir.path().join("other");
+    std::fs::create_dir(&own).unwrap();
+    std::fs::create_dir(&other).unwrap();
+    let path = own.join("aterm.toml");
+    std::fs::write(&path, "one\n").unwrap();
+    let linked = other.join("linked.toml");
+    std::fs::hard_link(&path, &linked).unwrap();
+    let mut events = platform_events().unwrap();
+    events.arm(1, &path).unwrap();
+    assert_eq!(
+        heard_for(events.as_mut(), || {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&linked)
+                .unwrap();
+            file.write_all(b"two\n").unwrap();
+        }),
+        [1],
+        "a write through the other link"
+    );
+    assert_eq!(
+        heard_for(events.as_mut(), || std::fs::set_permissions(
+            &linked,
+            std::fs::Permissions::from_mode(0o600)
+        )
+        .unwrap()),
+        [1],
+        "a change of mode through the other link"
+    );
+    events.disarm(1);
+}
+
+/// A file key armed again once its path names another file no longer hears the file it named:
+/// a write through a link to the old one touches nothing, while a key on the folder the link is
+/// in hears its own file written after it, in the same wait.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_file_key_armed_on_a_replaced_file_lets_the_old_one_go() {
+    let dir = scratch("watch-hard-link-gone");
+    let own = dir.path().join("conf");
+    let other = dir.path().join("other");
+    std::fs::create_dir(&own).unwrap();
+    std::fs::create_dir(&other).unwrap();
+    let path = own.join("aterm.toml");
+    std::fs::write(&path, "one\n").unwrap();
+    let linked = other.join("linked.toml");
+    std::fs::hard_link(&path, &linked).unwrap();
+    let sentinel = other.join("sentinel");
+    std::fs::write(&sentinel, "one\n").unwrap();
+    let mut events = platform_events().unwrap();
+    events.arm(1, &path).unwrap();
+    events.arm(2, &sentinel).unwrap();
+    let temporary = own.join(".aterm.toml.new");
+    std::fs::write(&temporary, "replaced\n").unwrap();
+    std::fs::rename(&temporary, &path).unwrap();
+    events.arm(1, &path).unwrap();
+    assert_eq!(
+        heard_for(events.as_mut(), || {
+            std::fs::write(&linked, "the old file, written\n").unwrap();
+            std::fs::write(&sentinel, "two\n").unwrap();
+        }),
+        [2],
+        "the old file's write touched no key"
+    );
+    assert_eq!(
+        heard_for(events.as_mut(), || std::fs::write(&path, "the new one\n")
+            .unwrap()),
+        [1],
+        "the file the path names now"
+    );
+    events.disarm(1);
+    events.disarm(2);
+}
+
+/// A key armed on a volume that does not report every writer's change (a network share, written
+/// from another machine) is looked at in each round, so a change no event tells is told; armed
+/// again on one that does, it leaves the rounds and the watch waits untimed.
+#[test]
+fn a_key_on_a_volume_that_misses_writers_is_looked_at_each_round() {
+    let dir = scratch("watch-elsewhere");
+    let path = dir.path().join("aterm.toml");
+    std::fs::write(&path, "one\n").unwrap();
+    let events = Scripted::default();
+    events.elsewhere.lock().unwrap().insert(5);
+    let (told, heard) = mpsc::channel();
+    let watch = FileWatch::spawn(
+        "aterm-document-watch",
+        Box::new(events.clone()),
+        Box::new(move |key| {
+            let _ = told.send(key);
+        }),
+    )
+    .unwrap();
+    watch.watch(5, path.clone());
+    assert_eq!(
+        heard.recv_timeout(aterm_spec::wait::MUST_HAPPEN),
+        Ok(5),
+        "the first look"
+    );
+    std::fs::write(&path, "two, written from another machine\n").unwrap();
+    assert_eq!(
+        heard.recv_timeout(aterm_spec::wait::MUST_HAPPEN),
+        Ok(5),
+        "a round's look told what no event did"
+    );
+    let arms = events.armed.lock().unwrap().len();
+    events.elsewhere.lock().unwrap().clear();
+    events.burst(&[5]);
+    events.settled(arms + 1);
+    assert_eq!(
+        events.waits.lock().unwrap().last(),
+        Some(&None),
+        "armed where every writer is heard, no round is due"
+    );
+    assert_eq!(heard.try_recv(), Err(mpsc::TryRecvError::Empty));
+    drop(watch);
+}
+
+/// A Mac volume reports every writer's change when it is local and not a user-space one; the
+/// type name is matched whatever its case.
+#[test]
+fn a_mac_volume_reports_every_writer_when_local_and_in_the_kernel() {
+    const MNT_LOCAL: u32 = 0x1000;
+    for (flags, fstype, every) in [
+        (MNT_LOCAL, "apfs", true),
+        (MNT_LOCAL | 0x1, "hfs", true),
+        (MNT_LOCAL, "msdos", true),
+        (0, "apfs", false),
+        (0, "smbfs", false),
+        (MNT_LOCAL, "nfs", false),
+        (MNT_LOCAL, "macfuse", false),
+        (MNT_LOCAL, "SMBFS", false),
+        (MNT_LOCAL, "virtiofs", false),
+    ] {
+        assert_eq!(
+            volume_reports_every_writer(flags, fstype),
+            every,
+            "{fstype} with flags {flags:#x}"
+        );
+    }
+}
+
+/// A Linux volume reports every writer's change unless it is a network one, a virtual machine's
+/// share, a cluster's shared disk or a user-space one; an overlay does.
+#[cfg(unix)]
+#[test]
+fn a_linux_volume_reports_every_writer_unless_written_elsewhere() {
+    for (magic, every) in [
+        (0xEF53, true),      // ext4
+        (0x9123_683E, true), // btrfs
+        (0x0102_1994, true), // tmpfs
+        (0x794C_7630, true), // overlay
+        (0x5846_5342, true), // xfs
+        (0x2FC1_2FC1, true), // zfs
+    ] {
+        assert_eq!(volume_type_reports_every_writer(magic), every, "{magic:#x}");
+    }
+    for magic in crate::shared_write::REMOTE_FILESYSTEMS.into_iter().chain([
+        0x517B,
+        0x786F_4256,
+        0x7C7C_6673,
+        0xBACB_ACBC,
+        0x7461_636F,
+        0x0116_1970,
+        0x7375_7245,
+        0x2003_0528,
+    ]) {
+        assert!(!volume_type_reports_every_writer(magic), "{magic:#x}");
+    }
+}
+
+/// The platform says a key in scratch, on this machine's own disk, hears every writer.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn the_platform_hears_every_writer_on_a_local_volume() {
+    let dir = scratch("watch-local-volume");
+    let path = dir.path().join("aterm.toml");
+    std::fs::write(&path, "one\n").unwrap();
+    let mut events = platform_events().unwrap();
+    events.arm(1, &path).unwrap();
+    events.arm_directory(2, dir.path()).unwrap();
+    assert!(events.hears_every_writer(1), "a file key");
+    assert!(events.hears_every_writer(2), "a directory key");
+    events.disarm(1);
+    events.disarm(2);
+}
+
+/// inotify's answer for a key matches what the kernel's mount table says the volume is: a key in
+/// this crate's own folder, which a virtual machine's share holds in the Linux guest lane, is
+/// looked at in rounds there, and heard from every writer on a local disk.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_inotify_key_hears_every_writer_as_its_mount_says() {
+    use std::os::unix::ffi::OsStrExt as _;
+    // The kernel writes a space, tab, newline or backslash in a mount point as `\NNN` in octal.
+    fn unescaped(field: &str) -> PathBuf {
+        let bytes = field.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut at = 0;
+        while at < bytes.len() {
+            let octal = bytes.get(at + 1..at + 4).and_then(|digits| {
+                std::str::from_utf8(digits)
+                    .ok()
+                    .and_then(|digits| u8::from_str_radix(digits, 8).ok())
+            });
+            match (bytes[at], octal) {
+                (b'\\', Some(byte)) => {
+                    out.push(byte);
+                    at += 4;
+                }
+                (byte, _) => {
+                    out.push(byte);
+                    at += 1;
+                }
+            }
+        }
+        PathBuf::from(std::ffi::OsStr::from_bytes(&out))
+    }
+    let folder = std::fs::canonicalize(aterm_tempfile::manifest_dir()).unwrap();
+    let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap();
+    let fstype = mounts
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split(' ');
+            let _source = fields.next()?;
+            let at = unescaped(fields.next()?);
+            let fstype = fields.next()?;
+            folder
+                .starts_with(&at)
+                .then(|| (at.components().count(), fstype.to_owned()))
+        })
+        .max_by_key(|(at, _)| *at)
+        .map(|(_, fstype)| fstype)
+        .unwrap();
+    // A FUSE mount's type names its program after a dot (`fuse.sshfs`, `fuseblk.ntfs-3g`).
+    let elsewhere = matches!(
+        fstype.split('.').next().unwrap_or_default(),
+        "nfs"
+            | "nfs4"
+            | "cifs"
+            | "smb3"
+            | "smbfs"
+            | "ceph"
+            | "afs"
+            | "9p"
+            | "lustre"
+            | "gpfs"
+            | "fuse"
+            | "fuseblk"
+            | "virtiofs"
+            | "vboxsf"
+            | "prl_fs"
+            | "vmhgfs"
+            | "ocfs2"
+            | "gfs2"
+            | "coda"
+            | "pvfs2"
+    );
+    let mut events = platform_events().unwrap();
+    events.arm(1, &folder.join("Cargo.toml")).unwrap();
+    assert_eq!(events.hears_every_writer(1), !elsewhere, "{fstype}");
+    events.disarm(1);
 }

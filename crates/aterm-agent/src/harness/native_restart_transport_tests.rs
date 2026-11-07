@@ -18,6 +18,9 @@ mod replay_model;
 #[path = "native_restart_legacy_tests.rs"]
 mod legacy;
 
+#[path = "native_restart_pairing_tests.rs"]
+mod pairing;
+
 const SID: &str = "s-native-transport";
 
 #[test]
@@ -268,6 +271,184 @@ fn every_prepare_replay_waits_for_its_state_barrier() {
         1,
         "nothing was dispatched while persistence was unavailable"
     );
+}
+
+#[test]
+fn a_completed_cold_predecessor_keeps_the_new_asked_prepare_exact_across_lost_ack() {
+    use super::super::native_act::{ClaimOutcome, ColdBilling, ColdIntent};
+    let world = aterm_tempfile::tempdir().unwrap();
+    let opts = opts(world.path());
+    let command = planned();
+    let mut st = lost_prepare(&opts, &command);
+    let Some(Request::Prepare(mut predecessor)) = Request::parse(&st.native_prepare) else {
+        panic!("actual saved preparation");
+    };
+    predecessor.duty = Scope::Relaunch;
+    let NativePlan::Restart { cold, rollback, .. } = &mut predecessor.plan else {
+        unreachable!()
+    };
+    *cold = Some(Box::new(ColdIntent {
+        login: None,
+        home: None,
+        auth_observed: true,
+        route: super::super::accounts::AuthRoute::Stored,
+        conversation: Some("conversation".into()),
+        profile: None,
+        mode: super::super::accounts::Mode::Wall,
+        billing: ColdBilling::Keep,
+    }));
+    *rollback = None;
+    st.native_prepare = Request::prepare(*predecessor.clone()).encode().unwrap();
+    // This endpoint control qualifies client persistence/replay only. The real host
+    // controls independently prove that a cold terminal ACK can grant succession.
+    assert_eq!(
+        terminal_reply(
+            &mut st,
+            &Reply::ColdRestartCommitted {
+                claim: ClaimOutcome::Builtin,
+                observation: None,
+                intent: Box::new(super::super::accounts_pool::ExecutionIntent::Stored {
+                    namespace: "11".repeat(32),
+                    login: None,
+                    owner: None,
+                    generation: "22".repeat(32),
+                }),
+            }
+        ),
+        Some(Recovery::Completed)
+    );
+    let expected_predecessor = predecessor.id.clone();
+    let completed = st.clone();
+    let (mut client, worker) = endpoint(|line| {
+        assert_eq!(line, format!("@{SID} native-act constructors"));
+        Some("OK native-act state=constructors plans=-\n".into())
+    });
+    assert_eq!(
+        begin(
+            &opts,
+            &mut client,
+            &mut st,
+            "conversation",
+            Scope::Upgrade,
+            &command.target,
+            Some(&command),
+            Some(&command)
+        ),
+        Err("native-asked-constructor-disabled")
+    );
+    assert_eq!(st, completed);
+    drop(client);
+    assert_eq!(
+        worker.join().unwrap(),
+        [format!("@{SID} native-act constructors")]
+    );
+    let mut no_private_token = opts.clone();
+    no_private_token.token = None;
+    let (mut client, worker) = endpoint(|_| panic!("no private authority dispatches no request"));
+    assert_eq!(
+        begin(
+            &no_private_token,
+            &mut client,
+            &mut st,
+            "conversation",
+            Scope::Upgrade,
+            &command.target,
+            Some(&command),
+            Some(&command)
+        ),
+        Err("native-asked-upgrade-unqualified")
+    );
+    assert_eq!(st, completed);
+    drop(client);
+    assert!(worker.join().unwrap().is_empty());
+    let (mut client, worker) = endpoint(move |line| {
+        if line == format!("@{SID} native-act constructors") {
+            return Some("OK native-act state=constructors plans=asked-upgrade\n".into());
+        }
+        common(line).or_else(|| match request(line) {
+            Request::Prepare(plan) => {
+                assert_eq!(plan.constructor(), Constructor::AskedUpgrade);
+                assert_eq!(
+                    plan.asked_upgrade.unwrap().predecessor,
+                    expected_predecessor
+                );
+                None
+            }
+            other => panic!("lost asked Prepare never dispatches {other:?}"),
+        })
+    });
+    assert!(
+        begin(
+            &opts,
+            &mut client,
+            &mut st,
+            "conversation",
+            Scope::Upgrade,
+            &command.target,
+            Some(&command),
+            Some(&command)
+        )
+        .is_err()
+    );
+    drop(client);
+    let seen = worker.join().unwrap();
+    assert_eq!(
+        seen.iter()
+            .filter(|line| matches!(actual_request(line), Some(Request::Prepare(_))))
+            .count(),
+        1
+    );
+    let saved = st.native_prepare.clone();
+    let mut loaded = upgrade_drive::load(&opts, "conversation").unwrap();
+    assert_eq!(loaded.native_prepare, saved);
+    for reply in [
+        format!(
+            "OK native-act state=pending id={} cap={}\n",
+            "fe".repeat(16),
+            binding().capability
+        ),
+        "OK native-act state=unknown\n".into(),
+    ] {
+        let expected = saved.clone();
+        let (mut client, worker) = endpoint(move |line| {
+            assert_eq!(line, format!("@{SID} native-act {expected}"));
+            Some(reply.clone())
+        });
+        assert!(matches!(
+            recover(&opts, "conversation", &mut client, SID, &mut loaded),
+            Err("native-unknown")
+        ));
+        assert_eq!(loaded.native_prepare, saved);
+        assert!(loaded.native.is_none());
+        drop(client);
+        assert_eq!(worker.join().unwrap().len(), 1);
+    }
+    let expected = saved.clone();
+    let (mut client, worker) = endpoint(move |line| {
+        assert_eq!(line, format!("@{SID} native-act {expected}"));
+        let Request::Prepare(plan) = request(line) else {
+            unreachable!()
+        };
+        Some(format!(
+            "OK native-act state=admitted id={} cap={}\n",
+            plan.id,
+            binding().capability
+        ))
+    });
+    let fault = aterm_durable::seam::FailingDirs::with_kind(std::io::ErrorKind::Unsupported);
+    assert_eq!(
+        recover(&opts, "conversation", &mut client, SID, &mut loaded),
+        Err("native-unsaved")
+    );
+    assert_eq!(loaded.native_prepare, saved);
+    drop(fault);
+    assert_eq!(
+        recover(&opts, "conversation", &mut client, SID, &mut loaded),
+        Ok(Recovery::Admitted)
+    );
+    assert_eq!(loaded.native_prepare, saved);
+    drop(client);
+    assert_eq!(worker.join().unwrap().len(), 1);
 }
 
 #[test]
@@ -769,6 +950,7 @@ fn a_cold_completion_keeps_the_selected_intent_and_the_original_seed_with_or_wit
     shell.pid = if vendor.pid == 2 { 3 } else { 2 };
     shell.group = shell.pid;
     let original = Prepare {
+        asked_upgrade: None,
         id: "ab".repeat(16),
         host_epoch: "ef".repeat(16),
         holder: "aterm-harness@fixture".into(),
@@ -923,7 +1105,7 @@ fn fresh_private_constructor_keeps_legacy_before_any_prepare_when_kind_is_disabl
 }
 
 #[test]
-fn disabled_kind_never_restores_raw_fallback_after_terminal_native_coordination() {
+fn unproven_completed_history_never_restores_raw_fallback_after_native_coordination() {
     let world = aterm_tempfile::tempdir().unwrap();
     let opts = opts(world.path());
     let command = planned();
@@ -955,9 +1137,9 @@ fn disabled_kind_never_restores_raw_fallback_after_terminal_native_coordination(
     );
     drop(client);
     let seen = worker.join().unwrap();
-    assert_eq!(result, Err("native-constructor-disabled"));
+    assert_eq!(result, Err("native-asked-predecessor-unproven"));
     assert!(st.native_coordination);
-    assert_eq!(seen, [format!("@{SID} native-act constructors")]);
+    assert!(seen.is_empty());
     let mut no_private_token = opts.clone();
     no_private_token.token = None;
     let (mut client, worker) =
@@ -974,7 +1156,7 @@ fn disabled_kind_never_restores_raw_fallback_after_terminal_native_coordination(
     );
     drop(client);
     assert!(worker.join().unwrap().is_empty());
-    assert_eq!(result, Err("native-coordinated-unavailable"));
+    assert_eq!(result, Err("native-asked-predecessor-unproven"));
 }
 
 #[test]
@@ -1559,13 +1741,17 @@ fn resume_only_driver_starts_with_observation_and_never_reissues_signal_on_lost_
     for signal_original in [false, true, false] {
         // A closed connection is unknown, so the exact retained admission is
         // replayed. The Resume-only path must not send Signal even on retry.
+        let key = format!("renewal-{}", prepare.id);
+        let current = upgrade_drive::load_record(&opts, &key)
+            .unwrap()
+            .unwrap_or_else(|| st.clone());
         let (client, worker) = endpoint(|_| None);
         assert!(
             super::super::codex_renewal::drive_connection(
                 &opts,
                 SID,
                 &prepare,
-                st.clone(),
+                current,
                 client,
                 signal_original,
             )
@@ -1587,13 +1773,10 @@ fn resume_only_driver_starts_with_observation_and_never_reissues_signal_on_lost_
 fn rollback_phase_checkpoint_failure_never_sends_precommit_or_commit() {
     let dir = aterm_tempfile::tempdir().unwrap();
     let opts = opts(dir.path());
+    let seed = aterm_tempfile::tempdir().unwrap();
+    let mut st = bound_record(&self::opts(seed.path()));
     std::fs::write(&opts.state, b"obstruct owned test state directory").unwrap();
-    let mut st = St {
-        native: Some(binding()),
-        native_prepare: "retained-original".into(),
-        native_rollback: true,
-        ..St::default()
-    };
+    st.native_rollback = true;
     let original = st.clone();
     let (mut client, worker) = endpoint(|line| {
         assert!(

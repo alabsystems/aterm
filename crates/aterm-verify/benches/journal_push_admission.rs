@@ -3,13 +3,14 @@
 
 //! Manual native admission measurement. Build this and the agh helper with `--profile opt-test`.
 //! Arguments: the source checkout, built agh helper and optional `history` or
-//! `history-connectivity` comparison.
+//! `history-connectivity`, `history-phases` or `retained-phases` comparison.
 //! All remotes and tokens are fixtures.
 
 #[cfg(all(unix, debug_assertions))]
 mod native {
     use agh::config::{self, Dirs};
-    use agh::git::HelperCommand;
+    use agh::fx::NativePushTiming;
+    use agh::git::{HelperCommand, NativePushPhase};
     use agh::identity::MapEnv;
     use agh::policy::{RouteRequest, RouteTarget, Router};
     use agh::wire::Endpoints;
@@ -31,6 +32,7 @@ mod native {
         let mut command = aterm_uds::fixture_git::git();
         command
             .current_dir(root)
+            .args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
             .args(args)
             .env("GIT_AUTHOR_NAME", "fixture")
             .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
@@ -116,6 +118,106 @@ mod native {
         Ok(child)
     }
 
+    /// One root and a retained chain whose last tree restores that same root tree.
+    /// All bodies are synthetic; fast-import writes only this owned fixture repository.
+    fn retained_history(root: &Path) -> Result<(), Box<dyn Error>> {
+        fn blob(stream: &mut String, next: &mut usize, content: &str) -> usize {
+            let mark = *next;
+            *next += 1;
+            stream.push_str(&format!(
+                "blob\nmark :{mark}\ndata {}\n{content}\n",
+                content.len()
+            ));
+            mark
+        }
+        fn commit(
+            stream: &mut String,
+            next: &mut usize,
+            reference: &str,
+            parent: Option<usize>,
+            step: usize,
+        ) -> usize {
+            let mark = *next;
+            *next += 1;
+            let message = format!("synthetic retained history {step:08}\n");
+            stream.push_str(&format!("commit {reference}\nmark :{mark}\ncommitter fixture <fixture@example.invalid> 1700000000 +0000\ndata {}\n{message}\n", message.len()));
+            if let Some(parent) = parent {
+                stream.push_str(&format!("from :{parent}\n"));
+            }
+            mark
+        }
+        fn record(index: usize, revision: usize) -> String {
+            format!(
+                "tree = \"{index:040x}\"\nstate = \"judging\"\nlease_until = 120\n# synthetic revision {revision:08}\n# {}\n",
+                "fixture".repeat(140)
+            )
+        }
+        let mut stream = String::from("feature done\n");
+        let mut next = 1;
+        let marker = blob(
+            &mut stream,
+            &mut next,
+            "synthetic retained-history fixture\n",
+        );
+        let rows: Vec<_> = (0..72)
+            .map(|index| blob(&mut stream, &mut next, &record(index, 0)))
+            .collect();
+        let mut parent = commit(&mut stream, &mut next, "refs/heads/journal", None, 0);
+        let restore = |stream: &mut String| {
+            stream.push_str(&format!("M 100644 :{marker} .fixture\n"));
+            for (index, mark) in rows.iter().enumerate() {
+                stream.push_str(&format!("M 100644 :{mark} verdicts/{index:040x}.toml\n"));
+            }
+        };
+        restore(&mut stream);
+        stream.push('\n');
+        // 2,572 BEFORE commits become 2,573 after the common same-tree child update.
+        for step in 1..2572 {
+            let last = step == 2571;
+            let changed =
+                (!last).then(|| blob(&mut stream, &mut next, &record((step - 1) % 72, step)));
+            parent = commit(
+                &mut stream,
+                &mut next,
+                "refs/heads/retained",
+                Some(parent),
+                step,
+            );
+            if let Some(mark) = changed {
+                stream.push_str(&format!(
+                    "M 100644 :{mark} verdicts/{:040x}.toml\n",
+                    (step - 1) % 72
+                ));
+            } else {
+                stream.push_str("deleteall\n");
+                restore(&mut stream);
+            }
+            stream.push('\n');
+        }
+        stream.push_str("done\n");
+        let mut command = aterm_uds::fixture_git::git();
+        command
+            .current_dir(root)
+            .args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
+            .args(["fast-import", "--quiet", "--date-format=raw"]);
+        let out = aterm_uds::deadline::output_with_input_until(
+            &mut command,
+            aterm_uds::secret::Secret::new(stream.as_bytes()),
+            Instant::now() + Duration::from_secs(60),
+            4096,
+        )?;
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).into_owned().into());
+        }
+        assert_eq!(git(root, &["rev-list", "--count", "journal"])?, "1");
+        assert_eq!(git(root, &["rev-list", "--count", "retained"])?, "2572");
+        assert_eq!(
+            git(root, &["rev-parse", "journal^{tree}"])?,
+            git(root, &["rev-parse", "retained^{tree}"])?
+        );
+        Ok(())
+    }
+
     fn fetch(root: &Path, from: &Path, reference: &str) -> Result<(), Box<dyn Error>> {
         git(
             root,
@@ -159,10 +261,68 @@ mod native {
     }
 
     type ConnectivityProbe = Arc<Mutex<ConnectivitySpan>>;
+    type PhaseProbe = Arc<Mutex<Vec<NativePushTiming>>>;
+
+    fn phase_observation(
+        spans: &[NativePushTiming],
+        began: Instant,
+        finished: Instant,
+    ) -> (aterm_json::Value, bool) {
+        let expected = [
+            NativePushPhase::MetadataPack,
+            NativePushPhase::MetadataVerify,
+            NativePushPhase::Connectivity,
+        ];
+        let valid = spans.len() == expected.len()
+            && spans.iter().zip(expected).all(|(span, phase)| {
+                span.phase == phase
+                    && span.success
+                    && began <= span.started
+                    && span.started <= span.finished
+                    && span.finished <= finished
+            })
+            && spans
+                .windows(2)
+                .all(|pair| pair[0].finished <= pair[1].started);
+        let rows: Vec<_> = spans.iter().map(|span| {
+            let name = match span.phase {
+                NativePushPhase::MetadataPack => "metadata_pack",
+                NativePushPhase::MetadataVerify => "metadata_verify",
+                NativePushPhase::Connectivity => "connectivity",
+            };
+            json!({"phase":name,"start_offset_ns":span.started.checked_duration_since(began).map(|d|d.as_nanos()),"end_offset_ns":span.finished.checked_duration_since(began).map(|d|d.as_nanos()),"wall_ns":span.finished.checked_duration_since(span.started).map(|d|d.as_nanos()),"success":span.success})
+        }).collect();
+        let total = spans.iter().try_fold(0u128, |total, span| {
+            total.checked_add(
+                span.finished
+                    .checked_duration_since(span.started)?
+                    .as_nanos(),
+            )
+        });
+        let outside =
+            total.and_then(|total| finished.duration_since(began).as_nanos().checked_sub(total));
+        (
+            json!({"spans":rows,"outside_observed_ns":outside}),
+            valid && outside.is_some(),
+        )
+    }
 
     impl Fixture {
         fn client(&self) -> Result<Github, Box<dyn Error>> {
             self.client_with_fx(agh::Fx::simulated(agh::Fx::live().wall_secs()?))
+        }
+
+        fn phase_client(&self) -> Result<(Github, PhaseProbe), Box<dyn Error>> {
+            let spans = Arc::new(Mutex::new(Vec::new()));
+            let observed = Arc::clone(&spans);
+            let fx = agh::Fx::simulated(agh::Fx::live().wall_secs()?)
+                .with_native_push_observer_for_tests(move |span| {
+                    observed
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push(span);
+                });
+            Ok((self.client_with_fx(fx)?, spans))
         }
 
         fn client_with_fx(&self, fx: agh::Fx) -> Result<Github, Box<dyn Error>> {
@@ -240,12 +400,18 @@ mod native {
             .filter(|a| a != "--bench")
             .collect();
         if !(args.len() == 2
-            || (args.len() == 3 && (args[2] == "history" || args[2] == "history-connectivity")))
+            || (args.len() == 3
+                && (args[2] == "history"
+                    || args[2] == "history-connectivity"
+                    || args[2] == "history-phases"
+                    || args[2] == "retained-phases")))
         {
-            return Err("usage: journal_push_admission SOURCE_CHECKOUT AGH_HELPER [history|history-connectivity] (build both with --profile opt-test)".into());
+            return Err("usage: journal_push_admission SOURCE_CHECKOUT AGH_HELPER [history|history-connectivity|history-phases|retained-phases] (build both with --profile opt-test)".into());
         }
         let history = args.len() == 3;
         let connectivity = args.len() == 3 && args[2] == "history-connectivity";
+        let retained = args.len() == 3 && args[2] == "retained-phases";
+        let observe_phases = args.len() == 3 && (args[2] == "history-phases" || retained);
         let source = std::fs::canonicalize(&args[0])?;
         let helper = std::fs::canonicalize(&args[1])?;
         let source_head = git(&source, &["rev-parse", "HEAD"])?;
@@ -274,18 +440,22 @@ mod native {
         let work = base.join("journal-work");
         std::fs::create_dir(&work)?;
         git(&work, &["init", "--quiet", "-b", "journal"])?;
-        std::fs::create_dir(work.join("verdicts"))?;
-        for index in 0..64 {
-            std::fs::write(
-                work.join(format!("verdicts/{index:040x}.toml")),
-                format!(
-                    "tree = \"{index:040x}\"\nstate = \"judging\"\nlease_until = 120\n# {}\n",
-                    "fixture".repeat(140)
-                ),
-            )?;
+        if retained {
+            retained_history(&work)?;
+        } else {
+            std::fs::create_dir(work.join("verdicts"))?;
+            for index in 0..64 {
+                std::fs::write(
+                    work.join(format!("verdicts/{index:040x}.toml")),
+                    format!(
+                        "tree = \"{index:040x}\"\nstate = \"judging\"\nlease_until = 120\n# {}\n",
+                        "fixture".repeat(140)
+                    ),
+                )?;
+            }
+            git(&work, &["add", "."])?;
+            git(&work, &["commit", "--quiet", "-m", "journal before"])?;
         }
-        git(&work, &["add", "."])?;
-        git(&work, &["commit", "--quiet", "-m", "journal before"])?;
         let before = git(&work, &["rev-parse", "HEAD"])?;
         let after = if history {
             let child = same_tree_child(&work, &before)?;
@@ -323,19 +493,27 @@ mod native {
         fetch(&remote, &work, &format!("{before}:{REF}"))?;
         fetch(&full, &work, &format!("{after}:{REF}"))?;
         let history_batch = if history {
-            let child = same_tree_child(&full, &source_head)?;
+            let history_before = if retained {
+                let before = git(&work, &["rev-parse", "retained"])?;
+                fetch(&remote, &work, &format!("{before}:{HISTORY_REF}"))?;
+                fetch(&full, &work, &format!("{before}:{HISTORY_REF}"))?;
+                before
+            } else {
+                source_head.clone()
+            };
+            let child = same_tree_child(&full, &history_before)?;
             assert_eq!(
                 git(&full, &["cat-file", "-s", &child])?,
                 git(&full, &["cat-file", "-s", &after])?,
                 "both new commit payloads have the same byte length"
             );
             git(&full, &["update-ref", HISTORY_REF, &child])?;
-            git(&remote, &["update-ref", HISTORY_REF, &source_head])?;
+            git(&remote, &["update-ref", HISTORY_REF, &history_before])?;
             assert_eq!(object_kind(&remote, &child)?, format!("{child} missing"));
             Some(agh::github::refs::AtomicRefBatch::new(vec![
                 agh::github::refs::RefUpdate {
                     reference: HISTORY_REF.into(),
-                    before: source_head.clone(),
+                    before: history_before,
                     after: child,
                 },
             ])?)
@@ -363,6 +541,9 @@ mod native {
         let full_config = std::fs::read(full.join("config"))?;
         let journal_config = std::fs::read(journal.join("config"))?;
         let remote_config = std::fs::read(remote.join("config"))?;
+        let full_objects = git(&full, &["count-objects", "-v"])?;
+        let journal_objects = git(&journal, &["count-objects", "-v"])?;
+        let remote_objects = git(&remote, &["count-objects", "-v"])?;
         let fake = FakeGithub::start();
         fake.add_repo(SLUG, RepoSpec::private().push("fixture-dev-bot"));
         fake.set_branch(SLUG, "main", &before);
@@ -411,7 +592,31 @@ mod native {
         } else {
             json!(null)
         };
-        let comparison = if connectivity {
+        let retained_shape = if retained {
+            let history_after = &history_batch
+                .as_ref()
+                .ok_or("retained batch missing")?
+                .updates()[0]
+                .after;
+            let tree = git(&full, &["rev-parse", &format!("{after}^{{tree}}")])?;
+            assert_eq!(
+                tree,
+                git(&full, &["rev-parse", &format!("{history_after}^{{tree}}")])?
+            );
+            let entries = git(&full, &["ls-tree", "-r", "--name-only", &after])?;
+            assert_eq!(entries.lines().count(), 73);
+            assert_eq!(entries.lines().filter(|p| p.ends_with(".toml")).count(), 72);
+            assert_eq!(git(&full, &["rev-list", "--count", &after])?, "2");
+            assert_eq!(git(&full, &["rev-list", "--count", history_after])?, "2573");
+            json!({"synthetic":true,"current_tree":tree,"current_tree_entries":73,"current_toml_paths":72,"tiny_commits":2,"retained_commits":2573,"tiny_closure_objects":git(&full,&["rev-list","--objects",&after])?.lines().count(),"retained_closure_objects":git(&full,&["rev-list","--objects",history_after])?.lines().count(),"same_current_tree":true,"new_objects_each":1,"new_commit_bytes_each":git(&full,&["cat-file","-s",&after])?.parse::<u64>()?})
+        } else {
+            json!(null)
+        };
+        let comparison = if retained {
+            "retained_phases"
+        } else if observe_phases {
+            "history_phases"
+        } else if connectivity {
             "history_connectivity"
         } else if history {
             "history"
@@ -420,8 +625,20 @@ mod native {
         };
         let subjects = if let Some(history_batch) = &history_batch {
             [
-                ("journal", &full, &batch),
-                ("source_history", &full, history_batch),
+                (
+                    if retained { "tiny_journal" } else { "journal" },
+                    &full,
+                    &batch,
+                ),
+                (
+                    if retained {
+                        "retained_journal"
+                    } else {
+                        "source_history"
+                    },
+                    &full,
+                    history_batch,
+                ),
             ]
         } else {
             [("full", &full, &batch), ("journal", &journal, &batch)]
@@ -453,15 +670,15 @@ mod native {
         };
         println!(
             "journal_admission_metadata: {}",
-            json!({"comparison":comparison,"source_head":source_head,"before":before,"after":after,"journal_records":64,"journal_commits":git(&full,&["rev-list","--count",&after])?,"history":history_metadata,"connectivity_calibration_calls":usize::from(connectivity),"full_store":git(&full,&["count-objects","-v"] )?,"journal_store":git(&journal,&["count-objects","-v"] )?,"profile":"opt-test: opt3, debug assertions, no LTO,16CGU","clock":"real Instant wall, not SDK simulated clock","scope":"isolated loopback/local-remote fixtures; dry-run only; source checkout is read-only input; no operator GitHub/vault write or installed-release latency claim"})
+            json!({"comparison":comparison,"git_version":git(&full,&["--version"])?,"source_head":source_head,"before":before,"after":after,"journal_records":if retained {72} else {64},"journal_commits":git(&full,&["rev-list","--count",&after])?,"history":history_metadata,"retained_shape":retained_shape,"connectivity_calibration_calls":usize::from(connectivity),"full_store":full_objects,"journal_store":journal_objects,"remote_store":remote_objects,"fixture_setup_maintenance_disabled":true,"profile":"opt-test: opt3, debug assertions, no LTO,16CGU","clock":"real Instant wall, not SDK simulated clock","scope":"isolated loopback/local-remote fixtures; dry-run only; source checkout is read-only input; no operator GitHub/vault write or installed-release latency claim"})
         );
         let reused = fixture.client()?;
-        let phases: &[&str] = if connectivity {
+        let phases: &[&str] = if connectivity || observe_phases {
             &["fresh_client"]
         } else {
             &["fresh_client", "reused_client"]
         };
-        let samples = if connectivity { 6 } else { 3 };
+        let samples = if connectivity || observe_phases { 6 } else { 3 };
         for &phase in phases {
             if phase == "reused_client" {
                 let permit = reused
@@ -483,17 +700,20 @@ mod native {
                     [subjects[1], subjects[0]]
                 };
                 for (position, (variant, store, batch)) in order.into_iter().enumerate() {
-                    let (fresh, probe) = if let Some(command) = &connectivity_command {
+                    let (fresh, probe, phase_probe) = if observe_phases {
+                        let (client, spans) = fixture.phase_client()?;
+                        (Some(client), None, Some(spans))
+                    } else if let Some(command) = &connectivity_command {
                         let (client, span) = fixture.connectivity_client(
                             command,
                             &after,
                             &batch.updates()[0].after,
                         )?;
-                        (Some(client), Some(span))
+                        (Some(client), Some(span), None)
                     } else if phase == "fresh_client" {
-                        (Some(fixture.client()?), None)
+                        (Some(fixture.client()?), None, None)
                     } else {
-                        (None, None)
+                        (None, None, None)
                     };
                     let client = fresh.as_ref().unwrap_or(&reused);
                     let permit = client
@@ -505,7 +725,14 @@ mod native {
                         .map_err(|e| format!("fixture permit: {e:?}"))?;
                     let began = Instant::now();
                     let result = client.refs(&slug).check_push(&permit, store, batch);
-                    let elapsed = began.elapsed().as_nanos();
+                    let finished = Instant::now();
+                    let elapsed = finished.duration_since(began).as_nanos();
+                    let (phase_spans, phases_valid) = if let Some(spans) = phase_probe {
+                        let spans = spans.lock().unwrap_or_else(PoisonError::into_inner);
+                        phase_observation(&spans, began, finished)
+                    } else {
+                        (json!(null), true)
+                    };
                     let (connectivity_span, probe_valid) = if let Some(span) = probe {
                         let span = span.lock().unwrap_or_else(PoisonError::into_inner);
                         let wall = span.wall.map(|d| d.as_nanos());
@@ -520,9 +747,13 @@ mod native {
                     };
                     println!(
                         "journal_admission_sample: {}",
-                        json!({"comparison":comparison,"phase":phase,"sample":sample,"position":position,"variant":variant,"wall_ns":elapsed,"connectivity":connectivity_span,"ok":result.is_ok(),"error":result.as_ref().err().map(|e|format!("{:?}: {}",e.kind,e.why))})
+                        json!({"comparison":comparison,"phase":phase,"sample":sample,"position":position,"variant":variant,"wall_ns":elapsed,"connectivity":connectivity_span,"native_phases":phase_spans,"ok":result.is_ok(),"error":result.as_ref().err().map(|e|format!("{:?}: {}",e.kind,e.why))})
                     );
                     result?;
+                    assert!(
+                        phases_valid,
+                        "three ordered successful real phases are contained by the whole call"
+                    );
                     assert!(
                         probe_valid,
                         "one completed real child span is contained by the whole call"
@@ -536,6 +767,12 @@ mod native {
         assert_eq!(std::fs::read(full.join("config"))?, full_config);
         assert_eq!(std::fs::read(journal.join("config"))?, journal_config);
         assert_eq!(std::fs::read(fixture.remote.join("config"))?, remote_config);
+        assert_eq!(git(&full, &["count-objects", "-v"])?, full_objects);
+        assert_eq!(git(&journal, &["count-objects", "-v"])?, journal_objects);
+        assert_eq!(
+            git(&fixture.remote, &["count-objects", "-v"])?,
+            remote_objects
+        );
         assert_eq!(
             object_kind(&fixture.remote, &after)?,
             format!("{after} missing")

@@ -24,6 +24,12 @@ use crate::harness::harness_mark;
 /// background work under Cruise ([`BACKGROUND_CARRY`]).
 pub const RULE_BACKGROUND: &str = "continue-background@v1";
 
+/// The ledger's name for the books of [`RULE_BACKGROUND`]'s carries started again in memory where
+/// they held a carry ([`BackgroundCarries`]: a turn of real work, someone else's message, a turn
+/// whose work went unread, a person's gesture after a loop before this one's last carry): a later
+/// loop's replay of the ladder starts after it, as after a judged point.
+pub const RULE_BACKGROUND_RESET: &str = "continue-background-reset@v1";
+
 /// The carry's words: the work runs on, so check on it and go on with everything else.
 pub const BACKGROUND_CARRY: &str = concat!(
     harness_mark!(),
@@ -93,31 +99,39 @@ impl BackgroundCarries {
     }
 
     /// THE BOOKS' LADDER REPLAYED AS THE LIVE LADDER TYPED IT, at `now_ms`, from the carries
-    /// `typed` (unix ms, oldest first, none before a row that started the books again:
-    /// [`crate::supervise::approvals::background_carries_in`]): the newest carry's time and its
-    /// streak, which [`Self::carried`] takes up. Each carry is one more in the run unless it came
-    /// on books started again where no row says so ([`Self::next_in_run`]). `None` with no carry,
-    /// or where the newest has lapsed ([`Self::lapsed`]): a restart there takes no ladder.
+    /// `typed` (unix ms and the streak each row names, oldest first, none before a row that
+    /// started the books again: [`crate::supervise::approvals::background_carries_in`]): the
+    /// newest carry's time and its streak, which [`Self::carried`] takes up. A carry whose row
+    /// names its streak is at that streak, the live ladder's, books started again in memory alone
+    /// included. One written before rows named it is one more in the run unless it came on books
+    /// started again where no row says so ([`Self::next_in_run`]). `None` with no carry, or where
+    /// the newest has lapsed ([`Self::lapsed`]): a restart there takes no ladder.
     #[must_use]
-    pub fn replayed(timing: &TurnEndTiming, typed: &[i64], now_ms: i64) -> Option<(i64, u32)> {
+    pub fn replayed(
+        timing: &TurnEndTiming,
+        typed: &[(i64, Option<u32>)],
+        now_ms: i64,
+    ) -> Option<(i64, u32)> {
         let mut run: Option<(i64, u32)> = None;
-        for &at in typed {
-            run = Some(match run {
-                Some((last, streak)) if Self::next_in_run(timing, streak, at - last) => {
+        for &(at, named) in typed {
+            run = Some(match (named, run) {
+                (Some(streak), _) => (at, streak),
+                (None, Some((last, streak))) if Self::next_in_run(timing, streak, at - last) => {
                     (at, streak.saturating_add(1))
                 }
-                _ => (at, 1),
+                (None, _) => (at, 1),
             });
         }
         run.filter(|&(last, streak)| !Self::lapsed(timing, streak, now_ms - last))
     }
 
     /// Whether a carry `gap_ms` after the one before it, the `streak`-th in a row, is the next of
-    /// their run. THE LIVE LADDER TYPES NONE SOONER THAN THE STREAK'S RUNG, so one closer came on
-    /// books started again in memory alone (a turn of real work, someone else's message at a
-    /// break); an eighth of the rung is the stamps' slack (a row is stamped after its typing, on a
-    /// wall clock that slews). And one past the rung by the lapse ([`Self::lapsed`]) came where a
-    /// restart takes no ladder.
+    /// their run, for a row that names no streak. THE LIVE LADDER TYPES NONE SOONER THAN THE
+    /// STREAK'S RUNG, so one closer came on books started again in memory alone (a turn of real
+    /// work, someone else's message at a break); an eighth of the rung is the stamps' slack (a row
+    /// is stamped after its typing, on a wall clock that slews). And one past the rung by the lapse
+    /// ([`Self::lapsed`]) came where a restart takes no ladder. Books started again after a turn
+    /// of real work longer than the rung show in no gap, which is why rows name their streak.
     fn next_in_run(timing: &TurnEndTiming, streak: u32, gap_ms: i64) -> bool {
         let rung = Self::rung(timing, streak);
         let gap = Duration::from_millis(u64::try_from(gap_ms).unwrap_or(0));
@@ -223,7 +237,10 @@ mod tests {
             typed.push(typed[typed.len() - 1] + min(wait) + 5_000);
         }
         let last = typed[typed.len() - 1];
-        let replay = |typed: &[i64], now: i64| BackgroundCarries::replayed(&timing, typed, now);
+        let replay = |typed: &[i64], now: i64| {
+            let unnamed: Vec<(i64, Option<u32>)> = typed.iter().map(|&at| (at, None)).collect();
+            BackgroundCarries::replayed(&timing, &unnamed, now)
+        };
         assert_eq!(replay(&typed, last + min(1)), Some((last, 9)));
         assert_eq!(
             replay(&typed, last + min(119)),
@@ -246,6 +263,38 @@ mod tests {
             let after = [0, min(2), at, at + min(2)];
             assert_eq!(replay(&after, at + min(3)), Some((at + min(2), 2)), "{why}");
         }
+    }
+
+    /// A row that names its streak is at it, whatever its gap: two carries 15 minutes apart, each
+    /// named at one (real work between them), are no run, and one a minute after the carry before
+    /// it is at the two it names, where its gap alone reads books started again. A row that names
+    /// none, written before rows named it, counts on from the named one before it by its gap. A
+    /// named newest still lapses.
+    #[test]
+    fn a_carrys_named_streak_is_replayed_as_its_row_says() {
+        let timing = TurnEndTiming::default();
+        let min = |m: i64| m * 60_000;
+        let replay = |typed: &[(i64, Option<u32>)], now: i64| {
+            BackgroundCarries::replayed(&timing, typed, now)
+        };
+        assert_eq!(
+            replay(&[(0, Some(1)), (min(15), Some(1))], min(16)),
+            Some((min(15), 1))
+        );
+        assert_eq!(
+            replay(&[(0, None), (min(15), None)], min(16)),
+            Some((min(15), 2)),
+            "CONTROL: their gap alone reads a run"
+        );
+        assert_eq!(
+            replay(&[(0, None), (min(1), Some(2))], min(2)),
+            Some((min(1), 2))
+        );
+        assert_eq!(
+            replay(&[(0, Some(3)), (min(8), None)], min(9)),
+            Some((min(8), 4))
+        );
+        assert_eq!(replay(&[(0, Some(6))], min(120)), None, "lapsed");
     }
 
     #[test]

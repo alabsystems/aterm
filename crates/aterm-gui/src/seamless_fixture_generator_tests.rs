@@ -4670,12 +4670,6 @@ const NO_HANDOFF_WRITES_OFF_MACOS: &[(&str, &str)] = &[
 
 const NO_HANDOFF_WRITES: &[(&str, &str)] = &[
     ("control", "Wire.turn_ids"),
-    // Retired with aterm's own fleet notices: the newest recorded release wrote it, so the hold
-    // wants it named here until a release's `fields.toml` omits it. The first one recorded after
-    // the field went does; this row then answers "listed, but no desk reaches it" and
-    // generate_handoff_fixtures fails: remove it then. Older desks keep the field; the reader
-    // skips it.
-    ("manifest", "SessionHandoff.fleet_told"),
     ("manifest", "WindowCarry.presence_row"),
     ("layout", "WindowLayout.presence_row"),
     ("layout", "WindowLayout.maximized"),

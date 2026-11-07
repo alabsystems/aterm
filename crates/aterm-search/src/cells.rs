@@ -7,7 +7,7 @@
 use std::num::NonZeroUsize;
 use std::ops::Range;
 
-use crate::grapheme::ColumnMap;
+use crate::grapheme::stored_span;
 
 /// The grid cells one line of text was read from.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -298,7 +298,7 @@ impl LineCells {
     /// The columns (start, end), end exclusive, that bytes start_byte..end_byte of text.
     #[must_use]
     pub fn columns_of(&self, text: &str, start_byte: usize, end_byte: usize) -> (usize, usize) {
-        ColumnMap::with_cells(text, self).span(start_byte, end_byte)
+        stored_span(text, self, start_byte, end_byte)
     }
 
     /// Every cell, in line order.

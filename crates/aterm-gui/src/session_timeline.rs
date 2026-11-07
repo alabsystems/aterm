@@ -4816,6 +4816,14 @@ impl SessionTimeline {
         }
     }
 
+    /// Name the program a program worker's spawn started on its task record
+    /// ([`crate::task_record::TaskRecord::program`]); `None` for an agent's worker.
+    pub(crate) fn set_task_program(&mut self, program: Option<&str>) {
+        if let Some(task) = self.task.as_mut() {
+            task.program = program.map(str::to_owned);
+        }
+    }
+
     /// The Mac the task's manager runs on, where that is another Mac
     /// ([`crate::task_record::TaskRecord::manager_node`]).
     pub(crate) fn set_task_manager_node(&mut self, node: Option<String>) {

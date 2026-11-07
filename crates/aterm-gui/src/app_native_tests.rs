@@ -8695,7 +8695,7 @@ fn contended_split_presentation_keeps_its_own_title_rung() {
             0,
             crate::app_tabs::CapturedTitle {
                 title: "~/repo".to_string(),
-                shell: false,
+                untitled: false,
             },
         );
 

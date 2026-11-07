@@ -36,11 +36,6 @@ pub const BUNDLE_ID: &str = "com.aterm.aterm";
 /// ([`super::IMAGE_EXECUTABLE`]) and what the clone is compared against in the source.
 pub const BUNDLE_EXECUTABLE: &str = "Contents/MacOS/aterm";
 
-/// The root-only (0700) folder the elevation clones the source into before it seals the clone
-/// and swaps it in: nothing but root can reach the clone while its owners and modes are still
-/// the source's.
-pub const STAGING_DIR: &str = "/Library/Application Support/aterm/lan/.staging";
-
 /// The longest plist [`Disk`] reads; anything longer is not one this build wrote.
 const PLIST_MAX: u64 = 64 * 1024;
 
