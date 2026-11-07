@@ -5,6 +5,9 @@
 
 use std::collections::BTreeMap;
 use std::io::Read;
+#[cfg(all(test, unix))]
+#[path = "install_cancel_tests.rs"]
+mod cancel_tests;
 use std::path::{Component, Path, PathBuf};
 
 use crate::extract::{
@@ -208,6 +211,7 @@ pub fn verify_and_stage(
     build_dir: &Path,
     hooks: &StageHooks<'_>,
 ) -> Result<String, StageError> {
+    aterm_update_core::check_operation().map_err(StageError::Io)?;
     verify_stage(artifact, archive, build_dir, hooks, Purpose::install()?)
 }
 
@@ -1420,11 +1424,9 @@ fn dmg_mount_point(dest: &Path) -> Result<PathBuf, StageError> {
 /// the tool's file name.
 #[cfg(target_os = "macos")]
 fn run_tool(path: &str, args: &[&std::ffi::OsStr]) -> Result<(), StageError> {
-    let out = aterm_uds::spawnfd::command(path)
-        .args(args)
-        .stdin(aterm_uds::spawnfd::Stdio::null())
-        .output()
-        .map_err(StageError::Io)?;
+    let mut cmd = aterm_uds::spawnfd::command(path);
+    cmd.args(args).stdin(aterm_uds::spawnfd::Stdio::null());
+    let out = aterm_update_core::run_operation_command(&mut cmd).map_err(StageError::Io)?;
     if out.status.success() {
         return Ok(());
     }
@@ -1435,6 +1437,20 @@ fn run_tool(path: &str, args: &[&std::ffi::OsStr]) -> Result<(), StageError> {
 #[cfg(target_os = "macos")]
 fn tool_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Cleanup must finish even after the operation's owner requested cancellation.
+#[cfg(target_os = "macos")]
+fn run_cleanup_tool(path: &str, args: &[&std::ffi::OsStr]) -> Result<(), StageError> {
+    let out = aterm_uds::spawnfd::command(path)
+        .args(args)
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .output()
+        .map_err(StageError::Io)?;
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(tool_failed(tool_name(path), out.status.code(), &out.stderr))
 }
 
 #[cfg(target_os = "macos")]
@@ -1666,7 +1682,7 @@ impl Mount {
             return Ok(());
         }
         self.attached = false;
-        let by_point = run_tool(
+        let by_point = run_cleanup_tool(
             aterm_uds::os_path!("hdiutil"),
             &["detach".as_ref(), "-quiet".as_ref(), self.point.as_os_str()],
         );
@@ -1685,7 +1701,7 @@ impl Mount {
         }
         let mut last: Option<StageError> = None;
         for node in &nodes {
-            if run_tool(
+            if run_cleanup_tool(
                 aterm_uds::os_path!("hdiutil"),
                 &["detach".as_ref(), "-quiet".as_ref(), node.as_os_str()],
             )
@@ -1693,7 +1709,7 @@ impl Mount {
             {
                 continue;
             }
-            if let Err(e) = run_tool(
+            if let Err(e) = run_cleanup_tool(
                 aterm_uds::os_path!("hdiutil"),
                 &[
                     "detach".as_ref(),
@@ -1899,6 +1915,8 @@ fn swap_into_place(
     build_dir: &Path,
     incoming: &Path,
 ) -> std::io::Result<Option<crate::lease::ReclaimGuard>> {
+    // Cancellation is admitted before the replacement transaction, never between its renames.
+    aterm_update_core::check_operation()?;
     let first_exec = crate::store::first_exec_removal(build_dir)?;
     let sdk = crate::compat::sdk_mutation_guard_for_build(build_dir)?;
     first_exec.check(incoming)?;

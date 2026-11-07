@@ -142,20 +142,25 @@ struct Provisioned {
     pin: String,
 }
 
-impl stable::Rustup for Provisioned {
+impl stock::Rustup for Provisioned {
     fn run(
         &self,
-        _homes: &stable::Homes,
+        _homes: &stock::Homes,
         _tool: &Path,
         args: &[String],
         toolchain: Option<&str>,
     ) -> Result<String, String> {
         let a: Vec<&str> = args.iter().map(String::as_str).collect();
-        let host = "aarch64-apple-darwin";
+        let host = aterm_toolchain::rustup::NATIVE_TRIPLE;
         Ok(match (a.as_slice(), toolchain) {
             (["toolchain", "list"], _) => format!("stable-{host}\n{}-{host}\n", self.pin),
-            (["target", "list", "--installed"], Some("stable")) => CELL_TARGETS.join("\n"),
-            (["target", "list", "--installed"], _) => "wasm32-unknown-unknown\n".into(),
+            (["target", "list", "--installed"], Some(pin)) if pin == self.pin => {
+                CELL_TARGETS.join("\n")
+            }
+            (["target", "list", "--installed"], Some(stock::RELEASE_TOOLCHAIN)) => {
+                stock::RELEASE_TARGETS.join("\n")
+            }
+            (["target", "list", "--installed"], _) => String::new(),
             (["component", "list", "--installed"], _) => format!("clippy-{host}\n"),
             (other, _) => return Err(format!("this rustup changes nothing: {other:?}")),
         })
@@ -167,10 +172,10 @@ struct Bare {
     calls: RefCell<Vec<(PathBuf, bool, String)>>,
 }
 
-impl stable::Rustup for Bare {
+impl stock::Rustup for Bare {
     fn run(
         &self,
-        homes: &stable::Homes,
+        homes: &stock::Homes,
         tool: &Path,
         args: &[String],
         _toolchain: Option<&str>,
@@ -187,7 +192,7 @@ impl stable::Rustup for Bare {
             use std::os::unix::fs::PermissionsExt as _;
             std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        stable::self_update(&homes.cargo_home, args)?;
+        stock::self_update(&homes.cargo_home, args)?;
         Ok(String::new())
     }
 }
@@ -245,7 +250,7 @@ impl Fake {
             )],
             zip_links: Vec::new(),
             rustup: Provisioned {
-                pin: stable::wasm_pin(&repo()).expect("the tree's wasm32 pin"),
+                pin: stock::stock_pin(&repo()).expect("the tree's stock pin"),
             },
             bare: None,
         }
@@ -422,7 +427,7 @@ impl Host for Fake {
         Ok(PathBuf::from("/stage2/bin/targo"))
     }
 
-    fn rustup(&self) -> &dyn stable::Rustup {
+    fn rustup(&self) -> &dyn stock::Rustup {
         match &self.bare {
             Some(bare) => bare,
             None => &self.rustup,
@@ -440,7 +445,7 @@ fn machine(home: &Path) -> Machine {
         platform: "macos-aarch64".into(),
         browser: home.join("Library/Caches/aterm/browser.noindex"),
         repo: repo(),
-        homes: stable::Homes {
+        homes: stock::Homes {
             home: home.to_path_buf(),
             rustup_home: home.join(".rustup"),
             cargo_home: home.join(".cargo"),
@@ -1807,8 +1812,11 @@ fn rustup_init_is_pinned_for_every_host_rustup_serves() {
     assert_eq!(init.len(), 4);
 }
 
+/// A public snapshot (no `publish/`) rides the stock pin as the checkout does, so a machine that
+/// holds it finds the row in place; an engine gate that is refused, or that names another release,
+/// is named by the probe and fails a run, never read as naming no pin.
 #[test]
-fn a_tree_without_publish_wants_no_wasm32_pin() {
+fn a_tree_without_publish_rides_the_stock_pin_and_a_gate_that_disagrees_is_named() {
     let home = aterm_tempfile::tempdir().unwrap();
     let mut m = machine(home.path());
     all_in_place(&m);
@@ -1822,18 +1830,32 @@ fn a_tree_without_publish_wants_no_wasm32_pin() {
     assert_eq!(provide(row, &m, &host, &mut |_| {}), State::Present(copy));
 
     std::fs::create_dir_all(public.join("publish")).unwrap();
-    std::fs::write(
-        public.join("publish/config.sh"),
-        "CHECK_CMD_DEFAULT=\"true\"\n",
-    )
-    .unwrap();
-    match check(row, &m, &host) {
-        State::Missing(why) => assert!(why.contains("no wasm32 clause"), "{why}"),
-        other => panic!("{other:?}"),
-    }
-    match provide(row, &m, &host, &mut |_| {}) {
-        State::Failed(why) => assert!(why.contains("the wasm32 pin is not acquired"), "{why}"),
-        other => panic!("{other:?}"),
+    for (gate, said) in [
+        (
+            "CHECK_CMD_DEFAULT=\"true\"\n".to_string(),
+            "no wasm32 clause".to_string(),
+        ),
+        (
+            "CHECK_CMD_DEFAULT=\"rustup target add --toolchain 1.95.0 wasm32-unknown-unknown && \
+             sh -c 'RUSTFLAGS=-Ctarget-feature=+simd128 RUSTC=$(rustup which --toolchain 1.95.0 \
+             rustc) rustup run 1.95.0 cargo check --locked --target wasm32-unknown-unknown -p \
+             aterm-wasm'\"\n"
+                .to_string(),
+            format!("stock pin is {}", stock::STOCK_PIN),
+        ),
+    ] {
+        std::fs::write(public.join("publish/config.sh"), gate).unwrap();
+        match check(row, &m, &host) {
+            State::Missing(why) => assert!(why.contains(&said), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        match provide(row, &m, &host, &mut |_| {}) {
+            State::Failed(why) => assert!(
+                why.contains("the stock pin is not acquired") && why.contains(&said),
+                "{why}"
+            ),
+            other => panic!("{other:?}"),
+        }
     }
 }
 
@@ -1850,25 +1872,29 @@ fn only_linux_holds_the_rustup_row_to_the_guest_agents_musl_std() {
         check(row, &m, &host)
     );
     let linux = parse(&["--linux".to_string()]).unwrap();
+    let pin = stock::stock_pin(&repo()).unwrap();
     match check_for(row, &linux, &m, &host) {
         State::Missing(why) => assert!(
-            why.contains("rustup target add --toolchain stable aarch64-unknown-linux-musl"),
+            why.contains(&format!(
+                "rustup target add --toolchain {pin} aarch64-unknown-linux-musl"
+            )),
             "{why}"
         ),
         other => panic!("{other:?}"),
     }
 }
 
-/// A provide run carries `--linux` down to stable: where stable lacks only the guest
+/// A provide run carries `--linux` down to the stock pin: where the pin lacks only the guest
 /// agent's musl std, a plain run finds the rustup row in place and a `--linux` run asks for
 /// that std (named in the run's lines, since this rustup refuses every change).
 #[test]
-fn a_linux_run_asks_stable_for_the_guest_agents_musl_std_and_a_plain_run_does_not() {
+fn a_linux_run_asks_the_pin_for_the_guest_agents_musl_std_and_a_plain_run_does_not() {
     let home = aterm_tempfile::tempdir().unwrap();
     let m = machine(home.path());
     all_in_place(&m);
     let host = Fake::new();
-    let add = "rustup target add --toolchain stable aarch64-unknown-linux-musl";
+    let pin = stock::stock_pin(&repo()).unwrap();
+    let add = format!("rustup target add --toolchain {pin} aarch64-unknown-linux-musl");
     let asked = |said: &[String]| {
         said.iter()
             .any(|l| l.contains("aarch64-unknown-linux-musl"))

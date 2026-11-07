@@ -869,3 +869,73 @@ fn the_ids_and_member_keys_an_evidence_file_holds_do_not_move() {
     assert_eq!(member_key(Lane::Fleet, "m1"), "0d66671f19b65cf3");
     assert_eq!(member_key(Lane::Commons, "m1"), "94a7181e890f14c5");
 }
+
+/// A reader on a record the keeper has not yet brought up to a move off the ALab LAN reads the
+/// move as starting now, as the keeper's look will record it: the away key waits for the dwell,
+/// and reads before the keeper writes all give the same key, so a follower that compares them
+/// sees no change. Once the keeper writes the move, the stay's start is the keeper's.
+/// NEGATIVE CONTROL: opening a reader's stay as here-before (`from_start` true for a reader in
+/// `observe`) stamps away-since with each read's own time and skips the dwell, so each read is a
+/// new settled key, and this test fails.
+#[test]
+fn a_reader_on_a_record_that_lags_a_move_keeps_one_away_key_and_the_dwell() {
+    use crate::words::{AWAY_ENTRY_AFTER_MS, away_key};
+
+    let book = book(41);
+    let (record, at_home) = keep(
+        learned(&home()),
+        &[(&on(home()), T0)],
+        &Evidence::default(),
+        Some(&book),
+    );
+    assert_eq!(at_home.at, Where::AlabLan);
+    let moved = T0 + 5 * MIN;
+    let read = |now: u64| {
+        let (_, place) = step(
+            &record,
+            &on(cafe()),
+            &Evidence::default(),
+            Some(&book),
+            now,
+            None,
+        );
+        assert_eq!(place.at, Where::Remote(Kind::Lan));
+        assert!(
+            !place.since_before,
+            "a reader opens the move as starting now"
+        );
+        away_key(&place, now)
+    };
+    for now in [moved, moved + 10_000, moved + AWAY_ENTRY_AFTER_MS] {
+        assert_eq!(
+            read(now),
+            None,
+            "no read is the dwell's end: each starts it"
+        );
+    }
+    let (kept, place) = keep(
+        record,
+        &[
+            (&on(cafe()), moved),
+            (&on(cafe()), moved + AWAY_ENTRY_AFTER_MS),
+        ],
+        &Evidence::default(),
+        Some(&book),
+    );
+    assert_eq!(place.since_ms, Some(moved));
+    let settled = away_key(&place, moved + AWAY_ENTRY_AFTER_MS).expect("the dwell has passed");
+    assert_eq!(settled.since_ms, Some(moved));
+    let (_, place) = step(
+        &kept,
+        &on(cafe()),
+        &Evidence::default(),
+        Some(&book),
+        moved + AWAY_ENTRY_AFTER_MS + 10_000,
+        None,
+    );
+    assert_eq!(
+        away_key(&place, moved + AWAY_ENTRY_AFTER_MS + 10_000),
+        Some(settled),
+        "a reader on the keeper's record reads the keeper's key"
+    );
+}

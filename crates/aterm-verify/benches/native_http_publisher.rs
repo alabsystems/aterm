@@ -4,6 +4,7 @@
 //! Manual native publisher measurement using real loopback HTTP Git services.
 //! Build this and agh with --profile opt-test; pass the built agh executable.
 //! Optional second argument: children, for accepted Git-door timing and nested accounting.
+//! With children, pair=0 through pair=5 selects one pair for interleaved artifact comparisons.
 //! The interval includes permit construction, journal opening and push_atomic.
 
 #[cfg(all(unix, debug_assertions))]
@@ -336,10 +337,25 @@ read = ["anonymous"]
             .skip(1)
             .filter(|a| a != "--bench")
             .collect();
-        if !(args.len() == 1 || (args.len() == 2 && args[1] == "children")) {
-            return Err("usage: native_http_publisher AGH_HELPER [children]".into());
+        const USAGE: &str = "usage: native_http_publisher AGH_HELPER [children [pair=0..5]]";
+        if args.len() == 1 && args[0] == "--help" {
+            println!("{USAGE}");
+            return Ok(());
         }
-        let observe_children = args.len() == 2;
+        let observe_children = args.get(1).is_some_and(|arg| arg == "children");
+        let only_pair = args
+            .get(2)
+            .and_then(|arg| arg.to_str())
+            .and_then(|arg| arg.strip_prefix("pair="))
+            .and_then(|pair| pair.parse::<usize>().ok())
+            .filter(|pair| *pair < 6);
+        if !(args.len() == 1
+            || (args.len() == 2 && observe_children)
+            || (args.len() == 3 && observe_children && only_pair.is_some()))
+        {
+            return Err(USAGE.into());
+        }
+        let pairs = if only_pair.is_some() { 1 } else { 6 };
         let helper = std::fs::canonicalize(&args[0])?;
         let root = aterm_tempfile::Builder::new()
             .prefix("native-http-study-")
@@ -428,7 +444,7 @@ read = ["anonymous"]
         let seed_objects = git(&seed, &["count-objects", "-v"])?;
         emit(
             "metadata",
-            json!({"child_observation":observe_children,"calls":12,"pairs":6,"cases":cases.iter().map(|c|json!({"case":c.name,"before":c.before,"after":c.after})).collect::<Vec<_>>(),"updates_per_call":2,"new_objects_each":1,"new_commit_bytes_each":bytes.parse::<u64>()?,
+            json!({"child_observation":observe_children,"calls":pairs*2,"pairs":pairs,"selected_pair":only_pair,"cases":cases.iter().map(|c|json!({"case":c.name,"before":c.before,"after":c.after})).collect::<Vec<_>>(),"updates_per_call":2,"new_objects_each":1,"new_commit_bytes_each":bytes.parse::<u64>()?,
             "same_current_tree":true,"current_tree":tree,"current_tree_entries":73,"current_toml_paths":72,
             "tiny_commits_after":2,"retained_commits_after":2573,"tiny_closure_objects":git(&source,&["rev-list","--objects",&cases[0].after])?.lines().count(),
             "retained_closure_objects":git(&source,&["rev-list","--objects",&cases[1].after])?.lines().count(),
@@ -516,7 +532,7 @@ read = ["anonymous"]
                 }
             }
         }
-        for pair in 0..6 {
+        for pair in (0..6).filter(|pair| only_pair.is_none_or(|only| only == *pair)) {
             let order = if pair % 2 == 0 { [0, 1] } else { [1, 0] };
             for (position, index) in order.into_iter().enumerate() {
                 let case = &cases[index];
@@ -564,7 +580,7 @@ read = ["anonymous"]
             && seed_objects == git(&seed, &["count-objects", "-v"])?;
         emit(
             "probe",
-            json!({"source_and_seed_refs_configs_inventories_unchanged":unchanged,"complete":true,"samples":12}),
+            json!({"source_and_seed_refs_configs_inventories_unchanged":unchanged,"complete":true,"samples":pairs*2}),
         )?;
         if !unchanged {
             return Err("source/seed mutated".into());

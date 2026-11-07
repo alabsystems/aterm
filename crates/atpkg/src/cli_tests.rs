@@ -303,6 +303,7 @@ fn lane_flags_come_off_a_pass_wherever_they_stand_and_stay_on_other_verbs() {
             no_init: true,
             published_index_hint: Some(45),
             defer_busy_flip: true,
+            cancel_stdin: false,
         }
     );
     assert_eq!(args, argv(&["update", "claude"]));
@@ -310,6 +311,7 @@ fn lane_flags_come_off_a_pass_wherever_they_stand_and_stay_on_other_verbs() {
     let mut args = argv(&[
         "install",
         crate::cli::NO_INIT_FLAG,
+        crate::cli::CANCEL_STDIN_FLAG,
         "--wait-lock",
         "5",
         "clt",
@@ -319,6 +321,7 @@ fn lane_flags_come_off_a_pass_wherever_they_stand_and_stay_on_other_verbs() {
     let lane = super::LaneFlags::take(&mut args);
     assert_eq!(lane.wait_lock, Some(std::time::Duration::from_secs(5)));
     assert!(lane.no_init);
+    assert!(lane.cancel_stdin);
     assert_eq!(lane.published_index_hint, None);
     assert_eq!(
         args,
@@ -370,6 +373,7 @@ fn a_finished_install_or_update_is_followed_by_setup_unless_its_words_say_otherw
         assert!(super::is_clt_alias(alias), "{alias}");
     }
     for stays in [
+        &["install", "codex", crate::cli::CANCEL_STDIN_FLAG][..],
         &[][..],
         &["doctor"],
         &["seed"],

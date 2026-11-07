@@ -342,7 +342,7 @@ impl Item for Fseventsd {
             return Ok(());
         }
         let validate = Self::validate(&measured);
-        match sys.run_tty(&validate) {
+        match sys.run_tty(&validate, &mut || Ok(())) {
             Ok(Some(0)) => {}
             Ok(status) => {
                 return Err(format!(
@@ -372,7 +372,7 @@ impl Item for Fseventsd {
             at_s: sys.now(),
         };
         let kill = Self::kill(&now);
-        let killed = match sys.run_tty(&kill) {
+        let killed = match sys.run_tty(&kill, &mut || Ok(())) {
             Ok(Some(0)) => Ok(true),
             // It may have ended on its own after the reading (`kill` finds no such process).
             Ok(_) | Err(_) if !Self::still_runs(sys, sent) => Ok(false),

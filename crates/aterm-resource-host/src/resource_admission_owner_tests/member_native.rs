@@ -57,8 +57,17 @@ fn outer() {
     for role in ["fixture-host", "fixture-host-unknown"] {
         let mut command = spawnfd::command(program.path());
         command.arg(role).env(STORE, &path);
-        let output = deadline::output_within(&mut command, HANG).unwrap();
-        assert!(output.status.success(), "actual member host: {output:?}");
+        let result = deadline::output_within(&mut command, HANG);
+        let output = match result {
+            Ok(output) if output.status.success() => output,
+            failure => {
+                let retained = scratch.keep();
+                panic!(
+                    "actual member host {role}: {failure:?}; preserved {}",
+                    retained.display()
+                );
+            }
+        };
         assert!(
             output
                 .stdout
@@ -272,7 +281,10 @@ fn host(unknown: bool) {
     )
     .unwrap();
     assert!(
-        matches!(accounted.finished.event, Event::Finished { outcome: Outcome::Exit(code), cause: CompletionCause::Exited, .. } if code == if unknown { 101 } else { 0 })
+        matches!(accounted.finished.event, Event::Finished { outcome: Outcome::Exit(code), cause: CompletionCause::Exited, .. } if code == if unknown { 101 } else { 0 }),
+        "actual root outcome: {:?}; root stderr: {}",
+        accounted.finished.event,
+        fs::read_to_string(&root_log).unwrap()
     );
     assert!(
         accounted.observation.cpu_times.is_some() && accounted.observation.peak_rss_bytes.is_some()
@@ -444,7 +456,9 @@ fn root() {
             },
             fences: Vec::new(),
         },
-        timeout_ns: Some(5_000_000_000),
+        // These cases judge exit, cancellation and original custody, not
+        // execution latency. The host and client also retain their hang bounds.
+        timeout_ns: Some(HANG.as_nanos().try_into().unwrap()),
     };
     let mut request = request;
     let unknown = std::env::var(MODE).is_ok_and(|mode| mode == "unknown");

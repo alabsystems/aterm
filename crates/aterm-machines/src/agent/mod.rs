@@ -524,8 +524,12 @@ mod tests {
         fn run(&self, c: &crate::port::Cmd) -> Result<crate::port::Ran, crate::port::RunFailed> {
             self.live.run(c)
         }
-        fn run_tty(&self, c: &crate::port::Cmd) -> Result<Option<i32>, crate::port::RunFailed> {
-            self.live.run_tty(c)
+        fn run_tty(
+            &self,
+            c: &crate::port::Cmd,
+            before: &mut dyn FnMut() -> Result<(), crate::port::RunFailed>,
+        ) -> Result<Option<i32>, crate::port::RunFailed> {
+            self.live.run_tty(c, before)
         }
         fn read_file(&self, p: &Path) -> std::io::Result<Vec<u8>> {
             self.live.read_file(p)

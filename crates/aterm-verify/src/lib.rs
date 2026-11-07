@@ -7,6 +7,9 @@
     reason = "never linked into the shipped binary: the verify CLI spawns its checks"
 )]
 
+#[cfg(all(test, unix, debug_assertions))]
+mod benchmark_fixture_tests;
+
 #[cfg(unix)]
 pub mod browser;
 pub mod cells;

@@ -6,10 +6,12 @@
 //! places it content-addressed at `vz.noindex/agent/<sha256>/aterm-vz-agent`, the directory the
 //! guest's boot share is.
 //!
-//! STOCK EXCEPTION: the build runs on rustup stable, because Trust has no Linux std
-//! ([`crate::linux_guest::RUST`]'s note), linked by stable's own `rust-lld` against the musl std
+//! STOCK EXCEPTION: the build runs on the checkout's stock pin
+//! (`aterm_toolchain::rustup::stock_pin`), because Trust has no Linux std
+//! ([`crate::linux_guest::RUST`]'s note), linked by the pin's own `rust-lld` against the musl std
 //! `targo --unverified verify provision --linux` places, configured by `--config` tables, never
-//! `RUSTFLAGS`.
+//! `RUSTFLAGS`. rustup's floating `stable` never builds it: its release is whatever a machine
+//! last installed.
 
 use std::ffi::OsString;
 use std::io::Write as _;
@@ -28,7 +30,7 @@ pub const AGENT: &str = "aterm-vz-agent";
 /// The guest's triple: a static musl executable needs no guest libc.
 pub const AGENT_TRIPLE: &str = "aarch64-unknown-linux-musl";
 
-/// What places a missing piece of the build: stable, its musl std and its `rust-lld`.
+/// What places a missing piece of the build: the stock pin, its musl std and its `rust-lld`.
 pub const PROVISION: &str = "targo --unverified verify provision --linux";
 
 /// The labelled reason the build is stock Rust, handed to the build in `ATERM_STOCK_REASON`.
@@ -65,12 +67,14 @@ const STEERING_PREFIXES: [&str; 2] = [
     "CARGO_PROFILE_RELEASE_",
 ];
 
-/// rustup's stable toolchain, as the build needs it.
+/// The checkout's stock pin, as the build needs it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Stable {
+pub struct Stock {
     /// The `rustup` that runs the build.
     pub rustup: PathBuf,
-    /// Stable's own `rustc` (`rustup which --toolchain stable rustc`), handed to cargo in
+    /// The pin (`1.97.1`), the toolchain `rustup run` names.
+    pub name: String,
+    /// The pin's own `rustc` (`rustup which --toolchain <pin> rustc`), handed to cargo in
     /// `RUSTC` so no `rustc` on PATH answers instead.
     pub rustc: PathBuf,
     /// Its sysroot (`rustc --print sysroot`).
@@ -79,8 +83,8 @@ pub struct Stable {
     pub host: String,
 }
 
-impl Stable {
-    /// The linker: stable's own `rust-lld`, which links a musl executable on macOS.
+impl Stock {
+    /// The linker: the pin's own `rust-lld`, which links a musl executable on macOS.
     #[must_use]
     pub fn rust_lld(&self) -> PathBuf {
         self.sysroot
@@ -95,11 +99,12 @@ impl Stable {
         self.sysroot.join("lib/rustlib").join(triple).join("lib")
     }
 
-    /// Asks `rustup` for stable's compiler, its sysroot and its host.
+    /// Asks `rustup` for the pin `name`'s compiler, its sysroot and its host, once rustup lists
+    /// the pin.
     ///
     /// # Errors
-    /// rustup has no stable toolchain, or its `rustc` would not say.
-    pub fn find(rustup: &Path) -> Result<Self, String> {
+    /// rustup does not hold the pin, or its `rustc` would not say.
+    pub fn find(rustup: &Path, name: &str) -> Result<Self, String> {
         let ask = |program: &Path, args: &[&str]| -> Result<String, String> {
             let mut cmd = aterm_uds::spawnfd::command(program);
             cmd.args(args)
@@ -119,12 +124,20 @@ impl Stable {
                 ))
             }
         };
-        let rustc = PathBuf::from(ask(rustup, &["which", "--toolchain", "stable", "rustc"])?);
+        let listing = ask(rustup, &["toolchain", "list"])?;
+        let host = aterm_toolchain::rustup::default_host_from_env();
+        if !aterm_toolchain::rustup::holds_toolchain(&listing, name, &host) {
+            return Err(format!(
+                "rustup holds no `{name}`, the checkout's stock pin"
+            ));
+        }
+        let rustc = PathBuf::from(ask(rustup, &["which", "--toolchain", name, "rustc"])?);
         let sysroot = PathBuf::from(ask(&rustc, &["--print", "sysroot"])?);
         let host = host_of(&ask(&rustc, &["-vV"])?)
             .ok_or_else(|| format!("`{} -vV` names no host", rustc.display()))?;
         Ok(Self {
             rustup: rustup.to_path_buf(),
+            name: name.to_string(),
             rustc,
             sysroot,
             host,
@@ -139,14 +152,16 @@ impl Stable {
         let std = self.std_dir(triple);
         if !std.is_dir() {
             return Err(format!(
-                "rustup stable has no {triple} std ({} is absent)",
+                "`{}`, the checkout's stock pin, has no {triple} std ({} is absent)",
+                self.name,
                 std.display()
             ));
         }
         let lld = self.rust_lld();
         if !crate::sys::executable(&lld.to_string_lossy()) {
             return Err(format!(
-                "rustup stable has no rust-lld ({} is absent)",
+                "`{}`, the checkout's stock pin, has no rust-lld ({} is absent)",
+                self.name,
                 lld.display()
             ));
         }
@@ -179,7 +194,7 @@ fn toml_string(s: &str) -> Option<String> {
 pub struct Recipe {
     /// `rustup`.
     pub program: PathBuf,
-    /// `run stable cargo build …`.
+    /// `run <pin> cargo build …`.
     pub args: Vec<String>,
     /// The variables set: `RUSTC`, `CARGO_TARGET_DIR` and `ATERM_STOCK_REASON`.
     pub set: Vec<(String, OsString)>,
@@ -227,7 +242,7 @@ impl Recipe {
 /// # Errors
 /// `repo` or `rust-lld`'s path is not one a `--config` value can carry.
 pub fn agent_recipe(
-    stable: &Stable,
+    stock: &Stock,
     repo: &Path,
     target_dir: &Path,
     inherited: &[String],
@@ -237,7 +252,7 @@ pub fn agent_recipe(
         .to_str()
         .ok_or_else(|| format!("{} is not UTF-8", manifest.display()))?
         .to_string();
-    let lld = stable.rust_lld();
+    let lld = stock.rust_lld();
     let linker = lld
         .to_str()
         .and_then(toml_string)
@@ -245,7 +260,7 @@ pub fn agent_recipe(
     let table = format!("target.{AGENT_TRIPLE}");
     let args = [
         "run",
-        "stable",
+        &stock.name,
         "cargo",
         "build",
         "--locked",
@@ -274,10 +289,10 @@ pub fn agent_recipe(
         }
     }
     Ok(Recipe {
-        program: stable.rustup.clone(),
+        program: stock.rustup.clone(),
         args,
         set: vec![
-            ("RUSTC".into(), stable.rustc.clone().into_os_string()),
+            ("RUSTC".into(), stock.rustc.clone().into_os_string()),
             (
                 "CARGO_TARGET_DIR".into(),
                 target_dir.to_path_buf().into_os_string(),
@@ -492,22 +507,24 @@ fn place_racing(
 /// line, the build's own output, its time, then where the agent is and its SHA-256.
 ///
 /// # Errors
-/// NOT RUN when rustup, stable, its musl std or `rust-lld` is missing (each named with
-/// [`PROVISION`]); a failure when the build or the placing fails.
+/// NOT RUN when the checkout's engine gate disagrees with its stock pin, or rustup, the pin
+/// (for rustup's host), its musl std or `rust-lld` is missing (each named with [`PROVISION`]); a
+/// failure when the build or the placing fails.
 pub fn build_agent(repo: &Path, vz: &Path) -> Result<Placed, Fail> {
     let rustup = aterm_uds::host::tool("rustup")
         .locate()
         .map_err(|absent| not_run(format!("{} (fix: {PROVISION})", absent.why)))?;
-    let stable =
-        Stable::find(&rustup).map_err(|why| not_run(format!("{why} (fix: {PROVISION})")))?;
-    stable
+    let pin = aterm_toolchain::rustup::stock_pin(repo).map_err(not_run)?;
+    let stock =
+        Stock::find(&rustup, &pin).map_err(|why| not_run(format!("{why} (fix: {PROVISION})")))?;
+    stock
         .ready(AGENT_TRIPLE)
         .map_err(|why| not_run(format!("{why} (fix: {PROVISION})")))?;
     let target = target_dir(repo);
     let inherited: Vec<String> = std::env::vars_os()
         .filter_map(|(name, _)| name.into_string().ok())
         .collect();
-    let recipe = agent_recipe(&stable, repo, &target, &inherited).map_err(Fail::die)?;
+    let recipe = agent_recipe(&stock, repo, &target, &inherited).map_err(Fail::die)?;
     println!("vz-agent: STOCK EXCEPTION, in {}", repo.display());
     println!("vz-agent: {}", recipe.line());
     let t0 = Instant::now();
@@ -557,11 +574,12 @@ pub fn cmd_vz_agent(rest: &[String]) -> Res {
 mod tests {
     use super::*;
 
-    fn stable() -> Stable {
-        Stable {
+    fn stock() -> Stock {
+        Stock {
             rustup: "/opt/rustup/bin/rustup".into(),
-            rustc: "/r/toolchains/stable-aarch64-apple-darwin/bin/rustc".into(),
-            sysroot: "/r/toolchains/stable-aarch64-apple-darwin".into(),
+            name: "1.97.1".into(),
+            rustc: "/r/toolchains/1.97.1-aarch64-apple-darwin/bin/rustc".into(),
+            sysroot: "/r/toolchains/1.97.1-aarch64-apple-darwin".into(),
             host: "aarch64-apple-darwin".into(),
         }
     }
@@ -569,7 +587,7 @@ mod tests {
     fn recipe(inherited: &[&str]) -> Recipe {
         let inherited: Vec<String> = inherited.iter().map(|s| (*s).to_string()).collect();
         agent_recipe(
-            &stable(),
+            &stock(),
             Path::new("/src/aterm"),
             Path::new("/src/aterm/target/vz-agent.noindex"),
             &inherited,
@@ -585,7 +603,7 @@ mod tests {
             r.args,
             [
                 "run",
-                "stable",
+                "1.97.1",
                 "cargo",
                 "build",
                 "--locked",
@@ -599,7 +617,7 @@ mod tests {
                 "--manifest-path",
                 "/src/aterm/Cargo.toml",
                 "--config",
-                "target.aarch64-unknown-linux-musl.linker=\"/r/toolchains/stable-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-lld\"",
+                "target.aarch64-unknown-linux-musl.linker=\"/r/toolchains/1.97.1-aarch64-apple-darwin/lib/rustlib/aarch64-apple-darwin/bin/rust-lld\"",
                 "--config",
                 "target.aarch64-unknown-linux-musl.rustflags=[\"-C\", \"linker-flavor=ld.lld\", \"-C\", \"link-self-contained=yes\"]",
             ]
@@ -620,7 +638,7 @@ mod tests {
         assert_eq!(set, ["RUSTC", "CARGO_TARGET_DIR", "ATERM_STOCK_REASON"]);
         assert_eq!(
             r.set[0].1,
-            OsString::from("/r/toolchains/stable-aarch64-apple-darwin/bin/rustc")
+            OsString::from("/r/toolchains/1.97.1-aarch64-apple-darwin/bin/rustc")
         );
         assert_eq!(
             r.set[1].1,
@@ -680,7 +698,7 @@ mod tests {
 
     #[test]
     fn a_linker_path_is_quoted_as_toml_or_refused() {
-        let mut s = stable();
+        let mut s = stock();
         s.sysroot = r#"/odd "dir"\x"#.into();
         let r = agent_recipe(&s, Path::new("/src"), Path::new("/t"), &[]).expect("quoted");
         assert!(r.args.contains(
@@ -702,9 +720,9 @@ mod tests {
     #[test]
     fn a_missing_std_or_linker_is_named_by_its_path() {
         let dir = aterm_tempfile::tempdir().expect("scratch");
-        let s = Stable {
+        let s = Stock {
             sysroot: dir.path().to_path_buf(),
-            ..stable()
+            ..stock()
         };
         let why = s.ready(AGENT_TRIPLE).expect_err("no std");
         assert!(why.contains("no aarch64-unknown-linux-musl std"), "{why}");

@@ -398,12 +398,33 @@ fn live_member_coverage_and_outer_timeout_preserve_original_scope() {
     );
     member.start(&mut fixture).unwrap();
     assert!(member.covers(peer));
+    assert!(scope_covers_at(
+        peer,
+        pid,
+        birth,
+        Instant::now() - Duration::from_secs(1),
+    ));
+    assert!(!scope_covers_at(
+        peer,
+        pid,
+        birth,
+        Instant::now() - Duration::from_secs(60),
+    ));
     assert!(!member.covers(Peer {
         pid,
         birth: birth ^ 1
     }));
     let root_pid = fixture.root.child_mut().id();
     let root_birth = process::read_birth(root_pid as i32).unwrap().0;
+    assert!(scope_covers_at(
+        Peer {
+            pid: root_pid,
+            birth: root_birth
+        },
+        root_pid,
+        root_birth,
+        Instant::now() - Duration::from_secs(1),
+    ));
     assert!(
         !member.covers(Peer {
             pid: root_pid,

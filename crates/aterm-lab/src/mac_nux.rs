@@ -142,14 +142,6 @@ pub const USAGE: &str = "\
                                    fleet=, aterm members status, and a no-URL aterm members join
                                    --no-wait, FAILED unless it refuses as a lab identity before it
                                    dials (a guest is a virtual machine: A12)
-                  first-launch-vault (by name only, never in all) first-launch's row with a lab vault in the
-                                   guest: served at the guest's own address, registered as alab-secrets
-                                   under a lab vault service made for the run (_alab-lab-<nonce>._tcp,
-                                   which no ALab Mac browses), named to the app by
-                                   ATERM_LAB_VAULT_SERVICE set with launchctl setenv in its GUI session;
-                                   FAILED unless aterm.log names the lab vault its own look heard (the
-                                   broker's log of the service beside it); NOT RUN on an app whose
-                                   executable does not name the variable
                   lan-allowed      (by name only, alone; implies --sudo-asks; not with --app,
                                    --standard-user, --person or --reader) an update on a Mac whose
                                    aterm a person allowed on the local network, with no broker:
@@ -490,7 +482,6 @@ pub enum Scenario {
     LaunchRepairs,
     DevtoolsControl,
     FirstLaunch,
-    FirstLaunchVault,
     LanAllowed,
     TerminalLaunch,
     AppLaunch,
@@ -553,11 +544,9 @@ pub const FAULTS: [Scenario; 13] = [
     Scenario::ClockBack,
 ];
 
-/// The rows run only by name, never in `all`: `first-launch-vault`, a second whole first launch
-/// that judges the vault found with no press, NOT RUN until the app names its knob
-/// ([`lan::LAB_VAULT_SERVICE_ENV`]); and `lan-allowed`, whose base holds macOS's Local Network
+/// The row run only by name, never in `all`: `lan-allowed`, whose base holds macOS's Local Network
 /// answer for the app built here ([`crate::mac::Prep::lan_allow`]), so it runs alone.
-pub const BY_NAME: [Scenario; 2] = [Scenario::FirstLaunchVault, Scenario::LanAllowed];
+pub const BY_NAME: [Scenario; 1] = [Scenario::LanAllowed];
 
 /// The rows that read a window's accessibility tree (`tree`; `mac_nux_reveal.rs`, one-mesh design
 /// §11 A17c), after [`FAULTS`]': `lab reveal-tab`'s world in the person base, and its negative
@@ -582,7 +571,6 @@ impl Scenario {
             Scenario::LaunchRepairs => "launch-repairs",
             Scenario::DevtoolsControl => "devtools-control",
             Scenario::FirstLaunch => "first-launch",
-            Scenario::FirstLaunchVault => "first-launch-vault",
             Scenario::LanAllowed => "lan-allowed",
             Scenario::TerminalLaunch => "terminal-launch",
             Scenario::AppLaunch => "app-launch",
@@ -627,7 +615,6 @@ impl Scenario {
         matches!(
             self,
             Scenario::FirstLaunch
-                | Scenario::FirstLaunchVault
                 | Scenario::LanAllowed
                 | Scenario::InitApply
                 | Scenario::InstallSh
@@ -4279,8 +4266,8 @@ fn first_launch(g: &Guest, ask: &Ask, row: &mut Row) -> Result<(), Fail> {
     // The page at each milestone the records name, from before the open on.
     let captures = capture::Captures::start(g);
     let broker_before = watch_elevations(g)?;
-    // What the app asks after the ALab vault while it is watched: System State's watch for the
-    // vault looks on a Mac that has none.
+    // Observe any ALab vault questions while the app is watched. The guest's default join
+    // must still refuse as a lab identity before dialing (A12).
     start_mdns(g)?;
     let (opened, prompt) = open_until_prompt(g, "first")?;
     let open_ms = secs_to_ms(opened);
@@ -6231,6 +6218,110 @@ fn successor(g: &Guest, row: &mut Row) -> Result<(), Fail> {
     Ok(())
 }
 
+/// An explicit record keeps private raw evidence before the disposable guest goes away.
+/// These reads happen after timing, census and isolation checks; no observer runs beside them.
+fn retain_raw(g: &Guest, ask: &Ask, scenario: Scenario) -> Result<Option<PathBuf>, String> {
+    let Some(record) = &ask.record else {
+        return Ok(None);
+    };
+    let collector_uid = g
+        .uid
+        .parse::<u32>()
+        .map_err(|_| "invalid guest account uid")?;
+    let mut name = record
+        .file_name()
+        .ok_or("raw evidence record has no file name")?
+        .to_os_string();
+    name.push(".raw.noindex");
+    let root = record.with_file_name(name);
+    crate::util::create_private_dir_all(&root).map_err(|error| error.to_string())?;
+    let directory = aterm_tempfile::Builder::new()
+        .prefix(&format!("{}-", scenario.name()))
+        .tempdir_in(&root)
+        .map_err(|error| error.to_string())?
+        .keep();
+    let files = format!(
+        r#"collector_uid=$(/usr/bin/id -u)
+[ "$collector_uid" = {collector_uid} ] || exit 5
+set --
+for f in /var/tmp/aterm-nux/*.rec /var/tmp/aterm-nux/*.out /var/tmp/aterm-nux/*.txt /var/tmp/aterm-nux/*.log /var/tmp/aterm-nux/phrase-*/*.out /var/tmp/aterm-nux/phrase-*/*.log /var/tmp/aterm-nux/phrase-*/Library/Logs/aterm/aterm.log "$HOME/Library/Logs/aterm/aterm.log" "$HOME/Library/Application Support/aterm/doctor/"*.json "$HOME/Library/Application Support/aterm/command-line-tools-tab" "$HOME/Library/Application Support/aterm/command-line-tools-tab.children/"*; do
+  [ -f "$f" ] && [ ! -L "$f" ] && [ "$(/usr/bin/stat -f %u "$f")" = "$collector_uid" ] && set -- "$@" "$f"
+done
+[ "$#" -gt 0 ] || exit 4
+exec /usr/bin/tar -c -f - "$@""#,
+    );
+    let archive = g.vm.exec_complete(&files, STEP);
+    let census = g.vm.exec_complete(
+        &format!(
+            r#"collector_uid=$(/usr/bin/id -u)
+[ "$collector_uid" = {collector_uid} ] || exit 5
+collector_status=0
+{aterm} ctl ls || collector_status=1
+for f in "$HOME/Library/Application Support/aterm/command-line-tools-tab.children/"*; do
+  [ -f "$f" ] && [ ! -L "$f" ] && [ "$(/usr/bin/stat -f %u "$f")" = "$collector_uid" ] || continue
+  collector_sid=$(/usr/bin/sed -n '2p' "$f")
+  printf '%s\n' "$collector_sid" | /usr/bin/grep -Eq '^s-[0-9a-f]{{1,62}}$' || continue
+  {aterm} ctl "@$collector_sid" status || collector_status=1
+  {aterm} ctl "@$collector_sid" sys procs --json || collector_status=1
+done
+exit "$collector_status""#,
+            aterm = crate::util::shell_quote(&g.aterm),
+        ),
+        STEP,
+    );
+    let mut complete = true;
+    let mut results = Vec::new();
+    for (label, result) in [("archive", archive), ("census", census)] {
+        match result {
+            Ok(output) => {
+                let success = output.status.success();
+                complete &= success;
+                crate::util::write_fresh_mode(
+                    &directory.join(if label == "archive" {
+                        "raw.tar"
+                    } else {
+                        "census.txt"
+                    }),
+                    &output.stdout,
+                    0o600,
+                )
+                .map_err(|error| error.to_string())?;
+                crate::util::write_fresh_mode(
+                    &directory.join(format!("{label}.stderr")),
+                    &output.stderr,
+                    0o600,
+                )
+                .map_err(|error| error.to_string())?;
+                results.push(aterm_json::json!({"part":label,"exit":output.status.code()}));
+            }
+            Err(error) => {
+                complete = false;
+                results.push(aterm_json::json!({"part":label,"unavailable":error}));
+            }
+        }
+    }
+    let metadata = aterm_json::json!({
+        "schema":1,"scenario":scenario.name(),"before_guest_drop":true,"complete":complete,
+        "required_collector_uid":collector_uid,"stdout_complete_limit_bytes":aterm_uds::deadline::MAX_COMPLETE_STDOUT_BYTES,
+        "stderr_policy":"bounded_tail",
+        "results":results,"child_argv":"not separately collected; owned responder validates kernel argv before input",
+    });
+    crate::util::write_fresh_mode(
+        &directory.join("capture.json"),
+        aterm_json::to_vec(&metadata).map_err(|error| error.to_string())?,
+        0o600,
+    )
+    .map_err(|error| error.to_string())?;
+    if complete {
+        Ok(Some(directory))
+    } else {
+        Err(format!(
+            "one or more bounded raw reads unavailable; partial private evidence at {}",
+            directory.display()
+        ))
+    }
+}
+
 fn run_row(
     tart: &str,
     base: &str,
@@ -6247,12 +6338,11 @@ fn run_row(
     let watchers = Watchers::start(&g)?;
     // A first launch times its readings from the app's open; every other row from its start, so
     // an alert any row raises is read by its words, not only its window's owner.
-    let started =
-        if ask.reader && !matches!(scenario, Scenario::FirstLaunch | Scenario::FirstLaunchVault) {
-            reader_start(&g).and_then(|()| g.clock_ms()).map(Some)
-        } else {
-            Ok(None)
-        };
+    let started = if ask.reader && scenario != Scenario::FirstLaunch {
+        reader_start(&g).and_then(|()| g.clock_ms()).map(Some)
+    } else {
+        Ok(None)
+    };
     let (read_from, body) = match started {
         Ok(from) => (from, row_body(&g, run, ask, scenario, &mut row)),
         Err(fail) => (None, Err(fail)),
@@ -6270,6 +6360,14 @@ fn run_row(
     } else {
         Ok(())
     };
+    match retain_raw(&g, ask, scenario) {
+        Ok(Some(directory)) => row.cell(
+            "private raw evidence",
+            Value::Text(directory.display().to_string()),
+        ),
+        Ok(None) => {}
+        Err(why) => row.cell("private raw evidence", Value::Missing(why)),
+    }
     drop(g);
     // Each step's refusal is folded into the row, which keeps its cells and any guard failure.
     for step in [body, read, watched, guarded, kept] {
@@ -6300,7 +6398,6 @@ fn row_body(
         Scenario::LaunchRepairs => launch_repairs(g, row),
         Scenario::DevtoolsControl => devtools_control(g, row),
         Scenario::FirstLaunch => first_launch(g, ask, row),
-        Scenario::FirstLaunchVault => lan::first_launch_vault(g, ask, row),
         Scenario::LanAllowed => lan::lan_allowed(g, row),
         Scenario::TerminalLaunch => terminal_launch(g, row),
         Scenario::AppLaunch => app_launch(g, row),
@@ -6623,13 +6720,6 @@ mod tests {
         for s in every() {
             assert_eq!(parse_scenarios(s.name()).unwrap(), [s]);
         }
-        // `first-launch-vault` comes by name alone, in neither `all` nor `faults`.
-        assert_eq!(
-            parse_scenarios("first-launch-vault").unwrap(),
-            [Scenario::FirstLaunchVault]
-        );
-        assert!(!ALL.contains(&Scenario::FirstLaunchVault));
-        assert!(!FAULTS.contains(&Scenario::FirstLaunchVault));
         assert_eq!(
             parse_scenarios("lan-allowed").unwrap(),
             [Scenario::LanAllowed]

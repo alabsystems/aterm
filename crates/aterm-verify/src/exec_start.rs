@@ -158,13 +158,6 @@ pub(super) fn kept<K: Copy + PartialEq, T: Copy>(
     v
 }
 
-/// `d`'s start, µs since the epoch (the clock [`StartFacts::start_us`] reads).
-fn daemon_start_us(d: Daemon) -> u64 {
-    d.start_s
-        .saturating_mul(1_000_000)
-        .saturating_add(u64::from(d.start_us))
-}
-
 /// [`aterm_uds::deadline::FIRST_EXEC_HANG`] in µs, the bound on a first exec.
 fn first_exec_hang_us() -> u64 {
     u64::try_from(aterm_uds::deadline::FIRST_EXEC_HANG.as_micros()).unwrap_or(u64::MAX)
@@ -270,7 +263,7 @@ impl<'a> Watch<'a> {
         }
         let daemon = self.host.daemon();
         if let DaemonNow::Running(d) = daemon {
-            let start = daemon_start_us(d);
+            let start = d.started_us();
             if held
                 .iter()
                 .any(|&(_, since)| probe::before_daemon(Some(since), start, now_us))
@@ -409,7 +402,7 @@ impl<'a> Watch<'a> {
 
     /// Why `m`, seen unrun since `since` and stranded under `d`, decided nothing.
     fn stranded_words(&self, m: &Unstarted, since: u64, d: Daemon, now_us: u64) -> String {
-        let up = Duration::from_micros(now_us.saturating_sub(daemon_start_us(d)));
+        let up = Duration::from_micros(now_us.saturating_sub(d.started_us()));
         format!(
             "macOS's program check stranded `{}` (pid {}) at its first exec: held, as verify saw \
              it, since before the syspolicyd running now (pid {}) started {} ago, so its check \
@@ -457,9 +450,7 @@ fn under(daemon: DaemonNow, now_us: u64) -> String {
         DaemonNow::Running(d) => format!(
             "under the syspolicyd running now (pid {}, up {})",
             d.pid,
-            aterm_capacity::span(Duration::from_micros(
-                now_us.saturating_sub(daemon_start_us(d))
-            ))
+            aterm_capacity::span(Duration::from_micros(now_us.saturating_sub(d.started_us())))
         ),
         DaemonNow::NoneRunning => "with no syspolicyd running now".to_string(),
         DaemonNow::Unread => "under a syspolicyd verify could not read".to_string(),

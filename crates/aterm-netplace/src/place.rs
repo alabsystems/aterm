@@ -1068,10 +1068,14 @@ fn observe<const TRACK: bool>(
             if stay.end_ms.is_none() {
                 stay.end_ms = Some(clock.now);
             }
-            // The keeper's first look, or a reader's on a record the keeper has not brought up
-            // to these facts: when this Mac came onto this network is not known, only that it
-            // was here by now.
-            let from_start = keeper_start.is_none_or(|start| !clock.at_least(start, FIRST_LOOK_MS));
+            // The keeper's first look: when this Mac came onto this network is not known, only
+            // that it was here by now. A reader on a record the keeper has not brought up to
+            // these facts sees a move a running keeper is about to record as starting now, so
+            // it opens the stay as that keeper will: from now, with the dwell still ahead.
+            // Treating it as here-before stamped away-since with each read's own time and
+            // skipped the dwell, so every read was a new settled away key.
+            let from_start =
+                keeper_start.is_some_and(|start| !clock.at_least(start, FIRST_LOOK_MS));
             record.stays.push(fresh(clock.now, from_start));
         }
         None => {

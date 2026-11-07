@@ -5,8 +5,9 @@
 //!
 //! Native cells and cross cells with actual std/core in the selected Trust
 //! sysroot are documented and probed under Trust. Remaining cells need a stock
-//! rustup toolchain (`--stock`, default `stable`, with each cross triple's std
-//! installed): this crate's one STOCK EXCEPTION.
+//! rustup toolchain (`--stock`, by default the checkout's stock pin, with each
+//! cross triple's std installed, as `verify provision rustup` installs them on
+//! the pin): this crate's one STOCK EXCEPTION.
 pub mod behaviour;
 pub mod decls;
 pub mod handwritten;
@@ -328,15 +329,20 @@ impl Toolchains {
                 .filter(|t| !found.has_target(t))
                 .collect();
             if !missing.is_empty() {
+                let fix = if stock == aterm_toolchain::rustup::STOCK_PIN {
+                    "targo --unverified verify provision rustup".to_string()
+                } else {
+                    format!(
+                        "rustup target add --toolchain {stock} {}",
+                        missing.join(" ")
+                    )
+                };
                 return Err(Stop::CouldNotRun(CouldNotRun::new(
                     format!(
                         "the stock `{stock}` toolchain has no std for {}",
                         missing.join(", ")
                     ),
-                    format!(
-                        "rustup target add --toolchain {stock} {}",
-                        missing.join(" ")
-                    ),
+                    fix,
                 )));
             }
             Some(found)

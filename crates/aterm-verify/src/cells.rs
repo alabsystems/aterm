@@ -4,10 +4,12 @@
 //! `verify cells`: cross-cell lint and type-check of every forge cell but this machine's own
 //! (Windows, Linux, both Mac slices and wasm32, less the host's).
 //!
-//! STOCK EXCEPTION: the Trust sysroot carries only the host std, so each cell
-//! compiles on a rustup toolchain carrying its triple's std (stable first),
-//! driven by path from a neutral cwd so neither this repo's Trust pin nor its
-//! Trust-only cargo config reaches it.
+//! STOCK EXCEPTION: the Trust sysroot carries only the host std, so every cell compiles and
+//! lints on the one stock toolchain the checkout pins ([`rustup::stock_pin`]), named in its
+//! row, driven by path from a neutral cwd so neither this repo's Trust pin nor its Trust-only
+//! cargo config reaches it. A machine whose pin lacks a cell's std or clippy has that cell
+//! COULD NOT RUN, naming `verify provision`: no other toolchain stands in, so one tree's verdict
+//! is the same on every Mac whatever rustup's floating `stable` is there.
 use aterm_uds::output::CommandOutput as _;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -432,11 +434,7 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
             return;
         }
     }
-    let row = aterm_uds::host::tool("rustup");
-    let rustup = row.locate_in(&aterm_uds::host::Lookup {
-        path: Some(ctx.env.path.clone()),
-        ..aterm_uds::host::Lookup::host(row)
-    });
+    let stock = stock_of(ctx);
     for cell in &cells {
         // A cell that failed ends a run whose halt is armed before the next cell starts.
         crate::red_now(ctx, crate::checks::Check::Cells, r);
@@ -453,21 +451,45 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
                 fix: "targo --unverified verify lint test".to_string(),
             }
         } else {
-            match &rustup {
-                Ok(rustup) => check_cell(ctx, rustup, cell, &policy, &mut members),
-                Err(absent) => CellOutcome::Skipped {
-                    why: absent.why.clone(),
-                    fix: format!("{}, with stable's {} std", absent.fix, cell.triple),
-                },
-            }
+            check_cell(ctx, &stock, cell, &policy, &mut members)
         };
         let took = format!("{label}: {}s", started.elapsed().as_secs());
         record_cell(r, &label, took, outcome);
     }
     if owes_win32_oracles(&cells, &ctx.scope, ctx.cells_pulled) {
-        win32_oracles(ctx, r, rustup.as_ref().err());
+        win32_oracles(ctx, r, &stock);
     }
     audit_policy(ctx, r, &policy, &cells);
+}
+
+/// The checkout's stock pin as the `rustup` row (looked up on the run's `PATH`) holds it: the one
+/// toolchain every cell and both windows-sys oracles compile with.
+fn stock_of(ctx: &Ctx) -> Result<rustup::Stock, rustup::Unready> {
+    let row = aterm_uds::host::tool("rustup");
+    let found = row.locate_in(&aterm_uds::host::Lookup {
+        path: Some(ctx.env.path.clone()),
+        ..aterm_uds::host::Lookup::host(row)
+    });
+    match found {
+        Ok(rustup) => rustup::pinned(rustup.as_path(), &ctx.root),
+        Err(absent) => Err(rustup::Unready {
+            why: absent.why,
+            fix: absent.fix,
+        }),
+    }
+}
+
+/// The stock pin's drivers for `triple`, linted when `clippy`: a COULD NOT RUN's words where the
+/// machine holds no pin, or a pin without that std or clippy ([`rustup::Stock::serving`]).
+fn serving<'s>(
+    stock: &'s Result<rustup::Stock, rustup::Unready>,
+    triple: &str,
+    clippy: bool,
+) -> Result<&'s rustup::Toolchain, rustup::Unready> {
+    stock
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|stock| stock.serving(triple, clippy))
 }
 
 /// Why the run's end keeps the next cell from starting, if it does: the halt's words once the
@@ -484,8 +506,9 @@ fn cell_ended(ctx: &Ctx) -> Option<String> {
 
 /// One cell's row under `label`, then how long it took and what it printed. A COULD NOT RUN row
 /// names its cause (the first line of what the machine said: a spawn error, a full disk, the
-/// run's interrupt, a toolchain's refusal) in the row itself, as the check's terminal line shows
-/// only the row: the lines under it reach the log alone.
+/// run's interrupt, a toolchain's refusal, cut to 240 characters with its fix kept,
+/// [`shortened`]) in the row itself, as the check's terminal line shows only the row: the lines
+/// under it reach the log alone.
 fn record_cell(r: &mut Report, label: &str, took: String, outcome: CellOutcome) {
     match outcome {
         CellOutcome::Unselected => r.pass(format!(
@@ -509,10 +532,7 @@ fn record_cell(r: &mut Report, label: &str, took: String, outcome: CellOutcome) 
                 .map(str::trim)
                 .find(|l| !l.is_empty());
             r.cannot_run(match cause {
-                Some(cause) => format!(
-                    "{label} — {status}: {}",
-                    cause.chars().take(240).collect::<String>()
-                ),
+                Some(cause) => format!("{label} — {status}: {}", shortened(cause, 240)),
                 None => format!("{label} — {status}: the cell's check named no cause"),
             });
             r.raw(took);
@@ -521,8 +541,31 @@ fn record_cell(r: &mut Report, label: &str, took: String, outcome: CellOutcome) 
     }
 }
 
+/// `cause` in at most `width` characters, a trailing ` (fix: …)` kept whole after an ellipsis:
+/// the row names what provides the missing piece though the cause before it runs long.
+fn shortened(cause: &str, width: usize) -> String {
+    if cause.chars().count() <= width {
+        return cause.to_string();
+    }
+    let fix = cause
+        .rfind(" (fix: ")
+        .filter(|_| cause.ends_with(')'))
+        .map(|at| &cause[at..])
+        .filter(|fix| fix.chars().count() < width);
+    match fix {
+        Some(fix) => {
+            let head: String = cause
+                .chars()
+                .take(width - 1 - fix.chars().count())
+                .collect();
+            format!("{head}…{fix}")
+        }
+        None => cause.chars().take(width).collect(),
+    }
+}
+
 /// The windows-sys oracles (`aterm-win32-oracle`'s two verbs) and what each holds to its
-/// registry crate version (STOCK EXCEPTION: stock stable compiles Windows std).
+/// registry crate version (STOCK EXCEPTION: the checkout's stock pin compiles Windows std).
 pub const WIN32_ORACLES: [(&str, &str); 2] = [
     (
         "oracle",
@@ -569,11 +612,12 @@ pub fn owes_win32_oracles(cells: &[Cell], scope: &crate::scope::Scope, pulled: b
 }
 
 /// `targo --unverified run -q -p aterm-win32-oracle --target-dir <cells lane>/win32-oracle-bin
-/// -- <verb> --root <R>`, from `<R>`.
+/// -- <verb> --root <R> --stock <pin>`, from `<R>`: the oracle compiles Windows std on the
+/// checkout's stock pin, as every cell does.
 ///
 /// # Errors
 /// The current-directory error from making a relative path absolute.
-pub fn win32_oracle_cmd(ctx: &Ctx, verb: &str) -> std::io::Result<Cmd> {
+pub fn win32_oracle_cmd(ctx: &Ctx, verb: &str, stock: &str) -> std::io::Result<Cmd> {
     let root = std::path::absolute(&ctx.root)?;
     let lane = std::path::absolute(
         lane_dir(ctx, Lane::CellsTarget).unwrap_or_else(|| ctx.target_dir.clone()),
@@ -595,6 +639,8 @@ pub fn win32_oracle_cmd(ctx: &Ctx, verb: &str) -> std::io::Result<Cmd> {
             verb.to_string(),
             "--root".to_string(),
             root.display().to_string(),
+            "--stock".to_string(),
+            stock.to_string(),
         ]),
     );
     cmd.cwd = Some(root);
@@ -615,22 +661,23 @@ pub fn win32_oracle_not_run_reason(output: &str) -> Option<String> {
 
 /// One row per [`WIN32_ORACLES`] verb. The oracle's exit is read as the libc
 /// oracle's: 0 passes, 1 is a finding, 3 or a signal decided nothing.
-fn win32_oracles(ctx: &Ctx, r: &mut Report, no_rustup: Option<&aterm_uds::host::Absent>) {
+fn win32_oracles(ctx: &Ctx, r: &mut Report, stock: &Result<rustup::Stock, rustup::Unready>) {
+    let windows = serving(stock, "x86_64-pc-windows-msvc", false)
+        .and_then(|_| serving(stock, "aarch64-pc-windows-msvc", false));
     for (verb, holds) in WIN32_ORACLES {
         let label = format!("win32 {verb} ({holds}; x86_64 and aarch64 pc-windows-msvc)");
         if !ctx.tools.have_targo() {
             r.skip(format!("{label} — no targo to build the driver"));
             continue;
         }
-        if let Some(absent) = no_rustup {
-            r.skip(format!(
-                "{label} — {} (fix: {}, with stable's x86_64-pc-windows-msvc and \
-                 aarch64-pc-windows-msvc stds)",
-                absent.why, absent.fix
-            ));
-            continue;
-        }
-        let cmd = match win32_oracle_cmd(ctx, verb) {
+        let toolchain = match &windows {
+            Ok(toolchain) => toolchain,
+            Err(unready) => {
+                r.cannot_run(format!("{label} — {unready}"));
+                continue;
+            }
+        };
+        let cmd = match win32_oracle_cmd(ctx, verb, &toolchain.name) {
             Ok(cmd) => cmd,
             Err(error) => {
                 r.cannot_run(format!("{label} — cannot resolve the checkout: {error}"));
@@ -951,17 +998,16 @@ pub fn resolve_roots(
     Ok((graph, paths))
 }
 
-/// Where a cell's missing std comes from: provision's rustup row adds every cell's std to
-/// stable, with clippy ([`crate::provision::stable::CELL_TARGETS`]).
-const PROVISION_RUSTUP: &str = "targo --unverified verify provision rustup";
-
-/// One cell, end to end: its graph, its shims, its toolchain, the lint of its roots, and (off
-/// wasm32) the all-targets pass over its workspace members; of [`narrows`] a selection, the lint and
-/// that pass of the selected members, in a cone run with the dependents in this cell's graph of what
-/// the change touched ([`wanted_in_cell`]).
+/// One cell, end to end: its graph, its shims, its toolchain (the stock pin, `stock`), the lint of
+/// its roots, and (off wasm32) the all-targets pass over its workspace members; of [`narrows`] a
+/// selection, the lint and that pass of the selected members, in a cone run with the dependents in
+/// this cell's graph of what the change touched ([`wanted_in_cell`]). A pin that cannot serve the
+/// cell ([`serving`]) is a COULD NOT RUN (`NO-TOOLCHAIN`) naming what provides the missing piece
+/// (provision's rustup row adds every cell's std and clippy to the pin,
+/// [`crate::provision::CELL_TARGETS`]).
 fn check_cell(
     ctx: &Ctx,
-    rustup: &Path,
+    stock: &Result<rustup::Stock, rustup::Unready>,
     cell: &Cell,
     policy: &[Shim],
     members: &mut Option<Result<Members, String>>,
@@ -1076,21 +1122,9 @@ fn check_cell(
         }
     }
 
-    let toolchain = match rustup::with_std(rustup, &cell.triple) {
-        Ok(Some(tc)) if tc.clippy => tc,
-        Ok(Some(tc)) => {
-            return CellOutcome::Skipped {
-                why: format!("`{}` has the std but no clippy", tc.name),
-                fix: format!("rustup component add clippy --toolchain {}", tc.name),
-            };
-        }
-        Ok(None) => {
-            return CellOutcome::Skipped {
-                why: "no rustup toolchain has its std".to_string(),
-                fix: PROVISION_RUSTUP.to_string(),
-            };
-        }
-        Err(e) => return could_not("NO-TOOLCHAIN", vec![e]),
+    let toolchain = match serving(stock, &cell.triple, true) {
+        Ok(toolchain) => toolchain,
+        Err(unready) => return could_not("NO-TOOLCHAIN", vec![unready.to_string()]),
     };
 
     let target_dir = crate::plan::cells_dir(ctx).join(&cell.name);
@@ -1104,7 +1138,7 @@ fn check_cell(
     let cargo = CellCargo {
         ctx,
         triple: &cell.triple,
-        toolchain: &toolchain,
+        toolchain,
         cwd: &cwd,
         target_dir: &target_dir,
         shim_args: &shim_args,
@@ -2086,6 +2120,62 @@ mod tests {
         list.iter().map(|s| (*s).to_string()).collect()
     }
 
+    /// A pin that cannot serve a cell names `verify provision` on the row itself, though rustup's
+    /// refusal spans lines or runs long.
+    #[test]
+    fn a_cell_without_its_pin_names_provision_on_its_row_whatever_rustup_said() {
+        let label = "cell win (x86_64-pc-windows-msvc)";
+        for why in [
+            "`rustup which --toolchain 1.97.1 cargo` failed: error: toolchain '1.97.1-aarch64-apple-\
+             darwin' is not installed\nhelp: run `rustup toolchain install 1.97.1` to install it"
+                .to_string(),
+            format!("`rustup target list` failed: {}", "x".repeat(400)),
+        ] {
+            let unready = rustup::Unready {
+                why,
+                fix: rustup::PROVISION.into(),
+            };
+            let mut r = Report::new("cells");
+            record_cell(
+                &mut r,
+                label,
+                format!("{label}: 1s"),
+                CellOutcome::CouldNotRun {
+                    status: "NO-TOOLCHAIN".into(),
+                    detail: vec![unready.to_string()],
+                },
+            );
+            let result = crate::report::judge(
+                crate::checks::Check::Cells,
+                &[&r],
+                1.0,
+                "",
+                "targo --unverified verify cells --cell win".into(),
+                None,
+            );
+            let shown = crate::report::render(&result, 5);
+            let first = shown.lines().next().unwrap_or_default();
+            assert!(
+                first.contains(&format!("(fix: {})", rustup::PROVISION)),
+                "{shown}"
+            );
+        }
+        let long = format!("{} (fix: {})", "x".repeat(400), rustup::PROVISION);
+        let cut = shortened(&long, 240);
+        assert_eq!(cut.chars().count(), 240, "{cut}");
+        assert!(
+            cut.ends_with(&format!("x… (fix: {})", rustup::PROVISION)),
+            "{cut}"
+        );
+        let bare = "y".repeat(400);
+        assert_eq!(
+            shortened(&bare, 240),
+            "y".repeat(240),
+            "no fix: a plain cut"
+        );
+        assert_eq!(shortened("short (fix: z)", 240), "short (fix: z)");
+    }
+
     /// A cell that could not run says why on the check's terminal line, which shows the row and
     /// nothing written under it: the run's interrupt (the 2026-10-24 bare `COULD-NOT-RUN`), a
     /// full disk, a toolchain's refusal.
@@ -2119,8 +2209,22 @@ mod tests {
             ),
             (
                 "NO-TOOLCHAIN",
-                vec!["\nrustup: toolchain 'stable' is not installed\nmore".to_string()],
-                "rustup: toolchain 'stable' is not installed",
+                vec!["\nrustup: toolchain '1.97.1' is not installed\nmore".to_string()],
+                "rustup: toolchain '1.97.1' is not installed",
+            ),
+            (
+                "NO-TOOLCHAIN",
+                vec![
+                    rustup::Unready {
+                        why: "`1.97.1`, the checkout's stock pin, has no x86_64-pc-windows-msvc \
+                              std"
+                        .into(),
+                        fix: rustup::PROVISION.into(),
+                    }
+                    .to_string(),
+                ],
+                "has no x86_64-pc-windows-msvc std (fix: targo --unverified verify provision \
+                 rustup)",
             ),
         ] {
             let shown = terminal(CellOutcome::CouldNotRun {
@@ -3427,7 +3531,7 @@ mod tests {
                 PathBuf::from("/tmp"),
             );
             let toolchain = rustup::Toolchain {
-                name: "stable".into(),
+                name: "1.97.1".into(),
                 cargo: PathBuf::from("/r/bin/cargo"),
                 rustc: PathBuf::from("/r/bin/rustc"),
                 clippy: true,
@@ -3515,7 +3619,7 @@ mod tests {
             crate::EnvSnapshot::default(),
             PathBuf::from("/tmp"),
         );
-        let cmd = win32_oracle_cmd(&ctx, "oracle-052").expect("absolute paths");
+        let cmd = win32_oracle_cmd(&ctx, "oracle-052", "1.97.1").expect("absolute paths");
         let argv = cmd.argv();
         let oracle_bin = root
             .join("target")
@@ -3540,6 +3644,8 @@ mod tests {
                 "oracle-052",
                 "--root",
                 root_str.as_str(),
+                "--stock",
+                "1.97.1",
             ]
         );
         assert_eq!(cmd.cwd.as_deref(), Some(root.as_path()));

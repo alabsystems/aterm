@@ -1754,6 +1754,7 @@ impl App {
         anchor: (usize, usize),
         keyboard: bool,
     ) {
+        self.clear_strip_press(wid);
         self.settle_rename_edit(wid);
         self.close_autopilot_menu();
         self.autopilot_menu_spent = None;

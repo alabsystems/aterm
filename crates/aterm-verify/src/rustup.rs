@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! rustup's toolchains for the STOCK EXCEPTION lanes (`verify cells` and wasm perf). The
-//! rustup they drive is the `rustup` row of [`aterm_uds::host::TOOLS`], found by that row's
-//! resolver alone (`aterm_uds::host::tool("rustup").locate()`).
+//! rustup's one stock toolchain for the STOCK EXCEPTION lanes (`verify cells`, the web modules'
+//! lanes and wasm perf): the stock pin the checkout names ([`stock_pin`], [`STOCK_PIN`]), held to
+//! what each lane needs of it ([`Stock::serving`]). The rustup they drive is the `rustup` row of
+//! [`aterm_uds::host::TOOLS`], found by that row's resolver alone
+//! (`aterm_uds::host::tool("rustup").locate()`).
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -11,17 +13,39 @@ use std::path::{Path, PathBuf};
 use aterm_uds::output::CommandOutput as _;
 use aterm_uds::spawnfd::{Command, command};
 
-pub use aterm_toolchain::rustup::{lists_target, toolchain_names};
+pub use aterm_toolchain::rustup::{
+    ClauseError, STOCK_PIN, STOCK_PIN_FILE, WasmClause, default_host, holds_toolchain,
+    lists_target, stock_pin, toolchain_names, wasm_clause,
+};
 
-/// Does `rustup`'s toolchain `name` carry `triple`'s std?
-#[must_use]
-pub fn carries(rustup: &Path, name: &str, triple: &str) -> bool {
-    command(rustup)
-        .args(["target", "list", "--installed", "--toolchain", name])
-        .output_owned()
-        .is_ok_and(|o| {
-            o.status.success() && lists_target(&String::from_utf8_lossy(&o.stdout), triple)
-        })
+/// Where the stock pin, and each std and component a lane takes from it, come from.
+pub const PROVISION: &str = "targo --unverified verify provision rustup";
+
+/// What answers a question put to rustup: a rustup at its path, or a test's stand-in.
+pub trait Ask {
+    /// `rustup args…`: its stdout.
+    ///
+    /// # Errors
+    /// rustup could not be run, or it failed: what it said.
+    fn ask(&self, args: &[&str]) -> Result<String, String>;
+}
+
+impl Ask for Path {
+    fn ask(&self, args: &[&str]) -> Result<String, String> {
+        let out = command(self)
+            .args(args)
+            .output_owned()
+            .map_err(|e| format!("could not run {} ({e})", self.display()))?;
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        } else {
+            Err(format!(
+                "`rustup {}` failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))
+        }
+    }
 }
 
 /// A rustup toolchain resolved to its own drivers by path.
@@ -38,19 +62,16 @@ impl Toolchain {
     /// `name`'s drivers, as `rustup which --toolchain` answers them.
     /// # Errors
     /// rustup could not be asked, or names no `cargo`/`rustc` for `name`.
-    pub fn resolve(rustup: &Path, name: &str) -> Result<Self, String> {
+    pub fn resolve<A: Ask + ?Sized>(rustup: &A, name: &str) -> Result<Self, String> {
         let which = |tool: &str| -> Result<PathBuf, String> {
-            let out = command(rustup)
-                .args(["which", "--toolchain", name, tool])
-                .output_owned()
-                .map_err(|e| format!("could not ask rustup for `{name}`'s {tool} ({e})"))?;
-            let path = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
-            if out.status.success() && path.is_file() {
+            let answer = rustup.ask(&["which", "--toolchain", name, tool])?;
+            let path = PathBuf::from(answer.trim());
+            if path.is_file() {
                 Ok(path)
             } else {
                 Err(format!(
                     "`rustup which --toolchain {name} {tool}` names no file: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
+                    path.display()
                 ))
             }
         };
@@ -158,133 +179,112 @@ fn loader_path(var: &str, lib: &Path, inherited: Option<&OsStr>, home: Option<&O
     path
 }
 
-/// The first installed toolchain carrying `triple`'s std (`Ok(None)` when none does).
-/// # Errors
-/// rustup could not list its toolchains, or one that carries the std named no drivers.
-pub fn with_std(rustup: &Path, triple: &str) -> Result<Option<Toolchain>, String> {
-    let list = command(rustup)
-        .args(["toolchain", "list"])
-        .output_owned()
-        .map_err(|e| format!("could not ask rustup which toolchains are installed ({e})"))?;
-    if !list.status.success() {
-        return Err(format!(
-            "`rustup toolchain list` failed: {}",
-            String::from_utf8_lossy(&list.stderr).trim_end()
-        ));
-    }
-    let mut names = toolchain_names(&String::from_utf8_lossy(&list.stdout));
-    names.sort_by_key(|tc| u8::from(tc.starts_with("nightly")));
-    names
-        .into_iter()
-        .find(|tc| carries(rustup, tc, triple))
-        .map(|tc| Toolchain::resolve(rustup, &tc))
-        .transpose()
-}
-
-/// The wasm32 clause of `publish/config.sh`'s `CHECK_CMD_DEFAULT` and the stock channel it names.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WasmClause {
-    pub clause: String,
-    pub pin: String,
-}
-
-/// Why `publish/config.sh` names no usable wasm32 pin, and the fix.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClauseError {
+/// Why the checkout's stock pin cannot serve a lane, and what puts that right.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unready {
     pub why: String,
-    pub remedy: String,
+    pub fix: String,
 }
 
-impl ClauseError {
-    fn new(why: impl Into<String>, remedy: impl Into<String>) -> Self {
+impl Unready {
+    fn provision(why: impl Into<String>) -> Self {
         Self {
             why: why.into(),
-            remedy: remedy.into(),
+            fix: PROVISION.to_string(),
         }
     }
 }
 
-/// Reads the wasm32 clause out of `config` (`CHECK_CMD_DEFAULT="…"`).
+/// One line: what rustup said over several lines (`error: …` then rustup's own `help: …`) is
+/// joined, so a row that shows a single line still ends with the fix.
+impl std::fmt::Display for Unready {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let why: Vec<&str> = self
+            .why
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        write!(f, "{} (fix: {})", why.join(" "), self.fix)
+    }
+}
+
+/// The checkout's stock pin as rustup holds it ([`stock`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Stock {
+    /// Its drivers.
+    pub toolchain: Toolchain,
+    /// The std targets installed on it.
+    pub targets: Vec<String>,
+}
+
+impl Stock {
+    /// The pin's drivers for a lane that compiles for `triple`, and lints it when `clippy`. A pin
+    /// without that std, or without the clippy a lint needs, is unready, with [`PROVISION`]: no
+    /// other toolchain answers in its place.
+    ///
+    /// # Errors
+    /// The pin lacks `triple`'s std, or clippy where `clippy` asks for it.
+    pub fn serving(&self, triple: &str, clippy: bool) -> Result<&Toolchain, Unready> {
+        let name = &self.toolchain.name;
+        if !self.targets.iter().any(|t| t == triple) {
+            return Err(Unready::provision(format!(
+                "`{name}`, the checkout's stock pin, has no {triple} std"
+            )));
+        }
+        if clippy && !self.toolchain.clippy {
+            return Err(Unready::provision(format!(
+                "`{name}`, the checkout's stock pin, has no clippy"
+            )));
+        }
+        Ok(&self.toolchain)
+    }
+}
+
+/// The stock pin `pin` as `rustup`, whose default host is `host` ([`default_host`]), holds it:
+/// its drivers and its installed stds. rustup is asked about the pin only once it lists the
+/// pin's install for `host`, so a machine without it (another host's install of the release
+/// included) is told so, with [`PROVISION`].
+///
 /// # Errors
-/// No clause; no stock channel; no target-add before it; no `RUSTC` naming the pin's own rustc.
-pub fn wasm_clause(config: &str) -> Result<WasmClause, ClauseError> {
-    let line = config
+/// rustup cannot list its toolchains, holds no `pin` for `host`, or names no drivers or stds
+/// for it.
+pub fn stock<A: Ask + ?Sized>(rustup: &A, pin: &str, host: &str) -> Result<Stock, Unready> {
+    let listing = rustup.ask(&["toolchain", "list"]).map_err(|why| {
+        Unready::provision(format!("rustup could not list its toolchains: {why}"))
+    })?;
+    if !holds_toolchain(&listing, pin, host) {
+        return Err(Unready::provision(format!(
+            "rustup holds no `{pin}`, the checkout's stock pin"
+        )));
+    }
+    let toolchain = Toolchain::resolve(rustup, pin).map_err(Unready::provision)?;
+    let targets = rustup
+        .ask(&["target", "list", "--installed", "--toolchain", pin])
+        .map_err(Unready::provision)?
         .lines()
-        .find_map(|l| l.strip_prefix("CHECK_CMD_DEFAULT=\""))
-        .and_then(|l| l.trim_end().strip_suffix('"'))
-        .unwrap_or_default();
-    let Some(clause) = line
-        .split(" && ")
-        .find(|c| c.contains("--target wasm32-unknown-unknown"))
         .map(str::trim)
-    else {
-        return Err(ClauseError::new(
-            "publish/config.sh's CHECK_CMD_DEFAULT has no wasm32 clause — nothing before the \
-             promote compiles the site's /terminal engine",
-            "restore its `cargo check --locked --target wasm32-unknown-unknown -p aterm-wasm` \
-             clause (publish/config.sh, THE WASM32 CLAUSE)",
-        ));
-    };
-    let pin = clause
-        .split_once("rustup run ")
-        .and_then(|(_, rest)| rest.split_once(" cargo "))
-        .map(|(pin, _)| pin.to_string())
-        .filter(|p| !p.is_empty() && !p.contains(' '));
-    let Some(pin) = pin else {
-        return Err(ClauseError::new(
-            format!(
-                "publish/config.sh's wasm32 clause names no stock channel — the wasm32 pin is the \
-                 compiler this check and the stage's gate both run: {clause}"
-            ),
-            "spell the clause `rustup run <channel> cargo check …`",
-        ));
-    };
-    let add = format!("rustup target add --toolchain {pin} wasm32-unknown-unknown");
-    if !line.contains(&format!("{add} && ")) {
-        return Err(ClauseError::new(
-            format!(
-                "publish/config.sh's CHECK_CMD_DEFAULT does not add the wasm32 target to {pin} \
-                 before its wasm32 clause — `pub stage` on a host without that target fails after \
-                 the verified build"
-            ),
-            format!("put `{add} && ` before the wasm32 clause"),
-        ));
-    }
-    let rustc = format!("RUSTC=$(rustup which --toolchain {pin} rustc) ");
-    if !clause.contains(&rustc) {
-        return Err(ClauseError::new(
-            format!(
-                "publish/config.sh's wasm32 clause does not name {pin}'s own rustc — cargo would \
-                 take `rustc` from the host PATH (the gate's fresh CARGO_HOME holds no rustup \
-                 proxy): {clause}"
-            ),
-            format!("put `{rustc}` before `rustup run {pin} cargo` in the wasm32 clause"),
-        ));
-    }
-    Ok(WasmClause {
-        clause: clause.to_string(),
-        pin,
-    })
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect();
+    Ok(Stock { toolchain, targets })
 }
 
-/// The wasm32 pin `repo`'s `publish/config.sh` names, or why it names none.
+/// The stock pin the checkout at `repo` names ([`stock_pin`]), as `rustup` holds it on the
+/// default host of the rustup home this process names ([`stock`]).
+///
 /// # Errors
-/// The file cannot be read, or its clause is refused ([`wasm_clause`]).
-pub fn wasm_pin(repo: &Path) -> Result<String, String> {
-    crate::read_regular_text(repo.join("publish/config.sh"))
-        .map_err(|e| format!("publish/config.sh: {e}"))
-        .and_then(|c| wasm_clause(&c).map_err(|r| format!("{} — {}", r.why, r.remedy)))
-        .map(|clause| clause.pin)
-}
-
-/// The wasm32 pin a provisioned machine holds for `repo`.
-/// # Errors
-/// The file exists and cannot be read, or its clause is refused ([`wasm_clause`]).
-pub fn wasm_pin_wanted(repo: &Path) -> Result<Option<String>, String> {
-    match std::fs::symlink_metadata(repo.join("publish/config.sh")) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        _ => wasm_pin(repo).map(Some),
-    }
+/// The checkout's engine gate disagrees with the pin or is refused, or [`stock`]'s.
+pub fn pinned<A: Ask + ?Sized>(rustup: &A, repo: &Path) -> Result<Stock, Unready> {
+    let pin = stock_pin(repo).map_err(|refused| Unready {
+        why: refused.why,
+        fix: refused.remedy,
+    })?;
+    stock(
+        rustup,
+        &pin,
+        &aterm_toolchain::rustup::default_host_from_env(),
+    )
 }
 
 #[cfg(test)]
@@ -346,30 +346,195 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_wasm32_clause_is_read_out_of_the_engines_own_line() {
-        let good = "CHECK_CMD_DEFAULT=\"rustup run trust targo trust check && rustup target add \
-                    --toolchain 1.95.0 wasm32-unknown-unknown && sh -c \
-                    'RUSTFLAGS=-Ctarget-feature=+simd128 RUSTC=$(rustup which --toolchain 1.95.0 \
-                    rustc) rustup run 1.95.0 cargo check --locked --target wasm32-unknown-unknown \
-                    -p aterm-wasm'\"\n";
-        let clause = wasm_clause(good).unwrap();
-        assert_eq!(clause.pin, "1.95.0");
-        assert!(
-            clause
-                .clause
-                .starts_with("sh -c 'RUSTFLAGS=-Ctarget-feature=+simd128 RUSTC=")
-        );
-        for config in [
-            "CHECK_CMD_DEFAULT=\"targo check\"\n",
-            &good.replace(
-                "rustup target add --toolchain 1.95.0 wasm32-unknown-unknown && ",
-                "",
-            ),
-            &good.replace("RUSTC=$(rustup which --toolchain 1.95.0 rustc) ", ""),
-            &good.replace("rustup run 1.95.0 cargo", "cargo"),
-        ] {
-            assert!(wasm_clause(config).is_err(), "{config}");
+    const HOST: &str = "aarch64-apple-darwin";
+    const PIN: &str = "1.97.1";
+
+    /// A rustup holding `toolchains` in its listing's order, each with its stds and whether it
+    /// has clippy, whose drivers are files under `dir`; it records every question.
+    struct Held {
+        dir: aterm_tempfile::TempDir,
+        toolchains: Vec<(&'static str, Vec<&'static str>, bool)>,
+        asked: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl Held {
+        fn new(toolchains: Vec<(&'static str, Vec<&'static str>, bool)>) -> Self {
+            Self {
+                dir: aterm_tempfile::tempdir().unwrap(),
+                toolchains,
+                asked: std::cell::RefCell::default(),
+            }
         }
+
+        fn held(&self, name: &str) -> Option<&(&'static str, Vec<&'static str>, bool)> {
+            self.toolchains.iter().find(|(t, _, _)| *t == name)
+        }
+    }
+
+    impl Ask for Held {
+        fn ask(&self, args: &[&str]) -> Result<String, String> {
+            self.asked.borrow_mut().push(args.join(" "));
+            match args {
+                ["toolchain", "list"] => Ok(self
+                    .toolchains
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (t, _, _))| {
+                        format!("{t}-{HOST}{}\n", if i == 0 { " (default)" } else { "" })
+                    })
+                    .collect()),
+                ["target", "list", "--installed", "--toolchain", name] => self
+                    .held(name)
+                    .map(|(_, stds, _)| stds.iter().map(|s| format!("{s}\n")).collect())
+                    .ok_or_else(|| format!("toolchain '{name}' is not installed")),
+                ["which", "--toolchain", name, tool] => {
+                    let (_, _, clippy) = self
+                        .held(name)
+                        .ok_or_else(|| format!("toolchain '{name}' is not installed"))?;
+                    if *tool == "cargo-clippy" && !clippy {
+                        return Err(format!("'{tool}' is not installed for '{name}'"));
+                    }
+                    let path = self.dir.path().join(name).join("bin").join(tool);
+                    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    std::fs::write(&path, "").unwrap();
+                    Ok(format!("{}\n", path.display()))
+                }
+                other => Err(format!("unexpected rustup question {other:?}")),
+            }
+        }
+    }
+
+    const EVERY: [&str; 7] = crate::provision::CELL_TARGETS;
+
+    /// EVERY LANE RIDES THE PIN, NEVER THE FIRST TOOLCHAIN THAT HAS THE STD: with `stable` listed
+    /// first (rustup's own order) and carrying every cell's std and clippy, each cell's std is
+    /// served by the pin's own drivers. NEGATIVE CONTROL: a choice that takes the first listed
+    /// toolchain carrying the std answers `stable` here, and the name and path checks fail.
+    #[test]
+    fn every_lane_rides_the_pin_though_stable_is_listed_first_with_every_std() {
+        let rustup = Held::new(vec![
+            ("stable", EVERY.to_vec(), true),
+            (PIN, EVERY.to_vec(), true),
+            ("nightly", EVERY.to_vec(), true),
+        ]);
+        let stock = stock(&rustup, PIN, HOST).unwrap();
+        for triple in EVERY {
+            let served = stock.serving(triple, true).unwrap();
+            assert_eq!(served.name, PIN, "{triple}");
+            assert!(
+                served.cargo.starts_with(rustup.dir.path().join(PIN))
+                    && served.rustc.starts_with(rustup.dir.path().join(PIN)),
+                "{triple}: {served:?}"
+            );
+        }
+        let asked = rustup.asked.borrow();
+        assert!(
+            asked
+                .iter()
+                .filter(|q| *q != "toolchain list")
+                .all(|q| q.contains(&format!("--toolchain {PIN}"))),
+            "nothing but the pin is asked about: {asked:#?}"
+        );
+    }
+
+    /// A PIN THAT LACKS A PIECE IS UNREADY, NAMING `verify provision`, AND NOTHING STANDS IN: the
+    /// pin without a cell's std, without clippy, or not held at all is refused though `stable`
+    /// carries all of it; a lane that only compiles is served without clippy. NEGATIVE CONTROL:
+    /// a `serving` that skips the std check serves the Windows cell, and its assertion fails.
+    #[test]
+    fn a_pin_missing_its_std_its_clippy_or_itself_is_unready_and_names_provision() {
+        let rustup = Held::new(vec![
+            ("stable", EVERY.to_vec(), true),
+            (PIN, vec![HOST, "wasm32-unknown-unknown"], false),
+        ]);
+        let stock = stock(&rustup, PIN, HOST).unwrap();
+        let no_std = stock.serving("x86_64-pc-windows-msvc", false).unwrap_err();
+        assert_eq!(no_std.fix, PROVISION);
+        assert!(
+            no_std.why.contains("`1.97.1`") && no_std.why.contains("x86_64-pc-windows-msvc std"),
+            "{no_std}"
+        );
+        let no_clippy = stock.serving(HOST, true).unwrap_err();
+        assert_eq!(no_clippy.fix, PROVISION);
+        assert!(no_clippy.why.contains("has no clippy"), "{no_clippy}");
+        assert_eq!(
+            stock
+                .serving("wasm32-unknown-unknown", false)
+                .map(|t| t.name.as_str()),
+            Ok(PIN),
+            "a lane that only compiles needs no clippy"
+        );
+
+        let without = Held::new(vec![("stable", EVERY.to_vec(), true)]);
+        let absent = super::stock(&without, PIN, HOST).unwrap_err();
+        assert_eq!(absent.fix, PROVISION);
+        assert!(absent.why.contains("holds no `1.97.1`"), "{absent}");
+        assert_eq!(
+            *without.asked.borrow(),
+            ["toolchain list"],
+            "a pin rustup does not list is asked nothing more"
+        );
+        assert!(
+            absent
+                .to_string()
+                .ends_with("(fix: targo --unverified verify provision rustup)"),
+            "{absent}"
+        );
+    }
+
+    /// A pin rustup holds only for another host is not held, and rustup is asked nothing more.
+    #[test]
+    fn a_pin_held_only_for_another_host_is_unready() {
+        let rustup = Held::new(vec![(PIN, EVERY.to_vec(), true)]);
+        let other = stock(&rustup, PIN, "x86_64-apple-darwin").unwrap_err();
+        assert!(other.why.contains("holds no `1.97.1`"), "{other}");
+        assert_eq!(*rustup.asked.borrow(), ["toolchain list"]);
+    }
+
+    /// Unready reads as one line, rustup's own lines joined, with the fix last.
+    #[test]
+    fn an_unready_pin_reads_as_one_line_ending_with_its_fix() {
+        let unready = Unready::provision(
+            "`rustup which` failed: error: toolchain '1.97.1' is not installed\n\
+             help: run `rustup toolchain install 1.97.1` to install it\n",
+        );
+        let said = unready.to_string();
+        assert_eq!(said.lines().count(), 1, "{said}");
+        assert!(said.ends_with(&format!("(fix: {PROVISION})")), "{said}");
+        assert!(said.contains("is not installed help: run"), "{said}");
+    }
+
+    /// The checkout's pin, and a public snapshot's (no `publish/`), is [`STOCK_PIN`], asked of
+    /// rustup; an engine gate the checkout's reader refuses is unready with the gate's own fix,
+    /// and rustup is asked nothing.
+    #[test]
+    fn the_checkout_and_a_public_snapshot_ride_the_pin_and_a_gate_that_disagrees_is_unready() {
+        let repo = aterm_tempfile::manifest_dir().join("../..");
+        let public = aterm_tempfile::tempdir().unwrap();
+        for tree in [repo.as_path(), public.path()] {
+            let rustup = Held::new(vec![("stable", EVERY.to_vec(), true)]);
+            let absent = pinned(&rustup, tree).unwrap_err();
+            assert!(
+                absent.why.contains(&format!("holds no `{STOCK_PIN}`")),
+                "{}: {absent}",
+                tree.display()
+            );
+            assert_eq!(absent.fix, PROVISION);
+        }
+
+        std::fs::create_dir_all(public.path().join("publish")).unwrap();
+        std::fs::write(
+            public.path().join(STOCK_PIN_FILE),
+            "CHECK_CMD_DEFAULT=\"true\"\n",
+        )
+        .unwrap();
+        let rustup = Held::new(vec![(STOCK_PIN, EVERY.to_vec(), true)]);
+        let refused = pinned(&rustup, public.path()).unwrap_err();
+        assert!(refused.why.contains("no wasm32 clause"), "{refused}");
+        assert!(refused.fix.contains("restore"), "{refused}");
+        assert!(
+            rustup.asked.borrow().is_empty(),
+            "a gate that is refused asks rustup nothing"
+        );
     }
 }

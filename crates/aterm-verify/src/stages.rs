@@ -2536,8 +2536,8 @@ fn glue_row(
 }
 
 /// The `cells` check ([`crate::cells`]): every forge cell but this machine's
-/// own (or each `--cell`), each linted for its own triple on rustup's
-/// toolchain (a STOCK EXCEPTION), one row per cell.
+/// own (or each `--cell`), each linted for its own triple on the checkout's
+/// stock pin (a STOCK EXCEPTION), one row per cell.
 fn foreign_cells(ctx: &Ctx, r: &mut Report) {
     if in_checkout(ctx, r, "cells") {
         crate::cells::run(ctx, r);
@@ -3235,7 +3235,7 @@ mod tests {
             "{label}"
         );
         let (outcome, label) = row(crate::perf::LaneRun::skip(
-            "no stable toolchain",
+            "no stock pin",
             "targo --unverified verify provision",
         ));
         assert_eq!(outcome, Outcome::Skip, "{label}");

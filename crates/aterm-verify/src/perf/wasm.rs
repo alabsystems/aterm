@@ -4,9 +4,10 @@
 //! WebAssembly renderer performance lane (`aterm-wasm` and `aterm-gpu-web`).
 //!
 //! STOCK EXCEPTION (Trust lacks a wasm32 std: `error[E0463]` can't find crate
-//! for `core`): the build rides rustup's `stable`, resolved to its own
-//! `cargo`/`rustc` by path, since a stock or rerouted `cargo` earlier on PATH
-//! ignores `RUSTUP_TOOLCHAIN`. It runs from a neutral cwd so no repo
+//! for `core`): the build rides the checkout's stock pin
+//! ([`crate::rustup::stock_pin`], the compiler the site's /terminal engine ships from),
+//! resolved to its own `cargo`/`rustc` by path, since a stock or rerouted `cargo` earlier on
+//! PATH ignores `RUSTUP_TOOLCHAIN`. It runs from a neutral cwd so no repo
 //! config (vendored source replacement, Trust `-Z` flags) applies.
 
 use aterm_uds::output::CommandOutput as _;
@@ -19,6 +20,7 @@ use aterm_uds::spawnfd::command;
 use super::LaneRun;
 use super::floors::{self, FloorLane};
 use super::workspace_root;
+use crate::rustup::Toolchain;
 use crate::wasm_page::{self, Page, Refused};
 
 use crate::wasm_glue::WASM_OPT_FLAGS;
@@ -72,41 +74,32 @@ fn answers(program: &Path, args: &[&str]) -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
-/// Resolves rustup and optional `wasm-opt` for building the WebAssembly modules.
-pub(crate) fn build_tools(wasm_opt: bool) -> Result<PathBuf, LaneRun> {
-    build_tools_with(aterm_uds::host::tool("rustup").locate(), wasm_opt)
+/// Resolves the stock pin of the checkout at `repo`, with its wasm32 std, and optional
+/// `wasm-opt` for building the WebAssembly modules.
+pub(crate) fn build_tools(repo: &Path, wasm_opt: bool) -> Result<Toolchain, LaneRun> {
+    build_tools_with(aterm_uds::host::tool("rustup").locate(), repo, wasm_opt)
 }
 
 /// [`build_tools`] with the `rustup` row's answer `found`: where it found none, COULD NOT
-/// RUN saying where the row looked and naming its provider, `verify provision`, once.
+/// RUN saying where the row looked and naming its provider, `verify provision`, once; where
+/// rustup holds no stock pin with a wasm32 std, COULD NOT RUN naming the same.
 fn build_tools_with(
     found: Result<PathBuf, aterm_uds::host::Absent>,
+    repo: &Path,
     wasm_opt: bool,
-) -> Result<PathBuf, LaneRun> {
+) -> Result<Toolchain, LaneRun> {
     let rustup = match found {
         Ok(rustup) => rustup,
         Err(absent) => {
             return Err(LaneRun::could_not_run(
                 absent.why,
-                format!("{}, with stable's wasm32 std", absent.fix),
+                format!("{}, with the stock pin's wasm32 std", absent.fix),
             ));
         }
     };
-    let has_target = command(&rustup)
-        .args(["target", "list", "--installed", "--toolchain", "stable"])
-        .output_owned()
-        .is_ok_and(|o| {
-            crate::rustup::lists_target(
-                &String::from_utf8_lossy(&o.stdout),
-                "wasm32-unknown-unknown",
-            )
-        });
-    if !has_target {
-        return Err(LaneRun::could_not_run(
-            "no stable wasm32-unknown-unknown target",
-            "rustup target add wasm32-unknown-unknown --toolchain stable",
-        ));
-    }
+    let toolchain = crate::rustup::pinned(rustup.as_path(), repo)
+        .and_then(|stock| stock.serving(WASM32, false).cloned())
+        .map_err(|unready| LaneRun::could_not_run(unready.why, unready.fix))?;
     if wasm_opt && !answers(&wasm_opt_program(), &["--version"]) {
         return Err(LaneRun::could_not_run(
             "wasm-opt not found; the lane applies the shipping -O3 pass and never measures \
@@ -114,8 +107,11 @@ fn build_tools_with(
             aterm_uds::host::tool("wasm-opt").remedy(),
         ));
     }
-    Ok(rustup)
+    Ok(toolchain)
 }
+
+/// The target every web module is built for.
+const WASM32: &str = "wasm32-unknown-unknown";
 
 /// WASM floors: the shipped modules in the browser, every gated key against its floor, plus the
 /// module-size ceilings.
@@ -125,11 +121,11 @@ pub(crate) fn gate_wasm(record: bool) -> LaneRun {
         Ok(browser) => browser,
         Err(refused) => return refused.verdict("the wasm bench"),
     };
-    let rustup = match build_tools(true) {
-        Ok(rustup) => rustup,
+    let toolchain = match build_tools(&root, true) {
+        Ok(toolchain) => toolchain,
         Err(verdict) => return verdict,
     };
-    let (product, json) = match build_and_bench(&root, &rustup, &browser) {
+    let (product, json) = match build_and_bench(&root, &toolchain, &browser) {
         Ok(ran) => ran,
         Err(refused) => return refused.verdict("the wasm bench"),
     };
@@ -151,14 +147,14 @@ pub(crate) fn gate_wasm(record: bool) -> LaneRun {
 /// execution or timing admission. The ordinary wasm lane also judges floors.
 pub(crate) fn gate_wasm_size() -> LaneRun {
     let root = workspace_root();
-    let rustup = match build_tools(true) {
-        Ok(rustup) => rustup,
+    let toolchain = match build_tools(&root, true) {
+        Ok(toolchain) => toolchain,
         Err(verdict) => return verdict,
     };
     let sizes = (|| {
         let built = build_modules(
             &root,
-            &rustup,
+            &toolchain,
             "release",
             Some("-C target-feature=+simd128"),
         )?;
@@ -229,12 +225,12 @@ pub(crate) fn record_replay(log: &mut String) -> LaneRun {
         Ok(browser) => browser,
         Err(refused) => return refused.verdict("the replay"),
     };
-    let rustup = match build_tools(false) {
-        Ok(rustup) => rustup,
+    let toolchain = match build_tools(&root, false) {
+        Ok(toolchain) => toolchain,
         Err(verdict) => return verdict,
     };
     let mut record = || -> Result<(), Refused> {
-        let built = build_modules(&root, &rustup, "dev", None).map_err(Refused::Failed)?;
+        let built = build_modules(&root, &toolchain, "dev", None).map_err(Refused::Failed)?;
         let site = output_root(&root).join("wasm-smoke");
         bind_modules(&built, &site, false).map_err(Refused::Failed)?;
         wasm_page::lay_drivers(&root, &site).map_err(Refused::Failed)?;
@@ -330,18 +326,20 @@ fn plant_frame_hash(answers: &str) -> Option<(String, String)> {
 
 fn build_modules(
     root: &Path,
-    rustup: &Path,
+    toolchain: &Toolchain,
     profile: &str,
     rustflags: Option<&str>,
 ) -> Result<PathBuf, String> {
     // STOCK EXCEPTION: Trust lacks a wasm32 std.
-    let stable = crate::rustup::Toolchain::resolve(rustup, "stable")?;
     let neutral = aterm_tempfile::Builder::new()
         .prefix("aterm-wasm-bench-")
         .tempdir()
         .map_err(|e| format!("could not create neutral build directory: {e}"))?;
-    eprintln!("  building aterm-wasm + aterm-gpu-web (wasm32, {profile}) on stable");
-    let mut build = stable.cargo();
+    eprintln!(
+        "  building aterm-wasm + aterm-gpu-web (wasm32, {profile}) on {}",
+        toolchain.name
+    );
+    let mut build = toolchain.cargo();
     let target = output_root(root);
     if let Some(value) =
         crate::fallback_build_dir(&crate::EnvSnapshot::capture(), neutral.path(), &target)
@@ -376,8 +374,14 @@ fn build_modules(
     drop(neutral);
     match built {
         Ok(s) if s.success() => {}
-        Ok(s) => return Err(format!("the stable wasm32 build exited {:?}", s.code())),
-        Err(e) => return Err(format!("could not run {}: {e}", stable.cargo.display())),
+        Ok(s) => {
+            return Err(format!(
+                "the {} wasm32 build exited {:?}",
+                toolchain.name,
+                s.code()
+            ));
+        }
+        Err(e) => return Err(format!("could not run {}: {e}", toolchain.cargo.display())),
     }
     let dir = if profile == "dev" { "debug" } else { profile };
     Ok(target.join("wasm32-unknown-unknown").join(dir))
@@ -413,12 +417,17 @@ fn wasm_opt_program() -> PathBuf {
 
 fn build_and_bench(
     root: &Path,
-    rustup: &Path,
+    toolchain: &Toolchain,
     browser: &wasm_page::Browser,
 ) -> Result<(String, Value), Refused> {
     let failed = Refused::Failed;
-    let built = build_modules(root, rustup, "release", Some("-C target-feature=+simd128"))
-        .map_err(failed)?;
+    let built = build_modules(
+        root,
+        toolchain,
+        "release",
+        Some("-C target-feature=+simd128"),
+    )
+    .map_err(failed)?;
     let site = output_root(root).join("wasm-bench");
     bind_modules(&built, &site, true).map_err(failed)?;
     wasm_page::lay_drivers(root, &site).map_err(failed)?;
@@ -561,7 +570,8 @@ mod tests {
             tooling: Some(tmp.path().join("tooling.noindex")),
             path: Some(tmp.path().join("empty").into_os_string()),
         };
-        let Err(refused) = build_tools_with(row.locate_in(&lookup), false) else {
+        let repo = workspace_root();
+        let Err(refused) = build_tools_with(row.locate_in(&lookup), &repo, false) else {
             panic!("no rustup built the modules");
         };
         let Status::CouldNotRun { why, fix } = refused.status else {
@@ -571,17 +581,21 @@ mod tests {
             why.starts_with("no rustup (looked in $ATERM_TEST_RUSTUP"),
             "{why}"
         );
-        assert_eq!(fix, format!("{}, with stable's wasm32 std", row.remedy()));
+        assert_eq!(
+            fix,
+            format!("{}, with the stock pin's wasm32 std", row.remedy())
+        );
         let said = format!("{why} {fix}");
         assert_eq!(said.matches("verify provision").count(), 1, "{said}");
         assert!(!said.contains("brew"), "{said}");
 
-        let Err(next) = build_tools_with(Ok(PathBuf::from("/usr/bin/false")), false) else {
-            panic!("a rustup with no wasm32 std built the modules");
+        let Err(next) = build_tools_with(Ok(PathBuf::from("/usr/bin/false")), &repo, false) else {
+            panic!("a rustup that holds no stock pin built the modules");
         };
         assert!(
-            matches!(&next.status, Status::CouldNotRun { why, .. }
-                if why == "no stable wasm32-unknown-unknown target"),
+            matches!(&next.status, Status::CouldNotRun { why, fix }
+                if why.starts_with("rustup could not list its toolchains")
+                    && fix == crate::rustup::PROVISION),
             "{:?}",
             next.status
         );

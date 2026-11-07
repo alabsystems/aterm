@@ -725,10 +725,6 @@ impl Item for NativeRepositories {
         self.apply_guarded(sys, ctx, &|| Ok(()))
     }
 
-    fn refresh(&self, sys: &dyn System, ctx: &Ctx) -> Option<Result<(), String>> {
-        self.refresh_guarded(sys, ctx, &|| Ok(()))
-    }
-
     fn refresh_guarded(
         &self,
         sys: &dyn System,

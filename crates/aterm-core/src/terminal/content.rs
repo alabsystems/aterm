@@ -18,7 +18,12 @@ fn push_cell_text(grid: &Grid, row: u16, col: u16, out: &mut String) {
 
 /// [`push_cell_text`] with the screen row already resolved: `cells` is
 /// `grid.row_at_screen(row)`.
-#[inline]
+// Keep per-cell emission inlined in both extraction loops.
+#[expect(
+    clippy::inline_always,
+    reason = "measured 58-case row extraction: ordinary inlining regressed full nonblank controls; per-cell emission plus separate recording loops restored them"
+)]
+#[inline(always)]
 fn push_row_cell_text(grid: &Grid, row: u16, cells: &Row, col: u16, out: &mut String) {
     let Some(cell) = cells.get(col) else {
         return;
@@ -36,8 +41,67 @@ fn push_row_cell_text(grid: &Grid, row: u16, cells: &Row, col: u16, out: &mut St
     }
     if cell.has_extras() {
         if let Some(extra) = grid.cell_extra(row, col) {
-            for &combining in extra.combining() {
+            let marks = extra.combining();
+            // A single push grows once. A sequence no larger than the whole
+            // buffer fits after its amortized growth; count bytes only when
+            // several marks can require more than that growth step.
+            if marks.len() > 1 && out.capacity() < marks.len().saturating_mul(4) {
+                reserve_combining_bytes(out, marks);
+            }
+            for &combining in marks {
                 out.push(combining);
+            }
+        }
+    }
+}
+
+// Keep the rare capacity-edge scan out of the per-cell emission frame.
+#[inline(never)]
+fn reserve_combining_bytes(out: &mut String, marks: &[char]) {
+    let bytes: usize = marks.iter().map(|mark| mark.len_utf8()).sum();
+    let needed = out.len().saturating_add(bytes);
+    if needed <= out.capacity() {
+        return;
+    }
+    // Skip intermediate growth without shrinking the geometric capacity that
+    // scalar pushes would leave for the next cell. A tiny byte buffer's first
+    // growth has a minimum capacity of eight in the pinned standard library.
+    let mut capacity = out.capacity().max(4);
+    while capacity < needed {
+        capacity = capacity.saturating_mul(2);
+    }
+    out.reserve(capacity.saturating_sub(out.len()));
+}
+
+#[cfg(test)]
+mod combining_capacity_tests {
+    use super::reserve_combining_bytes;
+
+    #[test]
+    fn batching_preserves_scalar_growth_capacity_for_following_text() {
+        for capacity in [0, 1, 2, 3, 4, 5, 7, 8, 15, 17, 31, 33, 63] {
+            for prefix in ["", "abc", "prefix  "] {
+                for mark in ['\u{301}', '\u{20dd}', '\u{1d185}'] {
+                    for count in 2..=16 {
+                        let marks = vec![mark; count];
+                        let mut actual = String::with_capacity(capacity);
+                        actual.push_str(prefix);
+                        actual.push('x');
+                        let mut scalar = String::with_capacity(capacity);
+                        scalar.push_str(prefix);
+                        scalar.push('x');
+                        reserve_combining_bytes(&mut actual, &marks);
+                        for &ch in &marks {
+                            actual.push(ch);
+                            scalar.push(ch);
+                        }
+                        assert_eq!(actual, scalar);
+                        assert_eq!(actual.capacity(), scalar.capacity());
+                        actual.push('y');
+                        scalar.push('y');
+                        assert_eq!(actual.capacity(), scalar.capacity());
+                    }
+                }
             }
         }
     }
@@ -98,13 +162,32 @@ pub(crate) fn visible_row_written(grid: &Grid, row: u16) -> (String, LineCells) 
     (text, cells)
 }
 
+/// Peel only cells whose emitted text is certainly whitespace or empty. Complex
+/// cells and extras retain the final string trim's complete Unicode semantics.
+fn trimmed_plain_end(cells: &Row, start: u16, mut end: Option<u16>) -> Option<u16> {
+    while let Some(col) = end.filter(|&col| start <= col) {
+        let removable = cells.get(col).is_none_or(|cell| {
+            let plain_blank = !cell.is_complex() && !cell.has_extras() && {
+                let ch = cell.char();
+                ch == '\0' || ch.is_whitespace()
+            };
+            plain_blank || cells.is_cell_wide_continuation(col)
+        });
+        if !removable {
+            break;
+        }
+        end = col.checked_sub(1);
+    }
+    end
+}
+
 fn push_visible_row_text(
     grid: &Grid,
     row: u16,
     start_col: u16,
     end_col: u16,
     trailing: TrailingBlanks,
-    mut cells: Option<&mut LineCells>,
+    cells: Option<&mut LineCells>,
     out: &mut String,
 ) {
     let last_col = grid.cols().saturating_sub(1);
@@ -128,16 +211,24 @@ fn push_visible_row_text(
     if let Some(row_cells) = grid.row_at_screen(row) {
         // Beyond the written extent every character is an unwritten blank;
         // Trim would discard that suffix after constructing it.
-        let end_col = row_cells
+        let mut end_col = row_cells
             .written_len()
             .checked_sub(1)
             .map(|last| end_col.min(last));
+        if trailing == TrailingBlanks::Trim
+            && let Some(bound) = end_col
+        {
+            end_col =
+                trimmed_plain_end(row_cells, effective_start, end_col).map(|end| end.min(bound));
+        }
         if let Some(end_col) = end_col.filter(|&end| effective_start <= end) {
             out.reserve(usize::from(end_col - effective_start) + 1);
-            for col in effective_start..=end_col {
-                let start = out.len();
-                push_row_cell_text(grid, row, row_cells, col, out);
-                if let Some(cells) = cells.as_deref_mut() {
+            // Choose recording once per row; text-only extraction has no
+            // metadata branch in its cell loop.
+            if let Some(cells) = cells {
+                for col in effective_start..=end_col {
+                    let start = out.len();
+                    push_row_cell_text(grid, row, row_cells, col, out);
                     let width = if row_cells.is_cell_wide_continuation(col.saturating_add(1)) {
                         2
                     } else {
@@ -148,6 +239,10 @@ fn push_visible_row_text(
                         usize::from(col.saturating_sub(effective_start)),
                         width,
                     );
+                }
+            } else {
+                for col in effective_start..=end_col {
+                    push_row_cell_text(grid, row, row_cells, col, out);
                 }
             }
         }
@@ -330,7 +425,7 @@ mod tests {
     use crate::terminal::Terminal;
 
     #[test]
-    fn trimmed_written_extent_matches_a_full_cell_scan() {
+    fn trimmed_row_ranges_match_a_full_cell_scan() {
         for text in [
             "",
             "a",
@@ -340,20 +435,51 @@ mod tests {
             "abc\r\x1b[K",
             "\x1b[7Gx",
             "👩🏽‍💻a",
+            "            ",
+            " \u{301}  ",
+            " \u{fe0f}  ",
+            " \u{200d}🦀  ",
+            "\u{3000}\u{a0} ",
+            "\x1b[41m\x1b[2K",
+            "x\x1b]8;;https://example.com\x1b\\ \x1b]8;;\x1b\\",
         ] {
             let mut term = Terminal::new(4, 12);
             term.process(text.as_bytes());
             for row in 0..4 {
                 let cells = term.grid.row_at_screen(row).unwrap();
-                let mut expected = String::new();
-                for col in 0..12 {
-                    super::push_row_cell_text(&term.grid, row, cells, col, &mut expected);
+                for first in 0u16..14 {
+                    for last in 0u16..14 {
+                        let start = if cells.is_cell_wide_continuation(first) {
+                            first.saturating_sub(1)
+                        } else {
+                            first
+                        };
+                        let end = last.min(11);
+                        let end = if cells.is_cell_wide_continuation(end + 1) {
+                            (end + 1).min(11)
+                        } else {
+                            end
+                        };
+                        let mut expected = String::new();
+                        for col in start..=end {
+                            super::push_row_cell_text(&term.grid, row, cells, col, &mut expected);
+                        }
+                        let mut actual = String::from("prefix  ");
+                        super::push_visible_row_bounds(
+                            &term.grid,
+                            row,
+                            first,
+                            last,
+                            super::TrailingBlanks::Trim,
+                            &mut actual,
+                        );
+                        assert_eq!(
+                            actual,
+                            format!("prefix  {}", expected.trim_end()),
+                            "{text:?} row={row} {first}..={last}"
+                        );
+                    }
                 }
-                assert_eq!(
-                    term.get_line_text(i32::from(row), None).unwrap(),
-                    expected.trim_end(),
-                    "{text:?} row={row}"
-                );
             }
         }
     }

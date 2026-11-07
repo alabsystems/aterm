@@ -14,6 +14,17 @@ pub struct Daemon {
     pub start_us: u32,
 }
 
+impl Daemon {
+    /// When it started: microseconds since the epoch, the clock a process's fork time is read on
+    /// (`aterm_sysprobe::jobs::StartFacts::start_us`); saturating.
+    #[must_use]
+    pub const fn started_us(&self) -> u64 {
+        self.start_s
+            .saturating_mul(1_000_000)
+            .saturating_add(self.start_us as u64)
+    }
+}
+
 /// Snapshot of `syspolicyd` workqueue thread-pool state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Reading {
@@ -166,6 +177,19 @@ mod tests {
             .iter()
             .map(|(at, r)| judge.absorb(*at, r.as_ref()))
             .collect()
+    }
+
+    #[test]
+    fn daemon_started_us_is_microseconds_since_the_epoch() {
+        assert_eq!(D.started_us(), 1_791_000_000_000_001);
+        for (start_s, start_us) in [(u64::MAX, 0), (u64::MAX / 1_000_000, 999_999)] {
+            let late = Daemon {
+                start_s,
+                start_us,
+                ..D
+            };
+            assert_eq!(late.started_us(), u64::MAX, "saturates: {late:?}");
+        }
     }
 
     #[test]

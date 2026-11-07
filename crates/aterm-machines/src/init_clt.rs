@@ -239,7 +239,7 @@ pub const INTRO_SETUP: &str = "aterm init: finishing the administrator's part of
                                asks for your Mac password once";
 
 /// The password prompt (`sudo -p`), in the tab and outside it.
-pub const TAB_PROMPT: &str = "Mac password: ";
+pub const TAB_PROMPT: &str = aterm_types::macos_setup::MAC_SETUP_PASSWORD_PROMPT;
 
 /// The tab's last line once the tools are installed and the rest of the elevation ran; the
 /// window then closes the tab unless it is its window's last (`aterm-gui`'s
@@ -761,33 +761,49 @@ impl Item for CommandLineTools {
         // Persist the episode before sudo can ask. Explicit retries bypass its withholding
         // decision, but consume the same record so a later update never retries unsolicited.
         let mut claimed = false;
-        if let Some(record) = &self.unbidden {
-            if let Some(why) = record.held() {
-                return Err(why);
-            }
-            match record.claim(sys) {
-                Ok(added) => {
-                    claimed = added;
-                    if !added && !record.explicit {
-                        return Err(format!("{ASK_ALREADY_SPENT}: {PERSONS_STEP}"));
-                    }
-                }
-                Err(error) if record.explicit => {
-                    aterm_log::warn!(
-                        "aterm init: could not record the explicit administrator attempt: {error}"
-                    );
-                }
-                Err(error) => return Err(format!("{NOT_NOTED} ({error}): {PERSONS_STEP}")),
-            }
-        }
-        (self.say)(&format!("{}\n", self.intro(sys, false)));
-        self.asked.store(true, std::sync::atomic::Ordering::Relaxed);
         // The root half runs in this terminal's foreground, so a Ctrl-C (which the
         // through-installer wait invites) or a closed terminal reaches this run too: held until
         // the root half has finished its step and aterm's own ask is kept or taken back, then
         // sent again, so the run still stops as it would have.
         let stops = sys.defer_stops();
-        let ran = sys.run_tty(&self.command());
+        let ran = sys.run_tty(&self.command(), &mut || {
+            // A vault question can own the terminal first. Re-read Stop and the automatic
+            // ask's current holds only after acquiring that terminal, immediately before
+            // claiming and starting this root episode.
+            if sys.stopped().is_some() {
+                return Err(crate::port::RunFailed::Refused(
+                    "setup was stopped before the root command started".into(),
+                ));
+            }
+            if let Some(record) = &self.unbidden {
+                if let Some(why) = record.held() {
+                    return Err(crate::port::RunFailed::Refused(why));
+                }
+                match record.claim(sys) {
+                    Ok(added) => {
+                        claimed = added;
+                        if !added && !record.explicit {
+                            return Err(crate::port::RunFailed::Refused(format!(
+                                "{ASK_ALREADY_SPENT}: {PERSONS_STEP}"
+                            )));
+                        }
+                    }
+                    Err(error) if record.explicit => {
+                        aterm_log::warn!(
+                            "aterm init: could not record the explicit administrator attempt: {error}"
+                        );
+                    }
+                    Err(error) => {
+                        return Err(crate::port::RunFailed::Refused(format!(
+                            "{NOT_NOTED} ({error}): {PERSONS_STEP}"
+                        )));
+                    }
+                }
+            }
+            (self.say)(&format!("{}\n", self.intro(sys, false)));
+            self.asked.store(true, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        });
         let ended = self.ended(sys, &ran, sys.stopped());
         // Only these port results prove sudo never existed. A password refusal, installer
         // failure, timeout or lost result may follow human interaction and keeps the episode.
@@ -980,11 +996,18 @@ impl CommandLineTools {
             return Err(tab.note(Unfinished::Other));
         }
         let stops = sys.catch_stops();
-        tab.line(self.intro(sys, true));
-        self.asked.store(true, std::sync::atomic::Ordering::Relaxed);
-        tab.entered
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        let ran = sys.run_tty(&self.command());
+        let ran = sys.run_tty(&self.command(), &mut || {
+            if sys.stopped().is_some() {
+                return Err(crate::port::RunFailed::Refused(
+                    "setup was stopped before the root command started".into(),
+                ));
+            }
+            tab.line(self.intro(sys, true));
+            self.asked.store(true, std::sync::atomic::Ordering::Relaxed);
+            tab.entered
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        });
         let stopped = sys.stopped();
         drop(stops);
         self.ended(sys, &ran, stopped).map_err(|why| tab.note(why))
@@ -1242,11 +1265,13 @@ mod tests {
             let sys = Arc::new(console());
             let said = Arc::new(Mutex::new(Vec::new()));
             let item = missing().saying({
-                let (said, sys) = (Arc::clone(&said), Arc::clone(&sys));
+                let said = Arc::clone(&said);
                 Arc::new(move |text: &str| {
-                    said.lock()
-                        .unwrap()
-                        .push((sys.calls().len(), text.to_owned()));
+                    assert!(
+                        crate::port::terminal_free().is_none(),
+                        "the prelude owns the terminal"
+                    );
+                    said.lock().unwrap().push(text.to_owned());
                 })
             });
             let installs = ran.success();
@@ -1263,8 +1288,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("no root half: {calls:?}"));
             assert_eq!(
                 *said.lock().unwrap(),
-                [(ran - 1, format!("{INTRO}\n"))],
-                "said once, right before the stops are held and sudo asks: {calls:?}"
+                [format!("{INTRO}\n")],
+                "said once under the same terminal lease as sudo: {calls:?}"
             );
             assert_eq!(calls[ran - 1], "defer stops", "{calls:?}");
             assert_eq!(asked(&sys), std::slice::from_ref(&argv), "{calls:?}");
@@ -1281,6 +1306,73 @@ mod tests {
             "{}",
             missing().command().display()
         );
+
+        // A vault question may own the terminal first. The root pass must not print its
+        // prelude, claim its episode or start sudo while that question still owns stdin.
+        for stopped_while_queued in [false, true] {
+            let sys = Arc::new(console());
+            sys.on(&argv, Ran::ok(""));
+            sys.on_write(&argv, std::path::Path::new(CC), b"");
+            let (probed, ready) = std::sync::mpsc::sync_channel(1);
+            let once = std::sync::atomic::AtomicBool::new(false);
+            let said = Arc::new(Mutex::new(String::new()));
+            let question_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let item = CommandLineTools::new(
+                Box::new(move |sys| {
+                    if !once.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        let _ = probed.send(());
+                    }
+                    if sys.read_file(std::path::Path::new(CC)).is_ok() {
+                        Found::Present(CC.into())
+                    } else {
+                        Found::Missing("no developer directory".into())
+                    }
+                }),
+                ATERM.into(),
+            )
+            .unbidden(Unbidden::new(Some(MARK.into()), BUILD.into(), || {
+                crate::init::Holds::NONE
+            }))
+            .saying({
+                let (said, question_done) = (Arc::clone(&said), Arc::clone(&question_done));
+                Arc::new(move |text| {
+                    assert!(question_done.load(std::sync::atomic::Ordering::SeqCst));
+                    assert!(crate::port::terminal_free().is_none());
+                    said.lock().unwrap().push_str(text);
+                })
+            });
+            let row = std::thread::scope(|scope| {
+                let worker = crate::port::owning_terminal(|| {
+                    let worker = scope.spawn(|| run(&sys, &item, Mode::Apply));
+                    ready
+                        .recv_timeout(std::time::Duration::from_secs(60))
+                        .expect("the root item probes");
+                    assert!(said.lock().unwrap().is_empty());
+                    assert!(asked(&sys).is_empty());
+                    assert!(!marked(&sys));
+                    if stopped_while_queued {
+                        sys.stop_now();
+                    }
+                    question_done.store(true, std::sync::atomic::Ordering::SeqCst);
+                    worker
+                });
+                worker.join().expect("the owned root pass joins")
+            });
+            if stopped_while_queued {
+                assert_eq!(row.outcome, Outcome::Failed, "{row:?}");
+                assert!(asked(&sys).is_empty());
+                assert!(said.lock().unwrap().is_empty());
+                assert!(
+                    !marked(&sys),
+                    "no root child or password episode was started"
+                );
+            } else {
+                assert_eq!(row.outcome, Outcome::Changed, "{row:?}");
+                assert_eq!(asked(&sys), std::slice::from_ref(&argv));
+                assert!(marked(&sys));
+                assert_eq!(*said.lock().unwrap(), format!("{INTRO}\n"));
+            }
+        }
     }
 
     /// The root half's failure says why in plain words on a person's own run too, never the argv
@@ -1667,8 +1759,11 @@ mod tests {
         let argv = argv();
         for decider in [crate::init::Decider::Person, crate::init::Decider::Aterm] {
             for status in [Some(0), Some(82)] {
-                let mut sys = console();
-                sys.stop_after = Some(0);
+                let sys = console();
+                sys.tty_model(|sys, _| {
+                    sys.stop_now();
+                    None
+                });
                 sys.on(
                     &argv,
                     Ran {
@@ -2072,10 +2167,12 @@ mod tests {
         let first = AtomicBool::new(true);
         sys.tty_model(move |sys, _| {
             if first.swap(false, Ordering::SeqCst) {
-                // At A's run boundary, a separate explicit execution B reaches sudo and fails
-                // its password. A then has no scripted child, the port's real Spawn failure.
-                let person = decided(crate::init::Decider::Person);
-                assert_eq!(run(sys, &person, Mode::Apply).outcome, Outcome::Failed);
+                // B is another process: record its explicit attempt while A owns this
+                // process's terminal. Nesting B's fake tty here deadlocks that same mutex.
+                assert!(
+                    !aterm_types::clt_mark::explicit(sys.clt_mark(), Path::new(MARK), BUILD)
+                        .unwrap()
+                );
                 None
             } else {
                 Some(Ran::exit(1, ""))
@@ -2086,6 +2183,8 @@ mod tests {
             Outcome::Failed
         );
         assert!(marked(&sys));
+        let person = decided(crate::init::Decider::Person);
+        assert_eq!(run(&sys, &person, Mode::Apply).outcome, Outcome::Failed);
         assert_eq!(
             run(&sys, &decided(crate::init::Decider::Aterm), Mode::Apply).outcome,
             Outcome::Deferred
@@ -2184,9 +2283,12 @@ mod tests {
             (Some(1), true, Unfinished::Stopped),
             (Some(82), true, Unfinished::Stopped),
         ] {
-            let mut fake = console();
+            let fake = console();
             if stopped {
-                fake.stop_after = Some(0);
+                fake.tty_model(|sys, _| {
+                    sys.stop_now();
+                    None
+                });
             }
             let sys = Arc::new(fake);
             let (item, said, tab) = in_tab(&sys, Found::Missing("no developer directory".into()));
@@ -2242,8 +2344,11 @@ mod tests {
     /// tools that arrived anyway end the tab on installed, whatever its exit said.
     #[test]
     fn in_the_tab_a_stop_waits_for_the_root_half_and_tools_that_arrived_are_installed() {
-        let mut fake = console();
-        fake.stop_after = Some(0);
+        let fake = console();
+        fake.tty_model(|sys, _| {
+            sys.stop_now();
+            None
+        });
         let sys = Arc::new(fake);
         let (item, _, tab) = in_tab(&sys, Found::Missing("no developer directory".into()));
         let argv = argv();

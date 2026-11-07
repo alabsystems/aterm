@@ -122,9 +122,9 @@ pub fn member_service(value: Option<&std::ffi::OsStr>) -> crate::Result<String> 
 /// place of [`crate::server::SERVICE_TYPE`]: every vault browse the look runs ([`browse_alab`],
 /// [`browse_names`], the subscriber's standing [`Watch::start_look`]) browses the type it names,
 /// and the look asks no compiled-in [`crate::ALAB_DEFAULT_URLS`] ([`look_defaults`]), so it names
-/// only what its lab browse heard. `lab mac nux --scenario first-launch-vault` sets it in its
-/// guest's GUI session, whose app must find the lab vault served there and never the live
-/// `_alab-vault._tcp`. As with [`LAB_MEMBER_SERVICE_ENV`], this build takes only a
+/// only what its lab browse heard. This changes a browse's target, without starting a browse
+/// or admitting an automatic default-vault join: a lab identity is still refused before that
+/// join looks (A12). As with [`LAB_MEMBER_SERVICE_ENV`], this build takes only a
 /// [`lab_service`] here ([`vault_service`]), so a value it cannot take browses for no vault, and
 /// the variable set marks the process a lab's ([`crate::Making`]). A vault server's own browse
 /// ([`Watch::start`]) and advert keep `_alab-vault._tcp` whatever it says. No install sets it.
@@ -173,8 +173,7 @@ pub(crate) fn look_default_urls() -> &'static [&'static str] {
     look_defaults(std::env::var_os(LAB_VAULT_SERVICE_ENV).as_deref())
 }
 
-/// The `aterm.log` line for the look hearing vault instance `instance` of `service`, which `lab
-/// mac nux`'s `first-launch-vault` reads (it names the service and the instance).
+/// The `aterm.log` line for the look hearing vault instance `instance` of `service`.
 #[cfg(any(test, target_os = "macos"))]
 fn vault_heard_line(service: &str, instance: &str) -> String {
     format!("vault look: heard {instance} on {service}")
@@ -1598,8 +1597,7 @@ mod tests {
     }
 
     /// The look logs each vault instance it hears once per process, on a line naming the
-    /// instance and the service (what `lab mac nux`'s `first-launch-vault` reads), and holds at
-    /// most `MOST_LOGGED` of them.
+    /// instance and the service, and holds at most `MOST_LOGGED` of them.
     ///
     /// NEGATIVE CONTROL: `first_heard` returning `true` for one already logged fails at the
     /// second hearing.

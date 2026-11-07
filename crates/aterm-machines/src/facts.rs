@@ -1613,8 +1613,12 @@ VendorID ProductID LocationID UsagePage Usage RegistryID  Transport            C
         fn run(&self, cmd: &Cmd) -> Result<Ran, crate::port::RunFailed> {
             self.inner.run(cmd)
         }
-        fn run_tty(&self, cmd: &Cmd) -> Result<Option<i32>, crate::port::RunFailed> {
-            self.inner.run_tty(cmd)
+        fn run_tty(
+            &self,
+            cmd: &Cmd,
+            before: &mut dyn FnMut() -> Result<(), crate::port::RunFailed>,
+        ) -> Result<Option<i32>, crate::port::RunFailed> {
+            self.inner.run_tty(cmd, before)
         }
         fn read_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
             if path == Path::new(SYSTEM_TCC_DB) {

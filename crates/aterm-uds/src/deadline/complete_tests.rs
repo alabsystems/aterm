@@ -142,6 +142,17 @@ fn retained_complete_timeout_preserves_cause_and_guards_until_positive_reap() {
 #[cfg(unix)]
 #[test]
 fn dispatch_witness_distinguishes_spawn_from_post_spawn_reader_failure() {
+    if let Some(ready) = std::env::var_os("ATERM_COMPLETE_CANCEL_CHILD") {
+        use std::io::Write as _;
+        std::io::stdout()
+            .write_all(b"owned cancellation prefix\n")
+            .unwrap();
+        std::io::stdout().flush().unwrap();
+        std::fs::write(ready, std::process::id().to_string()).unwrap();
+        // The parent keeps this private pipe open until the capture settles its child.
+        std::io::stdin().read_exact(&mut [0]).unwrap();
+        return;
+    }
     let dir = aterm_tempfile::tempdir().unwrap();
     let started = std::cell::Cell::new(false);
     let mut missing = crate::spawnfd::command(dir.path().join("absent"));
@@ -177,6 +188,7 @@ fn dispatch_witness_distinguishes_spawn_from_post_spawn_reader_failure() {
             );
             Err(io::Error::other("injected reader-thread spawn failure"))
         },
+        None,
     )
     .expect_err("post-spawn reader failure is reported");
     assert!(matches!(
@@ -189,6 +201,70 @@ fn dispatch_witness_distinguishes_spawn_from_post_spawn_reader_failure() {
         started.get(),
         "a reader failure cannot erase possible child effects"
     );
+
+    for panics in [false, true] {
+        let ready = dir.path().join(format!("cancel-child-ran-{panics}"));
+        let mut command = crate::spawnfd::command(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "deadline::complete::tests::dispatch_witness_distinguishes_spawn_from_post_spawn_reader_failure",
+                "--nocapture",
+            ])
+            .env("ATERM_COMPLETE_CANCEL_CHILD", &ready);
+        let (reader, writer) = std::io::pipe().unwrap();
+        let pid = std::cell::Cell::new(None);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut stopped = || match std::fs::read_to_string(&ready) {
+                Ok(ran) => {
+                    pid.set(Some(ran.parse::<i32>().unwrap()));
+                    assert!(!panics, "injected cancellation observer unwind");
+                    true
+                }
+                Err(_) => false,
+            };
+            if panics {
+                super::super::output_until_from_unless(
+                    &mut command,
+                    Stdio::from(reader),
+                    Instant::now() + HANG,
+                    &mut stopped,
+                )
+                .map_err(CompleteOutputError::Run)
+            } else {
+                output_until_complete_stdout_from_unless(
+                    &mut command,
+                    Stdio::from(reader),
+                    Instant::now() + HANG,
+                    &mut stopped,
+                )
+            }
+        }));
+        let pid = pid
+            .get()
+            .expect("the owned child executed before cancellation");
+        let mut status = 0;
+        // SAFETY: poll only the child whose own ready record identified it; sends no signal.
+        let waited = unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) };
+        let wait_error = std::io::Error::last_os_error().raw_os_error();
+        drop(writer);
+        if waited == 0 {
+            // The negative control leaves it alive: stdin EOF ends its Rust read, so settle
+            // it before asserting without ever signalling a possibly handed-off number.
+            // SAFETY: an owning wait for the child identified above, never another child.
+            let _ = unsafe { libc::waitpid(pid, &raw mut status, 0) };
+        }
+        assert_eq!(waited, -1, "the capture must perform its owning reap");
+        assert_eq!(wait_error, Some(libc::ECHILD));
+        if panics {
+            assert!(result.is_err());
+        } else {
+            assert!(matches!(
+                result,
+                Ok(Err(CompleteOutputError::Run(RunError::TimedOut)))
+            ));
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -209,6 +285,26 @@ fn an_observer_unwind_terminates_and_reaps_its_owned_child() {
         child.try_wait().unwrap().is_some(),
         "owned child was reaped"
     );
+
+    let mut child = crate::spawnfd::command(crate::deadline::stand_in(std::path::Path::new(
+        "/bin/sleep",
+    )))
+    .arg("30")
+    .process_group(0)
+    .spawn()
+    .unwrap();
+    let mut waits = 0;
+    super::super::settle_child_with(&mut child, |child| {
+        waits += 1;
+        if waits == 1 {
+            assert!(!child.is_reaped());
+            Err(io::Error::other("injected owning wait failure"))
+        } else {
+            child.wait()
+        }
+    });
+    assert!(waits >= 2, "a wait error cannot release pending ownership");
+    assert!(child.is_reaped());
 }
 
 fn collect(stream: impl Read + Send + 'static) -> Result<Vec<u8>, CompleteOutputError> {
@@ -303,7 +399,9 @@ fn explicit_stdout_limit_accepts_the_native_boundary_without_changing_the_defaul
         command
     };
     assert!(matches!(
-        output_until_complete_stdout(&mut command(), Instant::now() + HANG),
+        output_until_complete_stdout_from_unless(
+            &mut command(), Stdio::null(), Instant::now() + HANG, &mut || false,
+        ),
         Err(CompleteOutputError::StdoutTooLarge { limit }) if limit == OUTPUT_KEEP
     ));
     let output =
@@ -592,7 +690,7 @@ fn record_capture_reads_past_its_limit_keeping_only_the_records_it_accepts() {
 /// writes its own pid on a pipe it holds as its stdin before it becomes `sleep 600`, so the check
 /// is of that child alone, not of the pipe, whose write end a sibling test's child parked between
 /// fork and exec can hold a moment too ([`crate::fork_window`]); no timing decides it.
-/// NEGATIVE CONTROL: with `capture`'s `end_bounded` removed, the `sleep 600` is still there when
+/// NEGATIVE CONTROL: with `capture`'s cleanup guard removed, the `sleep 600` is still there when
 /// the call returns.
 #[cfg(unix)]
 #[test]
@@ -620,6 +718,7 @@ fn a_child_past_its_deadline_is_ended_not_left_running() {
             named = Some(heard.recv_timeout(HANG).expect("the child writes its pid"));
         },
         |pipe, stream| drain_stdout_with_limit(pipe, stream, 1024),
+        None,
     );
     assert!(
         matches!(got, Err(CompleteOutputError::Run(RunError::TimedOut))),

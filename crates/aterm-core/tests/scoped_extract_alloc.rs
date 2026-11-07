@@ -92,13 +92,50 @@ fn live_row_extraction_cost() {
     use aterm_core::terminal::{SearchRows, Terminal};
     const REPEATS: usize = 256;
     for cols in [80u16, 4096] {
-        for shape in ["empty", "short", "short-space", "ascii", "cjk", "combining"] {
+        for shape in [
+            "empty",
+            "short",
+            "short-space",
+            "ascii",
+            "cjk",
+            "combining",
+            "dense-mark",
+            "dense-mark-padded",
+            "dense-mark-full",
+            "mixed-mark-suffix",
+            "blank",
+            "padded",
+            "wide-padded",
+            "emoji-padded",
+            "space-mark",
+            "space-vs",
+            "ideographic-space",
+            "nbsp",
+        ] {
             let text = match shape {
                 "short" => "x".to_string(),
                 "short-space" => "x ".to_string(),
                 "ascii" => "x".repeat(usize::from(cols)),
                 "cjk" => "日".repeat(usize::from(cols) / 2),
                 "combining" => "e\u{301}".repeat(usize::from(cols)),
+                "dense-mark" => format!("x{}", "\u{301}".repeat(16)),
+                "dense-mark-padded" => format!(
+                    "x{}{}",
+                    "\u{301}".repeat(16),
+                    " ".repeat(usize::from(cols) - 1)
+                ),
+                "dense-mark-full" => format!("x{}", "\u{301}".repeat(16)).repeat(usize::from(cols)),
+                "mixed-mark-suffix" => {
+                    format!("x{}{}y", "\u{1d185}".repeat(14), "\u{20dd}".repeat(2))
+                }
+                "blank" => " ".repeat(usize::from(cols)),
+                "padded" => format!("x{}", " ".repeat(usize::from(cols) - 1)),
+                "wide-padded" => format!("日{}", " ".repeat(usize::from(cols) - 2)),
+                "emoji-padded" => format!("🦀{}", " ".repeat(usize::from(cols) - 2)),
+                "space-mark" => format!(" \u{301}{}", " ".repeat(usize::from(cols) - 1)),
+                "space-vs" => format!(" \u{fe0f}{}", " ".repeat(usize::from(cols) - 1)),
+                "ideographic-space" => "\u{3000}".repeat(usize::from(cols) / 2),
+                "nbsp" => "\u{a0}".repeat(usize::from(cols)),
                 _ => String::new(),
             };
             let mut terminal = Terminal::new(24, cols);
@@ -196,4 +233,56 @@ fn empty_written_rows_and_snapshots_allocate_nothing() {
         assert!(rows.text.iter().all(String::is_empty));
         assert_eq!(calls, 0, "empty snapshot at width {cols}");
     }
+}
+
+#[test]
+fn trimming_printed_plain_blanks_allocates_nothing_but_written_keeps_them() {
+    use aterm_core::terminal::Terminal;
+    for cols in [80, 4096] {
+        for blank in [" ", "\u{a0}", "\u{3000}"] {
+            let width = if blank == "\u{3000}" { 2 } else { 1 };
+            let text = blank.repeat(usize::from(cols) / width);
+            let mut terminal = Terminal::new(24, cols);
+            terminal.process(text.as_bytes());
+            let (trimmed, calls) = allocs_in(|| terminal.get_line_text(0, None).unwrap());
+            assert!(trimmed.is_empty());
+            assert_eq!(calls, 0, "{blank:?} width={cols}");
+            assert_eq!(terminal.written_line_cells(0).unwrap().0, text);
+        }
+    }
+}
+
+#[test]
+fn a_dense_combining_cell_grows_its_text_at_most_once_after_initial_reservation() {
+    use aterm_core::terminal::Terminal;
+    for mark in ['\u{301}', '\u{20dd}', '\u{1d185}'] {
+        for prefix in [0, 1, 7, 15, 31, 63] {
+            for count in 1..=16 {
+                let text = format!("{}e{}", "x".repeat(prefix), mark.to_string().repeat(count));
+                let mut terminal = Terminal::new(24, 80);
+                terminal.process(text.as_bytes());
+                let (actual, calls) = allocs_in(|| terminal.written_line_text(0).unwrap());
+                assert_eq!(actual, text);
+                assert!(
+                    calls <= 2,
+                    "{mark:?} prefix={prefix} count={count}: {calls} allocations"
+                );
+                let (actual, calls) = allocs_in(|| terminal.get_line_text(0, None).unwrap());
+                assert_eq!(actual, text);
+                assert!(
+                    calls <= 2,
+                    "trim {mark:?} prefix={prefix} count={count}: {calls} allocations"
+                );
+            }
+        }
+    }
+    let text = format!("x{}{}y", "\u{1d185}".repeat(14), "\u{20dd}".repeat(2));
+    let mut terminal = Terminal::new(24, 80);
+    terminal.process(text.as_bytes());
+    let (actual, calls) = allocs_in(|| terminal.written_line_text(0).unwrap());
+    assert_eq!(actual, text);
+    assert!(
+        calls <= 2,
+        "mixed marks followed by ASCII: {calls} allocations"
+    );
 }

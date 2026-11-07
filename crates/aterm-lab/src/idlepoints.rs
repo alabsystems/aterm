@@ -31,7 +31,10 @@ pub struct Spell {
     pub composer: bool,
     /// The program's own window title (OSC 0/2) when the spell opened, if it set one.
     pub title: Option<String>,
-    /// Seconds after the spell opened when the window title first stopped indicating activity.
+    /// Seconds after the end was drawn when the window title first stopped indicating activity,
+    /// counted from the first of the unbroken reads up to the spell's own whose rows alone read
+    /// idle: the time a running title held the drawn end counts, though the spell opens at the
+    /// title's rest.
     pub title_rested: Option<f64>,
     pub rows: Vec<String>,
 }
@@ -62,6 +65,8 @@ pub(crate) fn spells(cast: &halfdraw::Cast, reader: &dyn ScreenReader) -> Vec<Sp
     struct St {
         at: f64,
         busy: bool,
+        /// The rows alone read idle ([`ScreenReader::phase`]), whatever the title says.
+        drawn_idle: bool,
         idle: Option<(bool, bool)>,
         rows: Vec<String>,
         typed: bool,
@@ -87,7 +92,8 @@ pub(crate) fn spells(cast: &halfdraw::Cast, reader: &dyn ScreenReader) -> Vec<Sp
             continue;
         }
         let rows = halfdraw::screen(&t);
-        let phase = reader.phase(&rows);
+        let phase = reader.phase_seen(&rows, reader.runs(title.as_deref()));
+        let drawn_idle = reader.phase(&rows) == Phase::Idle;
         let composer = reader.composer(&rows);
         let typed = composer
             .as_ref()
@@ -101,6 +107,7 @@ pub(crate) fn spells(cast: &halfdraw::Cast, reader: &dyn ScreenReader) -> Vec<Sp
         states.push(St {
             at: e.at,
             busy: phase == Phase::Busy,
+            drawn_idle,
             idle,
             rows,
             typed,
@@ -126,9 +133,14 @@ pub(crate) fn spells(cast: &halfdraw::Cast, reader: &dyn ScreenReader) -> Vec<Sp
         let next = states.get(end);
         let inside = next.is_some_and(|n| n.busy && !typed && n.at - states[i].at <= TURN_GAP_S);
         let held = next.map_or(last_at, |n| n.at) - states[i].at;
+        let drawn = (0..=i)
+            .rev()
+            .take_while(|&k| states[k].drawn_idle)
+            .last()
+            .unwrap_or(i);
         let title_rested = (i..=end.min(states.len() - 1)).find_map(|j| {
             let runs = reader.title_runs(states[j].title.as_deref()?)?;
-            (!runs).then(|| states[j].at - states[i].at)
+            (!runs).then(|| states[j].at - states[drawn].at)
         });
         out.push(Spell {
             event: i,
@@ -1015,8 +1027,58 @@ mod tests {
         assert!(text.contains("10 after a run's end"), "{text}");
     }
 
+    /// Claude Code 2.1.311's status-line reply (lab `mr`, MEASURED frames, after a spinner frame
+    /// constructed over the first of them) draws no busy sign once its first line is up: its
+    /// frames read busy by their running title, so the one turn end is the done frame. NEGATIVE
+    /// CONTROL: the titles stripped, the end opens at the first mid-reply frame.
+    #[test]
+    fn a_status_line_reply_ends_at_its_done_frame_by_its_title() {
+        use aterm_phase::prompt::fixtures::{
+            STATUSLINE_MIDREPLY_2_1_311, STATUSLINE_REPLY_DONE_2_1_311, screen as rows_of,
+        };
+        let mid = rows_of(STATUSLINE_MIDREPLY_2_1_311);
+        let done = rows_of(STATUSLINE_REPLY_DONE_2_1_311);
+        let (top, _) = aterm_phase::phase::composer_rules(&mid).expect("a composer");
+        let mut spinning = mid.clone();
+        spinning.insert(
+            top,
+            "\u{2736} Deliberating\u{2026} (4s \u{00B7} esc to interrupt)".to_string(),
+        );
+        let claude = Program::Claude.reader();
+        let ends = |titles: [Option<&str>; 4]| -> Vec<usize> {
+            let text = halfdraw::frames_cast(&[
+                (spinning.as_slice(), titles[0]),
+                (mid.as_slice(), titles[1]),
+                (mid.as_slice(), titles[2]),
+                (done.as_slice(), titles[3]),
+            ]);
+            let cast = halfdraw::parse_cast(&text).expect("a cast");
+            spells(&cast, claude)
+                .iter()
+                .filter(|s| !s.inside)
+                .map(|s| s.event)
+                .collect()
+        };
+        assert_eq!(
+            ends([
+                Some("\u{25D0} Claude Code"),
+                Some("\u{25D0} Claude Code"),
+                Some("\u{25D1} Claude Code"),
+                Some("\u{2733} Claude Code"),
+            ]),
+            [3],
+            "the done frame"
+        );
+        assert_eq!(ends([None; 4]), [1], "CONTROL: the first mid-reply frame");
+    }
+
     const EOT_GATE: &str = include_str!("fixtures/muse-1.4.10-R6427.1-lab-eot-gate.cast");
 
+    /// Muse Code's end-of-turn gate (lab `eot-gate`, MEASURED): its last reply stands under its
+    /// spinner title for 0.5 to 1 s before the title rests. The scan reads the title beside the
+    /// screen, so the turn's end opens where the title rests; the screen alone (titles stripped)
+    /// opens it that gate earlier, and the gate is the time the end reports its title rested
+    /// after the end drew.
     #[test]
     fn a_muse_turn_end_is_told_by_its_resting_title() {
         let cast = halfdraw::parse_cast(EOT_GATE).expect("the cast");
@@ -1027,9 +1089,9 @@ mod tests {
             .rfind(|s| s.evidence && !s.inside)
             .expect("the turn's end");
         let title = end.title.as_deref().expect("a title");
-        assert!(muse.title_runs(title) == Some(true), "{title:?}");
+        assert!(muse.title_runs(title) == Some(false), "{title:?}");
         let rested = end.title_rested.expect("the title rested");
-        assert!((0.5..1.0).contains(&rested), "{rested}");
+        assert!((0.5..1.0).contains(&rested), "after the end drew: {rested}");
         assert!(
             end.rows
                 .iter()
@@ -1039,7 +1101,9 @@ mod tests {
         );
         let text = spell_report("c", &all, 1);
         assert!(
-            text.contains("1 of 1 turn ends saw the title rest (latest 0.6"),
+            text.contains(&format!(
+                "1 of 1 turn ends saw the title rest (latest {rested:.3} s after the end drew)"
+            )),
             "{text}"
         );
         let mut untitled = halfdraw::parse_cast(EOT_GATE).expect("the cast");
@@ -1057,6 +1121,15 @@ mod tests {
                 .all(|s| s.title.is_none() && s.title_rested.is_none())
         );
         assert!(!spell_report("c", &bare, 1).contains("title:"));
+        let screen_end = bare
+            .iter()
+            .rfind(|s| s.evidence && !s.inside)
+            .expect("the screen's end");
+        let gate = end.at - screen_end.at;
+        assert!(
+            (rested - gate).abs() < 1e-9,
+            "the gate the title holds: {gate}, reported {rested}"
+        );
         // Claude Code's reader reads its own title, in which Muse Code's spinner is no run: a
         // spell with a title rests where it opened.
         let claude = spells(&cast, Program::Claude.reader());

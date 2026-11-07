@@ -122,20 +122,17 @@ pub trait Item: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Reapplies an idempotent runtime setting after an `Ok` probe in apply mode.
-    fn refresh(&self, _sys: &dyn System, _ctx: &Ctx) -> Option<Result<(), String>> {
-        None
-    }
-
-    /// Refresh with the same live authorization used by a guarded apply. Batches
-    /// override this to check again before each effect.
+    /// Reapply an idempotent runtime setting after an `Ok` probe in apply mode, while the
+    /// caller's live authorization holds. A runtime refresh checks `current` immediately
+    /// before its effect, and a batch checks again at each boundary. An item without a
+    /// refresh returns `None` without consuming or changing that authorization.
     fn refresh_guarded(
         &self,
-        sys: &dyn System,
-        ctx: &Ctx,
+        _sys: &dyn System,
+        _ctx: &Ctx,
         _current: &(dyn Fn() -> Result<(), String> + Sync),
     ) -> Option<Result<(), String>> {
-        self.refresh(sys, ctx)
+        None
     }
 
     /// Whether an apply-mode refresh must be journaled before it runs.

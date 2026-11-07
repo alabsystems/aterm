@@ -118,13 +118,8 @@ pub(super) fn trusted_caller(job: &Job, peer: Peer) -> bool {
     }) && aterm_uds::process::read_birth(pid) == Some(birth)
 }
 pub(super) fn covered(job: &mut Job, peer: Peer) -> bool {
-    aterm_uds::process::stable_descendant(
-        peer.pid,
-        aterm_uds::process::Birth(peer.birth),
-        job.child.child_mut().id(),
-        aterm_uds::process::Birth(job.root_birth),
-        Instant::now() + Duration::from_millis(100),
-    ) || job.members.values_mut().any(|member| member.covers(peer))
+    member::scope_covers(peer, job.child.child_mut().id(), job.root_birth)
+        || job.members.values_mut().any(|member| member.covers(peer))
 }
 impl Owner {
     pub(in super::super) fn authorize_member(&mut self, request: &Authorization) -> bool {

@@ -6375,6 +6375,7 @@ mod worker_start_app_tests {
                     1,
                     aterm_phase::Program::Codex,
                     Err::<(aterm_agent::harness::worker::Admitted, ()), _>(refused),
+                    None,
                     || Some("m22".to_owned()),
                 );
                 assert!(taken.is_none(), "a refused worker goes no further");

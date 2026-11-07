@@ -58,6 +58,16 @@ pub struct Bound<'a> {
     after: Vec<String>,
 }
 
+fn continuing(sys: &dyn System) -> Result<(), String> {
+    match sys.stopped() {
+        Some(signal) => Err(format!(
+            "setup was stopped by {}",
+            crate::port::stop_name(signal)
+        )),
+        None => Ok(()),
+    }
+}
+
 impl<'a> Bound<'a> {
     /// `item`, bound to `sys` and `ctx` at `place`, with its own `after` edges.
     #[must_use]
@@ -124,11 +134,14 @@ impl aterm_converge::Item for Bound<'_> {
     }
 
     fn apply(&self) -> Result<(), String> {
-        self.item.apply(self.sys, self.ctx)
+        continuing(self.sys)?;
+        self.item
+            .apply_guarded(self.sys, self.ctx, &|| continuing(self.sys))
     }
 
     fn refresh(&self) -> Option<Result<(), String>> {
-        self.item.refresh(self.sys, self.ctx)
+        self.item
+            .refresh_guarded(self.sys, self.ctx, &|| continuing(self.sys))
     }
 
     fn refresh_changes(&self) -> bool {
@@ -212,6 +225,7 @@ impl aterm_converge::Activation for BoundActivation<'_> {
     }
 
     fn activate(&self) -> Result<Vec<(String, String)>, String> {
+        continuing(self.sys)?;
         self.inner.activate(self.sys, self.ctx)
     }
 }
@@ -257,6 +271,7 @@ mod tests {
     use super::*;
     use crate::model::{HostFacts, Outcome};
     use crate::port::Fake;
+    use aterm_converge::Item as _;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -323,9 +338,16 @@ mod tests {
         fn apply(&self, _: &dyn System, _: &Ctx) -> Result<(), String> {
             Ok(())
         }
-        fn refresh(&self, _: &dyn System, _: &Ctx) -> Option<Result<(), String>> {
-            self.refreshes.fetch_add(1, Ordering::SeqCst);
-            Some(self.refresh.clone())
+        fn refresh_guarded(
+            &self,
+            _: &dyn System,
+            _: &Ctx,
+            current: &(dyn Fn() -> Result<(), String> + Sync),
+        ) -> Option<Result<(), String>> {
+            Some(current().and_then(|()| {
+                self.refreshes.fetch_add(1, Ordering::SeqCst);
+                self.refresh.clone()
+            }))
         }
         fn after(&self) -> Vec<String> {
             self.after.clone()
@@ -364,6 +386,44 @@ mod tests {
         assert_eq!(rows[0].class, Some(Class::Preference));
         assert_eq!(refreshes.load(Ordering::SeqCst), 1);
         assert_eq!(*hosts.lock().unwrap(), ["h@501", "h@501"]);
+
+        // A stop caught after a real preference's probe must prevent its later native setter,
+        // even while another lane keeps the process alive to finish its owned child cleanup.
+        let mut native_ctx = ctx();
+        native_ctx.users = vec![crate::items::defaults::tests::user("alice", 501)];
+        let sys = Fake::root();
+        sys.scroll_state(true).on(
+            "alice$ /usr/bin/defaults export -g -",
+            crate::items::defaults::tests::export(
+                "<dict><key>com.apple.swipescrolldirection</key><true/></dict>",
+            ),
+        );
+        let items = crate::init_trackpad::items(&native_ctx).unwrap();
+        let bound = bind(
+            items
+                .iter()
+                .map(|item| (item.as_ref(), Place::fleet(item.family(), Remedy::None))),
+            &sys,
+            &native_ctx,
+        );
+        assert!(matches!(bound[0].probe(), Probe::Change { .. }));
+        sys.stop_now();
+        assert!(bound[0].apply().is_err());
+        assert!(matches!(bound[0].refresh(), Some(Err(_))));
+        assert!(
+            !sys.calls()
+                .iter()
+                .any(|call| call.starts_with("scroll-direction set"))
+        );
+        let no_refresh = crate::init_clt::CommandLineTools::new(
+            Box::new(|_| panic!("a missing refresh does not probe the root item")),
+            "/Applications/aterm.app/Contents/MacOS/aterm".into(),
+        );
+        assert!(
+            Bound::new(&no_refresh, &sys, &native_ctx, crate::init_clt::place())
+                .refresh()
+                .is_none()
+        );
     }
 
     #[test]

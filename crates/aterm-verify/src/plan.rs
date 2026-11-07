@@ -473,7 +473,7 @@ pub fn declared(scope: &Scope) -> Vec<StageSpec> {
         ),
         spec(
             StageId::ForeignCells,
-            "cells (each linted for its own triple on rustup's toolchain)",
+            "cells (each linted for its own triple on the checkout's stock pin)",
             Lane::CellsTarget,
         ),
         spec(

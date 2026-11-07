@@ -637,7 +637,7 @@ fn main_reader_records_then_checks_the_splice_without_blessing_old_answers() {
                 .lines()
                 .filter(|l| l.starts_with("worktree "))
                 .count(),
-            1
+            2
         );
     }
 }
@@ -655,7 +655,17 @@ fn measure_main_fixture_reader() {
         .parent()
         .unwrap()
         .to_path_buf();
-    let corpus = fs::read_to_string(repo.join(fixtures::SHIPPED_STATE_CORPUS)).unwrap();
+    let git = Git::new(&repo);
+    let before = std::env::var("ATERM_MEASURE_MAIN_BASE").unwrap_or_else(|_| "HEAD".into());
+    let corpus = crate::ledger::git_ok(
+        &git,
+        &[
+            "show",
+            &format!("{before}:{}", fixtures::SHIPPED_STATE_CORPUS),
+        ],
+    )
+    .unwrap()
+    .stdout_utf8();
     let prefix = format!("v{version}/");
     let without = corpus
         .lines()
@@ -664,12 +674,11 @@ fn measure_main_fixture_reader() {
         .join("\n")
         + "\n";
     assert_ne!(without, corpus);
-    let git = Git::new(&repo);
     let blob = git
         .git_input(&["hash-object", "-w", "--stdin"], without.as_bytes())
         .unwrap();
     assert!(blob.success());
-    let base = crate::ledger::rev_parse(&git, "HEAD^{tree}").unwrap();
+    let base = crate::ledger::rev_parse(&git, &format!("{before}^{{tree}}")).unwrap();
     let tree = fixtures::tree_with(
         &git,
         Some(&base),
@@ -682,7 +691,7 @@ fn measure_main_fixture_reader() {
             "commit-tree",
             &tree,
             "-p",
-            "HEAD",
+            &before,
             "-m",
             "measure main fixture reader (unreferenced)",
         ],
@@ -702,19 +711,23 @@ fn measure_main_fixture_reader() {
     println!("cold: {}", reading.checks);
     assert!(reading.answers.is_ok(), "{}", reading.checks);
     assert!(reading.checks.starts_with("PASS"), "{}", reading.checks);
-    // A new tip changes the tree, so it gets a new judgment. Unchanged source
-    // files keep their path and build-script inputs across the checkout.
+    // Reopen on current main, possibly many commits later. Rebuild the preview
+    // from that tip's own corpus rather than carrying the older tree's answers.
+    let corpus = fs::read_to_string(repo.join(fixtures::SHIPPED_STATE_CORPUS)).unwrap();
+    let without = corpus
+        .lines()
+        .filter(|l| !l.starts_with(&prefix))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
     let blob = git
-        .git_input(
-            &["hash-object", "-w", "--stdin"],
-            b"main moved during after-cut\n",
-        )
+        .git_input(&["hash-object", "-w", "--stdin"], without.as_bytes())
         .unwrap();
     assert!(blob.success());
     let moved_tree = fixtures::tree_with(
         &git,
-        Some(&tree),
-        &[("README.md", blob.stdout_utf8().trim())],
+        Some(&crate::ledger::rev_parse(&git, "HEAD^{tree}").unwrap()),
+        &[(fixtures::SHIPPED_STATE_CORPUS, blob.stdout_utf8().trim())],
     )
     .unwrap();
     let moved = crate::ledger::git_ok(
@@ -730,6 +743,8 @@ fn measure_main_fixture_reader() {
     )
     .unwrap()
     .stdout_utf8();
+    drop(reader);
+    let mut reader = fixtures::MainReader::new(&repo).unwrap();
     let reading = reader.read(
         &targo(),
         moved.trim(),
@@ -738,6 +753,87 @@ fn measure_main_fixture_reader() {
     );
     println!("changed tip, warm source: {}", reading.checks);
     assert!(reading.checks.starts_with("PASS"), "{}", reading.checks);
+}
+
+#[test]
+fn main_reader_reopens_warm_but_never_reuses_previous_answers_or_tree() {
+    let o = Origin::new();
+    let mut previous = None;
+    for take in 0..2 {
+        fs::write(o.work.join("reader-input"), format!("tip {take}\n")).unwrap();
+        git(&o.work, &["add", "reader-input"]);
+        git(&o.work, &["commit", "-m", "move reader input"]);
+        let tip = git(&o.work, &["rev-parse", "HEAD"]);
+        let mut reader = fixtures::MainReader::new(&o.work).unwrap();
+        assert!(
+            fixtures::MainReader::new(&o.work).is_err(),
+            "workspace must be leased"
+        );
+        let mut calls = 0;
+        let binary = o
+            .work
+            .join(format!("target/debug/deps/aterm_gui-{take:016x}"));
+        fs::write(&binary, format!("compiled tip {take}")).unwrap();
+        let reading = reader.read(&targo(), tip.trim(), &pins(7), &mut |cmd| {
+            calls += 1;
+            let tree = cmd.get_current_dir().unwrap();
+            assert_eq!(
+                fs::read_to_string(tree.join("reader-input")).unwrap(),
+                format!("tip {take}\n")
+            );
+            let stdout = match calls {
+                1 => {
+                    assert_eq!(
+                        fs::read_to_string(tree.join(fixtures::SHIPPED_STATE_CORPUS)).unwrap(),
+                        corpus()
+                    );
+                    assert!(!tree.join("interrupted-desk").exists());
+                    if let Some(path) = &previous {
+                        assert_eq!(tree, path);
+                    }
+                    previous = Some(tree.to_path_buf());
+                    artifact(tree, &binary)
+                }
+                2 => {
+                    assert_eq!(cmd.get_program(), binary.as_os_str());
+                    let output = env_of(cmd, fixtures::ANSWERS_OUT).unwrap();
+                    assert!(
+                        !Path::new(&output).exists(),
+                        "previous answers must be removed"
+                    );
+                    if take == 0 {
+                        fs::write(output, staged_answers(&["history"])).unwrap();
+                    }
+                    "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n"
+                        .into()
+                }
+                3 => {
+                    fs::write(tree.join("interrupted-desk"), "stale").unwrap();
+                    "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n"
+                        .into()
+                }
+                _ => unreachable!(),
+            };
+            Ok(Output {
+                status: exit(0),
+                stdout: stdout.into_bytes(),
+                stderr: Vec::new(),
+            })
+        });
+        if take == 0 {
+            assert!(reading.checks.starts_with("PASS"), "{}", reading.checks);
+        } else {
+            // Negative control: a successful recorder that writes nothing cannot
+            // borrow the preceding release's answers or reach the consumer tests.
+            assert!(reading.answers.is_err());
+            assert!(
+                reading.checks.contains("main reader answers:"),
+                "{}",
+                reading.checks
+            );
+            assert_eq!(calls, 2);
+        }
+    }
 }
 
 #[test]
@@ -753,9 +849,9 @@ fn an_unproven_main_recorder_is_held_before_another_compile() {
         &mut generator(&["history"], &runs),
     )
     .unwrap();
-    let mut reader = fixtures::MainReader::new(&o.work).unwrap();
     let mut calls = 0;
     let landed = fixtures::land(&Git::new(&o.work), &staged, &pins(7), 5, &mut |preview| {
+        let mut reader = fixtures::MainReader::new(&o.work).unwrap();
         let first = reader.read(&targo(), preview, &pins(7), &mut |cmd| {
             calls += 1;
             Ok(if calls == 1 {
@@ -778,6 +874,8 @@ fn an_unproven_main_recorder_is_held_before_another_compile() {
             })
         });
         assert!(first.answers.is_err());
+        drop(reader);
+        let mut reader = fixtures::MainReader::new(&o.work).unwrap();
         let held = reader.read(&targo(), preview, &pins(7), &mut |_| {
             panic!("must not replace an unproven executable")
         });
@@ -880,8 +978,8 @@ fn a_landing_that_loses_the_race_lands_on_the_winners_tip() {
     );
     drop(reader);
     assert!(
-        !source_paths[0].exists(),
-        "the landing releases its reader worktree"
+        source_paths[0].exists(),
+        "the landing retains its reader worktree for the next cut"
     );
     assert_eq!(
         o.on_main(fixtures::SHIPPED_STATE_CORPUS),

@@ -1903,9 +1903,8 @@ fn a_start_suspended_child_reads_one_unstarted_thread_and_is_not_held() {
         after + STRANDED_AFTER_US
     ));
     if let Ok(d) = aterm_uds::program_check::running() {
-        let daemon_us = d.start_s * 1_000_000 + u64::from(d.start_us);
         assert!(
-            !before_daemon(Some(after), daemon_us, now_us()),
+            !before_daemon(Some(after), d.started_us(), now_us()),
             "a fresh child is never older than the syspolicyd running now ({d:?}): {facts:?}"
         );
     }

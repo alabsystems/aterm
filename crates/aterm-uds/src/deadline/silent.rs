@@ -484,7 +484,7 @@ fn judged<C: super::Waited>(
 ) -> std::process::Output {
     let by = super::saturating_after(std::time::Instant::now(), hang);
     let mut overran = None;
-    let ended = super::drained_by(
+    let ended = super::drained_owned(
         child,
         pipes,
         group,
@@ -499,6 +499,8 @@ fn judged<C: super::Waited>(
                 super::saturating_after(std::time::Instant::now(), how.reap),
             );
         },
+        false,
+        None,
     );
     match ended {
         Ok(Ok(out)) => out,

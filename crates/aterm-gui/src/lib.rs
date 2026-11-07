@@ -22968,7 +22968,7 @@ impl PassRun {
     }
 
     fn verdict(&self) -> PassVerdict {
-        if self.seen.stdout_unread || self.seen.stderr_unread {
+        if self.seen.cancelled || self.seen.stdout_unread || self.seen.stderr_unread {
             return PassVerdict::Refused;
         }
         classify_pass_exit(self.code, self.seen.saw_start, self.seen.saw_terminal)
@@ -22985,11 +22985,15 @@ impl PassRun {
             .filter(|l| !l.is_empty())
             .collect::<Vec<_>>()
             .join(" | ");
-        let prefix = match (self.seen.stdout_unread, self.seen.stderr_unread) {
-            (true, true) => Some(PASS_OUTPUT_UNREAD),
-            (true, false) => Some(PASS_STDOUT_UNREAD),
-            (false, true) => Some(PASS_STDERR_UNREAD),
-            (false, false) => None,
+        let prefix = if self.seen.cancelled {
+            Some("atpkg operation cancelled after its launch moved on")
+        } else {
+            match (self.seen.stdout_unread, self.seen.stderr_unread) {
+                (true, true) => Some(PASS_OUTPUT_UNREAD),
+                (true, false) => Some(PASS_STDOUT_UNREAD),
+                (false, true) => Some(PASS_STDERR_UNREAD),
+                (false, false) => None,
+            }
         };
         let reserved = prefix.map_or(0, |prefix| prefix.chars().count().saturating_add(2));
         let keep = 2000usize.saturating_sub(reserved);
@@ -23017,6 +23021,7 @@ impl PassRun {
             && !self.seen.saw_failure
             && !self.seen.stdout_unread
             && !self.seen.stderr_unread
+            && !self.seen.cancelled
     }
 
     fn ran(&self) -> bool {
@@ -23026,12 +23031,55 @@ impl PassRun {
 
 fn run_atpkg_pass<P: Fn(Wake) + Clone + Send + 'static>(
     argv: Vec<std::ffi::OsString>,
-    mut cmd: aterm_uds::spawnfd::Command,
+    cmd: aterm_uds::spawnfd::Command,
     child_path: Option<&str>,
     layout: Option<&atpkg::store::Layout>,
     first_run: bool,
     post: &P,
     spawned: &dyn Fn(u32),
+) -> std::io::Result<PassRun> {
+    run_atpkg_pass_owned(
+        argv,
+        cmd,
+        child_path,
+        layout,
+        first_run,
+        post,
+        PassLaunch::new(spawned),
+    )
+}
+
+struct PassLaunch<'a> {
+    spawned: &'a dyn Fn(u32),
+    #[cfg(unix)]
+    cancellation: Option<PassCancellation<'a>>,
+}
+
+impl<'a> PassLaunch<'a> {
+    fn new(spawned: &'a dyn Fn(u32)) -> Self {
+        Self {
+            spawned,
+            #[cfg(unix)]
+            cancellation: None,
+        }
+    }
+}
+
+#[cfg(unix)]
+struct PassCancellation<'a> {
+    reader: std::io::PipeReader,
+    writer: std::io::PipeWriter,
+    requested: &'a dyn Fn() -> bool,
+}
+
+fn run_atpkg_pass_owned<P: Fn(Wake) + Clone + Send + 'static>(
+    argv: Vec<std::ffi::OsString>,
+    mut cmd: aterm_uds::spawnfd::Command,
+    child_path: Option<&str>,
+    layout: Option<&atpkg::store::Layout>,
+    first_run: bool,
+    post: &P,
+    launch: PassLaunch<'_>,
 ) -> std::io::Result<PassRun> {
     // The pass's stderr is copied into aterm.log ([`report_pass_verdict`] and the lane's own
     // lines), so its notices print the log's form: an aterm.toml value by its length, a line
@@ -23046,7 +23094,7 @@ fn run_atpkg_pass<P: Fn(Wake) + Clone + Send + 'static>(
         cmd.env("PATH", path);
     }
     let waiter = aterm_messages::Waiter::of(first_run);
-    let (run, _) = run_pass_child(&mut cmd, layout, first_run, waiter, post, spawned)?;
+    let (run, _) = run_pass_child_owned(&mut cmd, layout, first_run, waiter, post, launch)?;
     Ok(run)
 }
 
@@ -23061,15 +23109,33 @@ fn run_pass_child<P: Fn(Wake) + Clone + Send + 'static>(
     post: &P,
     spawned: &dyn Fn(u32),
 ) -> std::io::Result<(PassRun, std::io::Result<std::process::ExitStatus>)> {
+    run_pass_child_owned(
+        cmd,
+        layout,
+        first_run,
+        waiter,
+        post,
+        PassLaunch::new(spawned),
+    )
+}
+
+fn run_pass_child_owned<P: Fn(Wake) + Clone + Send + 'static>(
+    cmd: &mut aterm_uds::spawnfd::Command,
+    layout: Option<&atpkg::store::Layout>,
+    first_run: bool,
+    waiter: aterm_messages::Waiter,
+    post: &P,
+    launch: PassLaunch<'_>,
+) -> std::io::Result<(PassRun, std::io::Result<std::process::ExitStatus>)> {
     #[cfg(unix)]
     {
-        run_streamed_pass_child(cmd, layout, first_run, waiter, post, spawned)
+        run_streamed_pass_child(cmd, layout, first_run, waiter, post, launch)
     }
     #[cfg(not(unix))]
     {
         let pass_seq_before = layout.and_then(atpkg::status::read).map(|s| s.pass_seq);
         let mut child = cmd.spawn()?;
-        spawned(child.id());
+        (launch.spawned)(child.id());
         let tailer = layout.cloned().and_then(|l| {
             let post = post.clone();
             PkgProgressTailer::spawn(l, child.id(), waiter, move |snapshot| {
@@ -23127,9 +23193,9 @@ fn run_streamed_pass_child<P: Fn(Wake) + Clone + Send + 'static>(
     first_run: bool,
     waiter: aterm_messages::Waiter,
     post: &P,
-    spawned: &dyn Fn(u32),
+    launch: PassLaunch<'_>,
 ) -> std::io::Result<(PassRun, std::io::Result<std::process::ExitStatus>)> {
-    use aterm_uds::deadline::{ChildOutput, stream_until_stopped};
+    use aterm_uds::deadline::{ChildOutput, stream_with_stdin_until_stopped};
     let pass_seq_before = layout.and_then(atpkg::status::read).map(|s| s.pass_seq);
     let mut started = false;
     let mut tailer = None;
@@ -23137,12 +23203,29 @@ fn run_streamed_pass_child<P: Fn(Wake) + Clone + Send + 'static>(
     let mut seen = SeedMarkers::default();
     let mut stderr = PassStderrTail::default();
     let mut emit = |event| post(tag_first_run(event, first_run));
-    let result = stream_until_stopped(
+    let (stdin, writer, requested) = match launch.cancellation {
+        Some(cancel) => (
+            aterm_uds::spawnfd::Stdio::from(cancel.reader),
+            Some(cancel.writer),
+            Some(cancel.requested),
+        ),
+        None => (aterm_uds::spawnfd::Stdio::null(), None, None),
+    };
+    let writer = std::cell::RefCell::new(writer);
+    let mut retire = || {
+        writer.borrow_mut().take();
+    };
+    let retirement = requested
+        .is_some()
+        .then_some(&mut retire as &mut dyn FnMut());
+    let mut cancelled = false;
+    let result = stream_with_stdin_until_stopped(
         cmd,
+        stdin,
         None,
         |pid| {
             started = true;
-            spawned(pid);
+            (launch.spawned)(pid);
             tailer = layout.cloned().and_then(|layout| {
                 let post = post.clone();
                 PkgProgressTailer::spawn(layout, pid, waiter, move |snapshot| {
@@ -23162,11 +23245,20 @@ fn run_streamed_pass_child<P: Fn(Wake) + Clone + Send + 'static>(
             }
             Ok(())
         },
-        // Helpers may create independent process groups. Retiring this root alone is not
-        // sufficient cancellation authority for a package operation that still mutates.
-        || false,
+        || {
+            if requested.is_some_and(|request| request()) {
+                cancelled = true;
+                writer.borrow_mut().take();
+            }
+            // Only request cooperative cancellation; retain the root and its pipe drains
+            // until atpkg has retired its helpers and completed the mutation boundary.
+            false
+        },
+        retirement,
     );
-    let eof = matches!(&result, Ok(Some(_)));
+    cancelled |= requested.is_some_and(|request| request());
+    seen.cancelled = cancelled;
+    let eof = !cancelled && matches!(&result, Ok(Some(_)));
     seen.stdout_unread = frames.finish(eof, |raw| record_seed_frame(raw, &mut seen, &mut emit));
     seen.stderr_unread = !eof;
     if seen.saw_machine_change && !seen.saw_machine_state {
@@ -23345,7 +23437,10 @@ fn report_pass_verdict(
             aterm_log::warn!("{}", refused_line(verb, unanswered));
             if verb.refusal_is_a_failure() {
                 post(Wake::PkgSeedFailed {
-                    detail: if run.seen.stdout_unread || run.seen.stderr_unread {
+                    detail: if run.seen.cancelled
+                        || run.seen.stdout_unread
+                        || run.seen.stderr_unread
+                    {
                         why.clone()
                     } else {
                         pass_said_detail(&run.said)
@@ -24647,6 +24742,7 @@ struct SeedMarkers {
     saw_machine_state: bool,
     stdout_unread: bool,
     stderr_unread: bool,
+    cancelled: bool,
 }
 
 const PASS_STDOUT_LINE_MAX: usize = 8 * 1024 * 1024;
@@ -24791,7 +24887,7 @@ const fn seed_retire(seen: SeedMarkers, ok: bool, store_holds_programs: bool) ->
     if !seen.saw_start || seen.saw_terminal {
         return SeedRetire::Nothing;
     }
-    if !ok || seen.stdout_unread || seen.stderr_unread {
+    if !ok || seen.cancelled || seen.stdout_unread || seen.stderr_unread {
         return SeedRetire::Failed;
     }
     if store_holds_programs {

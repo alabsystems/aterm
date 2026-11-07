@@ -770,8 +770,15 @@ pub trait System: Sync {
         ))
     }
 
-    /// Run `cmd` with inherited stdio and no deadline on the controlling terminal.
-    fn run_tty(&self, cmd: &Cmd) -> Result<Option<i32>, RunFailed>;
+    /// Run `cmd` with inherited stdio and no deadline on the controlling terminal. After
+    /// validating the command and owning the terminal, call `before` immediately before
+    /// spawning; its refusal starts no child. The same terminal lease covers its prelude
+    /// and the child's whole owning wait.
+    fn run_tty(
+        &self,
+        cmd: &Cmd,
+        before: &mut dyn FnMut() -> Result<(), RunFailed>,
+    ) -> Result<Option<i32>, RunFailed>;
 
     /// Whether `/dev/tty` can be opened for reading and writing.
     fn has_tty(&self) -> bool {
@@ -1494,6 +1501,26 @@ impl Live {
         env
     }
 
+    fn capture_current(&self) -> Result<(), RunFailed> {
+        match self.stopped() {
+            Some(signal) => Err(RunFailed::Refused(format!(
+                "the run was stopped by {}",
+                stop_name(signal)
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    fn capture_failure(&self, failed: RunFailed) -> RunFailed {
+        match (failed, self.stopped()) {
+            (RunFailed::TimedOut(_), Some(signal)) => RunFailed::AfterStart(format!(
+                "the run was stopped by {} after starting its child",
+                stop_name(signal)
+            )),
+            (failed, _) => failed,
+        }
+    }
+
     fn run_until_deadline(&self, cmd: &Cmd) -> Result<Ran, RunFailed> {
         use std::os::unix::fs::OpenOptionsExt as _;
         let failed = |e: io::Error| RunFailed::Spawn(e.to_string());
@@ -1514,22 +1541,37 @@ impl Live {
             .stdin(stdin)
             .stdout(open(&out)?)
             .stderr(open(&err)?);
-        let mut child = child.spawn().map_err(failed)?;
+        self.capture_current()?;
+        struct Owned(aterm_uds::spawnfd::Child);
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                aterm_uds::deadline::settle_child(&mut self.0);
+            }
+        }
+        let mut owned = Owned(child.spawn().map_err(failed)?);
+        let child = &mut owned.0;
         let deadline = deadline_after(cmd.budget);
-        let mut exit = aterm_uds::deadline::ExitWait::new(&child);
+        let mut exit = aterm_uds::deadline::ExitWait::new(child);
         let status = loop {
+            if let Some(signal) = self.stopped() {
+                aterm_uds::deadline::settle_child(child);
+                return Err(RunFailed::AfterStart(format!(
+                    "the run was stopped by {} after starting its child",
+                    stop_name(signal)
+                )));
+            }
             match child.try_wait() {
                 Ok(Some(status)) => break status.code(),
                 Ok(None) => {
                     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                     if remaining.is_zero() {
-                        end_group(&mut child);
+                        aterm_uds::deadline::settle_child(child);
                         break None;
                     }
-                    exit.wait(remaining);
+                    exit.wait(remaining.min(aterm_uds::deadline::STOP_TICK));
                 }
                 Err(e) => {
-                    end_group(&mut child);
+                    aterm_uds::deadline::settle_child(child);
                     return Err(RunFailed::AfterStart(format!("wait failed: {e}")));
                 }
             }
@@ -1563,18 +1605,10 @@ fn account_env(user: &User) -> [(String, String); 6] {
     .map(|(k, v)| (k.to_owned(), v.to_owned()))
 }
 
-/// How long [`end_group`] and a relay's close wait to reap a child they killed: one still
+/// How long a relay's close waits to reap a child it killed: one still
 /// there (held in the kernel) is left to its handle's drop, which hands it to the reaper,
 /// rather than holding the caller for ever.
 const REAP_HANG: Duration = Duration::from_secs(1);
-
-fn end_group(child: &mut aterm_uds::spawnfd::Child) {
-    if let Ok(pid) = libc::pid_t::try_from(child.id()) {
-        // `child` is not yet reaped, so its pid and process group id remain valid.
-        let _ = aterm_uds::process::kill_group_until_empty(pid);
-    }
-    aterm_uds::deadline::kill_within(child, REAP_HANG);
-}
 
 fn open_stdin_file(path: Option<&Path>) -> Result<aterm_uds::spawnfd::Stdio, RunFailed> {
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -1812,6 +1846,7 @@ impl System for Live {
     }
 
     fn set_natural_scrolling(&self, natural: bool) -> Result<(), String> {
+        self.capture_current().map_err(|why| why.to_string())?;
         scroll_direction::set(natural)
     }
 
@@ -1822,6 +1857,7 @@ impl System for Live {
         product: u32,
         changes: &[KeyboardMapChange],
     ) -> Result<(), String> {
+        self.capture_current().map_err(|why| why.to_string())?;
         #[cfg(target_os = "macos")]
         {
             keyboard_maps::set(target_uid, vendor, product, changes)
@@ -1847,17 +1883,23 @@ impl System for Live {
         if cmd.keep_on_timeout {
             return self.run_until_deadline(cmd);
         }
+        self.capture_current()?;
         let (program, args) = self.argv(cmd)?;
         let mut child = fixed_command(&program, &args, &self.child_env(cmd), cmd.cwd.as_deref());
         let stdin = open_stdin_file(cmd.stdin.as_deref())?;
         let deadline = deadline_after(cmd.budget);
-        match aterm_uds::deadline::output_until_from(&mut child, stdin, deadline) {
+        match aterm_uds::deadline::output_until_from_unless(
+            &mut child,
+            stdin,
+            deadline,
+            &mut || self.stopped().is_some(),
+        ) {
             Ok(out) => Ok(Ran {
                 status: out.status.code(),
                 stdout: out.stdout,
                 stderr: out.stderr,
             }),
-            Err(error) => Err(RunFailed::from_child(error, cmd.budget)),
+            Err(error) => Err(self.capture_failure(RunFailed::from_child(error, cmd.budget))),
         }
     }
 
@@ -1873,13 +1915,20 @@ impl System for Live {
                 cmd.program.display()
             )));
         }
+        self.capture_current()?;
         let (program, args) = self.argv(cmd)?;
         let mut child = fixed_command(&program, &args, &self.child_env(cmd), cmd.cwd.as_deref());
         let stdin = open_stdin_file(cmd.stdin.as_deref())?;
         let deadline = deadline_after(cmd.budget);
-        let out =
-            aterm_uds::deadline::output_until_complete_stdout_from(&mut child, stdin, deadline)
-                .map_err(|error| RunFailed::from_complete_output(error, cmd.budget))?;
+        let out = aterm_uds::deadline::output_until_complete_stdout_from_unless(
+            &mut child,
+            stdin,
+            deadline,
+            &mut || self.stopped().is_some(),
+        )
+        .map_err(|error| {
+            self.capture_failure(RunFailed::from_complete_output(error, cmd.budget))
+        })?;
         Ok(Ran {
             status: out.status.code(),
             stdout: out.stdout,
@@ -1891,7 +1940,11 @@ impl System for Live {
         complete_input::run(self, cmd, input)
     }
 
-    fn run_tty(&self, cmd: &Cmd) -> Result<Option<i32>, RunFailed> {
+    fn run_tty(
+        &self,
+        cmd: &Cmd,
+        before: &mut dyn FnMut() -> Result<(), RunFailed>,
+    ) -> Result<Option<i32>, RunFailed> {
         if !cmd.program.is_absolute() {
             return Err(RunFailed::Refused(format!(
                 "{} is not an absolute path",
@@ -1907,6 +1960,9 @@ impl System for Live {
             child.current_dir(dir);
         }
         let status = owning_terminal(|| {
+            self.capture_current()?;
+            before()?;
+            self.capture_current()?;
             let mut started = child
                 .args(&args)
                 .stdin(aterm_uds::spawnfd::Stdio::inherit())
@@ -1928,6 +1984,7 @@ impl System for Live {
                 cmd.program.display()
             )));
         }
+        self.capture_current()?;
         let (program, args) = self.argv(cmd)?;
         let mut child = fixed_command(&program, &args, &self.child_env(cmd), cmd.cwd.as_deref());
         let (reader, mut writer) = io::pipe().map_err(|e| RunFailed::Spawn(e.to_string()))?;
@@ -1937,17 +1994,18 @@ impl System for Live {
             .map_err(|e| RunFailed::Spawn(format!("the input pipe: {e}")))?;
         drop(writer);
         let deadline = deadline_after(cmd.budget);
-        match aterm_uds::deadline::output_until_from(
+        match aterm_uds::deadline::output_until_from_unless(
             &mut child,
             aterm_uds::spawnfd::Stdio::from(reader),
             deadline,
+            &mut || self.stopped().is_some(),
         ) {
             Ok(out) => Ok(Ran {
                 status: out.status.code(),
                 stdout: out.stdout,
                 stderr: out.stderr,
             }),
-            Err(error) => Err(RunFailed::from_child(error, cmd.budget)),
+            Err(error) => Err(self.capture_failure(RunFailed::from_child(error, cmd.budget))),
         }
     }
 
@@ -3921,6 +3979,12 @@ mod fake {
         }
 
         fn set_natural_scrolling(&self, natural: bool) -> Result<(), String> {
+            if let Some(signal) = self.stopped() {
+                return Err(format!(
+                    "the run was stopped by {}",
+                    super::stop_name(signal)
+                ));
+            }
             self.calls
                 .lock()
                 .unwrap()
@@ -3945,6 +4009,12 @@ mod fake {
             _product: u32,
             changes: &[super::KeyboardMapChange],
         ) -> Result<(), String> {
+            if let Some(signal) = self.stopped() {
+                return Err(format!(
+                    "the run was stopped by {}",
+                    super::stop_name(signal)
+                ));
+            }
             if self.euid != target_uid {
                 return Err("keyboard activation actor differs from the target user".into());
             }
@@ -4235,28 +4305,35 @@ mod fake {
             *self.awake.lock().unwrap()
         }
 
-        fn run_tty(&self, cmd: &Cmd) -> Result<Option<i32>, RunFailed> {
-            let key = format!("tty {}", cmd.display());
-            self.calls.lock().unwrap().push(key.clone());
-            let model = self.tty_hook.lock().unwrap().clone();
-            if let Some(model) = model
-                && let Some(output) = model(self, cmd)
-            {
-                return Ok(output.status);
-            }
-            let mut replies = self.replies.lock().unwrap();
-            let status = match replies.get_mut(&key) {
-                Some(list) if list.len() > 1 => Ok(list.remove(0).status),
-                Some(list) if list.len() == 1 => Ok(list[0].status),
-                _ => Err(RunFailed::Spawn(format!(
-                    "fake: no reply scripted for `{key}`"
-                ))),
-            };
-            drop(replies);
-            if status.is_ok() {
-                self.produce(&key);
-            }
-            status
+        fn run_tty(
+            &self,
+            cmd: &Cmd,
+            before: &mut dyn FnMut() -> Result<(), RunFailed>,
+        ) -> Result<Option<i32>, RunFailed> {
+            super::owning_terminal(|| {
+                before()?;
+                let key = format!("tty {}", cmd.display());
+                self.calls.lock().unwrap().push(key.clone());
+                let model = self.tty_hook.lock().unwrap().clone();
+                if let Some(model) = model
+                    && let Some(output) = model(self, cmd)
+                {
+                    return Ok(output.status);
+                }
+                let mut replies = self.replies.lock().unwrap();
+                let status = match replies.get_mut(&key) {
+                    Some(list) if list.len() > 1 => Ok(list.remove(0).status),
+                    Some(list) if list.len() == 1 => Ok(list[0].status),
+                    _ => Err(RunFailed::Spawn(format!(
+                        "fake: no reply scripted for `{key}`"
+                    ))),
+                };
+                drop(replies);
+                if status.is_ok() {
+                    self.produce(&key);
+                }
+                status
+            })
         }
 
         fn admit_runtime(&self, root: &Path) -> Result<(), String> {

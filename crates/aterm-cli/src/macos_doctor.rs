@@ -4873,7 +4873,12 @@ mod tests {
                     model.sleep();
                 }
             }
-            fn run_tty(&self, cmd: &Cmd) -> Result<Option<i32>, RunFailed> {
+            fn run_tty(
+                &self,
+                cmd: &Cmd,
+                before: &mut dyn FnMut() -> Result<(), RunFailed>,
+            ) -> Result<Option<i32>, RunFailed> {
+                before()?;
                 self.run(cmd).map(|ran| ran.status)
             }
             fn read_file(&self, _: &Path) -> io::Result<Vec<u8>> {

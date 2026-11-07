@@ -65,7 +65,7 @@ pub fn ssh(
         },
         ["apply"] => {
             let _ = out.flush();
-            match sys.run_tty(&sudo_apply()) {
+            match sys.run_tty(&sudo_apply(), &mut || Ok(())) {
                 Ok(Some(code)) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
                 Ok(None) => ExitCode::FAILURE,
                 Err(e) => super::refuse(out, &format!("apply: sudo did not start: {e}")),

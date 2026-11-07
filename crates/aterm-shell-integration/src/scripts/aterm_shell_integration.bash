@@ -23,20 +23,25 @@
 # Only run in interactive shells
 [[ $- != *i* ]] && return
 
-# Suppress xtrace/verbose during integration load.
-{ __aterm_load_flags=$-; set +xv; } 2>/dev/null
+# Suppress allexport, xtrace and verbose during integration load.
+{ __aterm_load_flags=$-; set +axv; export -n __aterm_load_flags; } 2>/dev/null
 
 # ─── Trace suppression ───
 #
 # User XTRACE (`set -x`) or VERBOSE (`set -v`) would otherwise trace every line
 # of the DEBUG-trap preexec and PROMPT_COMMAND hooks and leak `$__aterm_shell_nonce`
-# into scrollback. bash 3.2 has no `local -`, and `set +x` is itself traced on
-# stderr, so `{ set +xv; } 2>/dev/null` silences both without output, and
+# into scrollback, and user ALLEXPORT (`set -a`) would export every variable and
+# function aterm sets, the nonce and the typed line among them, to each program
+# the user runs. bash 3.2 has no `local -`, and `set +x` is itself traced on
+# stderr, so `{ set +axv; } 2>/dev/null` turns all three off without output, and
 # `__aterm_flags_put` restores the user's flags on return (its `return` is traced
 # only into silenced stderr). User code chained by aterm (scalar PROMPT_COMMAND
 # or prior DEBUG trap) runs with the user's flags restored first. Under
-# BASH_XTRACEFD (bash 4.1+), only the opening `local`/`set +xv` and closing
-# `return` reach the trace fd, without the nonce.
+# BASH_XTRACEFD (bash 4.1+), only the opening `local`/`set +axv` and closing
+# `return` reach the trace fd, without the nonce. The opening `local` comes first,
+# since it reads `$-`, `$?` and `$_` before any command changes them, so under
+# ALLEXPORT what it declares is exported while its hook runs, to aterm's own
+# `rm`, `stty` and `git`.
 
 # ─── Multiplexer boundary (screen / tmux) ───
 #
@@ -114,6 +119,7 @@ if [[ -n "${ATERM_SHELL_INTEGRATION_INSTALLED:-}" ]]; then
         fi
     fi
     unset __aterm_mux
+    case $__aterm_load_flags in *a*) set -a ;; esac
     case $__aterm_load_flags in *v*) set -v ;; esac
     case $__aterm_load_flags in *x*) set -x ;; esac
     { return; } 2>/dev/null
@@ -206,11 +212,12 @@ __aterm_body_check() {
 }
 
 # Permanent PROMPT_COMMAND entry point. Captures `$?`, `$_`, and `$-` while
-# silencing xtrace/verbose, raises `__aterm_in_prompt_cmd` before checking for
-# a body reload so the DEBUG trap ignores sourced body lines, ends the command
-# (its D, before the body check can run a program), and restores flags.
+# turning allexport, xtrace and verbose off, raises `__aterm_in_prompt_cmd`
+# before checking for a body reload so the DEBUG trap ignores sourced body
+# lines, ends the command (its D, before the body check can run a program),
+# and restores xtrace and verbose (the body handler puts allexport back).
 __aterm_prompt_command() {
-    { local __aterm_status=$? __aterm_lastarg=$_ __aterm_flags=$-; set +xv; } 2>/dev/null
+    { local __aterm_status=$? __aterm_lastarg=$_ __aterm_flags=$- __aterm_hook_live=1; set +axv; } 2>/dev/null
     __aterm_in_prompt_cmd=1
     ! declare -F __aterm_end_command >/dev/null || __aterm_end_command "$__aterm_status"
     __aterm_body_check
@@ -222,18 +229,19 @@ __aterm_prompt_command() {
 # Permanent PS0 entry point (bash 5.3+). Guards `__aterm_body_ps0` with
 # `declare -F` so bodies without it do not fail on PS0 expansion.
 __aterm_ps0() {
-    { local __aterm_flags=$-; set +xv; } 2>/dev/null
+    { local __aterm_flags=$- __aterm_hook_live=1; set +axv; } 2>/dev/null
     if declare -F __aterm_body_ps0 >/dev/null; then
         __aterm_body_ps0 || :
     fi
+    case $__aterm_flags in *a*) set -a ;; esac
     case $__aterm_flags in *v*) set -v ;; esac
     case $__aterm_flags in *x*) set -x ;; esac
 }
 
 # @@ATERM-INTEGRATION-BODY-BEGIN@@ — everything from here to the END marker is re-sourced live
 
-# Suppress xtrace/verbose while re-sourcing the body (restored at the end).
-{ __aterm_body_flags=$-; set +xv; } 2>/dev/null
+# Suppress allexport, xtrace and verbose while re-sourcing the body (restored at the end).
+{ __aterm_body_flags=$-; set +axv; } 2>/dev/null
 
 # Enable agy's fast prompt editor by default (including in adopted shells when
 # this body is live-reloaded at the next prompt) so U+202F narrow no-break
@@ -242,10 +250,12 @@ __aterm_ps0() {
 : "${AGY_CLI_FAST_PROMPT_EDITOR=true}"
 export AGY_CLI_FAST_PROMPT_EDITOR
 
-# Restore user's XTRACE and VERBOSE from `$1` (captured `$-`), returning `$2`
-# (default 0) and setting `$_` to the last argument so chained user code sees
-# the original `$?` and `$_`.
+# Restore user's ALLEXPORT, XTRACE and VERBOSE from `$1` (captured `$-`),
+# returning `$2` (default 0) and setting `$_` to the last argument so chained
+# user code sees the original `$?` and `$_`.
 __aterm_flags_put() {
+    local __aterm_hook_live=1
+    case $1 in *a*) set -a ;; esac
     case $1 in *v*) set -v ;; esac
     case $1 in *x*) set -x ;; esac
     { return "${2:-0}"; } 2>/dev/null
@@ -612,7 +622,7 @@ __aterm_rekey_check() {
 # Capability-nonce suffix helper for external callers; internal emitters use
 # `$__aterm_id_suffix_str` directly to avoid a subshell fork.
 __aterm_id_suffix() {
-    { local __aterm_flags=$-; set +xv; } 2>/dev/null
+    { local __aterm_flags=$-; set +axv; } 2>/dev/null
     if [[ -n "$__aterm_shell_nonce" ]]; then
         printf ';id=%s' "$__aterm_shell_nonce"
     fi
@@ -744,7 +754,7 @@ fi
 __aterm_prompt_end_armed=0
 
 __aterm_prompt_end() {
-    { local __aterm_flags=$-; set +xv; } 2>/dev/null
+    { local __aterm_flags=$- __aterm_hook_live=1; set +axv; } 2>/dev/null
     if (( __aterm_prompt_end_armed )); then
         __aterm_prompt_end_armed=0
         __aterm_hist_mark_take
@@ -894,6 +904,7 @@ __aterm_mark_exec_finish() {
 # body's PROMPT_COMMAND handler calls it for a trampoline that predates it. Only
 # the first call writes.
 __aterm_end_command() {
+    local __aterm_hook_live=1
     [[ -n "$__aterm_last_command" ]] || return 0
     __aterm_rekey_take
     __aterm_untraced __aterm_mark_exec_finish "$1"
@@ -928,25 +939,54 @@ __aterm_mark_integration_rev() {
 # DEBUG trap entry point (`trap '__aterm_preexec "$_"' DEBUG`).
 # Passing `"$_"` as the last argument preserves the user's `$_` across the trap.
 # Returns 0 so `extdebug` does not skip the user's command. Only inspects
-# `FUNCNAME[1]` when `functrace`/`extdebug` (`T` in `$-`) is active, so wrapper
+# `FUNCNAME[1]` when `functrace`/`extdebug` (`T` in `$-`) is active or a hook of aterm's
+# is running (`__aterm_untraced` takes `T` away inside its own frame), so wrapper
 # functions installed by frameworks (e.g. starship on bash < 4.4) do not suppress
 # command capture, and because bash 3.2 keeps the frames of a function a Ctrl-C ended
 # in `FUNCNAME`, which outside functrace must not cost a shell its marks.
 __aterm_preexec() {
-    { local __aterm_flags=$-; set +xv; } 2>/dev/null
+    { local __aterm_flags=$-; set +axv; } 2>/dev/null
     local __aterm_in_fn=""
-    case $__aterm_flags in *T*) __aterm_in_fn=${FUNCNAME[1]-} ;; esac
+    case $__aterm_flags:${__aterm_hook_live-} in *T*|*:?*) __aterm_in_fn=${FUNCNAME[1]-} ;; esac
     if [[ -n "$__aterm_prev_debug_handler" || -z "$__aterm_last_command" ]]; then
         __aterm_preexec_run "${1-}" "$__aterm_in_fn"
     fi
-    case $__aterm_flags in *[xv]*) __aterm_flags_put "$__aterm_flags" ;; esac
+    case $__aterm_flags in *[axv]*) __aterm_flags_put "$__aterm_flags" ;; esac
 }
 
 __aterm_preexec_run() {
-    # Chain any pre-existing DEBUG trap handler with the user's flags and `$_`.
+    # Chain any pre-existing DEBUG trap handler with the user's flags and `$_`, for each
+    # command a bare bash runs it for, so never one of aterm's own. Under functrace each
+    # entry to aterm's functions this trap can run in (its hooks, the body's own for a
+    # trampoline that predates the mark, and `__aterm_flags_put`) declares
+    # `__aterm_hook_live` on its first line, as a local, which the functions it calls see
+    # and bash unwinds however the call ends (bash-preexec's hooks run under its own trap);
+    # a body a hook reloads runs in bash's `source` frame. `pc` is the person's scalar
+    # PROMPT_COMMAND, whose top level runs in `__aterm_body_prompt_command` and is theirs.
+    # An entry's first line, and a call of aterm's wherever it is made (the top level of
+    # PROMPT_COMMAND and PS0, the `$(…)` of the prompt aterm draws, a person's wrapper of
+    # PROMPT_COMMAND), are told by their text, so a frame bash 3.2 left stale never hides a
+    # person's command.
     if [[ -n "$__aterm_prev_debug_handler" ]]; then
-        __aterm_flags_put "$__aterm_flags" 0 "$1" && eval "$__aterm_prev_debug_handler"
-        { __aterm_flags=$-; set +xv; } 2>/dev/null
+        local __aterm_rc_skip=""
+        case ${__aterm_hook_live-}:$2:$BASH_COMMAND in
+            1:__aterm_* | 1:source:* | *:__aterm_*:'local __aterm_'*) __aterm_rc_skip=1 ;;
+            pc:__aterm_body_prompt_command:'(( last_status ))') __aterm_rc_skip=1 ;;
+            pc:__aterm_body_prompt_command:'eval "$__aterm_original_prompt_command"')
+                __aterm_rc_skip=1
+                ;;
+            # Where a bare bash runs the person's scalar PROMPT_COMMAND: with no functrace
+            # the trap reaches none of its commands in `__aterm_body_prompt_command`.
+            ::__aterm_prompt_command)
+                [[ $__aterm_flags != *T* ]] && (( ! __aterm_prompt_cmd_is_array )) &&
+                    [[ -n "$__aterm_original_prompt_command" ]] || __aterm_rc_skip=1
+                ;;
+            *:*:__aterm_*) __aterm_rc_skip=1 ;;
+        esac
+        if [[ -z "$__aterm_rc_skip" ]]; then
+            __aterm_flags_put "$__aterm_flags" 0 "$1" && eval "$__aterm_prev_debug_handler"
+            { __aterm_flags=$-; set +axv; } 2>/dev/null
+        fi
     fi
 
     # Skip commands run inside PROMPT_COMMAND (scalar or array elements), our
@@ -958,6 +998,10 @@ __aterm_preexec_run() {
     done
     case $BASH_COMMAND in __aterm_* | __bp_*) return 0 ;; esac
     [[ -n "$2" ]] && return
+    # Functrace hands this trap to each `$(…)` and subshell, the prompt's own among
+    # them, where what it records never reaches the shell: a line that opens with a
+    # subshell reports as it does with no flag (by PS0 on bash 5.3, not at all below).
+    (( BASH_SUBSHELL )) && return
 
     # Capture only the first simple command of the line.
     if [[ -z "$__aterm_last_command" ]]; then
@@ -973,11 +1017,11 @@ __aterm_preexec_run() {
 # here as it does under bash-preexec in a bare bash, once per line. Returns 0:
 # under `extdebug` a non-zero status skips the command.
 __aterm_bp_preexec() {
-    { local __aterm_flags=$-; set +xv; } 2>/dev/null
+    { local __aterm_flags=$-; set +axv; } 2>/dev/null
     if [[ -n "$__aterm_prev_debug_handler" ]]; then
         __aterm_flags_put "$__aterm_flags" 0 "${__bp_last_argument_prev_command-}" &&
             eval "$__aterm_prev_debug_handler"
-        { __aterm_flags=$-; set +xv; } 2>/dev/null
+        { __aterm_flags=$-; set +axv; } 2>/dev/null
     fi
     [[ -n "$__aterm_last_command" ]] || __aterm_untraced __aterm_line_start "$1"
     __aterm_flags_put "$__aterm_flags"
@@ -987,7 +1031,7 @@ __aterm_bp_preexec() {
 # first line for itself (its newest version puts it back at each prompt), so a
 # line's D comes before any program those hooks run.
 __aterm_bp_precmd() {
-    { local __aterm_status=$? __aterm_flags=$-; set +xv; } 2>/dev/null
+    { local __aterm_status=$? __aterm_flags=$-; set +axv; } 2>/dev/null
     ! declare -F __aterm_end_command >/dev/null || __aterm_end_command "$__aterm_status"
     __aterm_flags_put "$__aterm_flags" "$__aterm_status"
 }
@@ -1045,6 +1089,7 @@ if [[ ${PS0-} == *'${ __aterm_ps0; }'* ]]; then
     PS0=${PS0/'${ __aterm_ps0; }'/'${| __aterm_ps0; }'}
 fi
 __aterm_body_ps0() {
+    local __aterm_hook_live=1
     (( __aterm_in_prompt_cmd || ${__aterm_bp_joined:-0} )) && return 0
     [[ -z "$__aterm_last_command" && "$__aterm_hist_mark" == [1-9]* &&
         "$__aterm_hist_mark" != *[!0-9]* &&
@@ -1156,12 +1201,13 @@ __aterm_spare_hold() {
 
 # Body PROMPT_COMMAND handler called by `__aterm_prompt_command`.
 __aterm_body_prompt_command() {
-    { [[ -n ${2+x} ]] || local __aterm_flags=$-; set +xv; } 2>/dev/null
+    { local __aterm_hook_live=1; [[ -n ${2+x} ]] || local __aterm_flags=$-; set +axv; } 2>/dev/null
     local last_status=$1 __aterm_lastarg=${3-}
     __aterm_untraced __aterm_body_pc_open
     # Run scalar original PROMPT_COMMAND with original `$?`, `$_`, and flags,
     # passing non-zero status via `||` so `set -e` and `ERR` traps do not fire.
     if ! (( __aterm_prompt_cmd_is_array )) && [[ -n "$__aterm_original_prompt_command" ]]; then
+        __aterm_hook_live=pc
         if (( last_status )); then
             __aterm_flags_put "$__aterm_flags" "$last_status" "$__aterm_lastarg" ||
                 eval "$__aterm_original_prompt_command"
@@ -1169,11 +1215,16 @@ __aterm_body_prompt_command() {
             __aterm_flags_put "$__aterm_flags" 0 "$__aterm_lastarg" &&
                 eval "$__aterm_original_prompt_command"
         fi
-        { __aterm_flags=$-; set +xv; } 2>/dev/null
+        { __aterm_hook_live=1; __aterm_flags=$-; set +axv; } 2>/dev/null
     fi
     __aterm_untraced __aterm_body_pc_close
     (( __aterm_prompt_end_armed )) || __aterm_in_prompt_cmd=0
-    [[ -n ${2+x} ]] || __aterm_flags_put "$__aterm_flags"
+    if [[ -n ${2+x} ]]; then
+        # The trampoline that took the flags puts back xtrace and verbose.
+        case $__aterm_flags in *a*) set -a ;; esac
+    else
+        __aterm_flags_put "$__aterm_flags"
+    fi
 }
 
 # What each prompt does before the user's PROMPT_COMMAND.
@@ -1312,7 +1363,7 @@ __aterm_set_prompt() {
 
 # Error-aware prompt character (`\001`/`\002` raw markers for `$()` inside PS1).
 __aterm_err_prompt() {
-    { set +xv; } 2>/dev/null
+    { local __aterm_hook_live=1; set +axv; } 2>/dev/null
     if [[ ${__aterm_last_exit:-0} -ne 0 ]]; then
         printf '\001\033[38;5;%sm\002$\001\033[0m\002 ' "${ATERM_PROMPT_ERROR_COLOR:-1}"
     else
@@ -1321,7 +1372,7 @@ __aterm_err_prompt() {
 }
 
 __aterm_git_segment() {
-    { set +xv; } 2>/dev/null
+    { local __aterm_hook_live=1; set +axv; } 2>/dev/null
     local branch
     branch=$(command git rev-parse --abbrev-ref HEAD 2>/dev/null) || return
     [[ -n "$branch" ]] && printf ' (%s)' "$branch"
@@ -1356,6 +1407,11 @@ __aterm_setup_keybindings() {
     bind '"\e[1;2A": previous-history'   # Shift+Up
     bind '"\e[1;2B": next-history'       # Shift+Down
 }
+
+# A posix-mode bash 5 prints an unset trap as `trap -- - DEBUG`. `-` is never a handler's
+# text, since `trap -` resets a trap, and run as one it fails on every command. A body an
+# older loader took in that way is cleared here as it loads.
+[[ "${__aterm_prev_debug_handler-}" != - ]] || __aterm_prev_debug_handler=""
 
 __aterm_flags_put "$__aterm_body_flags"
 
@@ -1399,6 +1455,8 @@ if (( __aterm_fresh_load )); then
     fi
     unset __aterm_tmp __aterm_rc_debug_handed __aterm_rc_debug_trap
 fi
+# The capture above reads the same `-` from a posix-mode bash 5 (the body's own line says why).
+[[ "${__aterm_prev_debug_handler-}" != - ]] || __aterm_prev_debug_handler=""
 
 if (( __aterm_fresh_load )); then
     __aterm_start_pending=1

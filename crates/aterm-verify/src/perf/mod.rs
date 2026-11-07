@@ -378,7 +378,7 @@ impl Lane {
                  dev-seams and a build of aterm-lab for the idle take)"
             }
             Lane::Wasm => {
-                "chrome-headless-shell (verify provision), rustup stable + \
+                "chrome-headless-shell (verify provision), the checkout's stock pin + \
                  wasm32-unknown-unknown, wasm-opt"
             }
             Lane::VteEngine => {

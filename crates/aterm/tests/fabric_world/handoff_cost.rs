@@ -139,6 +139,11 @@ fn a_handoff_flushes_nothing_and_the_quit_after_it_flushes_the_run() {
         "over the open run it inherits, which its predecessor's start published in full and \
          proved, nothing written: {line}"
     );
+    // Its mirror says the floor at its first send of what it inherited, which a loaded host can
+    // put after a quit sent at once: the quit waits for it, a hang detector, not a budget.
+    until("the successor's mirror to say the floor", || {
+        (!said(&w, successor, FLOOR).is_empty()).then_some(())
+    });
     let before = log_len(&w);
     quit(&mut w);
     assert_eq!(

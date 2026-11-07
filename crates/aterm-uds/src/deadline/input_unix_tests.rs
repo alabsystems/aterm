@@ -155,6 +155,57 @@ fn stopped_or_expired_streaming_never_spawns_or_delivers_output() {
 }
 
 #[test]
+fn cooperative_stream_errors_and_unwind_allow_root_cleanup_before_retirement() {
+    for panic in [false, true] {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let cleaned = dir.path().join("cleaned");
+        let (reader, writer) = crate::kept_out(std::io::pipe).unwrap();
+        let writer = std::cell::RefCell::new(Some(writer));
+        let pid = std::cell::Cell::new(None);
+        let mut retire = || {
+            writer.borrow_mut().take();
+        };
+        let mut cmd = shell("printf ready; \"$1\" >/dev/null; printf cleaned > \"$2\"");
+        cmd.arg("cooperative-root")
+            .arg(super::super::stand_in(std::path::Path::new("/bin/cat")))
+            .arg(&cleaned);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::super::stream_with_stdin_until_stopped(
+                &mut cmd,
+                Stdio::from(reader),
+                Some(Instant::now() + HANG),
+                |child| pid.set(Some(child)),
+                |_, chunk| {
+                    assert!(!chunk.is_empty());
+                    assert!(!panic, "synthetic consumer unwind");
+                    Err(io::ErrorKind::InvalidData.into())
+                },
+                || false,
+                Some(&mut retire),
+            )
+        }));
+        if panic {
+            assert!(result.is_err());
+        } else {
+            assert_eq!(
+                result.unwrap().unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        assert!(writer.borrow().is_none());
+        assert_eq!(
+            std::fs::read(&cleaned).unwrap(),
+            b"cleaned",
+            "the root ran cleanup instead of being killed"
+        );
+        assert_eq!(
+            crate::process::process_presence(pid.get().unwrap().cast_signed()),
+            crate::process::ProcessPresence::Absent
+        );
+    }
+}
+
+#[test]
 fn streaming_deadline_after_output_retires_its_owned_root() {
     let began = Instant::now();
     let deadline = began + HANG;
@@ -299,6 +350,7 @@ fn uncertain_input_wait_retains_the_original_caller_lock_until_actual_reap() {
                     to_child: None,
                     sent: 0,
                     reaped: false,
+                    retire: None,
                 };
                 let mut calls = 0;
                 run.settle_with(|child| {

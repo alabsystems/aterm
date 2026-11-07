@@ -3,7 +3,8 @@
 //! Native Trust driver for the independent pinned Windows reference workspaces.
 //!
 //! STOCK EXCEPTION: `oracle` and `oracle-052` resolve a stock rustup toolchain's Cargo and
-//! rustc (`--stock`, `stable` by default; [`tools`]), because Trust ships no Windows std. They
+//! rustc (`--stock`, by default the checkout's stock pin,
+//! `aterm_toolchain::rustup::stock_pin`; [`tools`]), because Trust ships no Windows std. They
 //! only compile and read import tables: no Windows program runs.
 mod emit;
 mod facade052;
@@ -35,7 +36,8 @@ usage: targo --unverified run -p aterm-win32-oracle -- <gen|check|record|oracle|
   --target-dir <dir>    record/oracle/oracle-052 build dir (default: $ORACLE_TARGET_DIR, else
                         <root>/win32-oracle/target.noindex; for oracle-052,
                         <root>/crates/aterm-windows-sys-052/tests/oracle/target.noindex)
-  --stock <toolchain>   oracle/oracle-052 only: stock rustup toolchain (default: stable)
+  --stock <toolchain>   oracle/oracle-052 only: stock rustup toolchain (default: the checkout's
+                        stock pin, aterm_toolchain::rustup::STOCK_PIN)
   --no-format           gen only: skip trustfmt on emitted Rust
 
 gen writes crates/aterm-win32, crates/aterm-windows-sys's feature list and the win32-oracle
@@ -648,7 +650,7 @@ fn start() -> Result<u8> {
     let mut up = None;
     let mut out = None;
     let mut target = None;
-    let mut stock = "stable".to_string();
+    let mut stock = None;
     let mut format = true;
     let options = (|| -> Result<bool> {
         while let Some(arg) = args.next() {
@@ -662,7 +664,7 @@ fn start() -> Result<u8> {
                 }
                 "--out" if verb == "gen" => out = Some(PathBuf::from(value(&mut args)?)),
                 "--target-dir" => target = Some(PathBuf::from(value(&mut args)?)),
-                "--stock" if verb.starts_with("oracle") => stock = value(&mut args)?,
+                "--stock" if verb.starts_with("oracle") => stock = Some(value(&mut args)?),
                 "--no-format" if verb == "gen" => format = false,
                 "--help" | "-h" => {
                     return Ok(true);
@@ -689,9 +691,16 @@ fn start() -> Result<u8> {
         .canonicalize()
         .map_err(|e| e.to_string())?;
     let target = target.or_else(|| std::env::var_os("ORACLE_TARGET_DIR").map(PathBuf::from));
+    let stock = match stock {
+        Some(named) => Some(named),
+        None if verb.starts_with("oracle") => {
+            Some(aterm_toolchain::rustup::stock_pin(&root).map_err(|refused| refused.to_string())?)
+        }
+        None => None,
+    };
     if verb == "oracle-052" {
         answerable(&root, &format!("{}/Cargo.toml", facade052::WORKSPACE))?;
-        let tools = tools(&root, Some(stock.as_str()))?;
+        let tools = tools(&root, stock.as_deref())?;
         let target =
             target.unwrap_or_else(|| root.join(facade052::WORKSPACE).join("target.noindex"));
         let _held = hold_target(&target, &verb, &root, &mut |line| println!("{line}"))?;
@@ -735,7 +744,7 @@ fn start() -> Result<u8> {
     {
         return Err("upstream source is not pinned windows-sys 0.61.2".into());
     }
-    let tools = tools(&root, (verb == "oracle").then_some(stock.as_str()))?;
+    let tools = tools(&root, stock.as_deref())?;
     let model = model::Model::load(&root, &up, &tools)?;
     println!("{}", model.summary());
     for note in &model.notes {

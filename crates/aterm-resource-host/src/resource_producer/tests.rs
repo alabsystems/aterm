@@ -162,6 +162,19 @@ fn cached_helper_parent_challenge_and_stale_wrong_answer_refusals() {
     assert_eq!(authenticated.producer().pid, std::process::id());
     assert_eq!(authenticated.binding(), ([1; 16], [2; 16]));
     authenticated.validate().unwrap();
+    // Simulate preemption after taking the start time without sleeping. The
+    // original image, native identities and peer socket must still validate.
+    // Restoring the 100 ms budget fails this actual authenticated proof.
+    authenticated
+        .validate_at(Instant::now() - Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(
+        authenticated
+            .validate_at(Instant::now() - Duration::from_secs(60))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::TimedOut
+    );
     helper.0.kill().unwrap();
     helper.0.wait().unwrap();
     assert!(authenticated.validate().is_err());

@@ -8392,6 +8392,117 @@ fn a_footer_quoted_in_the_transcript_is_no_turn_running() {
     assert!(busy_footer(&wrapped), "the spinner's wrapped hint");
 }
 
+/// A reply drawn under a status line has no busy footer and no spinner (2.1.311 lab `mr`,
+/// MEASURED): its window title's `◐`/`◑` is the turn the gate waits out. The look's facts read
+/// it busy, so the press gate waits; the ladder reads no idle look, [`turn_shown`] holds, and
+/// neither a press's signal, a retry nor a lagging status's turn end opens; the done row ends
+/// the turn whatever the title says. NEGATIVE CONTROLS: with no title, `""`, the rest glyph or a
+/// title with no glyph, the mid-reply frames read as the screen alone reads them (idle: the
+/// misread the title answers).
+#[test]
+fn a_reply_drawn_under_a_status_line_holds_the_gate_while_its_title_runs() {
+    use aterm_phase::prompt::fixtures as f;
+    let read = |text: &str, title: Option<&str>| {
+        let rows = f::screen(text);
+        let cursor = aterm_phase::phase::composer_draft(&rows).map(|(caret, _)| (caret, 2));
+        Screen {
+            rows,
+            cursor,
+            seq: 1,
+            first: 0,
+            generation: None,
+            human: HumanInput::Never,
+            title: title.map(str::to_owned),
+            human_seq: None,
+        }
+    };
+    let dir = scratch("title-run-gate");
+    let opts = drive(&dir);
+    let session = SessionFile {
+        pid: 4_242,
+        session_id: SESSION.to_string(),
+        cwd: "/".to_string(),
+        version: "2.1.311".to_string(),
+        status: "idle".to_string(),
+        status_updated_at_ms: 1_000 * 1_000,
+        proc_start: String::new(),
+        kind: "interactive".to_string(),
+        entrypoint: "cli".to_string(),
+        claude_dir: None,
+        profile: None,
+    };
+    let facts = |scr: &Screen| {
+        let tab = TabRead {
+            scr,
+            status: Some("OK schema=1 agent=idle agent_since_ms=600000 hold=0 hand=-"),
+            dim: false,
+        };
+        look_facts(&opts, &session, &mut St::default(), TAB, &tab, &[], 2_000)
+            .expect("readable ledger evidence")
+            .0
+    };
+    let idle_look =
+        |scr: &Screen| ladder_look(&mut St::default(), "claude", scr, 1, 120, 1_000).idle_read;
+    let retry = |at_break| Retry {
+        looked: HandAt::Never,
+        owner_now: true,
+        at_break,
+        grace_s: 120,
+    };
+    for text in [
+        f::STATUSLINE_MIDREPLY_2_1_311,
+        f::STATUSLINE_LAST_LINE_HELD_2_1_311,
+    ] {
+        for run in ["\u{25D0} Claude Code", "\u{25D1} Claude Code"] {
+            let scr = read(text, Some(run));
+            assert!(!busy_footer(&scr.rows), "the footer itself is gone");
+            assert!(turn_shown(&scr), "{run}");
+            let look = facts(&scr);
+            assert!(look.busy_footer, "{run}: {look:?}");
+            assert_eq!(upgrade::press_gate(&look), upgrade::Gate::Wait("busy"));
+            assert!(
+                !press_lets_signal(&scr),
+                "{run}: a press waits the turn out too"
+            );
+            assert!(!reads_idle(&scr), "{run}");
+            assert!(!idle_look(&scr), "{run}");
+            assert!(!turn_over_shown(&scr, true), "{run}");
+            assert!(
+                !retry_open(&scr, &retry(false)) && !retry_open(&scr, &retry(true)),
+                "{run}"
+            );
+        }
+        for quiet in [
+            None,
+            Some(""),
+            Some("\u{2733} Claude Code"),
+            Some("Claude Code"),
+        ] {
+            let scr = read(text, quiet);
+            assert!(!turn_shown(&scr), "{quiet:?}");
+            let look = facts(&scr);
+            assert!(!look.busy_footer, "{quiet:?}: {look:?}");
+            assert_eq!(upgrade::press_gate(&look), upgrade::Gate::Go, "{quiet:?}");
+            assert!(press_lets_signal(&scr), "{quiet:?}");
+            assert!(reads_idle(&scr), "{quiet:?}: the screen alone, as before");
+            assert!(idle_look(&scr), "{quiet:?}");
+            assert!(turn_over_shown(&scr, true), "{quiet:?}");
+            assert!(retry_open(&scr, &retry(false)), "{quiet:?}");
+        }
+    }
+    for title in [
+        Some("\u{2733} Claude Code"),
+        Some("\u{25D0} Claude Code"),
+        None,
+    ] {
+        let scr = read(f::STATUSLINE_REPLY_DONE_2_1_311, title);
+        assert!(!turn_shown(&scr), "{title:?}: the done row ends the turn");
+        assert!(!facts(&scr).busy_footer, "{title:?}");
+        assert!(reads_idle(&scr) && idle_look(&scr), "{title:?}");
+        assert!(turn_over_shown(&scr, true), "{title:?}");
+    }
+}
+
 /// A host's `help turn` that names the rows fence (`if-rows=`).
 const ROWS_HELP: &str = "OK 1\nturn [option=value ...] <text>: ... [if-gen=<epoch>.<seq>] \
                          [if-rows=<first>-<last>:<hex16>] ...";

@@ -189,8 +189,8 @@ fn resolve_trust_stage2_bin() -> Result<PathBuf> {
     }))
 }
 
-/// The way past a missing x86_64 slice, for a caller to append verbatim under its own `fix:` marker.
-pub const X86_SLICE_REMEDIES: &str = "rustup +stable target add x86_64-apple-darwin";
+/// The way past a missing x86_64 slice, for a caller to append verbatim under its own `fix:` marker: `verify provision`'s rustup row puts the release chain's stable in place with that slice's std (`aterm_verify::provision::stock::RELEASE_TOOLCHAIN`), where a hand `rustup +stable target add` fails on a home whose auto-install it turned off and that holds no stable.
+pub const X86_SLICE_REMEDIES: &str = "targo --unverified verify provision rustup";
 
 /// How to build Trust from source, for every remedy that offers it.
 macro_rules! trust_from_source {

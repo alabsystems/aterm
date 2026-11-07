@@ -3988,11 +3988,12 @@ fn the_switch_draws_no_box() {
 }
 
 /// THE PRESS NAMES WHAT IT ENDS: a Claude Code press's words say when its restart lands, read off
-/// the screen as the press's own lane reads it (at once, at a turn's end, once a draft is sent),
-/// and name the background shells the restart ends, which it does
-/// (`upgrade::RESTART_ENDS_BACKGROUND`, measured). NEGATIVE CONTROLS: where a restart left them
-/// running the words name none; with no shells they name none; another CLI's arrow, whose press
-/// is the tab menu's Upgrade Now, keeps the lane's words.
+/// the screen and its window title as the press's own lane reads them (at once, at a turn's end,
+/// a reply only the title runs under a status line included, once a draft is sent), and name the
+/// background shells the restart ends, which it does (`upgrade::RESTART_ENDS_BACKGROUND`,
+/// measured). NEGATIVE CONTROLS: where a restart left them running the words name none; with no
+/// shells they name none; another CLI's arrow, whose press is the tab menu's Upgrade Now, keeps
+/// the lane's words; a title at rest leaves that reply's screen to read at once.
 #[test]
 fn the_press_names_what_it_ends() {
     assert_eq!(ends_words("1 shell", true), " \u{b7} ends 1 shell");
@@ -4045,9 +4046,30 @@ fn the_press_names_what_it_ends() {
         "\u{276f} ".to_string(),
         rule,
     ];
-    assert_eq!(press_wait(&idle, false), "", "an idle screen: at once");
-    assert_eq!(press_wait(&turn, false), "busy", "a turn: at its end");
-    assert_eq!(press_wait(&turn, true), "draft", "a draft before a turn");
+    assert_eq!(
+        press_wait(&idle, None, false),
+        "",
+        "an idle screen: at once"
+    );
+    assert_eq!(press_wait(&turn, None, false), "busy", "a turn: at its end");
+    assert_eq!(
+        press_wait(&turn, None, true),
+        "draft",
+        "a draft before a turn"
+    );
+    let mid_reply = aterm_phase::prompt::fixtures::screen(
+        aterm_phase::prompt::fixtures::STATUSLINE_MIDREPLY_2_1_311,
+    );
+    assert_eq!(
+        press_wait(&mid_reply, Some("\u{25D0} Claude Code"), false),
+        "busy",
+        "a reply the title runs under a status line: at its end, as the lane reads it"
+    );
+    assert_eq!(
+        press_wait(&mid_reply, Some("\u{2733} Claude Code"), false),
+        "",
+        "CONTROL: the rest glyph leaves the screen alone"
+    );
     assert_eq!(
         press_wait_of("background"),
         "",

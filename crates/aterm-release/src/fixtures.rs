@@ -661,24 +661,39 @@ pub struct Reading {
     pub checks: String,
 }
 
-/// One private source path for all compare-and-swap attempts in a landing.
-/// Keeping the worktree alive preserves Cargo's build-script inputs on a lost race.
+/// One leased source path per clone, retained across fixture landings.
 pub struct MainReader {
     repo: PathBuf,
-    scratch: aterm_tempfile::TempDir,
+    scratch: PathBuf,
+    _lease: aterm_update_core::FileLock,
     last_binary: Option<PathBuf>,
 }
 
 impl MainReader {
-    /// Allocate an isolated reader workspace.
+    /// Lease the clone's persistent, isolated reader workspace.
     ///
     /// # Errors
-    /// Returns scratch directory creation failures.
+    /// Returns git discovery, directory creation or exclusive lease failures.
     pub fn new(repo: &Path) -> std::io::Result<Self> {
+        let git = crate::ledger::GitCli::new(repo);
+        let dir = git_ok(&git, &["rev-parse", "--absolute-git-dir"])
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let scratch = PathBuf::from(dir.stdout_utf8().trim()).join(".ubd/main-reader.noindex");
+        fs::create_dir_all(&scratch)?;
+        let lease = aterm_update_core::FileLock::acquire_within(
+            &scratch.join("lease"),
+            std::time::Duration::ZERO,
+        )?;
+        let last_binary = match fs::read_to_string(scratch.join("last-binary")) {
+            Ok(path) => Some(PathBuf::from(path)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
         Ok(Self {
             repo: repo.to_path_buf(),
-            scratch: aterm_tempfile::tempdir()?,
-            last_binary: None,
+            scratch,
+            _lease: lease,
+            last_binary,
         })
     }
 
@@ -697,23 +712,26 @@ impl MainReader {
         let mut answers = Err("main reader did not record answers".to_string());
         let result = (|| -> Result<String> {
             if let Some(binary) = &self.last_binary {
-                check_execution_hold(self.scratch.path(), binary)?;
+                check_execution_hold(&self.scratch, binary)?;
             }
-            let tree = self.scratch.path().join("main");
+            let tree = self.scratch.join("main");
             let git = crate::ledger::GitCli::new(&self.repo);
             let tree_arg = tree.to_string_lossy().into_owned();
             let local = crate::ledger::GitCli::new(&tree);
             if tree.join(".git").exists() {
-                // This is our own generated corpus edit from the previous attempt.
-                git_ok(&local, &["restore", "--", SHIPPED_STATE_CORPUS])?;
-                git_ok(&local, &["checkout", "--detach", preview])?;
+                // This workspace is exclusively ours. Discard previous generated
+                // answers and interrupted runs before judging the new preview.
+                git_ok(&local, &["checkout", "--force", "--detach", preview])?;
+                git_ok(&local, &["clean", "-ffdx"])?;
             } else {
                 git_ok(&git, &["worktree", "add", "--detach", &tree_arg, preview])?;
             }
-            git_ok(&local, &["submodule", "update", "--init"])?;
-            // Apply the cut's cache policy. Its workspace-root template intentionally
-            // gives this source path its own lane: cross-root freshness on the deployed
-            // compiler cannot safely reuse the cut's live build directory (C4/B18).
+            git_ok(
+                &local,
+                &["submodule", "update", "--init", "--recursive", "--force"],
+            )?;
+            // The stable source path keeps its own lane across releases; no live
+            // directory is shared with the cut and no cross-root seeding is needed.
             let (target, layout) = crate::release_steps::verify_layout(&self.repo);
             let mut compile = crate::gates::aterm_gui_lib_compile(targo, &tree, &target);
             if let Some(layout) = layout {
@@ -749,7 +767,8 @@ impl MainReader {
                 .iter()
                 .find(|entry| entry.kind == "lib" && entry.name == "aterm_gui")
                 .ok_or_else(|| Error::new("main reader compile reported no GUI lib test binary"))?;
-            let output = self.scratch.path().join(STAGED_ANSWERS);
+            let output = self.scratch.join(STAGED_ANSWERS);
+            clear_marker(&output).map_err(|e| Error::new(format!("clear main answers: {e}")))?;
             let command = || {
                 let mut cmd = aterm_uds::spawnfd::command(&binary.path);
                 cmd.current_dir(&tree)
@@ -759,10 +778,15 @@ impl MainReader {
                 cmd
             };
             let record_start = std::time::Instant::now();
-            let hold = execution_hold(self.scratch.path(), &binary.path);
+            let hold = execution_hold(&self.scratch, &binary.path);
             let hold_error = |e| Error::new(format!("main reader execution hold: {e}"));
             fs::create_dir_all(&hold).map_err(hold_error)?;
             stamp_hold(&hold).map_err(hold_error)?;
+            fs::write(
+                self.scratch.join("last-binary"),
+                binary.path.as_os_str().as_encoded_bytes(),
+            )
+            .map_err(hold_error)?;
             self.last_binary = Some(binary.path.clone());
             let outcome = run(command()
                 .args([
@@ -828,21 +852,6 @@ impl MainReader {
                 timings.join(", "),
                 started.elapsed().as_secs_f64()
             ),
-        }
-    }
-}
-
-impl Drop for MainReader {
-    fn drop(&mut self) {
-        let tree = self.scratch.path().join("main");
-        if tree.join(".git").exists() {
-            let git = crate::ledger::GitCli::new(&self.repo);
-            if let Err(why) = git_ok(
-                &git,
-                &["worktree", "remove", "--force", &tree.to_string_lossy()],
-            ) {
-                eprintln!("main fixture reader cleanup: {why}");
-            }
         }
     }
 }

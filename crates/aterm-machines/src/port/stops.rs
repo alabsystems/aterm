@@ -292,10 +292,35 @@ pub fn name(sig: i32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    /// Dispositions and [`CAUGHT`] are the process's: one test at a time touches them.
-    static SERIAL: Mutex<()> = Mutex::new(());
+    /// Signal dispositions and [`CAUGHT`] belong to the process. Run each real-handler case
+    /// in its own exact-filter child so its stop cannot cancel another test's live capture.
+    fn isolated(case: &str) -> bool {
+        let args: Vec<_> = std::env::args_os().collect();
+        if std::env::var_os("ATERM_STOP_CASE").is_some_and(|value| value == case)
+            && args
+                .windows(2)
+                .any(|pair| pair[0] == "--exact" && pair[1] == case)
+        {
+            return false;
+        }
+        let mut child =
+            aterm_uds::spawnfd::command(std::env::current_exe().expect("test executable"));
+        child
+            .args(["--exact", case, "--nocapture"])
+            .env("ATERM_STOP_CASE", case);
+        let output =
+            aterm_uds::deadline::output_within(&mut child, std::time::Duration::from_secs(60))
+                .expect("the owned signal-test child must finish");
+        assert!(
+            output.status.success(),
+            "{case}: {}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        true
+    }
 
     /// A signal's disposition set to `to` until this drops, then put back.
     struct SetTo(c_int, libc::sigaction);
@@ -333,9 +358,11 @@ mod tests {
 
     #[test]
     fn a_stop_is_noted_while_caught_and_the_old_dispositions_come_back_after() {
-        let _serial = SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if isolated(
+            "port::stops::tests::a_stop_is_noted_while_caught_and_the_old_dispositions_come_back_after",
+        ) {
+            return;
+        }
         // Whatever this test binary inherited (a background job's shell ignores SIGINT and
         // SIGQUIT), every stop here is one nobody ignores.
         let _default = STOPS.map(|sig| SetTo::new(sig, libc::SIG_DFL));
@@ -365,9 +392,9 @@ mod tests {
     /// caught, is never noted, and is still ignored after.
     #[test]
     fn an_ignored_hang_up_stays_ignored_and_is_no_stop() {
-        let _serial = SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if isolated("port::stops::tests::an_ignored_hang_up_stays_ignored_and_is_no_stop") {
+            return;
+        }
         let _ignored = SetTo::new(libc::SIGHUP, libc::SIG_IGN);
         let held = catch();
         assert_eq!(disposition(libc::SIGHUP), libc::SIG_IGN);
@@ -401,9 +428,9 @@ mod tests {
     /// disposition is back; a plain catch forgets it.
     #[test]
     fn a_deferred_stop_is_sent_again_once_the_handle_drops() {
-        let _serial = SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if isolated("port::stops::tests::a_deferred_stop_is_sent_again_once_the_handle_drops") {
+            return;
+        }
         let _own = SetTo::new(
             libc::SIGHUP,
             heard as extern "C" fn(c_int) as libc::sighandler_t,
@@ -481,9 +508,11 @@ mod tests {
     /// dispositions come back after. No stop is raised: the handler ends the process.
     #[test]
     fn a_stop_says_its_line_while_held_and_the_old_dispositions_come_back_after() {
-        let _serial = SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if isolated(
+            "port::stops::tests::a_stop_says_its_line_while_held_and_the_old_dispositions_come_back_after",
+        ) {
+            return;
+        }
         let _default = STOPS.map(|sig| SetTo::new(sig, libc::SIG_DFL));
         let _ignored = SetTo::new(libc::SIGHUP, libc::SIG_IGN);
         let before = STOPS.map(disposition);
@@ -549,9 +578,11 @@ mod tests {
         use std::io::Read as _;
         use std::os::fd::AsRawFd as _;
         use std::os::unix::process::ExitStatusExt as _;
-        let _serial = SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if isolated(
+            "port::stops::tests::a_stop_that_meets_the_handler_says_its_line_and_ends_the_process",
+        ) {
+            return;
+        }
         let _default = STOPS.map(|sig| SetTo::new(sig, libc::SIG_DFL));
         let line = "stopped; setup is not finished\n";
         for (sig, armed) in [

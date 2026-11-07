@@ -2380,14 +2380,7 @@ pub(super) struct Screen {
     pub(super) generation: Option<String>,
     pub(super) human: HumanInput,
     /// The program's title read with `rows` (`"title"`); `None` where the host sent no such string.
-    /// Only the unix test module reads it yet, so the expectation stands wherever that module is out.
-    #[cfg_attr(
-        not(all(test, unix)),
-        expect(
-            dead_code,
-            reason = "parsed ahead of the gate's title read, which waits on aterm-phase's title rule"
-        )
-    )]
+    /// Claude Code's `◐`/`◑` there runs a turn its screen may not show ([`turn_shown`]).
     pub(super) title: Option<String>,
     /// The person's input count the host took with `rows` (`"human_seq"`), which a turn fences on
     /// (`turn if-human=`): a key since that moves no fenced row stops it. `None` where the host sent
@@ -11438,11 +11431,12 @@ pub(super) fn ladder_look(
     grace_s: u32,
     now: u64,
 ) -> LadderLook {
-    let reading = aterm_phase::read_at(
+    let reading = aterm_phase::read_seen(
         Some(agent),
         &scr.rows,
         scr.cursor.map(|(row, _)| row),
         scr.cursor.map(|(_, col)| col),
+        scr.title.as_deref(),
     );
     let idle_read = reading.phase == aterm_phase::Phase::Idle
         && reading.phase_authoritative
@@ -11478,8 +11472,24 @@ pub(super) struct LadderLook {
     pub(super) still_s: u64,
 }
 
-/// Whether Claude Code's screen shows its turn running: the interrupt hint on its status line,
-/// or on a row below its composer.
+/// Whether `scr` shows a Claude Code turn running ([`turn_runs`] over its rows and title).
+pub(super) fn turn_shown(scr: &Screen) -> bool {
+    turn_runs(&scr.rows, scr.title.as_deref())
+}
+
+/// Whether Claude Code's screen `rows` under window title `title` show a turn running: its busy
+/// footer ([`busy_footer`]), or its title running one the screen does not show
+/// (`aterm_phase::phase::title_live`: a reply drawn under a status line, which hides the footer).
+/// A done row, a wall, a box or delegated work leave it to the footer, so a finished turn never
+/// reads as running for the title.
+#[must_use]
+pub fn turn_runs(rows: &[String], title: Option<&str>) -> bool {
+    use aterm_phase::ScreenReader as _;
+    busy_footer(rows) || aterm_phase::phase::title_live(rows, aterm_phase::ClaudeReader.runs(title))
+}
+
+/// Whether Claude Code's footer shows its turn running: the interrupt hint on its status line,
+/// or on a row below its composer. [`turn_runs`] reads the window title beside it.
 #[must_use]
 pub fn busy_footer(rows: &[String]) -> bool {
     let Some((caret, draft)) = aterm_phase::phase::composer_draft(rows) else {
@@ -11560,7 +11570,7 @@ pub(super) fn look_facts(
         status_age_s: now.saturating_sub(sf.status_updated_at_ms / 1000),
         composer_empty: upgrade::composer_is_empty(&scr.rows, scr.cursor, dim),
         approval_box: aterm_phase::prompt::prompt_box_span(&scr.rows).is_some(),
-        busy_footer: busy_footer(&scr.rows),
+        busy_footer: turn_shown(scr),
         background: own_work(sf.pid, t, &scr.rows),
         held: status.is_none_or(|line| held_by_status(line, 0)),
         quiet_s: quiet,
@@ -11607,8 +11617,10 @@ pub(super) fn look_facts(
     };
     let idle_read = ladder.idle_read;
     // An idle look is in a row only over the words the one before it read. Under a status line a reply
-    // being drawn shows no busy row, so its looks read idle, but the words above its composer grow
-    // between them: two such looks are never the lag ([`upgrade::status_lags`]) `--now` ends a turn at.
+    // being drawn shows no busy row. A title that runs it holds its looks busy ([`ladder_look`]);
+    // under no title, or one that does not run it, its looks read idle, but the words above its
+    // composer grow between them: two such looks are never the lag ([`upgrade::status_lags`])
+    // `--now` ends a turn at.
     let in_a_row = ladder.still_run
         && st.idle_pid == sf.pid
         && now.saturating_sub(st.idle_at) <= IDLE_RUN_GAP_S;
@@ -12680,7 +12692,7 @@ const TURN_RUNNING: &str = "busy";
 
 fn claude_fence(c: &mut Client, tab: &str) -> Result<(Option<String>, Screen), &'static str> {
     let (generation, read) = typing_fence_read(c, tab)?;
-    if busy_footer(&read.rows) {
+    if turn_shown(&read) {
         return Err(TURN_RUNNING);
     }
     let narrow = composer_rows(&read)
@@ -12748,7 +12760,7 @@ pub(super) fn retry_open(read: &Screen, retry: &Retry) -> bool {
     if !retry.owner_now && upgrade::attended_by(read.human, retry.grace_s) {
         return false;
     }
-    if busy_footer(&read.rows) {
+    if turn_shown(read) {
         return false;
     }
     if retry.at_break {
@@ -12758,11 +12770,12 @@ pub(super) fn retry_open(read: &Screen, retry: &Retry) -> bool {
 }
 
 fn reads_idle(read: &Screen) -> bool {
-    let reading = aterm_phase::read_at(
+    let reading = aterm_phase::read_seen(
         Some("claude"),
         &read.rows,
         read.cursor.map(|(row, _)| row),
         read.cursor.map(|(_, col)| col),
+        read.title.as_deref(),
     );
     reading.phase == aterm_phase::Phase::Idle
         && reading.phase_authoritative
@@ -12774,15 +12787,17 @@ fn reads_idle(read: &Screen) -> bool {
 /// work that no process row names pending on it ([`aterm_phase::phase::unlisted_work`]: the work
 /// Claude Code runs in its own process, any other work its footer's pill counts; the process
 /// table the signal re-reads names none of it), and, where the status lags, an idle reading with
-/// no busy footer.
+/// no turn running ([`turn_shown`]: its busy footer, or its title running a reply the screen
+/// does not show).
 fn turn_over_shown(read: &Screen, lagging: bool) -> bool {
     aterm_phase::phase::unlisted_work(&read.rows).is_none()
-        && (!lagging || (!busy_footer(&read.rows) && reads_idle(read)))
+        && (!lagging || (!turn_shown(read) && reads_idle(read)))
 }
 
-/// Whether `read` lets a press's signal go: no turn running and no box open on it.
+/// Whether `read` lets a press's signal go: no turn running ([`turn_shown`]) and no box open on
+/// it.
 fn press_lets_signal(read: &Screen) -> bool {
-    !busy_footer(&read.rows) && aterm_phase::prompt::prompt_box_span(&read.rows).is_none()
+    !turn_shown(read) && aterm_phase::prompt::prompt_box_span(&read.rows).is_none()
 }
 
 /// The screen read when it shows no box and an empty composer, else `None`.

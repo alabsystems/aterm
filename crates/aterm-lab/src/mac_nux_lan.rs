@@ -4,9 +4,7 @@
 //! `lab mac nux`'s judgement of aterm's LAN on a new Mac, for a build whose own LAN traffic goes
 //! through the root LAN broker (`docs/DESIGN-lan-broker-2026-11-05.md`): macOS's Local Network
 //! alerts that name aterm (target 0, [`count_alerts`]), the broker's own rows ([`broker_cells`]:
-//! launchd's view of `systems.alab.aterm-lan`, `aterm lan status`, the broker's log), and the
-//! `first-launch-vault` row ([`first_launch_vault`]), whose app finds a lab vault in its own
-//! guest with no press.
+//! launchd's view of `systems.alab.aterm-lan`, `aterm lan status`, the broker's log).
 //!
 //! The broker runs as root, so its own socket use is invisible to the lane's unprivileged reads
 //! and macOS never asks about it; its rows read launchd and its log instead. What macOS asks
@@ -20,7 +18,7 @@ use std::collections::BTreeMap;
 
 use aterm_uds::lan::{LABEL, LOG_PATH};
 
-use super::{Ask, GUEST_NUX, Guest, LOCAL_VAULT, LOCAL_VAULT_PORT, Row, Value, phrase, squeeze};
+use super::{GUEST_NUX, Guest, Row, Value, phrase, squeeze};
 use crate::Fail;
 use crate::mac::STEP;
 use crate::mac_nux_guest::{Words, local_network_asker};
@@ -533,178 +531,6 @@ pub(super) fn broker_cells(
     Ok(())
 }
 
-/// The variable the vault look reads for `first-launch-vault`: the Bonjour type every vault
-/// browse of the look browses, through the broker, in place of `_alab-vault._tcp`
-/// (`aterm_secrets::discover::vault_service`: a value that is no `_alab-lab-<nonce>._tcp`
-/// browses for no vault). Set, it marks the process a lab's, so A12 refuses a live-vault join,
-/// and the look logs each vault instance it heard to `aterm.log` on a line naming the service and
-/// the instance, which [`vault_heard`] reads. The GUI app gets the variable from its launchd
-/// session: the row sets it with `launchctl setenv` in the account's GUI domain before the open,
-/// since an app `open` starts inherits no environment from the lane's shell.
-pub use aterm_secrets::discover::LAB_VAULT_SERVICE_ENV;
-
-/// The instance name the lab vault is registered under: the one the vault look takes for the
-/// ALab vault (`aterm_secrets::discover`'s `alab-secrets` or a collision rename of it).
-pub const LAB_VAULT_INSTANCE: &str = "alab-secrets";
-
-/// `aterm.log`'s lines that name `service` (the lab vault service) and the lab vault's instance:
-/// the vault look heard the lab vault. Pure.
-#[must_use]
-pub fn vault_heard<'a>(log: &'a str, service: &str) -> Vec<&'a str> {
-    log.lines()
-        .filter(|l| l.contains(service) && l.contains(LAB_VAULT_INSTANCE))
-        .collect()
-}
-
-/// `aterm.log`'s lines where the vault look heard an instance of the live `_alab-vault._tcp`:
-/// none on an app whose look browses the lab vault service alone. Pure.
-#[must_use]
-pub fn live_vault_heard(log: &str) -> Vec<&str> {
-    let live = format!(" on {}", super::ALAB_SERVICE);
-    log.lines()
-        .filter(|l| l.contains("vault look: heard ") && l.trim_end().ends_with(&live))
-        .collect()
-}
-
-/// The guest commands that serve the lab vault as its own identity (`home`): a server on every
-/// address at `port` (so the advert resolves to the guest's LAN address) that advertises nothing
-/// itself, a vault named [`LOCAL_VAULT`] made on it, then a registration of it under the lab
-/// `service` as [`LAB_VAULT_INSTANCE`] (`dns-sd -R`, in the background while the row runs).
-///
-/// Everything the lane itself sends the server goes to 127.0.0.1: this runs before setup's
-/// elevation installs the broker, and an aterm that `tart exec` runs has no direct path to a LAN
-/// address (macOS holds the guest agent responsible for it, and a fresh guest allowed nothing:
-/// `aterm_uds::lan::direct`), so a `secrets create` dialled at one fails; a `curl` to one from
-/// `tart exec` would put the guest agent's own Local Network alert on screen for the whole
-/// launch. Only the app's browse and dial, through the broker, cross the LAN. A wait on the
-/// server answering is a one-minute hang detector.
-fn lab_vault_setup(aterm: &str, home: &str, port: u16, service: &str) -> String {
-    let local = format!("http://127.0.0.1:{port}");
-    format!(
-        "set -e; A={home}; rm -rf $A; mkdir -p $A/seed; printf nux-probe-value > $A/seed/NUX_PROBE; export HOME=$A; \
-         ({aterm} secrets serve --listen 0.0.0.0:{port} --no-advertise --no-keep-awake --store $A/served </dev/null >$A/serve.log 2>&1 &); \
-         n=0; until curl -s -o /dev/null --max-time 1 {local}/; do \
-         n=$((n+1)); [ $n -gt 600 ] && {{ echo 'the lab vault did not answer within 60 s'; cat $A/serve.log; exit 1; }}; sleep 0.1; done; \
-         {aterm} secrets create '{local}/v1/{LOCAL_VAULT}' --import $A/seed --no-agent --name nux-seed > $A/create.out 2>&1 || {{ cat $A/create.out; exit 1; }}; \
-         (/usr/bin/dns-sd -R {LAB_VAULT_INSTANCE} {service} local {port} </dev/null >$A/register.log 2>&1 &); echo served"
-    )
-}
-
-/// `first-launch-vault`: a first launch whose app finds a lab vault served in its own guest, by
-/// its own browse through the broker, with no press (`docs/DESIGN-lan-broker-2026-11-05.md` §7).
-///
-/// The guest never reaches the live ALab (A12, the lane's packet filter) and tart's NAT keeps
-/// guests apart, so the vault is the guest's own: served at the guest's address and registered
-/// under a lab vault service made for the run (`_alab-lab-<nonce>._tcp`, which no ALab Mac
-/// registers or browses), named to the app by [`LAB_VAULT_SERVICE_ENV`] in its GUI session. On an
-/// app whose executable does not name that variable the row is NOT RUN before anything is served:
-/// that build's look would browse the live `_alab-vault._tcp`. Otherwise it is `first-launch`'s
-/// row, then the vault verdict: the app's `aterm.log` names the lab vault it heard
-/// ([`vault_heard`]) and no instance of the live `_alab-vault._tcp` ([`live_vault_heard`]). The
-/// broker logs no request it answered, only one it refused, so the row shows its log's lines
-/// that name the lab service: a refused browse or resolve of it.
-pub(super) fn first_launch_vault(g: &Guest, ask: &Ask, row: &mut Row) -> Result<(), Fail> {
-    let named = g.run(
-        &format!(
-            "/usr/bin/grep -q -a -F {LAB_VAULT_SERVICE_ENV} '{}' && echo named || echo absent",
-            g.aterm
-        ),
-        STEP,
-    )?;
-    if named.trim() != "named" {
-        return Err(crate::mac::not_run(format!(
-            "the app's executable names no {LAB_VAULT_SERVICE_ENV}, so its vault look would \
-             browse the live _alab-vault._tcp: the vault found with no press is NOT MEASURED \
-             on a build that does not read that knob"
-        )));
-    }
-    let mut bytes = [0u8; 6];
-    aterm_uds::rand::fill(&mut bytes).map_err(|e| Fail::die(format!("random bytes: {e}")))?;
-    let service = phrase::lab_service_of(bytes);
-    let addresses = phrase::inet_addresses(&g.run("/sbin/ifconfig -a 2>/dev/null || true", STEP)?);
-    let Some(lan) = phrase::lan_address(&addresses) else {
-        return Err(Fail::die(
-            "the guest has no address on tart's network for the lab vault to listen at",
-        ));
-    };
-    let listen = format!("{lan}:{LOCAL_VAULT_PORT}");
-    let served = g.sh(
-        &lab_vault_setup(
-            &g.aterm,
-            &format!("{GUEST_NUX}/lab-vault"),
-            LOCAL_VAULT_PORT,
-            &service,
-        ),
-        STEP + STEP,
-    )?;
-    if served.trim().lines().last() != Some("served") {
-        return Err(Fail::die(format!(
-            "the lab vault did not come up: {}",
-            squeeze(served.trim(), 300)
-        )));
-    }
-    let set = g.sh(
-        &g.as_root(&format!(
-            "/bin/launchctl asuser {uid} /bin/launchctl setenv {LAB_VAULT_SERVICE_ENV} {service} && \
-             /bin/launchctl asuser {uid} /bin/launchctl getenv {LAB_VAULT_SERVICE_ENV}",
-            uid = g.uid
-        )),
-        STEP,
-    )?;
-    if set.trim() != service {
-        return Err(Fail::die(format!(
-            "the GUI session's {LAB_VAULT_SERVICE_ENV} did not read back: {}",
-            squeeze(set.trim(), 120)
-        )));
-    }
-    row.cell(
-        "lab vault",
-        Value::Text(format!(
-            "{LAB_VAULT_INSTANCE} under {service} at {listen} ({LAB_VAULT_SERVICE_ENV} in gui/{})",
-            g.uid
-        )),
-    );
-    super::first_launch(g, ask, row)?;
-    let log = g.log()?;
-    let heard = vault_heard(&log, &service);
-    let live = live_vault_heard(&log);
-    let broker_log = g.run(
-        &g.as_root(&format!(
-            "/usr/bin/grep -F -- '{service}' '{LOG_PATH}' 2>/dev/null || true"
-        )),
-        STEP,
-    )?;
-    row.cell(
-        "the lab vault found by the app's own browse, no press",
-        if heard.is_empty() {
-            Value::Text("not found: aterm.log names no lab vault it heard".into())
-        } else {
-            Value::Text(squeeze(&heard.join(" | "), 300))
-        },
-    );
-    row.cell(
-        "the broker's refusals of the lab service",
-        Value::Text(if broker_log.trim().is_empty() {
-            format!("none: {LOG_PATH} names no {service}")
-        } else {
-            squeeze(broker_log.trim(), 300)
-        }),
-    );
-    if !live.is_empty() {
-        row.fail(format!(
-            "the app's vault look heard the live {}: {}",
-            super::ALAB_SERVICE,
-            squeeze(&live.join(" | "), 300)
-        ));
-    }
-    if heard.is_empty() {
-        row.fail(format!(
-            "the app's vault look never heard the lab vault ({LAB_VAULT_INSTANCE} under {service})"
-        ));
-    }
-    Ok(())
-}
-
 /// What `aterm.log` says when the GUI's Commons waits on a broker: `Commons … repair: LanHeld`.
 const LAN_HELD: &str = ": LanHeld";
 
@@ -1183,32 +1009,5 @@ mod tests {
             ),
             LanStatus::Not(_)
         ));
-    }
-
-    #[test]
-    fn the_lab_vault_is_heard_only_on_its_own_service() {
-        let log = "1 INFO aterm: vault look: heard alab-secrets on _alab-lab-x1y2z3._tcp\n\
-                   2 INFO aterm: vault look: heard alab-secrets on _alab-vault._tcp\n";
-        assert_eq!(vault_heard(log, "_alab-lab-x1y2z3._tcp").len(), 1);
-        assert!(vault_heard(log, "_alab-lab-other._tcp").is_empty());
-        // NEGATIVE CONTROL: `live_vault_heard` matching any `heard` line takes the lab's too.
-        assert_eq!(
-            live_vault_heard(log),
-            ["2 INFO aterm: vault look: heard alab-secrets on _alab-vault._tcp"]
-        );
-        assert!(live_vault_heard(log.lines().next().unwrap()).is_empty());
-        let setup = lab_vault_setup("/a/aterm", "/h", 7485, "_alab-lab-x1y2z3._tcp");
-        assert!(setup.contains("--no-advertise"), "{setup}");
-        assert!(setup.contains("--listen 0.0.0.0:7485"), "{setup}");
-        assert!(
-            setup.contains("secrets create 'http://127.0.0.1:7485/v1/"),
-            "the lane's own dial stays on loopback: {setup}"
-        );
-        assert!(!setup.contains("192.168."), "{setup}");
-        assert!(
-            setup.contains("dns-sd -R alab-secrets _alab-lab-x1y2z3._tcp local 7485"),
-            "{setup}"
-        );
-        assert!(!setup.contains("_alab-vault._tcp"), "{setup}");
     }
 }

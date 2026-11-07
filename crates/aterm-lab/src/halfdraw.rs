@@ -73,7 +73,12 @@ struct State {
     open: bool,
     /// The screen is a frame the program closed, nothing drawn since.
     closed: bool,
-    busy: bool,
+    /// The busy row ([`ScreenReader::busy_guard`]) is drawn: the read `await gone <guard>`
+    /// answers on, which reads no title.
+    row: bool,
+    /// The title runs and the reading beside it ([`ScreenReader::read_titled`]) is Busy: the
+    /// harness's read of a turn whose screen draws no busy row, a reply under a status line.
+    held: bool,
     torn: bool,
     phase: String,
     composer: bool,
@@ -193,12 +198,17 @@ fn scan(
         splits += usize::from(t.sync_frame_unfinished());
         let rows = screen(&t);
         let zone = reader.busy_zone_start(&rows).min(rows.len());
-        let reading = reader.read(&rows, None);
+        // The program's title read with the rows, as the harness reads them: under a status
+        // line Claude Code draws its reply with no busy row, and its title's run glyph is the
+        // turn's one sign.
+        let runs = reader.runs(Some(t.title()));
+        let reading = reader.read_titled(&rows, None, runs);
         states.push(State {
             at: e.at,
             open,
             closed: t.screen_is_closed_frame(),
-            busy: rows[zone..].iter().any(|r| busy.is_match(r)),
+            row: rows[zone..].iter().any(|r| busy.is_match(r)),
+            held: runs == Some(true) && reading.phase == aterm_phase::phase::Phase::Busy,
             torn: reader.frame_torn(&rows),
             phase: reading.phase.name().to_string(),
             composer: reading.composer.is_some(),
@@ -221,16 +231,23 @@ fn scan(
         (0usize, 0usize, 0usize, 0usize, 0usize);
     let mut shown = 0usize;
     for i in 1..states.len() {
-        let s = &states[i];
-        if s.busy || !states[i - 1].busy {
-            continue;
-        }
-        let Some(back) = states[i + 1..]
-            .iter()
-            .take_while(|n| n.at - s.at <= GAP_WINDOW_S)
-            .find(|n| n.busy)
-            .map(|n| n.at - s.at)
-        else {
+        let (s, before) = (&states[i], &states[i - 1]);
+        let back_of = |sign: fn(&State) -> bool| {
+            states[i + 1..]
+                .iter()
+                .take_while(|n| n.at - s.at <= GAP_WINDOW_S)
+                .find(|n| sign(n))
+                .map(|n| n.at - s.at)
+        };
+        // A gap is the busy row gone mid-turn, the read `await gone <guard>` answers on whatever
+        // the title says; or, with no busy row drawn, the titled busy read gone mid-turn, the
+        // harness's read under a status line. Each comes back by its own sign. A cast no title
+        // runs over holds nothing, so its busy row alone decides, as for every cast before.
+        let row_gap = (before.row && !s.row).then(|| back_of(|n| n.row)).flatten();
+        let held_gap = (before.held && !s.held && !s.row)
+            .then(|| back_of(|n| n.held))
+            .flatten();
+        let Some(back) = row_gap.or(held_gap) else {
             continue;
         };
         let class = if s.open {
@@ -265,6 +282,16 @@ fn scan(
             }
         }
     }
+    let busy_states = states.iter().filter(|s| s.row || s.held).count();
+    let _ = writeln!(
+        out,
+        "busy states: {busy_states}{}",
+        if busy_states == 0 {
+            " (blind: no read showed the busy row or read busy under a running title, so no gap could be seen)"
+        } else {
+            ""
+        }
+    );
     let _ = writeln!(
         out,
         "busy gaps: {} (open {open}, settle {settle}, torn {torn}, UNGUARDED {unguarded}, of them idle {idle})",
@@ -276,12 +303,33 @@ fn scan(
         let s = &states[i];
         let _ = writeln!(
             out,
-            "event {i} t={:.6} open={} closed={} busy={} torn={} phase={}",
-            s.at, s.open, s.closed, s.busy, s.torn, s.phase
+            "event {i} t={:.6} open={} closed={} row={} held={} torn={} phase={}",
+            s.at, s.open, s.closed, s.row, s.held, s.torn, s.phase
         );
         for (n, r) in rows.iter().enumerate() {
             let _ = writeln!(out, "  {n:2}|{r}");
         }
+    }
+    out
+}
+
+/// A cast of whole frames, one event each a millisecond apart: each frame's rows drawn from
+/// the top, the cursor on its composer's caret, under the window title given (none set where
+/// it is `None`).
+#[cfg(test)]
+pub(crate) fn frames_cast(frames: &[(&[String], Option<&str>)]) -> String {
+    let mut out = String::from("{\"version\": 2, \"width\": 144, \"height\": 20}\n");
+    for (i, (rows, title)) in frames.iter().enumerate() {
+        let mut data = title.map_or_else(String::new, |t| format!("\x1b]2;{t}\x07"));
+        data.push_str("\x1b[2J");
+        for (n, row) in rows.iter().enumerate() {
+            data.push_str(&format!("\x1b[{};1H{row}", n + 1));
+        }
+        if let Some((caret, _)) = aterm_phase::phase::composer_draft(rows) {
+            data.push_str(&format!("\x1b[{};3H", caret + 1));
+        }
+        let quoted = aterm_json::to_string(&data).expect("a JSON string");
+        out.push_str(&format!("[{:.6}, \"o\", {quoted}]\n", i as f64 * 0.001));
     }
     out
 }
@@ -340,6 +388,176 @@ mod tests {
         let whole = scan_claude(&[b"\x1b[47;3H", BEFORE, &joined, END]);
         assert!(whole.contains(", 0 ending inside an open frame"), "{whole}");
         assert!(whole.contains("busy gaps: 0 "), "{whole}");
+    }
+
+    /// The same MEASURED split under the running title Claude Code 2.1.308 sets mid-turn (its
+    /// `end.bin` runs `◑`/`◐`): `await gone <guard>` reads no title, so the half frame is still
+    /// the one open gap, though the reading beside the title calls it busy. NEGATIVE CONTROL: the
+    /// split joined under the same title leaves no gap.
+    #[test]
+    fn a_running_title_hides_no_busy_row_gap() {
+        let title = "\x1b]0;\u{25D0} Claude Code\x07\x1b[47;3H";
+        let split = scan_claude(&[title.as_bytes(), BEFORE, HALF, REST, END]);
+        assert!(
+            split.contains("busy gaps: 1 (open 1, settle 0, torn 0, UNGUARDED 0"),
+            "{split}"
+        );
+        assert!(split.contains("gap at event 2 "), "{split}");
+        assert!(split.contains(" open phase=busy "), "{split}");
+        let joined: Vec<u8> = [HALF, REST].concat();
+        let whole = scan_claude(&[title.as_bytes(), BEFORE, &joined, END]);
+        assert!(whole.contains("busy gaps: 0 "), "CONTROL: {whole}");
+    }
+
+    /// Claude Code 2.1.311's spinner row, drawn above a status line's composer with no
+    /// `esc to interrupt`, is no busy row; under a running title the reading beside it is busy
+    /// all the same, so a spinner frame between title-held reply frames is no gap and a cast of
+    /// spinner frames alone is not blind. NEGATIVE CONTROL: the titles stripped, no read is busy.
+    #[test]
+    fn a_spinner_under_a_running_title_is_busy() {
+        use aterm_phase::prompt::fixtures::{STATUSLINE_MIDREPLY_2_1_311, screen as rows_of};
+        let mid = rows_of(STATUSLINE_MIDREPLY_2_1_311);
+        let (top, _) = aterm_phase::phase::composer_rules(&mid).expect("a composer");
+        let mut spinning = mid.clone();
+        spinning.insert(
+            top,
+            "\u{2736} Deliberating\u{2026} (4s \u{00B7} \u{2193} 120 tokens)".to_string(),
+        );
+        let (a, b) = (Some("\u{25D0} Claude Code"), Some("\u{25D1} Claude Code"));
+        let between = scan_status_line(&[(&mid, a), (&spinning, b), (&mid, a)]);
+        assert!(between.contains("\nbusy states: 3\n"), "{between}");
+        assert!(between.contains("busy gaps: 0 "), "{between}");
+        let alone = scan_status_line(&[(&spinning, a), (&spinning, b), (&spinning, a)]);
+        assert!(alone.contains("\nbusy states: 3\n"), "{alone}");
+        let stripped = scan_status_line(&[(&mid, None), (&spinning, None), (&mid, None)]);
+        assert!(
+            stripped.contains("\nbusy states: 0 (blind: "),
+            "CONTROL: {stripped}"
+        );
+    }
+
+    /// Under a status line the turn's one sign is the reading beside its running title: a frame
+    /// mid-reply that it does not read busy (here the composer cut, so the title holds nothing)
+    /// is a gap, the read the harness takes there. NEGATIVE CONTROL: the composer kept, no gap.
+    #[test]
+    fn under_a_status_line_a_gap_is_the_titled_busy_read_gone() {
+        use aterm_phase::prompt::fixtures::{STATUSLINE_MIDREPLY_2_1_311, screen as rows_of};
+        let mid = rows_of(STATUSLINE_MIDREPLY_2_1_311);
+        let (top, _) = aterm_phase::phase::composer_rules(&mid).expect("a composer");
+        let cut: Vec<String> = mid[..top].to_vec();
+        let (a, b) = (Some("\u{25D0} Claude Code"), Some("\u{25D1} Claude Code"));
+        let gap = scan_status_line(&[(&mid, a), (&cut, b), (&mid, a)]);
+        assert!(gap.contains("busy gaps: 1 "), "{gap}");
+        assert!(gap.contains("gap at event 1 "), "{gap}");
+        let kept = scan_status_line(&[(&mid, a), (&mid, b), (&mid, a)]);
+        assert!(kept.contains("busy gaps: 0 "), "CONTROL: {kept}");
+    }
+
+    /// `frames_cast` of `frames` scanned as Claude Code's.
+    fn scan_status_line(frames: &[(&Vec<String>, Option<&str>)]) -> String {
+        let frames: Vec<(&[String], Option<&str>)> =
+            frames.iter().map(|(r, t)| (r.as_slice(), *t)).collect();
+        let cast = parse_cast(&frames_cast(&frames)).expect("a cast");
+        let reader = Program::Claude.reader();
+        let guard = reader.busy_guard().expect("a busy guard");
+        scan(
+            &cast,
+            reader,
+            &aterm_regex::Regex::new(&guard).expect("the guard"),
+            0,
+            None,
+        )
+    }
+
+    /// Claude Code 2.1.311's status-line reply (lab `mr`, MEASURED frames) draws no busy row: the
+    /// scan counts the reads its running title holds busy and finds no gap. NEGATIVE CONTROL: the
+    /// same cast with its titles stripped shows no busy state, and the scan says it was blind.
+    #[test]
+    fn a_status_line_reply_is_seen_busy_by_its_title() {
+        use aterm_phase::prompt::fixtures::{
+            STATUSLINE_MIDREPLY_2_1_311, STATUSLINE_REPLY_DONE_2_1_311, screen as rows_of,
+        };
+        let mid = rows_of(STATUSLINE_MIDREPLY_2_1_311);
+        let done = rows_of(STATUSLINE_REPLY_DONE_2_1_311);
+        let scan_of = |titles: [Option<&str>; 3]| {
+            let text = frames_cast(&[
+                (mid.as_slice(), titles[0]),
+                (mid.as_slice(), titles[1]),
+                (done.as_slice(), titles[2]),
+            ]);
+            let cast = parse_cast(&text).expect("a cast");
+            let reader = Program::Claude.reader();
+            let guard = reader.busy_guard().expect("a busy guard");
+            scan(
+                &cast,
+                reader,
+                &aterm_regex::Regex::new(&guard).expect("the guard"),
+                0,
+                None,
+            )
+        };
+        let titled = scan_of([
+            Some("\u{25D0} Claude Code"),
+            Some("\u{25D1} Claude Code"),
+            Some("\u{2733} Claude Code"),
+        ]);
+        assert!(titled.contains("\nbusy states: 2\n"), "{titled}");
+        assert!(titled.contains("busy gaps: 0 "), "{titled}");
+        let stripped = scan_of([None, None, None]);
+        assert!(
+            stripped.contains("\nbusy states: 0 (blind: "),
+            "CONTROL: {stripped}"
+        );
+    }
+
+    /// With no running title a read is busy by its busy row alone, as before the scan read titles:
+    /// a frame that keeps Claude Code's spinner row but has lost its footer's `esc to interrupt`
+    /// is a busy gap, the read `await gone esc.to.interrupt` answers on, though the reader still
+    /// reads the spinner as a live turn. NEGATIVE CONTROL: the footer kept, no gap.
+    #[test]
+    fn with_no_running_title_a_gap_is_the_busy_row_gone() {
+        use aterm_phase::prompt::fixtures::{STATUSLINE_MIDREPLY_2_1_311, screen as rows_of};
+        let mid = rows_of(STATUSLINE_MIDREPLY_2_1_311);
+        let (top, _) = aterm_phase::phase::composer_rules(&mid).expect("a composer");
+        let mut torn = mid.clone();
+        torn.insert(
+            top,
+            "\u{2736} Deliberating\u{2026} (4s \u{00B7} \u{2193} 120 tokens)".to_string(),
+        );
+        let reader = Program::Claude.reader();
+        assert_eq!(
+            reader.phase(&torn),
+            aterm_phase::phase::Phase::Busy,
+            "the reader reads the spinner"
+        );
+        let mode = torn
+            .iter()
+            .position(|r| r.contains("auto mode on"))
+            .expect("the mode row");
+        let mut shown = torn.clone();
+        shown[mode].push_str(" \u{00B7} esc to interrupt");
+        let scan_of = |middle: &[String]| {
+            let text = frames_cast(&[
+                (shown.as_slice(), None),
+                (middle, None),
+                (shown.as_slice(), None),
+            ]);
+            let cast = parse_cast(&text).expect("a cast");
+            let guard = reader.busy_guard().expect("a busy guard");
+            scan(
+                &cast,
+                reader,
+                &aterm_regex::Regex::new(&guard).expect("the guard"),
+                0,
+                None,
+            )
+        };
+        let gap = scan_of(&torn);
+        assert!(gap.contains("\nbusy states: 2\n"), "{gap}");
+        assert!(gap.contains("busy gaps: 1 "), "{gap}");
+        assert!(gap.contains("gap at event 1 "), "{gap}");
+        let kept = scan_of(&shown);
+        assert!(kept.contains("busy gaps: 0 "), "CONTROL: {kept}");
     }
 
     #[test]

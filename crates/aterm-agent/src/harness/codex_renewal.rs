@@ -496,8 +496,9 @@ impl Candidate {
 #[path = "codex_renewal_attempts.rs"]
 mod attempts;
 pub use attempts::{
-    Attempt, AttemptRef, Cancellation, CancellationKind, NativeCancellationProof, ReceiptWriter,
-    read_active_attempt, read_attempt, read_cancellation, with_receipt_writer,
+    Attempt, AttemptRef, Cancellation, CancellationKind, CompletionProgress,
+    NativeCancellationProof, ReceiptWriter, read_active_attempt, read_attempt, read_cancellation,
+    with_receipt_writer,
 };
 
 /// Durable metadata only. Native command and operation persistence are retained

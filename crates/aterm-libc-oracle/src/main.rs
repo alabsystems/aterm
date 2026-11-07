@@ -5,8 +5,10 @@
 //! verbs ([`regen`], [`harvest`]).
 //!
 //! STOCK EXCEPTION: authoring cells absent from the selected Trust sysroot use
-//! a stock rustup toolchain with those targets' std (`--stock`, `stable` by
-//! default). A Trust target with actual std/core stays under Trust.
+//! a stock rustup toolchain with those targets' std (`--stock`, by default the
+//! checkout's stock pin, `aterm_toolchain::rustup::stock_pin`, whose stds
+//! `targo --unverified verify provision rustup` places). A Trust target with
+//! actual std/core stays under Trust.
 
 mod cargo;
 mod cells;
@@ -102,7 +104,7 @@ Trust; remaining cells use stock rustup with target std installed (STOCK EXCEPTI
   --cell <key>        regenerate only mac, macx, linux or linuxa (native cell needs no stock)
   --work <dir>        scratch dir (default: <checkout>/libc-oracle/target.noindex/regen)
   --docs <dir>        use prebuilt libc-0.2.186-<triple>.json rustdoc dumps from <dir>
-  --stock <toolchain> rustup toolchain for non-host cells (default: stable)
+  --stock <toolchain> rustup toolchain for non-host cells (default: the checkout's stock pin)
   --no-format         skip trustfmt on emitted files
 
 harvest: parse a `--message-format short` check log for `--cell <key>` (mac, macx, linux,
@@ -246,20 +248,31 @@ fn absolute(path: PathBuf) -> PathBuf {
     std::path::absolute(&path).unwrap_or(path)
 }
 
-/// The authoring verbs' options: scratch under the oracle's own target lane.
-fn regen_options(root: PathBuf, args: &Args) -> regen::Options {
-    regen::Options {
+/// The authoring verbs' options: scratch under the oracle's own target lane, and the checkout's
+/// stock pin for the cross cells unless `--stock` names another toolchain.
+///
+/// # Errors
+/// No `--stock`, and the checkout's engine gate disagrees with its stock pin
+/// (`aterm_toolchain::rustup::stock_pin`).
+fn regen_options(root: PathBuf, args: &Args) -> Result<regen::Options, Stop> {
+    let stock = match &args.stock {
+        Some(named) => named.clone(),
+        None => aterm_toolchain::rustup::stock_pin(&root).map_err(|refused| {
+            Stop::CouldNotRun(verdict::CouldNotRun::new(refused.why, refused.remedy))
+        })?,
+    };
+    Ok(regen::Options {
         out: args.out.clone().map_or_else(|| root.clone(), absolute),
         work: args
             .work
             .clone()
             .map_or_else(|| root.join(ORACLE_TARGET).join("regen"), absolute),
         docs: args.docs.clone().map(absolute),
-        stock: args.stock.clone().unwrap_or_else(|| "stable".into()),
+        stock,
         cell: args.cell.clone(),
         format: !args.no_format,
         root,
-    }
+    })
 }
 
 fn stopped(stop: Stop) -> ExitCode {
@@ -276,7 +289,10 @@ fn stopped(stop: Stop) -> ExitCode {
 }
 
 fn regen_verb(root: PathBuf, args: Args) -> ExitCode {
-    let options = regen_options(root, &args);
+    let options = match regen_options(root, &args) {
+        Ok(options) => options,
+        Err(stop) => return stopped(stop),
+    };
     match regen::regen(&options, &mut std::io::stdout()) {
         Ok(written) => {
             let formatted = if options.format { " and formatted" } else { "" };
@@ -308,8 +324,9 @@ fn harvest_verb(root: PathBuf, args: Args) -> ExitCode {
             return ExitCode::from(EXIT_USAGE);
         }
     };
-    let options = regen_options(root, &args);
-    report_harvest(&options, cell, &log, args.write).map_or_else(stopped, |()| ExitCode::SUCCESS)
+    regen_options(root, &args)
+        .and_then(|options| report_harvest(&options, cell, &log, args.write))
+        .map_or_else(stopped, |()| ExitCode::SUCCESS)
 }
 
 /// Report what `log` says `cell` lacks; with `write`, add it to the list.
@@ -404,6 +421,26 @@ mod tests {
         assert_eq!(find_root(&start), Some(root.clone()));
         std::fs::remove_file(root.join("libc-oracle/Cargo.toml")).expect("remove");
         assert_eq!(find_root(&start), None);
+    }
+
+    /// Regen's cross cells compile on the checkout's stock pin unless `--stock` names another,
+    /// never on rustup's floating `stable`.
+    #[test]
+    fn regen_rides_the_stock_pin_by_default() {
+        let root = aterm_tempfile::manifest_dir().join("../..");
+        let stock = |words: &[&str]| {
+            regen_options(root.clone(), &args(words).unwrap())
+                .map(|options| options.stock)
+                .ok()
+        };
+        assert_eq!(
+            stock(&["regen"]).as_deref(),
+            Some(aterm_toolchain::rustup::STOCK_PIN)
+        );
+        assert_eq!(
+            stock(&["regen", "--stock", "1.98.1"]).as_deref(),
+            Some("1.98.1")
+        );
     }
 
     #[test]

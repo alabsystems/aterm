@@ -1,22 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `verify provision`'s rustup row for stock stable and the wasm32 pin, driven by the rustup
-//! the `rustup` row of [`aterm_uds::host::TOOLS`] resolves (the row's stamped copy, once
-//! placed).
+//! `verify provision`'s rustup row for the checkout's stock pin and the release chain's stock
+//! toolchain, driven by the rustup the `rustup` row of [`aterm_uds::host::TOOLS`] resolves (the
+//! row's stamped copy, once placed).
 //!
-//! STOCK EXCEPTION: the Trust sysroot carries only its host's std, so `verify cells` compiles
-//! and lints its cells ([`CELL_TARGETS`]) on stock stable, and the wasm32 target rides the pin
-//! `publish/config.sh` names; this row installs both toolchains and their targets.
+//! STOCK EXCEPTION: the Trust sysroot carries only its host's std, so every dev lane that
+//! compiles for another target rides the one stock toolchain the checkout pins ([`stock_pin`]):
+//! `verify cells` compiles and lints its cells ([`CELL_TARGETS`]) on it, the web modules'
+//! lanes build on it, and `--linux` adds the Linux lane's guest agent's std
+//! ([`LINUX_LANE_TARGETS`]). This row installs that one toolchain, its stds and its clippy, and
+//! beside it the toolchain the release chain still builds its own slices on
+//! ([`RELEASE_TOOLCHAIN`], [`RELEASE_TARGETS`]); no dev lane takes anything from that one.
 
 use std::path::{Path, PathBuf};
 
 use aterm_uds::host::{Absent, Lookup};
 
 /// The std targets the `cells` check (`targo --unverified verify cells`, by hand)
-/// compiles its cells for, on upstream stable: every forge cell's triple (this
-/// machine's own is stable's host std, there already). The x86_64 Mac's is also the
-/// shipped binary's x86_64 slice.
+/// compiles its cells for, on the stock pin: every forge cell's triple (this machine's
+/// own among them, which a minimal install already carries). wasm32's is also the one the web
+/// modules' lanes build for, and the Macs' and Linux gnu ones the libc oracle's cross cells.
 pub const CELL_TARGETS: [&str; 7] = [
     "x86_64-apple-darwin",
     "aarch64-apple-darwin",
@@ -27,19 +31,33 @@ pub const CELL_TARGETS: [&str; 7] = [
     "wasm32-unknown-unknown",
 ];
 
-/// The std targets `--linux` adds to stable: the Linux lane's guest agent
+/// The std targets `--linux` adds to the stock pin: the Linux lane's guest agent
 /// (`crates/aterm-vz-agent`) is a static musl binary cross-built for this one
 /// (STOCK EXCEPTION: Trust has no Linux std; docs/DESIGN-vz-guest-2026-10-23.md §6).
 pub const LINUX_LANE_TARGETS: [&str; 1] = ["aarch64-unknown-linux-musl"];
 
-pub use crate::rustup::{ClauseError, WasmClause, wasm_clause, wasm_pin, wasm_pin_wanted};
+/// The toolchain the release chain builds its STOCK EXCEPTION slices on: `aterm-release`
+/// compiles the universal binary's x86_64 slice, `ship check --compat` (and `verify watch`'s
+/// stage that rehearses it) and a Linux worker's static bootstrap verifier with
+/// `RUSTUP_TOOLCHAIN=stable`, and `ship provision`'s `x86 slice` probes it. This row puts it in
+/// place, so `ship provision`, which runs this row, readies a release host, until the release
+/// chain builds on a pinned release as the dev lanes do.
+pub const RELEASE_TOOLCHAIN: &str = "stable";
 
-/// The wasm32 target the pin carries.
-const WASM32: &str = "wasm32-unknown-unknown";
+/// The stds the release chain takes from [`RELEASE_TOOLCHAIN`] past its host's: on a Mac, the
+/// universal binary's x86_64 slice's. A Linux worker builds only for its own host.
+pub const RELEASE_TARGETS: &[&str] = if cfg!(target_os = "macos") {
+    &["x86_64-apple-darwin"]
+} else {
+    &[]
+};
 
-/// The component stable carries past the minimal profile: `verify cells` lints each
-/// foreign cell with its toolchain's clippy, and skips a toolchain that has the std
-/// but no clippy.
+pub use crate::rustup::{
+    ClauseError, STOCK_PIN, STOCK_PIN_FILE, WasmClause, stock_pin, wasm_clause,
+};
+
+/// The component the pin carries past the minimal profile: `verify cells` lints each foreign
+/// cell with the pin's clippy, and a pin without it is a COULD NOT RUN.
 const CLIPPY: &str = "clippy";
 
 /// The file rustup keeps its settings in, which a home rustup never ran in lacks.
@@ -58,15 +76,18 @@ const NO_SELF_UPDATE: &str = "--no-self-update";
 pub(crate) struct Seen {
     /// rustup's home holds no settings yet: rustup never ran there.
     pub fresh_home: bool,
+    /// The host rustup resolves a bare release or channel to
+    /// ([`aterm_toolchain::rustup::default_host`]).
+    pub host: String,
     /// `rustup toolchain list`'s names.
     pub toolchains: Vec<String>,
-    /// The std targets installed on stable.
-    pub stable_targets: Vec<String>,
-    /// The components installed on stable, as rustup names them
-    /// (`clippy-aarch64-apple-darwin`).
-    pub stable_components: Vec<String>,
-    /// The std targets installed on the wasm32 pin.
+    /// The std targets installed on the pin.
     pub pin_targets: Vec<String>,
+    /// The components installed on the pin, as rustup names them
+    /// (`clippy-aarch64-apple-darwin`).
+    pub pin_components: Vec<String>,
+    /// The std targets installed on [`RELEASE_TOOLCHAIN`].
+    pub release_targets: Vec<String>,
 }
 
 /// One acquisition.
@@ -74,59 +95,84 @@ pub(crate) struct Seen {
 pub(crate) enum Step {
     /// `rustup set auto-install disable`, first in a home rustup never ran in.
     AutoInstallOff,
-    /// `rustup toolchain install stable --profile minimal --component clippy --no-self-update`.
-    StableToolchain,
-    /// `rustup target add --toolchain stable <targets>`.
-    StableTargets(Vec<String>),
-    /// `rustup component add --toolchain stable clippy`.
-    StableClippy,
-    /// `rustup toolchain install <pin> --profile minimal --target wasm32-unknown-unknown
-    /// --no-self-update`.
+    /// `rustup toolchain install <pin> --profile minimal --component clippy --no-self-update`.
     PinToolchain(String),
-    /// `rustup target add --toolchain <pin> wasm32-unknown-unknown`.
-    PinTarget(String),
+    /// `rustup target add --toolchain <pin> <targets>`.
+    PinTargets(String, Vec<String>),
+    /// `rustup component add --toolchain <pin> clippy`.
+    PinClippy(String),
+    /// `rustup toolchain install stable --profile minimal [--target <t>]… --no-self-update`.
+    ReleaseToolchain(Vec<String>),
+    /// `rustup target add --toolchain stable <targets>`.
+    ReleaseTargets(Vec<String>),
 }
 
-/// Whether `listed` holds `name`, which rustup lists with a triple after it: a toolchain
-/// (`stable-aarch64-apple-darwin`) or a component (`clippy-aarch64-apple-darwin`).
+/// Whether `seen` holds the toolchain `name` as rustup resolves it on its host
+/// ([`aterm_toolchain::rustup::holds_toolchain`]).
+fn holds(seen: &Seen, name: &str) -> bool {
+    aterm_toolchain::rustup::holds_toolchain(&seen.toolchains.join("\n"), name, &seen.host)
+}
+
+/// Whether `listed` holds the component `name`, which rustup lists with its triple after it
+/// (`clippy-aarch64-apple-darwin`).
 fn has(listed: &[String], name: &str) -> bool {
     listed
         .iter()
         .any(|t| t == name || t.starts_with(&format!("{name}-")))
 }
 
-/// What a machine that holds `seen` lacks, in order.
-pub(crate) fn plan(seen: &Seen, pin: Option<&str>, stable_targets: &[&str]) -> Vec<Step> {
+/// What a machine that holds `seen` lacks, in order: of the stock pin `pin` with `targets`' stds
+/// and clippy (nothing of it where the checkout's pin could not be read, `None`), then of
+/// [`RELEASE_TOOLCHAIN`] with `release`'s stds.
+pub(crate) fn plan(
+    seen: &Seen,
+    pin: Option<&str>,
+    targets: &[&str],
+    release: &[&str],
+) -> Vec<Step> {
     let mut steps = Vec::new();
     if seen.fresh_home {
         steps.push(Step::AutoInstallOff);
     }
-    if has(&seen.toolchains, "stable") {
-        let missing: Vec<String> = stable_targets
+    if let Some(pin) = pin {
+        pin_plan(seen, pin, targets, &mut steps);
+    }
+    if holds(seen, RELEASE_TOOLCHAIN) {
+        let missing: Vec<String> = release
             .iter()
-            .filter(|t| !seen.stable_targets.iter().any(|i| i == *t))
+            .filter(|t| !seen.release_targets.iter().any(|i| i == *t))
             .map(|t| (*t).to_string())
             .collect();
         if !missing.is_empty() {
-            steps.push(Step::StableTargets(missing));
-        }
-        if !has(&seen.stable_components, CLIPPY) {
-            steps.push(Step::StableClippy);
+            steps.push(Step::ReleaseTargets(missing));
         }
     } else {
-        steps.push(Step::StableToolchain);
-        steps.push(Step::StableTargets(
-            stable_targets.iter().map(|t| (*t).to_string()).collect(),
+        steps.push(Step::ReleaseToolchain(
+            release.iter().map(|t| (*t).to_string()).collect(),
         ));
     }
-    if let Some(pin) = pin {
-        if !has(&seen.toolchains, pin) {
-            steps.push(Step::PinToolchain(pin.to_string()));
-        } else if !seen.pin_targets.iter().any(|t| t == WASM32) {
-            steps.push(Step::PinTarget(pin.to_string()));
-        }
-    }
     steps
+}
+
+/// What `seen` lacks of the pin `pin` with `targets`' stds and clippy, onto `steps`.
+fn pin_plan(seen: &Seen, pin: &str, targets: &[&str], steps: &mut Vec<Step>) {
+    let (held, components): (&[String], &[String]) = if holds(seen, pin) {
+        (&seen.pin_targets, &seen.pin_components)
+    } else {
+        steps.push(Step::PinToolchain(pin.to_string()));
+        (&[], &[CLIPPY.to_string()])
+    };
+    let missing: Vec<String> = targets
+        .iter()
+        .filter(|t| !held.iter().any(|i| i == *t))
+        .map(|t| (*t).to_string())
+        .collect();
+    if !missing.is_empty() {
+        steps.push(Step::PinTargets(pin.to_string(), missing));
+    }
+    if !has(components, CLIPPY) {
+        steps.push(Step::PinClippy(pin.to_string()));
+    }
 }
 
 /// The rustup command line of `step`.
@@ -134,30 +180,6 @@ pub(crate) fn argv(step: &Step) -> Vec<String> {
     let v = |a: &[&str]| a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
     match step {
         Step::AutoInstallOff => v(&["rustup", "set", "auto-install", "disable"]),
-        Step::StableToolchain => v(&[
-            "rustup",
-            "toolchain",
-            "install",
-            "stable",
-            "--profile",
-            "minimal",
-            "--component",
-            CLIPPY,
-            NO_SELF_UPDATE,
-        ]),
-        Step::StableTargets(ts) => {
-            let mut a = v(&["rustup", "target", "add", "--toolchain", "stable"]);
-            a.extend(ts.iter().cloned());
-            a
-        }
-        Step::StableClippy => v(&[
-            "rustup",
-            "component",
-            "add",
-            "--toolchain",
-            "stable",
-            CLIPPY,
-        ]),
         Step::PinToolchain(pin) => v(&[
             "rustup",
             "toolchain",
@@ -165,11 +187,36 @@ pub(crate) fn argv(step: &Step) -> Vec<String> {
             pin,
             "--profile",
             "minimal",
-            "--target",
-            WASM32,
+            "--component",
+            CLIPPY,
             NO_SELF_UPDATE,
         ]),
-        Step::PinTarget(pin) => v(&["rustup", "target", "add", "--toolchain", pin, WASM32]),
+        Step::PinTargets(pin, ts) => {
+            let mut a = v(&["rustup", "target", "add", "--toolchain", pin]);
+            a.extend(ts.iter().cloned());
+            a
+        }
+        Step::PinClippy(pin) => v(&["rustup", "component", "add", "--toolchain", pin, CLIPPY]),
+        Step::ReleaseToolchain(ts) => {
+            let mut a = v(&[
+                "rustup",
+                "toolchain",
+                "install",
+                RELEASE_TOOLCHAIN,
+                "--profile",
+                "minimal",
+            ]);
+            for t in ts {
+                a.extend(["--target".to_string(), t.clone()]);
+            }
+            a.push(NO_SELF_UPDATE.to_string());
+            a
+        }
+        Step::ReleaseTargets(ts) => {
+            let mut a = v(&["rustup", "target", "add", "--toolchain", RELEASE_TOOLCHAIN]);
+            a.extend(ts.iter().cloned());
+            a
+        }
     }
 }
 
@@ -280,29 +327,25 @@ fn observe(homes: &Homes, bin: &Path, rustup: &dyn Rustup, pin: Option<&str>) ->
             .map(|out| first_words(&out))
             .unwrap_or_default()
     };
-    let toolchains = lines(None, &["toolchain", "list"]);
-    let installed = |t: &str, what: &str| {
-        if has(&toolchains, t) {
-            lines(Some(t), &[what, "list", "--installed"])
-        } else {
-            Vec::new()
-        }
-    };
-    let stable_targets = installed("stable", "target");
-    let stable_components = installed("stable", "component");
-    let pin_targets = pin.map(|p| installed(p, "target")).unwrap_or_default();
-    Seen {
+    let mut seen = Seen {
         fresh_home: !homes.rustup_home.join(SETTINGS).is_file(),
-        toolchains,
-        stable_targets,
-        stable_components,
-        pin_targets,
+        host: aterm_toolchain::rustup::default_host(&homes.rustup_home),
+        toolchains: lines(None, &["toolchain", "list"]),
+        ..Seen::default()
+    };
+    if let Some(p) = pin.filter(|p| holds(&seen, p)) {
+        seen.pin_targets = lines(Some(p), &["target", "list", "--installed"]);
+        seen.pin_components = lines(Some(p), &["component", "list", "--installed"]);
     }
+    if holds(&seen, RELEASE_TOOLCHAIN) {
+        seen.release_targets = lines(Some(RELEASE_TOOLCHAIN), &["target", "list", "--installed"]);
+    }
+    seen
 }
 
-/// What this row asks stable for: the cells' stds ([`CELL_TARGETS`]), and with `linux`
+/// What this row asks the pin for: the cells' stds ([`CELL_TARGETS`]), and with `linux`
 /// (`--linux`) the Linux lane's [`LINUX_LANE_TARGETS`] last.
-fn stable_targets(linux: bool) -> Vec<&'static str> {
+fn pin_targets(linux: bool) -> Vec<&'static str> {
     let mut targets: Vec<&str> = CELL_TARGETS.to_vec();
     if linux {
         targets.extend(LINUX_LANE_TARGETS);
@@ -311,8 +354,9 @@ fn stable_targets(linux: bool) -> Vec<&'static str> {
 }
 
 /// What rustup's home lacks of the row, read only through the rustup the row resolves:
-/// empty when it is in place. `linux` (`--linux`) holds stable to the Linux lane's targets
-/// too.
+/// empty when it is in place. `pin` is the checkout's stock pin (`None` where it could not be
+/// read, which asks nothing of it); `linux` (`--linux`) holds the pin to the Linux lane's
+/// targets too.
 ///
 /// # Errors
 /// The row resolves no rustup to read with.
@@ -323,19 +367,16 @@ pub fn missing(
     linux: bool,
 ) -> Result<Vec<String>, Absent> {
     let bin = homes.rustup()?;
-    Ok(plan(
-        &observe(homes, &bin, rustup, pin),
-        pin,
-        &stable_targets(linux),
-    )
-    .iter()
-    .map(|step| argv(step).join(" "))
-    .collect())
+    let seen = observe(homes, &bin, rustup, pin);
+    Ok(plan(&seen, pin, &pin_targets(linux), RELEASE_TARGETS)
+        .iter()
+        .map(|step| argv(step).join(" "))
+        .collect())
 }
 
 /// Acquire what rustup's home lacks with the rustup the row resolves; each step is said,
-/// and a step that fails is said with why. `linux` (`--linux`) adds the Linux lane's stable
-/// targets.
+/// and a step that fails is said with why. `linux` (`--linux`) adds the Linux lane's
+/// targets to the pin.
 ///
 /// # Errors
 /// Returns an error naming every step that failed, the unreadable pin, or the rustup the
@@ -348,10 +389,10 @@ pub fn run(
     report: &mut dyn FnMut(&str),
 ) -> Result<Vec<String>, String> {
     let mut failed = Vec::new();
-    let pin = match wasm_pin_wanted(repo) {
-        Ok(pin) => pin,
-        Err(why) => {
-            failed.push(format!("the wasm32 pin is not acquired — {why}"));
+    let pin = match stock_pin(repo) {
+        Ok(pin) => Some(pin),
+        Err(refused) => {
+            failed.push(format!("the stock pin is not acquired — {refused}"));
             None
         }
     };
@@ -361,7 +402,7 @@ pub fn run(
     })?;
     let seen = observe(homes, &bin, rustup, pin.as_deref());
     let mut acquired = Vec::new();
-    for step in plan(&seen, pin.as_deref(), &stable_targets(linux)) {
+    for step in plan(&seen, pin.as_deref(), &pin_targets(linux), RELEASE_TARGETS) {
         let args = &argv(&step)[1..];
         match rustup.run(homes, &bin, args, None) {
             Ok(_) => {
@@ -388,6 +429,9 @@ mod tests {
     use super::*;
 
     const TARGETS: &[&str] = &["x86_64-apple-darwin", "wasm32-unknown-unknown"];
+    const RELEASE: &[&str] = &["x86_64-apple-darwin"];
+    const PIN: &str = "1.97.1";
+    const HOST: &str = "aarch64-apple-darwin";
 
     fn names(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| (*s).to_string()).collect()
@@ -396,83 +440,167 @@ mod tests {
     fn provisioned() -> Seen {
         Seen {
             fresh_home: false,
+            host: HOST.into(),
             toolchains: names(&["stable-aarch64-apple-darwin", "1.97.1-aarch64-apple-darwin"]),
-            stable_targets: names(TARGETS),
-            stable_components: names(&[
-                "cargo-aarch64-apple-darwin",
-                "clippy-aarch64-apple-darwin",
-            ]),
-            pin_targets: names(&["aarch64-apple-darwin", WASM32]),
+            pin_targets: names(TARGETS),
+            pin_components: names(&["cargo-aarch64-apple-darwin", "clippy-aarch64-apple-darwin"]),
+            release_targets: names(&[HOST, "x86_64-apple-darwin"]),
         }
     }
 
     #[test]
-    fn a_missing_target_or_clippy_is_added_to_the_toolchain_that_lacks_it() {
+    fn a_missing_target_or_clippy_is_added_to_the_pin() {
         let mut s = provisioned();
-        s.stable_targets = names(&["wasm32-unknown-unknown"]);
-        s.stable_components = names(&["cargo-aarch64-apple-darwin"]);
-        s.pin_targets = names(&["aarch64-apple-darwin"]);
+        s.pin_targets = names(&["wasm32-unknown-unknown"]);
+        s.pin_components = names(&["cargo-aarch64-apple-darwin"]);
         assert_eq!(
-            plan(&s, Some("1.97.1"), TARGETS),
+            plan(&s, Some(PIN), TARGETS, RELEASE),
             [
-                Step::StableTargets(names(&["x86_64-apple-darwin"])),
-                Step::StableClippy,
-                Step::PinTarget("1.97.1".into()),
+                Step::PinTargets(PIN.into(), names(&["x86_64-apple-darwin"])),
+                Step::PinClippy(PIN.into()),
             ]
         );
         assert_eq!(
-            argv(&Step::StableClippy).join(" "),
-            "rustup component add --toolchain stable clippy"
+            argv(&Step::PinClippy(PIN.into())).join(" "),
+            "rustup component add --toolchain 1.97.1 clippy"
         );
+        assert_eq!(plan(&provisioned(), Some(PIN), TARGETS, RELEASE), []);
     }
 
+    /// THE PIN IS PROVISIONED WHATEVER STABLE HOLDS: a machine whose floating `stable` carries
+    /// every cell's std and clippy, and which lacks the pin, gets the pin installed with clippy
+    /// and every target; nothing of the pin is asked of `stable`. NEGATIVE CONTROL: a plan that
+    /// counts `stable`'s stds and clippy as the pin's leaves this machine as it is, and the first
+    /// assertion fails.
     #[test]
-    fn a_missing_pin_is_installed_with_its_wasm32_target_and_stable_alone_when_absent() {
+    fn a_missing_pin_is_installed_with_clippy_and_every_target_whatever_stable_holds() {
         let mut s = provisioned();
-        s.toolchains = names(&["nightly-aarch64-apple-darwin"]);
+        s.toolchains = names(&[
+            "stable-aarch64-apple-darwin",
+            "nightly-aarch64-apple-darwin",
+        ]);
+        s.pin_targets = Vec::new();
+        s.pin_components = Vec::new();
+        let steps = plan(&s, Some(PIN), TARGETS, RELEASE);
         assert_eq!(
-            plan(&s, Some("1.97.1"), TARGETS),
+            steps,
             [
-                Step::StableToolchain,
-                Step::StableTargets(names(TARGETS)),
-                Step::PinToolchain("1.97.1".into()),
+                Step::PinToolchain(PIN.into()),
+                Step::PinTargets(PIN.into(), names(TARGETS)),
             ]
         );
-        assert_eq!(plan(&provisioned(), None, TARGETS), []);
+        assert_eq!(
+            argv(&steps[0]).join(" "),
+            "rustup toolchain install 1.97.1 --profile minimal --component clippy --no-self-update"
+        );
+        assert!(
+            steps
+                .iter()
+                .flat_map(argv)
+                .all(|word| !word.starts_with("stable")),
+            "{steps:?}"
+        );
         let fresh = Seen {
             fresh_home: true,
+            host: HOST.into(),
             ..Seen::default()
         };
         assert_eq!(
-            plan(&fresh, Some("1.97.1"), TARGETS),
+            plan(&fresh, Some(PIN), TARGETS, RELEASE),
             [
                 Step::AutoInstallOff,
-                Step::StableToolchain,
-                Step::StableTargets(names(TARGETS)),
-                Step::PinToolchain("1.97.1".into()),
+                Step::PinToolchain(PIN.into()),
+                Step::PinTargets(PIN.into(), names(TARGETS)),
+                Step::ReleaseToolchain(names(RELEASE)),
             ],
             "a home rustup never ran in turns auto-install off first"
+        );
+        assert_eq!(
+            plan(&fresh, None, TARGETS, RELEASE),
+            [Step::AutoInstallOff, Step::ReleaseToolchain(names(RELEASE))],
+            "a pin that could not be read is asked for nothing, the release chain's stable still"
+        );
+    }
+
+    /// THE RELEASE CHAIN'S `stable` IS IN PLACE WITH ITS SLICE'S STD, AND NOTHING MORE: absent, it
+    /// is installed with the x86_64 slice's std and no clippy; held without that std, the std is
+    /// added; held with it, nothing. NEGATIVE CONTROL: a plan without the release part leaves a
+    /// bare machine without `stable`, and `ship provision`'s `x86 slice` stays red.
+    #[test]
+    fn the_release_chains_stable_is_put_in_place_with_its_slice_std() {
+        let mut s = provisioned();
+        s.toolchains = names(&["1.97.1-aarch64-apple-darwin"]);
+        s.release_targets = Vec::new();
+        let steps = plan(&s, Some(PIN), TARGETS, RELEASE);
+        assert_eq!(steps, [Step::ReleaseToolchain(names(RELEASE))]);
+        assert_eq!(
+            argv(&steps[0]).join(" "),
+            "rustup toolchain install stable --profile minimal --target x86_64-apple-darwin \
+             --no-self-update"
+        );
+        let mut s = provisioned();
+        s.release_targets = names(&[HOST]);
+        let steps = plan(&s, Some(PIN), TARGETS, RELEASE);
+        assert_eq!(steps, [Step::ReleaseTargets(names(RELEASE))]);
+        assert_eq!(
+            argv(&steps[0]).join(" "),
+            "rustup target add --toolchain stable x86_64-apple-darwin"
+        );
+        assert_eq!(plan(&provisioned(), Some(PIN), TARGETS, &[]), []);
+        assert_eq!(
+            argv(&Step::ReleaseToolchain(Vec::new())).join(" "),
+            "rustup toolchain install stable --profile minimal --no-self-update",
+            "a Linux worker's stable carries its host's std alone"
+        );
+    }
+
+    /// ANOTHER HOST'S INSTALL IS NOT THE HOST'S: a machine whose rustup lists the pin and
+    /// `stable` only for x86_64 on an arm64 host gets both installed for its host, since rustup
+    /// resolves `1.97.1` and `stable` to `-aarch64-apple-darwin` and finds neither. NEGATIVE
+    /// CONTROL: a plan that reads `1.97.1-x86_64-apple-darwin` as the pin adds stds to a
+    /// toolchain rustup cannot resolve, and the run never converges.
+    #[test]
+    fn another_hosts_install_of_the_pin_or_stable_is_not_held() {
+        let s = Seen {
+            host: HOST.into(),
+            toolchains: names(&[
+                "1.97.1-x86_64-apple-darwin",
+                "stable-x86_64-apple-darwin",
+                "1.97.1-mine",
+            ]),
+            ..Seen::default()
+        };
+        assert_eq!(
+            plan(&s, Some(PIN), TARGETS, RELEASE),
+            [
+                Step::PinToolchain(PIN.into()),
+                Step::PinTargets(PIN.into(), names(TARGETS)),
+                Step::ReleaseToolchain(names(RELEASE)),
+            ]
         );
     }
 
     #[test]
-    fn only_linux_asks_stable_for_the_guest_agents_musl_std() {
+    fn only_linux_asks_the_pin_for_the_guest_agents_musl_std() {
         assert!(
-            !stable_targets(false).contains(&"aarch64-unknown-linux-musl"),
+            !pin_targets(false).contains(&"aarch64-unknown-linux-musl"),
             "{:?}",
-            stable_targets(false)
+            pin_targets(false)
         );
-        let linux = stable_targets(true);
+        let linux = pin_targets(true);
         assert_eq!(linux.last(), Some(&"aarch64-unknown-linux-musl"));
         let mut s = provisioned();
-        s.stable_targets = stable_targets(false)
+        s.pin_targets = pin_targets(false)
             .iter()
             .map(|t| (*t).to_string())
             .collect();
-        assert_eq!(plan(&s, None, &stable_targets(false)), []);
+        assert_eq!(plan(&s, Some(PIN), &pin_targets(false), RELEASE), []);
         assert_eq!(
-            plan(&s, None, &linux),
-            [Step::StableTargets(names(&["aarch64-unknown-linux-musl"]))]
+            plan(&s, Some(PIN), &linux, RELEASE),
+            [Step::PinTargets(
+                PIN.into(),
+                names(&["aarch64-unknown-linux-musl"])
+            )]
         );
     }
 }
@@ -534,7 +662,9 @@ mod stateful {
 
     use super::*;
 
-    const HOST: &str = "aarch64-apple-darwin";
+    /// The host this rustup installs for: the one `observe` reads off a scratch home whose
+    /// settings name none.
+    const HOST: &str = aterm_toolchain::rustup::NATIVE_TRIPLE;
 
     #[derive(Default)]
     struct State {
@@ -676,7 +806,7 @@ mod stateful {
     }
 
     fn pin() -> String {
-        wasm_pin(&repo()).unwrap()
+        stock_pin(&repo()).unwrap()
     }
 
     /// A scratch account's homes: nothing on `$PATH`, no `$ATERM_TEST_RUSTUP`, and the row's
@@ -710,6 +840,12 @@ mod stateful {
         exe
     }
 
+    /// The release chain's install line on this host.
+    fn release_install() -> String {
+        let targets = RELEASE_TARGETS.iter().map(|t| (*t).to_string()).collect();
+        argv(&Step::ReleaseToolchain(targets)).join(" ")
+    }
+
     fn position(calls: &[String], prefix: &str) -> usize {
         calls
             .iter()
@@ -718,7 +854,7 @@ mod stateful {
     }
 
     #[test]
-    fn a_bare_home_gets_auto_install_off_then_every_toolchain_by_name() {
+    fn a_bare_home_gets_auto_install_off_then_the_pin_by_name() {
         let tmp = aterm_tempfile::tempdir().unwrap();
         let homes = homes(tmp.path());
         let rustup = FakeRustup::default();
@@ -740,15 +876,24 @@ mod stateful {
         let pin = pin();
         position(
             &calls,
-            "rustup toolchain install stable --profile minimal --component clippy",
+            &format!("rustup toolchain install {pin} --profile minimal --component clippy"),
         );
         position(
             &calls,
             &format!(
-                "rustup toolchain install {pin} --profile minimal --target wasm32-unknown-unknown"
+                "rustup target add --toolchain {pin} {}",
+                CELL_TARGETS.join(" ")
             ),
         );
-        position(&calls, "rustup target add --toolchain stable");
+        let release = release_install();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| c.contains("stable"))
+                .collect::<Vec<_>>(),
+            [&release],
+            "rustup's floating stable gets the release chain's toolchain alone: {calls:#?}"
+        );
         assert!(
             rustup.0.borrow().auto_installed.is_empty(),
             "every toolchain is installed by name: {:?}",
@@ -759,7 +904,7 @@ mod stateful {
             "every call ran the row's copy: {:?}",
             rustup.0.borrow().ran
         );
-        let add = ["target", "add", "--toolchain", &pin, WASM32].map(String::from);
+        let add = ["component", "add", "--toolchain", &pin, CLIPPY].map(String::from);
         rustup
             .run(&homes, &copy, &add, None)
             .expect("the pin was installed by name");
@@ -767,6 +912,38 @@ mod stateful {
             missing(&homes, &rustup, Some(&pin), false),
             Ok(Vec::<String>::new())
         );
+        assert_eq!(
+            run(&repo(), &homes, &rustup, false, &mut |_| {}),
+            Ok(Vec::new())
+        );
+    }
+
+    /// The release chain builds its x86_64 compat slice on rustup's `stable`: a bare home gets
+    /// it by name, with that slice's std on a Mac, and a second run finds it in place.
+    #[test]
+    fn a_bare_home_gets_the_release_chains_stable_with_its_slice_std() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let homes = homes(tmp.path());
+        let rustup = FakeRustup::default();
+        placed(&homes);
+        run(&repo(), &homes, &rustup, false, &mut |_| {}).unwrap();
+        let calls = rustup.calls();
+        let release = release_install();
+        position(&calls, &release);
+        if cfg!(target_os = "macos") {
+            assert!(
+                release.contains(" --target x86_64-apple-darwin "),
+                "{release}"
+            );
+        }
+        {
+            let state = rustup.0.borrow();
+            let stable = &state.toolchains[&format!("stable-{HOST}")];
+            for t in RELEASE_TARGETS {
+                assert!(stable.iter().any(|s| s == t), "{stable:?}");
+            }
+            assert!(state.auto_installed.is_empty());
+        }
         assert_eq!(
             run(&repo(), &homes, &rustup, false, &mut |_| {}),
             Ok(Vec::new())
@@ -786,8 +963,8 @@ mod stateful {
 
     /// A TOOLCHAIN INSTALL WRITES NOTHING TO `CARGO_HOME`: on a bare account (no `CARGO_HOME`
     /// at all) every step succeeds and none is made, and where a person's own rustup sits in
-    /// `CARGO_HOME/bin` it stays alone there, because each install carries
-    /// `--no-self-update`. NEGATIVE CONTROL: the same two install lines without the flag, run
+    /// `CARGO_HOME/bin` it stays alone there, because the install carries
+    /// `--no-self-update`. NEGATIVE CONTROL: the same install line without the flag, run
     /// through the fake that models the pinned copy's self-update, fail the bare account's
     /// step (`rustup is not installed at …`) and write 13 proxies beside the person's rustup.
     #[test]
@@ -801,10 +978,7 @@ mod stateful {
         assert!(
             acquired
                 .iter()
-                .any(|a| a.contains("toolchain install stable"))
-                && acquired
-                    .iter()
-                    .any(|a| a.contains(&format!("toolchain install {pin}"))),
+                .any(|a| a.contains(&format!("toolchain install {pin}"))),
             "{acquired:#?}"
         );
         assert!(!bare.cargo_home.exists(), "no CARGO_HOME was made");
@@ -816,8 +990,8 @@ mod stateful {
         run(&repo(), &own, &FakeRustup::default(), false, &mut |_| {}).unwrap();
         assert_eq!(entries(&own.cargo_home.join("bin")), ["rustup"]);
 
-        for step in [Step::StableToolchain, Step::PinToolchain(pin.clone())] {
-            let with: Vec<String> = argv(&step)[1..].to_vec();
+        {
+            let with: Vec<String> = argv(&Step::PinToolchain(pin.clone()))[1..].to_vec();
             assert_eq!(with.last().map(String::as_str), Some(NO_SELF_UPDATE));
             let without: Vec<String> = with
                 .iter()
@@ -849,8 +1023,11 @@ mod stateful {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    /// A PIN MISSING A PIECE GETS IT ON THE PIN ALONE, WHATEVER STABLE HOLDS: where `stable`
+    /// carries every cell's std and clippy and the pin only its host's std, the probe and the
+    /// run name the pin's missing stds and its clippy, and nothing of `stable`.
     #[test]
-    fn a_toolchain_missing_a_piece_gets_it_on_that_channel_alone() {
+    fn a_pin_missing_a_piece_gets_it_on_the_pin_alone() {
         let tmp = aterm_tempfile::tempdir().unwrap();
         let homes = homes(tmp.path());
         let rustup = FakeRustup::default();
@@ -860,27 +1037,36 @@ mod stateful {
             let mut s = rustup.0.borrow_mut();
             s.auto_install_off = true;
             s.toolchains.insert(format!("stable-{HOST}"), targets);
+            s.components
+                .insert(format!("stable-{HOST}"), vec![CLIPPY.into()]);
             s.toolchains
                 .insert(format!("{pin}-{HOST}"), vec![HOST.into()]);
         }
         std::fs::create_dir_all(&homes.rustup_home).unwrap();
         std::fs::write(homes.rustup_home.join(SETTINGS), "").unwrap();
         placed(&homes);
+        let others: Vec<&str> = CELL_TARGETS
+            .iter()
+            .copied()
+            .filter(|t| *t != HOST)
+            .collect();
+        let add = format!("rustup target add --toolchain {pin} {}", others.join(" "));
+        let clippy = format!("rustup component add --toolchain {pin} clippy");
         assert_eq!(
             missing(&homes, &rustup, Some(&pin), false),
-            Ok(vec![
-                "rustup component add --toolchain stable clippy".to_string(),
-                format!("rustup target add --toolchain {pin} wasm32-unknown-unknown"),
-            ]),
+            Ok(vec![add.clone(), clippy.clone()]),
             "the read-only probe names what a run adds"
         );
         run(&repo(), &homes, &rustup, false, &mut |_| {}).unwrap();
         let calls = rustup.calls();
-        position(
-            &calls,
-            &format!("rustup target add --toolchain {pin} wasm32-unknown-unknown"),
+        position(&calls, &add);
+        position(&calls, &clippy);
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.contains("stable") && !c.contains(" list")),
+            "nothing of the pin is added to stable: {calls:#?}"
         );
-        position(&calls, "rustup component add --toolchain stable clippy");
         assert!(
             !calls
                 .iter()
@@ -894,14 +1080,14 @@ mod stateful {
         );
 
         // `--linux` holds the same machine to the guest agent's musl std as well, and
-        // adds it to stable alone.
-        let musl = "rustup target add --toolchain stable aarch64-unknown-linux-musl";
+        // adds it to the pin alone.
+        let musl = format!("rustup target add --toolchain {pin} aarch64-unknown-linux-musl");
         assert_eq!(
             missing(&homes, &rustup, Some(&pin), true),
-            Ok(vec![musl.to_string()])
+            Ok(vec![musl.clone()])
         );
         let acquired = run(&repo(), &homes, &rustup, true, &mut |_| {}).unwrap();
-        assert_eq!(acquired, [musl.to_string()]);
+        assert_eq!(acquired, [musl]);
         assert_eq!(
             missing(&homes, &rustup, Some(&pin), true),
             Ok(Vec::<String>::new())

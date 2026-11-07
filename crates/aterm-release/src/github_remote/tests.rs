@@ -46,6 +46,185 @@ fn repo(root: &Path, name: &str, bare: bool) -> PathBuf {
     path
 }
 
+fn commit(repo: &Path, text: &str) -> String {
+    std::fs::write(repo.join("line.toml"), text).unwrap();
+    git(repo, &["add", "line.toml"]);
+    git(repo, &["commit", "-q", "-m", "fixture"]);
+    git(repo, &["rev-parse", "HEAD"])
+}
+
+#[test]
+fn native_origin_refresh_records_only_main_and_preserves_annotated_tag_peels() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let bare = repo(root.path(), "remote.git", true);
+    let source = repo(root.path(), "source", false);
+    let old = commit(&source, "old remote\n");
+    git(&source, &["tag", "v1"]);
+    git(
+        &source,
+        &["push", "-q", bare.to_str().unwrap(), "main", "--tags"],
+    );
+
+    let target = repo(root.path(), "target", false);
+    let local_head = commit(&target, "local checkout\n");
+    git(&target, &["tag", "local-only"]);
+    git(
+        &target,
+        &["update-ref", "refs/remotes/other/main", &local_head],
+    );
+    git(
+        &target,
+        &[
+            "config",
+            "remote.origin.url",
+            "https://github.com/fixture/app.git",
+        ],
+    );
+    let gitdir = target.join(".git");
+    std::fs::write(gitdir.join("FETCH_HEAD"), "do not replace this\n").unwrap();
+    let files = ["HEAD", "index", "config", "FETCH_HEAD"];
+    let before = files.map(|name| std::fs::read(gitdir.join(name)).unwrap());
+    let remote = local(&target, &bare);
+    let first = remote.fetch_origin().unwrap();
+    assert_eq!(first.main, old);
+    assert_eq!(git(&target, &["rev-parse", ORIGIN_MAIN]), old);
+    assert_eq!(
+        parse_tags(&first.tags).unwrap().get("refs/tags/v1"),
+        Some(&old)
+    );
+
+    let new = commit(&source, "new remote\n");
+    git(&source, &["tag", "-a", "v2", "-m", "annotated"]);
+    let annotated = git(&source, &["rev-parse", "refs/tags/v2"]);
+    assert_ne!(annotated, new);
+    git(&source, &["update-ref", "refs/tags/v2-alias", &annotated]);
+    git(&source, &["tag", "v1-lookalike"]);
+    git(
+        &source,
+        &["push", "-q", bare.to_str().unwrap(), "main", "--tags"],
+    );
+    let advertised = git(&bare, &["show-ref"]);
+    let fetched = remote.fetch_origin().unwrap();
+    assert_eq!(fetched.main, new);
+    let tags = parse_tags(&fetched.tags).unwrap();
+    assert_eq!(tags.get("refs/tags/v2"), Some(&annotated));
+    assert_eq!(tags.get("refs/tags/v2^{}"), Some(&new));
+    assert_eq!(tags.get("refs/tags/v2-alias"), Some(&annotated));
+    assert_eq!(tags.get("refs/tags/v2-alias^{}"), Some(&new));
+    assert_eq!(remote.tag("v1").unwrap(), Some(old));
+    assert_eq!(remote.tag("v2").unwrap(), Some(new.clone()));
+    assert_eq!(remote.tag("v2-alias").unwrap(), Some(new.clone()));
+    assert_eq!(remote.tag("absent").unwrap(), None);
+    for invalid in ["v1*", "../main", "v2^{}"] {
+        assert!(remote.tag(invalid).is_err());
+    }
+    assert_eq!(git(&target, &["rev-parse", ORIGIN_MAIN]), new);
+    assert_eq!(git(&target, &["rev-parse", "HEAD"]), local_head);
+    assert_eq!(
+        git(&target, &["rev-parse", "refs/remotes/other/main"]),
+        local_head
+    );
+    assert_eq!(git(&target, &["tag", "--list"]), "local-only");
+    assert_eq!(
+        before,
+        files.map(|name| std::fs::read(gitdir.join(name)).unwrap())
+    );
+    assert_eq!(git(&bare, &["show-ref"]), advertised);
+}
+
+#[test]
+fn refresh_refuses_missing_main_symbolic_tracking_and_concurrent_ref_changes() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let bare = repo(root.path(), "remote.git", true);
+    let target = repo(root.path(), "target", false);
+    let head = commit(&target, "owned checkout\n");
+    git(
+        &target,
+        &[
+            "config",
+            "remote.origin.url",
+            "https://github.com/fixture/app.git",
+        ],
+    );
+    let remote = local(&target, &bare);
+    let before = git(&target, &["show-ref"]);
+    assert!(
+        remote
+            .fetch_origin()
+            .err()
+            .unwrap()
+            .contains("no main branch")
+    );
+    assert_eq!(git(&target, &["show-ref"]), before);
+
+    let source = repo(root.path(), "source", false);
+    let old = commit(&source, "old\n");
+    let new = commit(&source, "new\n");
+    git(&source, &["push", "-q", bare.to_str().unwrap(), "main"]);
+    remote.fetch_exact(&old).unwrap();
+    remote.fetch_exact(&new).unwrap();
+    remote.record_main(None, &old).unwrap();
+    let expected = remote.tracking_main().unwrap();
+    git(&target, &["update-ref", ORIGIN_MAIN, &head]);
+    assert!(
+        remote
+            .record_main(expected.as_deref(), &new)
+            .unwrap_err()
+            .contains("changed")
+    );
+    assert_eq!(git(&target, &["rev-parse", ORIGIN_MAIN]), head);
+    assert!(remote.record_main(None, &new).is_err());
+
+    git(&target, &["update-ref", ORIGIN_MAIN, &old]);
+    git(
+        &target,
+        &[
+            "config",
+            "remote.origin.url",
+            "https://github.com/fixture/foreign.git",
+        ],
+    );
+    assert!(remote.record_main(Some(&old), &new).is_err());
+    assert_eq!(git(&target, &["rev-parse", ORIGIN_MAIN]), old);
+    assert_eq!(git(&target, &["rev-parse", "HEAD"]), head);
+    git(
+        &target,
+        &[
+            "config",
+            "remote.origin.url",
+            "https://github.com/fixture/app.git",
+        ],
+    );
+    git(&target, &["symbolic-ref", ORIGIN_MAIN, "refs/heads/main"]);
+    assert!(remote.fetch_origin().err().unwrap().contains("symbolic"));
+    assert_eq!(
+        git(&target, &["symbolic-ref", ORIGIN_MAIN]),
+        "refs/heads/main"
+    );
+    assert_eq!(git(&target, &["rev-parse", "HEAD"]), head);
+    assert!(remote.record_main(Some(&head), &new).is_err());
+    assert_eq!(git(&target, &["rev-parse", "HEAD"]), head);
+}
+
+#[test]
+fn malformed_partial_or_foreign_tag_ads_cannot_establish_absence_or_echo_payloads() {
+    let oid = "1".repeat(40);
+    for text in [
+        "x".repeat(COMPLETE_LIMIT),
+        format!("{oid}\trefs/heads/private-payload\n"),
+        format!("{oid}\trefs/tags/v1\n{oid}\trefs/tags/v1\n"),
+        format!("{oid}\trefs/tags/v1^{{}}\n"),
+        format!("{oid}\trefs/tags/v1^{{}}^{{}}\n"),
+        format!("{oid} refs/tags/v1\n"),
+        format!("{}\trefs/tags/v1\n", "0".repeat(39)),
+        format!("{oid}\trefs/tags/\n"),
+    ] {
+        let error = parse_tags(&text).unwrap_err();
+        assert!(!error.contains("private-payload"));
+    }
+    assert!(parse_tags("").unwrap().is_empty());
+}
+
 #[test]
 fn helper_forwarding_accepts_only_the_actual_credential_protocol() {
     let words = |args: &[&str]| {
@@ -338,6 +517,8 @@ fn implicit_release_owner_has_no_grant_and_missing_identity_has_no_fallback() {
         .build();
     let remote = Remote::new(client, Slug::parse("fixture-release/app").unwrap(), &target).unwrap();
     assert!(remote.list("refs/aterm-release/line/").is_err());
+    assert!(remote.fetch_origin().is_err());
+    assert!(remote.tag("v1").is_err());
     assert!(git(&target, &["for-each-ref"]).is_empty());
 }
 

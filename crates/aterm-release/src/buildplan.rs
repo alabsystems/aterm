@@ -1894,7 +1894,8 @@ fn require_rustup_target(triple: &str) -> Result<(), String> {
     {
         return Err(format!(
             "rust std for {triple} is not installed on stable — run \
-             `rustup +stable target add {triple}` (the release is universal)"
+             `targo --unverified verify provision rustup`, which puts the release chain's stable \
+             in place with it (the release is universal)"
         ));
     }
     Ok(())

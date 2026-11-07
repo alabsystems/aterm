@@ -678,6 +678,22 @@ impl Vm {
         .map_err(|e| format!("tart exec: {e}"))
     }
 
+    /// Complete stdout up to 16 MiB; oversized or incomplete reads fail instead of retaining
+    /// a tail. Stderr keeps the existing bounded-tail policy.
+    pub(crate) fn exec_complete(
+        &self,
+        script: &str,
+        limit: Duration,
+    ) -> Result<std::process::Output, String> {
+        aterm_uds::deadline::output_until_complete_stdout_with_limit(
+            aterm_uds::spawnfd::command(&self.tart)
+                .args(["exec", &self.name, "/bin/sh", "-c", script]),
+            Instant::now() + limit,
+            aterm_uds::deadline::MAX_COMPLETE_STDOUT_BYTES,
+        )
+        .map_err(|e| format!("tart exec complete: {e}"))
+    }
+
     pub(crate) fn sh(&self, script: &str, limit: Duration) -> Result<String, Fail> {
         let out = self.exec(script, limit)?;
         let text = String::from_utf8_lossy(&out.stdout).into_owned();

@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Instant;
 
 use aterm_uds::program_check::Look;
-use aterm_vitals::program_check::{Judge, Reading, State};
+use aterm_vitals::program_check::{Daemon, Judge, Reading, State};
 
 use crate::harness_host::HostNote;
 
@@ -17,6 +17,9 @@ use crate::harness_host::HostNote;
 pub(crate) struct Board {
     judge: Judge,
     last: Option<Reading>,
+    /// When the last look read [`Self::last`], on [`now_ms`]'s clock: `None` once a later look
+    /// read nothing or found no `syspolicyd` running.
+    read_ms: Option<u64>,
     /// Whether the window has been notified that the check is not stuck.
     told_unstuck: bool,
     /// `(workers, limit)` reported at the stuck edge and repeated while stuck.
@@ -29,6 +32,7 @@ impl Board {
         Self {
             judge: Judge::new(),
             last: None,
+            read_ms: None,
             told_unstuck: false,
             told_stuck: None,
         }
@@ -116,13 +120,18 @@ pub(crate) fn step(board: &mut Board, at_ms: u64, look: Look) -> Option<HostNote
     let now = match look {
         Look::Read(reading) => {
             board.last = Some(reading);
+            board.read_ms = Some(at_ms);
             board.judge.absorb(at_ms, Some(&reading))
         }
         Look::NoneRunning => {
             board.last = None;
+            board.read_ms = None;
             board.judge.absorb_none_running()
         }
-        Look::Unread => board.judge.absorb(at_ms, None),
+        Look::Unread => {
+            board.read_ms = None;
+            board.judge.absorb(at_ms, None)
+        }
     };
     match now {
         State::Stuck { since_ms } => {
@@ -293,6 +302,13 @@ pub(crate) fn starts_held(board: &Mutex<Board>) -> bool {
 /// Formats the `syspolicyd=*` fields for `status`.
 pub(crate) fn status_fields() -> String {
     let b = BOARD.lock().unwrap_or_else(PoisonError::into_inner);
+    fields(&b, now_ms(), aterm_sysprobe::jobs::now_us())
+}
+
+/// `status`'s `syspolicyd=*` fields from `b` at `now_ms` ([`now_ms`]'s clock) and `wall_us`
+/// (µs since the epoch). The daemon's age is `-` while the last look read nothing, since no
+/// look says it still runs.
+fn fields(b: &Board, now_ms: u64, wall_us: u64) -> String {
     let state = b.judge.state();
     let workers = b.last.map_or_else(
         || "-".to_owned(),
@@ -306,11 +322,52 @@ pub(crate) fn status_fields() -> String {
     );
     let full_ms = state.since_ms().map_or_else(
         || "-".to_owned(),
-        |since| now_ms().saturating_sub(since).to_string(),
+        |since| now_ms.saturating_sub(since).to_string(),
     );
+    let daemon = b.last.map(|r| r.daemon);
+    let pid = daemon.map_or_else(|| "-".to_owned(), |d| d.pid.to_string());
+    let up_ms = daemon
+        .filter(|_| b.read_ms.is_some())
+        .and_then(|d| wall_us.checked_sub(d.started_us()))
+        .map_or_else(|| "-".to_owned(), |up| (up / 1000).to_string());
     format!(
-        "syspolicyd={} syspolicyd_workers={workers} syspolicyd_full_ms={full_ms}",
+        "syspolicyd={} syspolicyd_workers={workers} syspolicyd_full_ms={full_ms} \
+         syspolicyd_pid={pid} syspolicyd_up_ms={up_ms}",
         state.as_str()
+    )
+}
+
+/// The `syspolicyd` a fresh look read: the daemon and whether its pool read full.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RunningCheck {
+    /// The daemon the look read.
+    pub(crate) daemon: Daemon,
+    /// Whether its pool read full ([`Reading::full`]).
+    pub(crate) pool_full: bool,
+}
+
+/// The check `b`'s last look read, while that look read it and is at most two looks old at
+/// `now_ms`.
+fn check_of(b: &Board, now_ms: u64) -> Option<RunningCheck> {
+    let read_ms = b.read_ms?;
+    if u128::from(now_ms.saturating_sub(read_ms)) > 2 * every().as_millis() {
+        return None;
+    }
+    b.last.map(|r| RunningCheck {
+        daemon: r.daemon,
+        pool_full: r.full(),
+    })
+}
+
+/// [`check_of`] the process-wide board now.
+#[expect(
+    dead_code,
+    reason = "the jobs pass's stranded judge is its reader, and it is not wired yet"
+)]
+pub(crate) fn last_read() -> Option<RunningCheck> {
+    check_of(
+        &BOARD.lock().unwrap_or_else(PoisonError::into_inner),
+        now_ms(),
     )
 }
 
@@ -362,7 +419,7 @@ pub(crate) fn start(note: Arc<dyn Fn(HostNote) + Send + Sync>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aterm_vitals::program_check::{Daemon, STUCK_AFTER_MS};
+    use aterm_vitals::program_check::STUCK_AFTER_MS;
 
     const D: Daemon = Daemon {
         pid: 690,
@@ -472,6 +529,85 @@ mod tests {
         assert!(s.starts_with("syspolicyd="), "{s}");
         assert!(s.contains(" syspolicyd_workers="), "{s}");
         assert!(s.contains(" syspolicyd_full_ms="), "{s}");
+    }
+
+    /// `status` names the daemon the last look read and how long it has run, by the wall clock
+    /// its start is on; `-` before a read, once none runs, or with the clock before its start.
+    /// A look that reads nothing keeps the pid and gives no age, since no look says it still runs.
+    #[test]
+    fn status_names_the_syspolicyd_the_last_look_read_and_how_long_it_has_run() {
+        let half_hour = D.started_us() + 1_800_000_000;
+        let mut b = Board::default();
+        let unread = fields(&b, 0, half_hour);
+        assert!(
+            unread.ends_with(" syspolicyd_pid=- syspolicyd_up_ms=-"),
+            "{unread}"
+        );
+        step(&mut b, MIN, reading(6, false));
+        assert_eq!(
+            fields(&b, MIN, half_hour),
+            "syspolicyd=ok syspolicyd_workers=6/90 syspolicyd_full_ms=- syspolicyd_pid=690 \
+             syspolicyd_up_ms=1800000"
+        );
+        let early = fields(&b, MIN, D.started_us() - 1);
+        assert!(
+            early.ends_with(" syspolicyd_pid=690 syspolicyd_up_ms=-"),
+            "CONTROL: a clock before the start reads no age: {early}"
+        );
+        step(&mut b, 2 * MIN, Look::Unread);
+        let kept = fields(&b, 2 * MIN, half_hour);
+        assert!(
+            kept.ends_with(" syspolicyd_pid=690 syspolicyd_up_ms=-"),
+            "a look that read nothing leaves the last daemon named, and no age, since no look \
+             says it still runs: {kept}"
+        );
+        step(&mut b, 3 * MIN, reading(6, false));
+        let again = fields(&b, 3 * MIN, half_hour);
+        assert!(
+            again.ends_with(" syspolicyd_pid=690 syspolicyd_up_ms=1800000"),
+            "CONTROL: the next look that reads it gives its age again: {again}"
+        );
+        step(&mut b, 4 * MIN, Look::NoneRunning);
+        let gone = fields(&b, 4 * MIN, half_hour);
+        assert!(
+            gone.ends_with(" syspolicyd_pid=- syspolicyd_up_ms=-"),
+            "CONTROL: none running names none: {gone}"
+        );
+    }
+
+    /// The stranded judge gets the board only while its last look read a daemon, at most two
+    /// looks (two `DISK_TICK`s, 120 s) ago.
+    #[test]
+    fn the_stranded_judge_reads_the_board_only_while_its_last_look_read_it() {
+        let mut b = Board::default();
+        assert_eq!(check_of(&b, 0), None, "nothing read");
+        let at = 5 * MIN;
+        step(&mut b, at, reading(6, false));
+        let answering = Some(RunningCheck {
+            daemon: D,
+            pool_full: false,
+        });
+        assert_eq!(check_of(&b, at), answering);
+        assert_eq!(check_of(&b, at + 120_000), answering, "two looks old");
+        assert_eq!(check_of(&b, at + 120_001), None, "older than two looks");
+        step(&mut b, at + MIN, Look::Unread);
+        assert_eq!(check_of(&b, at + MIN), None, "the last look read nothing");
+        let said = fields(&b, at + MIN, D.started_us());
+        assert!(
+            said.contains(" syspolicyd_workers=6/90 "),
+            "CONTROL: status still says the last reading: {said}"
+        );
+        step(&mut b, at + 2 * MIN, stood_in(reading(2, false), true));
+        assert_eq!(
+            check_of(&b, at + 2 * MIN),
+            Some(RunningCheck {
+                daemon: D,
+                pool_full: true,
+            }),
+            "the full stand-in reads full"
+        );
+        step(&mut b, at + 3 * MIN, Look::NoneRunning);
+        assert_eq!(check_of(&b, at + 3 * MIN), None, "none running");
     }
 
     /// The `full` stand-in drives a healthy reading to stuck, and `live` clears it.

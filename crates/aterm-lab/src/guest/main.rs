@@ -33,8 +33,10 @@
 //!   administrator's dialog still there after its Return is answered again, at most [`TRIES`]
 //!   times, the account's own password typed once per dialog. No password goes in while the focus
 //!   reads a text field that is not secure ([`may_type`]), and none is written to the record
-//!   ([`Credentials::holds_password`]). It needs Accessibility (to read the dialogs) and the
-//!   event-post grant, which the lane's person base writes for this file's path.
+//!   ([`Credentials::holds_password`]). Separately, `--app` admits the synthetic account password
+//!   to its exact receipt-bound Mac Setup PTY through fenced control input; that delivery is
+//!   labelled as control input, never as a measured HID key. It needs Accessibility (to read
+//!   the dialogs) and the event-post grant, which the lane's person base writes for this file's path.
 //! - `watch FILE OUT [--kill PID --when-running MASK]`: FILE's text, on one line, each time it
 //!   changes (looked at every 50 ms); with `--kill`, PID is sent SIGKILL the first time the
 //!   record's `running` stage is one of MASK's bits.
@@ -65,6 +67,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod captures;
 mod dns_sd_text;
+#[cfg(target_os = "macos")]
+mod mac_setup;
 mod member;
 mod steps;
 #[cfg(target_os = "macos")]
@@ -499,6 +503,8 @@ fn person(out: &Out, who: &Credentials, sheet: Sheet, app: Option<&str>) -> Resu
     // Each process's verdict by its pid and start: whether it runs the app ([`app_pids`]).
     let mut known: BTreeMap<(u32, u64), bool> = BTreeMap::new();
     let mut dev = Devtools::new(app);
+    #[cfg(target_os = "macos")]
+    let mut mac_setup = mac_setup::Person::default();
     loop {
         if last_nudge.is_none_or(|t| t.elapsed() >= NUDGE) {
             proven(out, "nudge", || cg::nudge(step));
@@ -551,6 +557,10 @@ fn person(out: &Out, who: &Credentials, sheet: Sheet, app: Option<&str>) -> Resu
             && answers_quit(sheet, reopen_pressed(&pressed).map(|t| t.elapsed()))
         {
             answer_quit(out, exe, &windows, who, &mut pressed, &mut known);
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(exe) = app {
+            mac_setup.step(out, who, exe);
         }
         std::thread::sleep(SWEEP);
     }
@@ -3191,7 +3201,7 @@ mod tests {
         );
         pressed.insert(sheet_key(812, Sheet::Reopen), at);
         assert_eq!(reopen_pressed(&pressed), Some(at));
-        // The person's ordinary passes never act in the app: its own buttons are pressed only here.
+        // Native dialog passes never act in the app. Its receipt-bound setup PTY is separate.
         assert!(!ACTS_ON.iter().any(|o| o.to_lowercase().contains("aterm")));
         assert!(!ALLOW.contains(&"Quit"));
     }

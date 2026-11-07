@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 pub(crate) fn git(root: &Path, args: &[&str]) -> Result<String, Box<dyn Error>> {
     let mut command = aterm_uds::fixture_git::git();
+    // The same synthetic inputs must create the same commit in each process.
     command
         .current_dir(root)
         .args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
@@ -19,7 +20,9 @@ pub(crate) fn git(root: &Path, args: &[&str]) -> Result<String, Box<dyn Error>> 
         .env("GIT_AUTHOR_NAME", "fixture")
         .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
         .env("GIT_COMMITTER_NAME", "fixture")
-        .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid");
+        .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+        .env("GIT_AUTHOR_DATE", "@1700000000 +0000")
+        .env("GIT_COMMITTER_DATE", "@1700000000 +0000");
     let out = aterm_uds::deadline::output_until_complete_stdout(
         &mut command,
         Instant::now() + Duration::from_secs(60),

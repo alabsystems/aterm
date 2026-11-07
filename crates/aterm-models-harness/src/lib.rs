@@ -206,6 +206,8 @@ mod models_native_noexec_recovery;
 pub use models_native_noexec_recovery::native_noexec_recovery_model;
 mod models_receipt_acknowledgement;
 pub use models_receipt_acknowledgement::receipt_acknowledgement_model;
+mod models_renewal_completion_publication;
+pub use models_renewal_completion_publication::renewal_completion_publication_model;
 mod models_codex_login_publication;
 mod models_codex_refresh_authority;
 mod models_codex_refresh_identity;

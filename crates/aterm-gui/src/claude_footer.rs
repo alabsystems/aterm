@@ -7082,7 +7082,7 @@ pub(crate) fn press_wait_on(t: &aterm_core::terminal::Terminal) -> Option<&'stat
     let rows: Vec<String> = (0..usize::from(t.rows()))
         .map(|r| crate::claude_lights::row_text(t, r))
         .collect();
-    Some(press_wait(&rows, draft))
+    Some(press_wait(&rows, Some(t.title()), draft))
 }
 
 /// [`press_wait`]'s word for a row whose lane's last look waited on `wait`
@@ -7103,15 +7103,16 @@ fn press_wait_of(wait: &str) -> &'static str {
     }
 }
 
-/// What a press of the ⬆️ waits for on screen `rows`, `draft` whether its composer holds one:
-/// [`aterm_agent::harness::upgrade::press_gate`]'s word (a dialog, a draft, a usage limit, a
-/// login, a running turn), `""` for a press that restarts at once.
-fn press_wait(rows: &[String], draft: bool) -> &'static str {
+/// What a press of the ⬆️ waits for on screen `rows` under window title `title`, `draft` whether
+/// its composer holds one: [`aterm_agent::harness::upgrade::press_gate`]'s word (a dialog, a
+/// draft, a usage limit, a login, a running turn, the title's included:
+/// [`aterm_agent::harness::upgrade_drive::turn_runs`]), `""` for a press that restarts at once.
+fn press_wait(rows: &[String], title: Option<&str>, draft: bool) -> &'static str {
     use aterm_agent::harness::upgrade::{self, Gate};
     let facts = upgrade::Facts {
         composer_empty: !draft,
         approval_box: aterm_phase::prompt::prompt_box_span(rows).is_some(),
-        busy_footer: aterm_agent::harness::upgrade_drive::busy_footer(rows),
+        busy_footer: aterm_agent::harness::upgrade_drive::turn_runs(rows, title),
         limited: upgrade::limited(rows),
         login: upgrade::login_wall(upgrade::Agent::Claude, rows),
         ..upgrade::Facts::default()

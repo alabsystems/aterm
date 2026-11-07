@@ -3,7 +3,7 @@
 
 //! Complete bounded child output with an exact stdin request, without staging input.
 
-use super::{Cmd, Live, Ran, RunFailed, fixed_command};
+use super::{Cmd, Live, Ran, RunFailed, System, fixed_command};
 use aterm_uds::deadline::{CompleteOutputError, RunError};
 use aterm_uds::spawnfd::Stdio;
 use std::io::{self, Write as _};
@@ -32,46 +32,60 @@ pub(super) fn admit(cmd: &Cmd) -> Result<(), RunFailed> {
 
 pub(super) fn run(live: &Live, cmd: &Cmd, input: &[u8]) -> Result<Ran, RunFailed> {
     admit(cmd)?;
+    live.capture_current()?;
     let (program, args) = live.argv(cmd)?;
-    let mut command = fixed_command(&program, &args, &live.child_env(cmd), cmd.cwd.as_deref());
+    let command = fixed_command(&program, &args, &live.child_env(cmd), cmd.cwd.as_deref());
     let (reader, writer) =
         io::pipe().map_err(|_| RunFailed::Spawn("input pipe creation failed".into()))?;
     nonblocking(&writer).map_err(|_| RunFailed::Spawn("input pipe configuration failed".into()))?;
     let deadline = super::deadline_after(cmd.budget);
     let cancelled = AtomicBool::new(false);
     std::thread::scope(|scope| {
+        // Keep the command's pipe reader on this closure's stack, so unwinding closes it
+        // before scope auto-joins the writer. The cancellation lease drops before both.
+        let mut command = command;
         let writer = std::thread::Builder::new()
             .name("child-complete-input".into())
             .spawn_scoped(scope, || write_input(writer, input, deadline, &cancelled))
             .map_err(|_| RunFailed::Spawn("input writer could not start".into()))?;
-        let output = aterm_uds::deadline::output_until_complete_stdout_from(
+        struct Cancel<'a>(&'a AtomicBool);
+        impl Drop for Cancel<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let cancel = Cancel(&cancelled);
+        let output = aterm_uds::deadline::output_until_complete_stdout_from_unless(
             &mut command,
             Stdio::from(reader),
             deadline,
+            &mut || live.stopped().is_some(),
         );
-        cancelled.store(true, Ordering::Release);
+        drop(cancel);
         drop(command);
         let written = writer.join();
-        let output = output.map_err(|error| match error {
-            CompleteOutputError::Run(RunError::TimedOut) => RunFailed::TimedOut(cmd.budget),
-            CompleteOutputError::Run(RunError::Spawn(_)) => {
-                RunFailed::Spawn("child spawn failed".into())
-            }
-            CompleteOutputError::Run(RunError::Capture(_)) => {
-                RunFailed::AfterStart("child output capture setup failed".into())
-            }
-            CompleteOutputError::Run(RunError::Wait(_)) => {
-                RunFailed::AfterStart("child wait failed".into())
-            }
-            CompleteOutputError::StdoutRead(_) => {
-                RunFailed::AfterStart("complete stdout read failed".into())
-            }
-            CompleteOutputError::StdoutTooLarge { limit } => {
-                RunFailed::AfterStart(format!("complete stdout exceeds {limit} bytes"))
-            }
-            CompleteOutputError::StdoutIncomplete => {
-                RunFailed::AfterStart("complete stdout did not reach EOF".into())
-            }
+        let output = output.map_err(|error| {
+            live.capture_failure(match error {
+                CompleteOutputError::Run(RunError::TimedOut) => RunFailed::TimedOut(cmd.budget),
+                CompleteOutputError::Run(RunError::Spawn(_)) => {
+                    RunFailed::Spawn("child spawn failed".into())
+                }
+                CompleteOutputError::Run(RunError::Capture(_)) => {
+                    RunFailed::AfterStart("child output capture setup failed".into())
+                }
+                CompleteOutputError::Run(RunError::Wait(_)) => {
+                    RunFailed::AfterStart("child wait failed".into())
+                }
+                CompleteOutputError::StdoutRead(_) => {
+                    RunFailed::AfterStart("complete stdout read failed".into())
+                }
+                CompleteOutputError::StdoutTooLarge { limit } => {
+                    RunFailed::AfterStart(format!("complete stdout exceeds {limit} bytes"))
+                }
+                CompleteOutputError::StdoutIncomplete => {
+                    RunFailed::AfterStart("complete stdout did not reach EOF".into())
+                }
+            })
         })?;
         if !matches!(written, Ok(Ok(()))) {
             return Err(RunFailed::AfterStart(

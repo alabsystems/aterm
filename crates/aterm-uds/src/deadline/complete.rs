@@ -4,7 +4,7 @@
 //! Complete-stdout capture for child processes with bounded output.
 
 use super::{
-    DRAIN_GRACE, ExitWait, Grace, OUTPUT_KEEP, PipeEnd, RunError, drain, pipe_end, reap_within,
+    DRAIN_GRACE, ExitWait, Grace, OUTPUT_KEEP, PipeEnd, RunError, STOP_TICK, drain, pipe_end,
 };
 use crate::spawnfd::{Child, Command, Stdio};
 use std::io::{self, Read};
@@ -158,6 +158,7 @@ fn capture_retained<T: Send + 'static>(
         deadline,
         stdout_reader,
         &mut reaped,
+        &mut None,
     ) {
         Ok(output) => owned.finish(output),
         Err(error) => Err(RetainedOutputError {
@@ -303,6 +304,7 @@ fn capped(
         deadline,
         || {},
         move |pipe, stream| drain_stdout_with_limit(pipe, stream, limit),
+        None,
     )
 }
 
@@ -351,14 +353,14 @@ pub fn output_within_complete_stdout_records_from(
         deadline,
         || {},
         move |pipe, stream| drain_stdout_records(pipe, stream, separator, limit, keep),
+        None,
     )
 }
 
 /// As [`output_until_complete_stdout`], reporting successful process creation before any
 /// output reader starts. A later reader-start error must not be treated as no dispatch.
-/// If the observer unwinds, cleanup signals the owned child and makes a bounded reap attempt
-/// before unwinding continues. An unreaped child remains subject to the Child drop reaper;
-/// this is not a receipt that reaping or descendant drain completed.
+/// Every post-spawn return or unwind retains the original child until its positive owning
+/// wait. Cleanup may outlive the work deadline. This establishes no descendant-drain receipt.
 ///
 /// # Errors
 /// The same errors as [`output_until_complete_stdout`].
@@ -393,7 +395,25 @@ pub fn output_until_complete_stdout_from_observed(
     deadline: Instant,
     on_started: impl FnOnce(),
 ) -> Result<Output, CompleteOutputError> {
-    capture(cmd, stdin, deadline, on_started, drain_stdout)
+    capture(cmd, stdin, deadline, on_started, drain_stdout, None)
+}
+
+/// As [`output_until_complete_stdout_from`], observing `stopped` at least every [`STOP_TICK`]
+/// while waiting for the child or output. Cancellation publishes no partial output and is a
+/// post-spawn [`RunError::TimedOut`], not a spawn refusal. The original child stays owned
+/// through cleanup until a positive owning wait, even on an unwind or wait error; cleanup may
+/// outlive the work deadline. No group is signalled after its leader has been reaped, and no
+/// descendant-drain receipt is supplied.
+///
+/// # Errors
+/// As [`output_until_complete_stdout_from`], or cancellation after process creation.
+pub fn output_until_complete_stdout_from_unless(
+    cmd: &mut Command,
+    stdin: Stdio,
+    deadline: Instant,
+    stopped: &mut dyn FnMut() -> bool,
+) -> Result<Output, CompleteOutputError> {
+    capture(cmd, stdin, deadline, || {}, drain_stdout, Some(stopped))
 }
 
 fn capture(
@@ -402,6 +422,7 @@ fn capture(
     deadline: Instant,
     on_started: impl FnOnce(),
     stdout_reader: impl FnOnce(Option<PipeEnd>, std::process::ChildStdout) -> io::Result<CompleteDrain>,
+    mut stopped: Option<&mut dyn FnMut() -> bool>,
 ) -> Result<Output, CompleteOutputError> {
     #[cfg(unix)]
     cmd.process_group(0);
@@ -411,13 +432,28 @@ fn capture(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| CompleteOutputError::Run(RunError::Spawn(error)))?;
-    observe_started(&mut child, on_started);
+    let owned = CaptureGuard { child: &mut child };
+    observe_started(owned.child, on_started);
     let mut reaped = false;
-    let result = collect_started(&mut child, deadline, stdout_reader, &mut reaped);
-    if result.is_err() && !reaped {
-        end_bounded(&mut child);
+    collect_started(
+        owned.child,
+        deadline,
+        stdout_reader,
+        &mut reaped,
+        &mut stopped,
+    )
+}
+
+/// Hold the actual child across reader creation, callbacks and output collection. A failure
+/// cannot release its caller's cleanup lifetime while the owning wait remains unproven.
+struct CaptureGuard<'a> {
+    child: &'a mut Child,
+}
+
+impl Drop for CaptureGuard<'_> {
+    fn drop(&mut self) {
+        super::settle_child(self.child);
     }
-    result
 }
 
 fn collect_started(
@@ -425,6 +461,7 @@ fn collect_started(
     deadline: Instant,
     stdout_reader: impl FnOnce(Option<PipeEnd>, std::process::ChildStdout) -> io::Result<CompleteDrain>,
     reaped: &mut bool,
+    stopped: &mut Option<&mut dyn FnMut() -> bool>,
 ) -> Result<Output, CompleteOutputError> {
     let stdout = match child.stdout.take() {
         Some(stream) => match stdout_reader(pipe_end(&stream), stream) {
@@ -453,6 +490,9 @@ fn collect_started(
     };
     let mut exit = ExitWait::new(child);
     let status = loop {
+        if stopped.as_mut().is_some_and(|stop| stop()) {
+            return Err(CompleteOutputError::Run(RunError::TimedOut));
+        }
         match child.try_wait() {
             Ok(Some(status)) => {
                 *reaped = true;
@@ -463,7 +503,11 @@ fn collect_started(
                 if remaining.is_zero() {
                     return Err(CompleteOutputError::Run(RunError::TimedOut));
                 }
-                exit.wait(remaining);
+                exit.wait(if stopped.is_some() {
+                    remaining.min(STOP_TICK)
+                } else {
+                    remaining
+                });
             }
             Err(error) => {
                 return Err(CompleteOutputError::Run(RunError::Wait(error)));
@@ -475,9 +519,11 @@ fn collect_started(
         until: deadline,
         group: Some(child.id()),
     };
-    let stdout = stdout.collect(&grace)?;
+    let stdout = stdout.collect_unless(&grace, stopped)?;
     let stderr = stderr
-        .map(|stream| stream.collect(&grace))
+        .map(|stream| stream.collect_unless(&grace, stopped))
+        .transpose()
+        .map_err(CompleteOutputError::Run)?
         .unwrap_or_default();
     Ok(Output {
         status,
@@ -494,7 +540,7 @@ fn observe_started(child: &mut Child, observer: impl FnOnce()) {
     impl Drop for Guard<'_> {
         fn drop(&mut self) {
             if self.armed {
-                end_bounded(self.child);
+                super::settle_child(self.child);
             }
         }
     }
@@ -503,27 +549,28 @@ fn observe_started(child: &mut Child, observer: impl FnOnce()) {
     guard.armed = false;
 }
 
-fn end_bounded(child: &mut Child) {
-    #[cfg(unix)]
-    super::children::kill_group(child);
-    #[cfg(not(unix))]
-    let _ = child.kill();
-    reap_within(child, None, Instant::now() + Duration::from_secs(60));
-}
-
 struct CompleteDrain {
     ended: mpsc::Receiver<Result<Vec<u8>, CompleteOutputError>>,
     pipe: Option<PipeEnd>,
 }
 
 impl CompleteDrain {
+    #[cfg(test)]
     fn collect(self, grace: &Grace) -> Result<Vec<u8>, CompleteOutputError> {
-        let ended = match self
-            .ended
-            .recv_timeout(grace.by.saturating_duration_since(Instant::now()))
-        {
+        self.collect_unless(grace, &mut None)
+    }
+
+    fn collect_unless(
+        self,
+        grace: &Grace,
+        stopped: &mut Option<&mut dyn FnMut() -> bool>,
+    ) -> Result<Vec<u8>, CompleteOutputError> {
+        let receive = |wait, stopped: &mut Option<&mut dyn FnMut() -> bool>| {
+            super::receive_unless(&self.ended, wait, stopped).map_err(CompleteOutputError::Run)
+        };
+        let ended = match receive(grace.by.saturating_duration_since(Instant::now()), stopped)? {
             Err(mpsc::RecvTimeoutError::Timeout) => match grace.read_on(self.pipe.as_ref()) {
-                Some(wait) => self.ended.recv_timeout(wait),
+                Some(wait) => receive(wait, stopped)?,
                 None => Err(mpsc::RecvTimeoutError::Timeout),
             },
             ended => ended,

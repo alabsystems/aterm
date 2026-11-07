@@ -17,6 +17,22 @@ use std::time::{Duration, Instant};
 #[path = "resource_admission_member/sampling_decision.rs"]
 mod sampling_decision;
 
+/// Native lineage is evidence of scope; time spent reading it is only a hang detector.
+pub(super) fn scope_covers(peer: Peer, pid: u32, birth: u64) -> bool {
+    scope_covers_at(peer, pid, birth, Instant::now())
+}
+
+fn scope_covers_at(peer: Peer, pid: u32, birth: u64, started: Instant) -> bool {
+    let deadline = started + Duration::from_secs(60);
+    process::stable_descendant(
+        peer.pid,
+        process::Birth(peer.birth),
+        pid,
+        process::Birth(birth),
+        deadline,
+    )
+}
+
 /// Borrowed original claim/fence/root access, never a second memory claim.
 pub(super) trait MemberCustody {
     fn before_arm(&mut self) -> io::Result<()>;
@@ -316,13 +332,7 @@ impl<D: MemberResources> OwnedAttempt<D> {
         let root = process::Birth(bound.birth);
         let native = i32::try_from(bound.pid).ok().and_then(process::read_birth);
         native == Some(root)
-            && process::stable_descendant(
-                peer.pid,
-                process::Birth(peer.birth),
-                bound.pid,
-                root,
-                Instant::now() + Duration::from_millis(100),
-            )
+            && scope_covers(peer, bound.pid, bound.birth)
             && i32::try_from(bound.pid).ok().and_then(process::read_birth) == Some(root)
     }
     pub fn poll(

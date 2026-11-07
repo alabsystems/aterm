@@ -86,9 +86,10 @@ mod custody;
 pub use complete::{
     CompleteOutputError, MAX_COMPLETE_LISTING_BYTES, MAX_COMPLETE_STDOUT_BYTES,
     output_until_complete_listing, output_until_complete_stdout, output_until_complete_stdout_from,
-    output_until_complete_stdout_from_observed, output_until_complete_stdout_observed,
-    output_until_complete_stdout_with_limit, output_within_complete_listing,
-    output_within_complete_stdout_records, output_within_complete_stdout_records_from,
+    output_until_complete_stdout_from_observed, output_until_complete_stdout_from_unless,
+    output_until_complete_stdout_observed, output_until_complete_stdout_with_limit,
+    output_within_complete_listing, output_within_complete_stdout_records,
+    output_within_complete_stdout_records_from,
 };
 #[cfg(unix)]
 pub use complete::{RetainedOutputError, output_until_complete_stdout_retained};
@@ -685,6 +686,30 @@ pub fn stream_until_stopped(
     input_unix::stream_until_stopped(cmd, deadline, spawned, output, stopped)
 }
 
+/// Streaming with explicit stdin custody, for a cooperative operation's cancellation pipe.
+/// The caller owns the writer's lifetime. Output completion and retirement follow
+/// [`stream_until_stopped`]; this runner neither writes to nor replaces the supplied input.
+/// With `retire`, error/unwind retirement requests cooperative stop and waits for the actual
+/// root instead of killing its group. Such a root must finish cleanup with output pipes
+/// closed. A callback that cannot stop its root retains this call indefinitely.
+///
+/// # Errors
+/// As [`stream_until_stopped`].
+#[cfg(unix)]
+pub fn stream_with_stdin_until_stopped(
+    cmd: &mut Command,
+    stdin: Stdio,
+    deadline: Option<Instant>,
+    spawned: impl FnOnce(u32),
+    output: impl FnMut(ChildOutput, &[u8]) -> io::Result<()>,
+    stopped: impl FnMut() -> bool,
+    retire: Option<&mut dyn FnMut()>,
+) -> io::Result<Option<std::process::ExitStatus>> {
+    input_unix::stream_with_stdin_until_stopped(
+        cmd, stdin, deadline, spawned, output, stopped, retire,
+    )
+}
+
 /// Runs `cmd` with closed stdin, draining stdout/stderr and killing its process group at
 /// `deadline`.
 ///
@@ -728,14 +753,16 @@ pub fn output_until_from(
         cmd,
         stdin,
         &mut || deadline.saturating_duration_since(deadline_now()),
-        &mut end,
+        &mut settle_child,
+        None,
     )
 }
 
 /// [`output_until_from`] that also ends `cmd` once `stopped()` reads true: read at least every
-/// [`STOP_TICK`] while it runs, and then the child and its group killed and it reaped, as at
-/// `deadline`. Either end answers [`RunError::TimedOut`]; the caller tells its stop from its
-/// deadline by its own reading.
+/// [`STOP_TICK`] while it runs or its output is collected. A running child and its group are
+/// killed and the child positively reaped; after the child is reaped its former group is never
+/// signalled. Cancellation publishes no output. Either end answers [`RunError::TimedOut`]; the
+/// caller tells its stop from its deadline by its own reading.
 ///
 /// # Errors
 /// Returns the same errors as [`output_until`].
@@ -748,16 +775,9 @@ pub fn output_until_from_unless(
     output_by(
         cmd,
         stdin,
-        &mut || {
-            if stopped() {
-                Duration::ZERO
-            } else {
-                deadline
-                    .saturating_duration_since(deadline_now())
-                    .min(STOP_TICK)
-            }
-        },
-        &mut end,
+        &mut || deadline.saturating_duration_since(deadline_now()),
+        &mut settle_child,
+        Some(stopped),
     )
 }
 
@@ -845,24 +865,27 @@ fn progressing_until(
             let left = window.saturating_sub(quiet).min(tick);
             deadline.map_or(left, |limit| left.min(limit.saturating_duration_since(now)))
         },
-        &mut end,
+        &mut settle_child,
+        None,
     )
 }
 
 /// `cmd` run with `stdin` in a process group of its own (on Unix), its output drained, until it
 /// ends or `left()` reads zero; then `overrun` ends it (for `output_until` and
-/// `output_while_progressing`, [`end`]: it and its group killed, and it reaped).
+/// `output_while_progressing`, [`settle_child`]: it and its group killed, and it reaped).
 fn output_by(
     cmd: &mut Command,
     stdin: Stdio,
     left: &mut dyn FnMut() -> Duration,
     overrun: &mut dyn FnMut(&mut Child),
+    stopped: Option<&mut dyn FnMut() -> bool>,
 ) -> Result<Output, RunError> {
     let (child, pipes, group) = started(cmd, stdin)?;
-    drained_by(child, pipes, group, left, overrun)?.map_err(|_| RunError::TimedOut)
+    drained_owned(child, pipes, group, left, overrun, true, stopped)?
+        .map_err(|_| RunError::TimedOut)
 }
 
-/// A child's stdout and stderr, taken for a drained wait ([`drained_by`]).
+/// A child's stdout and stderr, taken for a drained wait ([`drained_owned`]).
 type Pipes = (
     Option<std::process::ChildStdout>,
     Option<std::process::ChildStderr>,
@@ -884,7 +907,7 @@ fn started(cmd: &mut Command, stdin: Stdio) -> Result<(Child, Pipes, Option<u32>
     Ok((child, pipes, group))
 }
 
-/// A started child a drained wait ([`drained_by`]) reads: this crate's, or, for a test that
+/// A started child a drained wait ([`drained_owned`]) reads: this crate's, or, for a test that
 /// launches its own, `std`'s.
 trait Waited {
     /// Its process id.
@@ -907,7 +930,7 @@ impl Waited for Child {
     }
 
     fn end(&mut self) {
-        end(self);
+        settle_child(self);
     }
 
     fn release(self) {}
@@ -957,14 +980,35 @@ impl Late {
 /// `child`, started with `pipes` (its stdout and stderr), waited on with its output drained until
 /// it ends or `left()` reads zero; `group` is its process group when it leads one. Past its time
 /// `overrun` ends it while it still runs, and the answer is [`Late`]; on a failure it is
-/// [`Waited::end`]ed.
-fn drained_by<C: Waited>(
-    mut child: C,
+/// [`Waited::end`]ed. Ordinary captures also keep their child on unwind; the silent lab selects
+/// its explicit bounded cleanup policy instead.
+fn drained_owned<C: Waited>(
+    child: C,
     pipes: Pipes,
     group: Option<u32>,
     left: &mut dyn FnMut() -> Duration,
     overrun: &mut dyn FnMut(&mut C),
+    settle_on_unwind: bool,
+    mut stopped: Option<&mut dyn FnMut() -> bool>,
 ) -> Result<Result<Output, Late>, RunError> {
+    struct Owner<C: Waited> {
+        child: Option<C>,
+        settle: bool,
+    }
+    impl<C: Waited> Drop for Owner<C> {
+        fn drop(&mut self) {
+            if self.settle
+                && let Some(child) = &mut self.child
+            {
+                child.end();
+            }
+        }
+    }
+    let mut owned = Owner {
+        child: Some(child),
+        settle: settle_on_unwind,
+    };
+    let child = owned.child.as_mut().expect("capture owns its child");
     let stdout = pipes.0.map(|s| {
         let pipe = pipe_end(&s);
         drain(s, pipe, "stdout")
@@ -985,13 +1029,25 @@ fn drained_by<C: Waited>(
         match child.poll_exit() {
             Ok(Some(status)) => break status,
             Ok(None) => {
-                let remaining = left();
+                let remaining = if stopped.as_mut().is_some_and(|stop| stop()) {
+                    Duration::ZERO
+                } else {
+                    left()
+                };
                 if remaining.is_zero() {
-                    overrun(&mut child);
-                    child.release();
+                    overrun(child);
+                    owned
+                        .child
+                        .take()
+                        .expect("capture owns its child")
+                        .release();
                     return Ok(Err(Late { stdout, stderr }));
                 }
-                exit.wait(remaining);
+                exit.wait(if stopped.is_some() {
+                    remaining.min(STOP_TICK)
+                } else {
+                    remaining
+                });
             }
             Err(e) => {
                 child.end();
@@ -1004,11 +1060,22 @@ fn drained_by<C: Waited>(
         until: saturating_after(Instant::now(), left()),
         group,
     };
-    let collect = |drain: Option<Drain>| drain.map(|d| d.collect(&grace)).unwrap_or_default();
+    let mut collect = |drain: Option<Drain>| {
+        drain
+            .map(|d| {
+                if stopped.is_some() {
+                    d.collect_unless(&grace, &mut stopped)
+                } else {
+                    Ok(d.collect(&grace))
+                }
+            })
+            .transpose()
+            .map(Option::unwrap_or_default)
+    };
     Ok(Ok(Output {
         status,
-        stdout: collect(stdout),
-        stderr: collect(stderr),
+        stdout: collect(stdout)?,
+        stderr: collect(stderr)?,
     }))
 }
 
@@ -1109,12 +1176,62 @@ impl ExitWait {
     }
 }
 
-fn end(child: &mut Child) {
-    #[cfg(unix)]
-    children::kill_group(child);
-    #[cfg(not(unix))]
+/// End this owned child's process group on Unix, or the child on other platforms, and retain
+/// it until a positive owning wait. Already reaped children cause no signal. A child whose
+/// numeric custody was lost stays retained without signalling a possibly reused identity.
+/// Cleanup may outlive any work deadline; this establishes no descendant-drain receipt.
+pub fn settle_child(child: &mut Child) {
+    settle_child_with(child, Child::wait);
+}
+
+/// Keep the actual child until an owning wait succeeds, including on cleanup errors. An
+/// unknown child is retained without signalling a number that may have been reused.
+#[cfg(unix)]
+fn settle_child_with(
+    child: &mut Child,
+    mut wait: impl FnMut(&mut Child) -> io::Result<std::process::ExitStatus>,
+) {
+    if child.is_reaped() {
+        return;
+    }
+    if child.owns_unreaped() {
+        children::kill_group(child);
+    }
+    let mut exit = child.owns_unreaped().then(|| ExitWait::new(child));
+    loop {
+        if !child.owns_unreaped() && !child.is_reaped() {
+            exit = None;
+            std::thread::sleep(STOP_TICK);
+            continue;
+        }
+        if wait(child).is_ok() {
+            return;
+        }
+        if !child.owns_unreaped() {
+            exit = None;
+        }
+        let at = Instant::now();
+        if let Some(exit) = &mut exit {
+            exit.wait(STOP_TICK);
+        }
+        let left = STOP_TICK.saturating_sub(at.elapsed());
+        if !left.is_zero() {
+            std::thread::sleep(left);
+        }
+    }
+}
+
+/// Off Unix, `Child` retains the native process handle, so ending and waiting never use a
+/// potentially reused process id. Wait failures retain that same handle until completion.
+#[cfg(not(unix))]
+fn settle_child_with(
+    child: &mut Child,
+    mut wait: impl FnMut(&mut Child) -> io::Result<std::process::ExitStatus>,
+) {
     let _ = child.kill();
-    let _ = child.wait();
+    while wait(child).is_err() {
+        std::thread::sleep(STOP_TICK);
+    }
 }
 
 /// `SIGKILL` `child` and reap it within `hang`, waiting on its exit as the kernel reports it. One still there at `hang` is left to its handle's drop, which hands it to the reaper: whether a program macOS's program check holds takes its signal is unmeasured.
@@ -1262,14 +1379,49 @@ struct Drain {
 
 impl Drain {
     fn collect(self, grace: &Grace) -> Vec<u8> {
-        let ended = self
-            .ended
-            .recv_timeout(grace.by.saturating_duration_since(Instant::now()))
-            .is_ok();
+        self.collect_unless(grace, &mut None)
+            .expect("an unobserved capture cannot be cancelled")
+    }
+
+    fn collect_unless(
+        self,
+        grace: &Grace,
+        stopped: &mut Option<&mut dyn FnMut() -> bool>,
+    ) -> Result<Vec<u8>, RunError> {
+        let ended = receive_unless(
+            &self.ended,
+            grace.by.saturating_duration_since(Instant::now()),
+            stopped,
+        )?
+        .is_ok();
         if !ended && let Some(wait) = grace.read_on(self.pipe.as_ref()) {
-            let _ = self.ended.recv_timeout(wait);
+            let _ = receive_unless(&self.ended, wait, stopped)?;
         }
-        std::mem::take(&mut *self.tail.lock().unwrap_or_else(PoisonError::into_inner))
+        Ok(std::mem::take(
+            &mut *self.tail.lock().unwrap_or_else(PoisonError::into_inner),
+        ))
+    }
+}
+
+/// Keep ordinary captures' single wait; cancellation-aware captures reuse the existing tick.
+fn receive_unless<T>(
+    receiver: &mpsc::Receiver<T>,
+    wait: Duration,
+    stopped: &mut Option<&mut dyn FnMut() -> bool>,
+) -> Result<Result<T, mpsc::RecvTimeoutError>, RunError> {
+    if stopped.is_none() {
+        return Ok(receiver.recv_timeout(wait));
+    }
+    let by = saturating_after(Instant::now(), wait);
+    loop {
+        if stopped.as_mut().is_some_and(|stop| stop()) {
+            return Err(RunError::TimedOut);
+        }
+        let left = by.saturating_duration_since(Instant::now());
+        match receiver.recv_timeout(left.min(STOP_TICK)) {
+            Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() < by => {}
+            got => return Ok(got),
+        }
     }
 }
 
@@ -1690,6 +1842,58 @@ mod tests {
             let _ = release.send(());
         });
         assert_eq!(drain.collect(&grace), b"Thu Oct 22 16:44:35 2026\n");
+
+        struct Released<R>(Late<R>, mpsc::Sender<()>);
+        impl<R: std::io::Read> std::io::Read for Released<R> {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                std::io::Read::read(&mut self.0, bytes)
+            }
+        }
+        impl<R> Drop for Released<R> {
+            fn drop(&mut self) {
+                let _ = self.1.send(());
+            }
+        }
+        for panics in [false, true] {
+            let (reader, mut writer) = std::io::pipe().expect("cancellable pipe");
+            writer.write_all(b"unpublished tail").unwrap();
+            drop(writer);
+            let pipe = super::pipe_end(&reader);
+            let (release, held) = mpsc::channel();
+            let (dropped, gone) = mpsc::channel();
+            let drain = super::drain(
+                Released(Late { held, reader }, dropped),
+                pipe,
+                "cancellable-late",
+            )
+            .unwrap();
+            let grace = super::Grace {
+                by: Instant::now(),
+                until: Instant::now() + HANG,
+                group: Some(an_empty_group()),
+            };
+            let mut first = true;
+            let mut stopped = || {
+                if std::mem::take(&mut first) {
+                    false
+                } else {
+                    assert!(!panics, "injected post-exit observer unwind");
+                    true
+                }
+            };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                drain.collect_unless(&grace, &mut Some(&mut stopped))
+            }));
+            release.send(()).expect("release this capture's reader");
+            drop(release);
+            gone.recv_timeout(HANG)
+                .expect("the owned reader released its pipe");
+            if panics {
+                assert!(result.is_err());
+            } else {
+                assert!(matches!(result, Ok(Err(RunError::TimedOut))));
+            }
+        }
     }
 
     /// A pipe only something outside the exited child's group holds is read until it lets

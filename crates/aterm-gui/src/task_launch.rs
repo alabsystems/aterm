@@ -954,8 +954,7 @@ fn run_worker_launch(work: &Launch) {
                 None => admitted,
             };
             admitted.prepare(cli, aterm_types::dirs::home_dir().as_deref(), |starter| {
-                let _google_mark =
-                    native_google_agent(work.agent).then(|| InstallingMark::of(&work.ctx));
+                let _google_mark = native_google_agent(work.agent).then(|| store.installing());
                 if account_preparation_cancelled(work) {
                     return Err(PREPARATION_CANCELLED.into());
                 }
@@ -963,6 +962,13 @@ fn run_worker_launch(work: &Launch) {
             })
         },
     );
+    if admission.is_err() && store.cancelled.get() {
+        note_launch(
+            &work.ctx,
+            "installation retired after its launch moved on".into(),
+        );
+        return;
+    }
     if admission.is_err() && account_preparation_cancelled(work) {
         stall_cancelled(work);
         return;
@@ -972,6 +978,7 @@ fn run_worker_launch(work: &Launch) {
         work.local,
         work.agent,
         admission,
+        store.install_mark.get().zip(store.install_entered.get()),
         crate::harness_host::member_label,
     ) else {
         return;
@@ -1203,6 +1210,8 @@ pub(crate) trait ProgramStore {
 pub(crate) struct AtpkgStore<'a> {
     ctx: &'a SessionCtx,
     install_mark: std::cell::Cell<Option<u64>>,
+    install_entered: std::cell::Cell<Option<u64>>,
+    cancelled: std::cell::Cell<bool>,
 }
 
 impl<'a> AtpkgStore<'a> {
@@ -1210,12 +1219,15 @@ impl<'a> AtpkgStore<'a> {
         Self {
             ctx,
             install_mark: std::cell::Cell::new(None),
+            install_entered: std::cell::Cell::new(None),
+            cancelled: std::cell::Cell::new(false),
         }
     }
 
     fn installing(&self) -> InstallingMark<'a> {
         let guard = InstallingMark::of(self.ctx);
         self.install_mark.set(Some(guard.mark));
+        self.install_entered.set(guard.task_entered);
         guard
     }
 }
@@ -1254,7 +1266,15 @@ impl ProgramStore for AtpkgStore<'_> {
     fn install(&self, program: &str) -> Result<(), String> {
         let (atpkg, layout) = Self::installer()?;
         let mark = self.install_mark.get().ok_or("no owned install episode")?;
-        install_with(&atpkg, &layout, program, self.ctx, mark)
+        install_with(
+            &atpkg,
+            &layout,
+            program,
+            self.ctx,
+            mark,
+            self.install_entered.get(),
+            &self.cancelled,
+        )
     }
 }
 
@@ -1280,19 +1300,51 @@ fn install_with(
     program: &str,
     ctx: &SessionCtx,
     mark: u64,
+    entered: Option<u64>,
+    cancelled: &std::cell::Cell<bool>,
 ) -> Result<(), String> {
-    if !ctx
-        .timeline
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .worker_installing_at(mark)
-    {
+    if !install_wanted(ctx, mark, entered) {
+        cancelled.set(true);
         return Err("the install episode no longer owns this launch".into());
     }
     let mut cmd = crate::qos::atpkg_command(atpkg);
     cmd.args(crate::pass_lead(
         aterm_types::dirs::runs_under_private_state_root(),
     ));
+    let spawned = |pid| {
+        ctx.timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .set_worker_install_child(mark, pid);
+    };
+    #[cfg(unix)]
+    let run = {
+        let (reader, writer) =
+            aterm_uds::kept_out(std::io::pipe).map_err(|e| format!("cancellation pipe: {e}"))?;
+        let mut argv = install_argv(program, Some(layout));
+        argv.push(atpkg::cli::CANCEL_STDIN_FLAG.into());
+        crate::run_atpkg_pass_owned(
+            argv,
+            cmd,
+            Some(&crate::spawn::atpkg_child_path()),
+            Some(layout),
+            false,
+            &|_: crate::Wake| {},
+            crate::PassLaunch {
+                spawned: &spawned,
+                cancellation: Some(crate::PassCancellation {
+                    reader,
+                    writer,
+                    requested: &|| {
+                        let stop = cancelled.get() || !install_wanted(ctx, mark, entered);
+                        cancelled.set(stop);
+                        stop
+                    },
+                }),
+            },
+        )
+    };
+    #[cfg(not(unix))]
     let run = crate::run_atpkg_pass(
         install_argv(program, Some(layout)),
         cmd,
@@ -1300,14 +1352,9 @@ fn install_with(
         Some(layout),
         false,
         &|_: crate::Wake| {},
-        &|pid| {
-            ctx.timeline
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .set_worker_install_child(mark, pid);
-        },
-    )
-    .map_err(|e| format!("it could not run: {e}"))?;
+        &spawned,
+    );
+    let run = run.map_err(|e| format!("it could not run: {e}"))?;
     if run.clean() {
         return Ok(());
     }
@@ -1317,6 +1364,14 @@ fn install_with(
     } else {
         why
     })
+}
+
+fn install_wanted(ctx: &SessionCtx, mark: u64, entered: Option<u64>) -> bool {
+    let timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+    timeline.worker_installing_at(mark)
+        && timeline
+            .task()
+            .is_some_and(|task| task.state == TaskState::Working && Some(task.entered) == entered)
 }
 
 /// A credit claim's Chrome ([`crate::harness_host::credit_claim::ready`]), which aterm puts in
@@ -1525,13 +1580,15 @@ pub(crate) const fn refused_why(refused: &aterm_agent::harness::worker::Refused)
 
 /// A session's launcher is installing its worker's program, or preparing a Google worker's sign-in
 /// (`NativeGoogleAdmission::prepare`): set on the session's timeline while it lives, and cleared
-/// when it drops, on an error or a panic too
+/// when it drops while still owning that episode, on an error or a panic too
 /// ([`crate::session_timeline::SessionTimeline::worker_installing`]). The startup deadline does
 /// not judge a worker by its 120 s while this stands, since an install ordinarily ends by itself,
 /// in a line or a stall. Once no work of its own has moved for
 /// [`crate::harness_host::INSTALL_QUIET_LIMIT`], it stalls the worker naming what holds its screen;
-/// the launcher then types nothing when the work ends, and nothing ends atpkg's child
-/// (ATERM-KI-1105-2). Its own work is what the atpkg child it spawned writes ([`install_with`]), so
+/// the launcher then types nothing when the work ends. Unix worker installs request cooperative
+/// cancellation when the task moves on or their epoch is superseded, retaining the package root
+/// through helper retirement and cleanup ([`install_with`]). Windows retains the earlier wait.
+/// Its own work is what the atpkg child it spawned writes ([`install_with`]), so
 /// a sign-in check, which has no such child, has that limit whole, whatever else moves on the
 /// store. Each mark has a clock of its own
 /// ([`crate::session_timeline::SessionTimeline::worker_install_mark`]), so no install's silence
@@ -1540,6 +1597,7 @@ pub(crate) const fn refused_why(refused: &aterm_agent::harness::worker::Refused)
 pub(crate) struct InstallingMark<'a> {
     ctx: &'a SessionCtx,
     mark: u64,
+    task_entered: Option<u64>,
 }
 
 impl<'a> InstallingMark<'a> {
@@ -1548,7 +1606,12 @@ impl<'a> InstallingMark<'a> {
         let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
         timeline.set_worker_installing(true);
         let mark = timeline.worker_install_mark();
-        Self { ctx, mark }
+        let task_entered = timeline.task().map(|task| task.entered);
+        Self {
+            ctx,
+            mark,
+            task_entered,
+        }
     }
 }
 
@@ -2033,14 +2096,16 @@ pub(crate) fn take_admission<T>(
         (aterm_agent::harness::worker::Admitted, T),
         aterm_agent::harness::worker::Refused,
     >,
+    install_owner: Option<(u64, u64)>,
     on: impl FnOnce() -> Option<String>,
 ) -> Option<(aterm_agent::harness::worker::Admitted, T)> {
     let refused = match admission {
         Ok(admitted) => {
-            ctx.timeline
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .set_worker_kept_off(admitted.0.kept_off_why().map(str::to_owned));
+            let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+            if install_owner.is_some() && !install_record_stands(&timeline, install_owner) {
+                return None;
+            }
+            timeline.set_worker_kept_off(admitted.0.kept_off_why().map(str::to_owned));
             return Some(admitted);
         }
         Err(refused) => refused,
@@ -2057,7 +2122,7 @@ pub(crate) fn take_admission<T>(
         word,
     }
     .attention_on(on().as_deref());
-    mark_refused(ctx, local, word, &words);
+    mark_refused(ctx, local, word, &words, install_owner);
     None
 }
 
@@ -2120,28 +2185,46 @@ pub(crate) fn stall_refused_task(
         word,
     }
     .attention_on(crate::harness_host::member_label().as_deref());
-    mark_refused(ctx, local, word, &words);
+    mark_refused(ctx, local, word, &words, None);
 }
 
 /// Mark session `local`'s `working` task stalled with the `why=` word `word` and `words` in
 /// `attention=`, both under one lock. A record that moved on already says what became of the task,
 /// and keeps its attention.
-fn mark_refused(ctx: &SessionCtx, local: u64, word: &'static str, words: &str) {
+fn mark_refused(
+    ctx: &SessionCtx,
+    local: u64,
+    word: &'static str,
+    words: &str,
+    install_owner: Option<(u64, u64)>,
+) {
     let mut mark = TaskMark::new(TaskState::Stalled);
     mark.why = Some(word);
-    let marked = crate::task_record::mark_session_task_with(
+    let marked = crate::task_record::mark_session_task_with_timeline(
         ctx,
         local,
         Some(&mark),
         crate::task_record::AttentionEdit::Raise(words),
         ctx.fabric.fence_wait(),
-        |task, _| task.is_some_and(|task| task.state == TaskState::Working),
+        |timeline, _| install_record_stands(timeline, install_owner),
     );
     if marked.is_err() {
         aterm_log::warn!(
             "worker session {local}: the stall was not marked (an update was committing)"
         );
     }
+}
+
+fn install_record_stands(
+    timeline: &crate::session_timeline::SessionTimeline,
+    owner: Option<(u64, u64)>,
+) -> bool {
+    timeline.task().is_some_and(|task| {
+        task.state == TaskState::Working
+            && owner.is_none_or(|(mark, entered)| {
+                timeline.worker_install_mark() == mark && task.entered == entered
+            })
+    })
 }
 
 /// [`stall`] of session `local` by its parts: `stalled why=shell`.

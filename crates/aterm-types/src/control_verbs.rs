@@ -1733,7 +1733,8 @@ pub const VERBS: &[VerbSpec] = &[
         App,
         "program-check [full|live|held <pid>|held -]: the stuck check's macOS program-check board",
         "— answers `OK reading=<live|full> held=<pid|-> syspolicyd=<-|ok|full|stuck> \
-         syspolicyd_workers=<n>/<limit|->|- syspolicyd_full_ms=<ms|->`, the board `status` \
+         syspolicyd_workers=<n>/<limit|->|- syspolicyd_full_ms=<ms|-> syspolicyd_pid=<pid|-> \
+         syspolicyd_up_ms=<ms|->`, the board `status` \
          carries (`aterm help permissions`), sampled once a minute on macOS. The forms below \
          need `dev-seams`: `program-check full` stages `syspolicyd` at the kernel thread limit \
          (after 5 min it reads `stuck`, raising the restart alert and pausing harness \
@@ -2361,8 +2362,8 @@ pub const VERBS: &[VerbSpec] = &[
          fg_rss_mb= disk=<ok|low|short|emergency|-> disk_free_mb= disk_room_mb= disk_age_ms= \
          job=<verdict|none> job_quiet_ms= program_check=<n>:<oldest_ms>|0|- \
          left=<n>:<oldest_ms>|0:-|- \
-         syspolicyd=<-|ok|full|stuck> syspolicyd_workers= syspolicyd_full_ms= \
-         service_mem=<-|ok|large|huge> service_mem_top=<name>:<MiB>|- \
+         syspolicyd=<-|ok|full|stuck> syspolicyd_workers= syspolicyd_full_ms= syspolicyd_pid= \
+         syspolicyd_up_ms= service_mem=<-|ok|large|huge> service_mem_top=<name>:<MiB>|- \
          occupancy=<off|observe|prompt> occupancy_hold=<declared|undeclared|none> ready= slots= \
          idle_ready_min= waits= waits_ready=` (`service_mem=` is the largest of macOS's own \
          services that has held past the bar any service needs for ten minutes, `ok` when none \
@@ -2374,8 +2375,10 @@ pub const VERBS: &[VerbSpec] = &[
          that still run and `sys left` offers to end (born while an agent ran in the tab, or \
          after the shell in a tab where none was seen, and a dead verify run's that rode in this \
          session; `sys left` marks each `left_of=<sid>`), with the oldest's age in ms, `0:-` with \
-         none, `-` with no whole reading that speaks for now; \
-         `occupancy why` explains `occupancy_hold=` to \
+         none, `-` with no whole reading that speaks for now; `syspolicyd_pid=` is the \
+         `syspolicyd` the stuck check's last look read and `syspolicyd_up_ms=` how long it has \
+         run, `-` before a look reads one and once none runs (a look that reads nothing keeps \
+         the pid, with no age); `occupancy why` explains `occupancy_hold=` to \
          `idle_ready_min=`; `waits=` counts the session's declared wakes still to be told and \
          `waits_ready=` those whose condition held, which `waits` lists). Harness and records: \
          `supervisor= supervisor_proven= supervisor_version= supervisor_vendor= \

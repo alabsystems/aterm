@@ -7,7 +7,7 @@ use crate::harness::native_act::{
     Image, NativePlan, Prepare, Process, Request as NativeRequest, RestartCommand,
 };
 
-fn fixture() -> (aterm_tempfile::TempDir, Env, Receipt, Prepare) {
+pub(super) fn fixture() -> (aterm_tempfile::TempDir, Env, Receipt, Prepare) {
     let tmp = aterm_tempfile::tempdir().unwrap();
     let mut env = Env::from_process().unwrap();
     env.home = Some(tmp.path().join("home"));
@@ -30,7 +30,7 @@ fn fixture() -> (aterm_tempfile::TempDir, Env, Receipt, Prepare) {
         settles: None,
         account_intent: None,
         image: image.clone(),
-        program: "/fixture/codex".into(),
+        program: at!("/fixture/codex").into(),
         argv: vec!["resume".into(), "original-thread".into()],
         env: vec![("CODEX_AUTH_PATH".into(), "/fixture/new/auth.json".into())],
         unset: None,
@@ -59,7 +59,7 @@ fn fixture() -> (aterm_tempfile::TempDir, Env, Receipt, Prepare) {
             observation: None,
             shell,
             launcher: image,
-            socket: "/fixture/control.sock".into(),
+            socket: at!("/fixture/control.sock").into(),
             forward: Box::new(command),
             cold: None,
             rollback: None,

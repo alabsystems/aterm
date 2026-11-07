@@ -3879,9 +3879,19 @@ impl Item for Guard {
         self.inner.probe(sys, ctx)
     }
     fn apply(&self, sys: &dyn System, ctx: &Ctx) -> Result<(), String> {
+        self.apply_guarded(sys, ctx, &|| Ok(()))
+    }
+    fn apply_guarded(
+        &self,
+        sys: &dyn System,
+        ctx: &Ctx,
+        current: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Result<(), String> {
+        current()?;
         self.validate(sys, ctx)?;
+        current()?;
         self.record_attempt();
-        self.inner.apply(sys, ctx)
+        self.inner.apply_guarded(sys, ctx, current)
     }
     fn preference_changes(
         &self,
@@ -3890,12 +3900,17 @@ impl Item for Guard {
     ) -> Result<PreferenceSnapshot, String> {
         self.inner.preference_changes(sys, ctx)
     }
-    fn refresh(&self, sys: &dyn System, ctx: &Ctx) -> Option<Result<(), String>> {
+    fn refresh_guarded(
+        &self,
+        sys: &dyn System,
+        ctx: &Ctx,
+        current: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Option<Result<(), String>> {
         if let Err(why) = self.validate(sys, ctx) {
             return Some(Err(why));
         }
         self.record_attempt();
-        let refreshed = self.inner.refresh(sys, ctx);
+        let refreshed = self.inner.refresh_guarded(sys, ctx, current);
         if refreshed.is_none() {
             self.forget_attempt();
         }
@@ -5530,9 +5545,20 @@ impl Item for HeldLate<'_> {
         }
     }
     fn apply(&self, sys: &dyn System, ctx: &Ctx) -> Result<(), String> {
+        self.apply_guarded(sys, ctx, &|| Ok(()))
+    }
+    fn apply_guarded(
+        &self,
+        sys: &dyn System,
+        ctx: &Ctx,
+        current: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Result<(), String> {
         match self.held() {
             Some(why) => Err(why.clone()),
-            None => self.finished(self.inner.apply_guarded(sys, ctx, &|| self.current())),
+            None => self.finished(self.inner.apply_guarded(sys, ctx, &|| {
+                current()?;
+                self.current()
+            })),
         }
     }
     fn preference_changes(
@@ -5542,9 +5568,17 @@ impl Item for HeldLate<'_> {
     ) -> Result<Vec<(Target, Read<PValue>)>, String> {
         self.inner.preference_changes(sys, ctx)
     }
-    fn refresh(&self, sys: &dyn System, ctx: &Ctx) -> Option<Result<(), String>> {
+    fn refresh_guarded(
+        &self,
+        sys: &dyn System,
+        ctx: &Ctx,
+        current: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Option<Result<(), String>> {
         self.inner
-            .refresh_guarded(sys, ctx, &|| self.current())
+            .refresh_guarded(sys, ctx, &|| {
+                current()?;
+                self.current()
+            })
             .map(|result| self.finished(result))
     }
     fn refresh_changes(&self, sys: &dyn System, ctx: &Ctx) -> bool {
@@ -5600,8 +5634,8 @@ enum Lane {
     /// After the base layer, on the calling thread: Rust in Spotlight (rustup, once the base
     /// layer let the store lock go) and aterm's grants.
     Base,
-    /// Apple's Command Line Tools, the vault, GitHub and the develop layer: installs and the
-    /// network.
+    /// The vault, downloaded tools and GitHub: installs and the network. The root transaction
+    /// has its own lane, and develop follows both.
     Network,
     /// The preferences, the trackpad and the sign-outs: every Dock relaunch and every UI
     /// automation stays in this one lane.
@@ -5653,8 +5687,8 @@ impl Drop for Opens<'_> {
 /// The id of the Network lane's gate ([`AfterBase`]), whose row [`run_layers`] drops.
 const AFTER_BASE: &str = "init.after-base";
 
-/// Holds the Network lane, after the vault's join, until the base layer let the store lock go
-/// ([`Latch`]): `base.clt` and the develop layer's tools may take it.
+/// Holds root work and the Network lane after the vault's join until the base layer lets the
+/// store lock go ([`Latch`]): the root transaction and package passes may take it.
 struct AfterBase<'a>(&'a Latch);
 
 impl Item for AfterBase<'_> {
@@ -5702,11 +5736,50 @@ impl Journal for Shared<'_, '_> {
     }
 }
 
+/// An already-run predecessor, used only to preserve the develop stage's existing `after`
+/// edges. It performs no probe, effect, refresh or journal write on the original item, and
+/// its synthetic row is never published. Only the original pass's successful outcomes admit
+/// a dependent apply; a plan still probes its dependents as usual.
+struct Completed<'a> {
+    inner: &'a dyn Item,
+    row: &'a ItemReport,
+}
+
+impl Item for Completed<'_> {
+    fn id(&self) -> String {
+        self.row.id.clone()
+    }
+    fn family(&self) -> &'static str {
+        self.inner.family()
+    }
+    fn title(&self) -> String {
+        self.row.title.clone()
+    }
+    fn probe(&self, _sys: &dyn System, _ctx: &Ctx) -> Probe {
+        if matches!(self.row.outcome, Outcome::Ok | Outcome::Changed) {
+            Probe::Ok {
+                now: self.row.to.clone().unwrap_or_else(|| self.title()),
+            }
+        } else {
+            Probe::Unusable {
+                why: self.row.why.clone().unwrap_or_else(|| self.title()),
+            }
+        }
+    }
+    fn apply(&self, _sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
+        Err("a completed predecessor changes nothing".into())
+    }
+    fn read_aside(&self) -> Option<aterm_converge::StoodAside> {
+        self.row.stood_aside.clone()
+    }
+}
+
 /// Run `base` items, release the store lock, and then run `base.clt`, `groups`, and `develop`
-/// in three lanes at once ([`Lane`]): the Desktop lane and the vault's join in the Network lane
-/// start at once, the rest of the Network lane (the toolset, GitHub, `base.clt`, the develop layer) once
-/// the base layer let the store lock go ([`AfterBase`]), and the Base lane follows the base
-/// layer. Each row reaches `hooks.on_row` as its item finishes, and the Desktop lane runs
+/// independently: the Desktop lane and the vault's join in the Network lane start at once;
+/// the root lane and the rest of the Network lane (the toolset and GitHub) once the base layer
+/// let the store lock go ([`AfterBase`]), and the Base lane follows the base layer. Develop
+/// runs once both root and network work finish, preserving its predecessor outcomes. Each
+/// row reaches `hooks.on_row` as its item finishes, and the Desktop lane runs
 /// inside `hooks.desktop`; the rows come back in composition order whichever lane finished
 /// first. The phases `base` (the base layer) and `workstation` (the rest, until every lane is
 /// done) of `laps` add up to the run's wall time; a lane's own time is the sum of its rows'
@@ -5739,6 +5812,9 @@ fn run_layers(
         toolset,
         ..
     } = base;
+    // The last inner deferral must not resend a stop while another lane still owns a child.
+    // Keep one owner until every lane and the develop stage have returned and been joined.
+    let _stops = (mode == Mode::Apply && clt.is_some()).then(|| sys.defer_stops());
     let order: Vec<String> = clt
         .iter()
         .map(Item::id)
@@ -5782,8 +5858,9 @@ fn run_layers(
             said: std::sync::OnceLock::new(),
         })
         .collect();
-    // Downloaded tools and repository clones need no Apple compiler. Finish them before
-    // an interactive Command Line Tools installation can wait for a Mac password.
+    // Downloaded tools and repository clones need no Apple compiler. They proceed beside
+    // the one root transaction, rather than delaying its LAN helper or waiting on its CLT
+    // download or password.
     let gated: Vec<(&dyn Item, Place)> = toolset
         .as_ref()
         .map(|toolset| (toolset as &dyn Item, crate::init_toolset::place()))
@@ -5794,26 +5871,31 @@ fn run_layers(
                 .zip(&held_late)
                 .map(|((_, place), item)| (item as &dyn Item, place.clone())),
         )
-        .chain(
-            clt.as_ref()
-                .map(|clt| (clt as &dyn Item, crate::init_clt::place())),
-        )
-        .chain(
-            develop
-                .iter()
-                .map(|(item, place)| (item.as_ref(), place.clone())),
-        )
         .collect();
     if !gated.is_empty() {
         network.push((&gate as &dyn Item, crate::init_clt::place()));
         network.extend(gated);
     }
+    let root: Vec<(&dyn Item, Place)> = clt.as_ref().map_or_else(Vec::new, |clt| {
+        vec![
+            (&gate as &dyn Item, crate::init_clt::place()),
+            (clt as &dyn Item, crate::init_clt::place()),
+        ]
+    });
+    let develop: Vec<(&dyn Item, Place)> = develop
+        .iter()
+        .map(|(item, place)| (item.as_ref(), place.clone()))
+        .collect();
     let journal = Mutex::new(journal);
-    let run = |lane: &[(&dyn Item, Place)]| -> Result<Vec<ItemReport>, String> {
+    let run = |lane: &[(&dyn Item, Place)],
+               prior: &[(&dyn Item, Place)]|
+     -> Result<Vec<ItemReport>, String> {
         if lane.is_empty() {
             return Ok(Vec::new());
         }
-        let bound = crate::engine::bind(lane.iter().cloned(), sys, ctx);
+        let completed: std::collections::BTreeSet<String> =
+            prior.iter().map(|(item, _)| item.id()).collect();
+        let bound = crate::engine::bind(prior.iter().chain(lane).cloned(), sys, ctx);
         let bound = if narrowing.only.is_empty() {
             bound
         } else {
@@ -5829,15 +5911,16 @@ fn run_layers(
         };
         let mut rows =
             aterm_converge::run_scoped(&bound, mode, scope, &mut Shared(&journal), &mut |row| {
-                if row.id != AFTER_BASE {
+                if row.id != AFTER_BASE && !completed.contains(&row.id) {
                     on_row(row);
                 }
             })
             .map_err(|refused| refused.to_string())?;
-        rows.retain(|row| row.id != AFTER_BASE);
+        rows.retain(|row| row.id != AFTER_BASE && !completed.contains(&row.id));
         Ok(rows)
     };
-    let network_lane = || run(&network);
+    let network_lane = || run(&network, &[]);
+    let root_lane = || run(&root, &[]);
     // A Desktop-lane stage as its desk says: the items it leaves out dropped, and the rest each
     // doing what it says in place of a change.
     let staged = |lane: &[(&dyn Item, Place)], desk: Desk<'_>| {
@@ -5855,16 +5938,18 @@ fn run_layers(
                 })
             })
             .collect();
-        run(&ran
-            .iter()
-            .zip(&unchanged)
-            .map(|((inner, place), unchanged)| {
-                (
-                    unchanged.as_ref().map_or(*inner, |item| item as &dyn Item),
-                    place.clone(),
-                )
-            })
-            .collect::<Vec<_>>())
+        run(
+            &ran.iter()
+                .zip(&unchanged)
+                .map(|((inner, place), unchanged)| {
+                    (
+                        unchanged.as_ref().map_or(*inner, |item| item as &dyn Item),
+                        place.clone(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            &[],
+        )
     };
     let preferences = |desk: Desk<'_>| staged(&desktop, desk);
     let sign_outs = |desk: Desk<'_>| staged(&last, desk);
@@ -5876,6 +5961,14 @@ fn run_layers(
         })
     };
     let (base_rows, lanes) = std::thread::scope(|threads| {
+        let root_thread = (!root.is_empty())
+            .then(|| {
+                std::thread::Builder::new()
+                    .name("aterm-init-root".into())
+                    .spawn_scoped(threads, root_lane)
+                    .ok()
+            })
+            .flatten();
         let network_thread = std::thread::Builder::new()
             .name("aterm-init-network".into())
             .spawn_scoped(threads, network_lane)
@@ -5894,8 +5987,11 @@ fn run_layers(
         drop(held);
         drop(opens);
         laps.lap("base");
-        let spotlight_rows = run(&spotlight);
-        // A lane whose thread could not start runs here, after the others.
+        // Start a refused spawn inline while its independent peer is already running. Never
+        // join a worker before the refused peer has had a chance to begin.
+        let root_inline = root_thread.is_none().then(root_lane);
+        let network_inline = network_thread.is_none().then(network_lane);
+        let spotlight_rows = run(&spotlight, &[]);
         let joined = |thread: Option<std::thread::ScopedJoinHandle<'_, _>>,
                       inline: &dyn Fn() -> Result<Vec<ItemReport>, String>| {
             match thread {
@@ -5905,10 +6001,46 @@ fn run_layers(
                 None => inline(),
             }
         };
-        let network_rows = joined(network_thread, &network_lane);
+        let root_rows = match root_thread {
+            Some(thread) => joined(Some(thread), &root_lane),
+            None => root_inline.expect("the refused root spawn ran inline"),
+        };
+        let network_rows = match network_thread {
+            Some(thread) => joined(Some(thread), &network_lane),
+            None => network_inline.expect("the refused network spawn ran inline"),
+        };
+        let develop_rows = match (&root_rows, &network_rows) {
+            (Ok(root_rows), Ok(network_rows)) => {
+                let predecessors: Vec<_> = root_rows
+                    .iter()
+                    .chain(network_rows)
+                    .filter_map(|row| {
+                        root.iter()
+                            .chain(&network)
+                            .find(|(item, _)| item.id() == row.id)
+                            .map(|(inner, place)| (Completed { inner: *inner, row }, place.clone()))
+                    })
+                    .collect();
+                let prior: Vec<_> = predecessors
+                    .iter()
+                    .map(|(item, place)| (item as &dyn Item, place.clone()))
+                    .collect();
+                run(&develop, &prior)
+            }
+            _ => Ok(Vec::new()),
+        };
         drop(done);
         let desktop_rows = joined(desktop_thread, &desktop_lane);
-        (base_rows, [spotlight_rows, network_rows, desktop_rows])
+        (
+            base_rows,
+            [
+                spotlight_rows,
+                root_rows,
+                network_rows,
+                develop_rows,
+                desktop_rows,
+            ],
+        )
     });
     let mut rows = base_rows?;
     let mut rest = Vec::new();
@@ -6900,10 +7032,16 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
-        fn refresh(&self, _: &dyn System, _: &Ctx) -> Option<Result<(), String>> {
-            self.refreshes
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Some(Ok(()))
+        fn refresh_guarded(
+            &self,
+            _: &dyn System,
+            _: &Ctx,
+            current: &(dyn Fn() -> Result<(), String> + Sync),
+        ) -> Option<Result<(), String>> {
+            Some(current().map(|()| {
+                self.refreshes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }))
         }
         fn stood_aside(&self) -> Option<aterm_converge::StoodAside> {
             self.aside.clone()
@@ -7978,13 +8116,51 @@ mod tests {
             !saw.is_empty() && saw.iter().all(|&released| released),
             "{saw:?}"
         );
-        assert!(sys.calls().is_empty(), "{:?}", sys.calls());
+        assert!(
+            sys.calls()
+                .iter()
+                .all(|call| matches!(call.as_str(), "defer stops" | "stops restored")),
+            "no machine command runs: {:?}",
+            sys.calls()
+        );
     }
 
     #[test]
     fn repository_setup_does_not_wait_for_the_apple_tools_install() {
+        use crate::init_toolset::{Found, Toolset};
         use std::sync::Arc;
-        struct Repositories(Arc<Mutex<Vec<&'static str>>>);
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let wait = Duration::from_secs(60);
+        let released = Arc::new(AtomicBool::new(false));
+        let package_held = Arc::new(AtomicBool::new(false));
+        let packages_ready = Arc::new(AtomicBool::new(false));
+        let root_started = Arc::new(AtomicBool::new(false));
+        let root_done = Arc::new(AtomicBool::new(false));
+        let root_during_package = Arc::new(AtomicBool::new(false));
+        let root_after_base = Arc::new(AtomicBool::new(false));
+        let repositories_during_root = Arc::new(AtomicBool::new(false));
+        let repositories_done = Arc::new(AtomicBool::new(false));
+        let develop_done = Arc::new(AtomicBool::new(false));
+        let signouts_done = Arc::new(AtomicBool::new(false));
+        let (package_started, package_entered) = mpsc::sync_channel(1);
+        let (root_entered, root_arrived) = mpsc::sync_channel(1);
+        let (repositories_entered, repositories_arrived) = mpsc::sync_channel(1);
+        struct Held(Arc<AtomicBool>);
+        impl Drop for Held {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        struct Repositories {
+            packages_ready: Arc<AtomicBool>,
+            root_started: Arc<AtomicBool>,
+            root_done: Arc<AtomicBool>,
+            during_root: Arc<AtomicBool>,
+            done: Arc<AtomicBool>,
+            entered: mpsc::SyncSender<()>,
+        }
         impl Item for Repositories {
             fn id(&self) -> String {
                 "init.github.native@alice".into()
@@ -7996,60 +8172,242 @@ mod tests {
                 "Repositories".into()
             }
             fn probe(&self, _: &dyn System, _: &Ctx) -> Probe {
-                self.0.lock().unwrap().push("repositories");
+                self.during_root.store(
+                    self.packages_ready.load(Ordering::SeqCst)
+                        && self.root_started.load(Ordering::SeqCst)
+                        && !self.root_done.load(Ordering::SeqCst),
+                    Ordering::SeqCst,
+                );
+                if !self.done.swap(true, Ordering::SeqCst) {
+                    let _ = self.entered.send(());
+                }
                 ok()
             }
             fn apply(&self, _: &dyn System, _: &Ctx) -> Result<(), String> {
                 panic!("the repositories are already present")
             }
         }
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let toolset_seen = Arc::clone(&seen);
-        let clt_seen = Arc::clone(&seen);
+        struct Finished {
+            id: &'static str,
+            root: Arc<AtomicBool>,
+            repositories: Arc<AtomicBool>,
+            develop: Option<Arc<AtomicBool>>,
+            done: Arc<AtomicBool>,
+        }
+        impl Item for Finished {
+            fn id(&self) -> String {
+                self.id.into()
+            }
+            fn family(&self) -> &'static str {
+                "test"
+            }
+            fn title(&self) -> String {
+                self.id()
+            }
+            fn probe(&self, _: &dyn System, _: &Ctx) -> Probe {
+                self.done.store(
+                    self.root.load(Ordering::SeqCst)
+                        && self.repositories.load(Ordering::SeqCst)
+                        && self
+                            .develop
+                            .as_ref()
+                            .is_none_or(|done| done.load(Ordering::SeqCst)),
+                    Ordering::SeqCst,
+                );
+                ok()
+            }
+            fn apply(&self, _: &dyn System, _: &Ctx) -> Result<(), String> {
+                panic!("the completion sentinel changes nothing")
+            }
+            fn after(&self) -> Vec<String> {
+                if self.id.starts_with("develop.") {
+                    crate::init_develop::TOOLS_AFTER
+                        .iter()
+                        .map(|&id| id.into())
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+        let mut sys = Fake::default();
+        sys.euid = 501;
+        sys.tty = true;
+        sys.terminal = true;
+        sys.graphic_session = Some(true);
+        sys.admin = Some(true);
+        sys.stat_of(
+            "/dev/console",
+            Stat {
+                uid: 501,
+                gid: 20,
+                mode: 0o600,
+                dir: false,
+                symlink: false,
+                len: 0,
+            },
+        )
+        .running(&[]);
+        sys.tty_model({
+            let (released, package_held, root_started, root_done, during, after_base) = (
+                Arc::clone(&released),
+                Arc::clone(&package_held),
+                Arc::clone(&root_started),
+                Arc::clone(&root_done),
+                Arc::clone(&root_during_package),
+                Arc::clone(&root_after_base),
+            );
+            let package_entered = Mutex::new(package_entered);
+            let repositories_arrived = Mutex::new(repositories_arrived);
+            move |_, cmd| {
+                assert_eq!(cmd.program, Path::new("/usr/bin/sudo"));
+                assert!(cmd.args.iter().any(|word| word == "--plain"));
+                let package_started = package_entered.lock().unwrap().recv_timeout(wait).is_ok();
+                after_base.store(released.load(Ordering::SeqCst), Ordering::SeqCst);
+                during.store(
+                    package_started && package_held.load(Ordering::SeqCst),
+                    Ordering::SeqCst,
+                );
+                root_started.store(true, Ordering::SeqCst);
+                let _ = root_entered.send(());
+                let repositories_started = repositories_arrived
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(wait)
+                    .is_ok();
+                root_done.store(true, Ordering::SeqCst);
+                Some(if repositories_started {
+                    Ran::ok("")
+                } else {
+                    Ran::exit(
+                        1,
+                        "repositories did not progress while the root command was held",
+                    )
+                })
+            }
+        });
         let base = Base {
             items: Vec::new(),
-            held: None,
-            toolset: Some(crate::init_toolset::Toolset::new(
-                Box::new(move || {
-                    toolset_seen.lock().unwrap().push("toolset");
-                    crate::init_toolset::Found::Complete("Git installed".into())
-                }),
-                Box::new(|_, _, _| panic!("the toolset is already installed")),
+            held: Some(Box::new(Held(Arc::clone(&released)))),
+            toolset: Some(Toolset::new(
+                {
+                    let ready = Arc::clone(&packages_ready);
+                    Box::new(move || {
+                        if ready.load(Ordering::SeqCst) {
+                            Found::Complete("Git installed".into())
+                        } else {
+                            Found::Missing("Git is not installed".into())
+                        }
+                    })
+                },
+                {
+                    let held = Arc::clone(&package_held);
+                    let ready = Arc::clone(&packages_ready);
+                    let root_arrived = Mutex::new(root_arrived);
+                    Box::new(move |args, _, _| {
+                        if args[0] == "seed" {
+                            held.store(true, Ordering::SeqCst);
+                            let _ = package_started.send(());
+                            let root_started =
+                                root_arrived.lock().unwrap().recv_timeout(wait).is_ok();
+                            held.store(false, Ordering::SeqCst);
+                            if !root_started {
+                                return Err(crate::port::RunFailed::Refused(
+                                    "root setup could not start while the package pass was held"
+                                        .into(),
+                                ));
+                            }
+                        } else {
+                            assert_eq!(args[0], "update");
+                            ready.store(true, Ordering::SeqCst);
+                        }
+                        Ok(Ran::ok(""))
+                    })
+                },
                 None,
                 crate::init_toolset::tests::ATPKG,
             )),
-            clt: Some(crate::init_clt::CommandLineTools::new(
-                Box::new(move |_| {
-                    let mut seen = clt_seen.lock().unwrap();
-                    assert!(seen.contains(&"repositories"), "{seen:?}");
-                    seen.push("apple tools");
-                    crate::init_clt::Found::Present("compiler installed".into())
-                }),
-                PathBuf::from("/Applications/aterm.app/Contents/MacOS/aterm"),
-            )),
+            clt: Some(
+                crate::init_clt::CommandLineTools::new(
+                    {
+                        let ready = Arc::clone(&root_done);
+                        Box::new(move |_| {
+                            if ready.load(Ordering::SeqCst) {
+                                crate::init_clt::Found::Present("compiler installed".into())
+                            } else {
+                                crate::init_clt::Found::Missing("compiler not installed".into())
+                            }
+                        })
+                    },
+                    PathBuf::from("/Applications/aterm.app/Contents/MacOS/aterm"),
+                )
+                .saying(Arc::new(|_| {})),
+            ),
             targo: None,
         };
-        let groups: Vec<Group> = vec![(
-            vec![Box::new(Repositories(Arc::clone(&seen)))],
-            place(Class::Install),
+        let groups: Vec<Group> = vec![
+            (
+                vec![Box::new(Repositories {
+                    packages_ready: Arc::clone(&packages_ready),
+                    root_started: Arc::clone(&root_started),
+                    root_done: Arc::clone(&root_done),
+                    during_root: Arc::clone(&repositories_during_root),
+                    done: Arc::clone(&repositories_done),
+                    entered: repositories_entered,
+                })],
+                place(Class::Install),
+            ),
+            (
+                vec![Box::new(Finished {
+                    id: ACCOUNTS_GROUP,
+                    root: Arc::clone(&root_done),
+                    repositories: Arc::clone(&repositories_done),
+                    develop: Some(Arc::clone(&develop_done)),
+                    done: Arc::clone(&signouts_done),
+                })],
+                place(Class::Preference),
+            ),
+        ];
+        let develop: Vec<(Box<dyn Item>, Place)> = vec![(
+            Box::new(Finished {
+                id: "develop.workspace-tools@~/aterm",
+                root: Arc::clone(&root_done),
+                repositories: Arc::clone(&repositories_done),
+                develop: None,
+                done: Arc::clone(&develop_done),
+            }),
+            crate::init_develop::place(Class::Install),
         )];
-        run(
-            &Fake::default(),
+        let result = run_layers(
+            &sys,
             &at_console(user("alice", 501)),
             base,
             &groups,
+            &develop,
+            &Narrowing {
+                only: &[],
+                record: false,
+                relayed: false,
+            },
             Mode::Apply,
             &mut NoJournal,
-        )
-        .unwrap();
-        let seen = seen.lock().unwrap();
-        let at = |name| seen.iter().position(|step| *step == name).unwrap();
-        assert!(at("toolset") < at("repositories"), "{seen:?}");
-        assert!(at("repositories") < at("apple tools"), "{seen:?}");
+            &mut Laps::start(),
+            &Hooks::QUIET,
+        );
+        // The ordinary run has joined every lane before a failed causal assertion unwinds.
+        let rows = result.unwrap();
+        assert!(
+            root_during_package.load(Ordering::SeqCst),
+            "root setup waited for the held package pass: {rows:?}"
+        );
+        assert!(root_after_base.load(Ordering::SeqCst));
+        assert!(repositories_during_root.load(Ordering::SeqCst));
+        assert!(develop_done.load(Ordering::SeqCst));
+        assert!(signouts_done.load(Ordering::SeqCst));
     }
 
-    /// `base.pkg.toolset` READS ONLY ONCE THE BASE LAYER LET THE STORE LOCK GO (its passes
-    /// take it), before `base.clt` and the develop layer, whose tools run after it
+    /// `base.pkg.toolset` reads only once the base layer lets the store lock go (its passes
+    /// take it), beside `base.clt` and before the develop layer, whose tools run after both
     /// whatever it ends as: once it installed the set, and while it installs nothing
     /// (`auto_install = false`), since their own probe reads the `targo` they need. CONTROL:
     /// with the toolset complete it runs no pass.
@@ -8064,7 +8422,10 @@ mod tests {
                 self.0.store(true, Ordering::SeqCst);
             }
         }
-        struct Tools(Arc<AtomicU32>);
+        struct Tools {
+            applied: Arc<AtomicU32>,
+            after_toolset: bool,
+        }
         impl Item for Tools {
             fn id(&self) -> String {
                 "develop.workspace-tools@~/aterm".into()
@@ -8076,21 +8437,25 @@ mod tests {
                 self.id()
             }
             fn probe(&self, _: &dyn System, _: &Ctx) -> Probe {
-                if self.0.load(Ordering::SeqCst) == 0 {
+                if self.applied.load(Ordering::SeqCst) == 0 {
                     change()
                 } else {
                     ok()
                 }
             }
             fn apply(&self, _: &dyn System, _: &Ctx) -> Result<(), String> {
-                self.0.fetch_add(1, Ordering::SeqCst);
+                self.applied.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             }
             fn after(&self) -> Vec<String> {
-                crate::init_develop::TOOLS_AFTER
+                let mut after: Vec<_> = crate::init_develop::TOOLS_AFTER
                     .iter()
                     .map(|&id| id.to_owned())
-                    .collect()
+                    .collect();
+                if self.after_toolset {
+                    after.push(crate::init_toolset::ID.into());
+                }
+                after
             }
         }
         let missing = Found::Missing("none installed".into());
@@ -8140,7 +8505,10 @@ mod tests {
             };
             let applied = Arc::new(AtomicU32::new(0));
             let develop: Vec<(Box<dyn Item>, Place)> = vec![(
-                Box::new(Tools(Arc::clone(&applied))),
+                Box::new(Tools {
+                    applied: Arc::clone(&applied),
+                    after_toolset: false,
+                }),
                 crate::init_develop::place(Class::Install),
             )];
             let ctx = Ctx {
@@ -8195,13 +8563,119 @@ mod tests {
                     ]
                 );
             }
-            // The machine sees nothing of the run but the stops the toolset's passes hold.
-            let held: &[&str] = if passes > 0 {
-                &["defer stops", "stops restored"]
-            } else {
-                &[]
+            assert!(
+                sys.calls()
+                    .iter()
+                    .all(|call| matches!(call.as_str(), "defer stops" | "stops restored")),
+                "no other machine effect runs: {:?}",
+                sys.calls()
+            );
+        }
+
+        // Moving develop to its own stage must preserve actual failed predecessor outcomes
+        // and their typed standing, without replaying an original probe or callback. Plan
+        // mode still probes the dependent instead of suppressing it for an apply-only edge.
+        for (mode, clt_refuses, toolset_locked) in [
+            (Mode::Apply, true, false),
+            (Mode::Plan, true, false),
+            (Mode::Apply, false, true),
+            (Mode::Plan, false, true),
+        ] {
+            let reads = Arc::new(AtomicU32::new(0));
+            let base = Base {
+                items: Vec::new(),
+                held: None,
+                clt: Some(crate::init_clt::CommandLineTools::new(
+                    {
+                        let reads = Arc::clone(&reads);
+                        Box::new(move |_| {
+                            reads.fetch_add(1, Ordering::SeqCst);
+                            if clt_refuses {
+                                crate::init_clt::Found::Refuses("compiler refused".into())
+                            } else {
+                                crate::init_clt::Found::Present("cc".into())
+                            }
+                        })
+                    },
+                    "/Applications/aterm.app/Contents/MacOS/aterm".into(),
+                )),
+                toolset: toolset_locked.then(|| {
+                    Toolset::new(
+                        Box::new(|| Found::Missing("tools not installed".into())),
+                        Box::new(|_, _, _| {
+                            Ok(Ran::exit(crate::init_toolset::CONTENDED, "store held"))
+                        }),
+                        None,
+                        crate::init_toolset::tests::ATPKG,
+                    )
+                }),
+                targo: None,
             };
-            assert_eq!(sys.calls(), held);
+            let applied = Arc::new(AtomicU32::new(0));
+            let develop: Vec<(Box<dyn Item>, Place)> = vec![(
+                Box::new(Tools {
+                    applied: Arc::clone(&applied),
+                    after_toolset: toolset_locked,
+                }),
+                crate::init_develop::place(Class::Install),
+            )];
+            let heard = Mutex::new(Vec::new());
+            let on_row = |row: &ItemReport| heard.lock().unwrap().push(row.id.clone());
+            let rows = run_layers(
+                &Fake::default(),
+                &ctx(&[]),
+                base,
+                &[],
+                &develop,
+                &Narrowing {
+                    only: &[],
+                    record: false,
+                    relayed: false,
+                },
+                mode,
+                &mut NoJournal,
+                &mut Laps::start(),
+                &Hooks {
+                    on_row: &on_row,
+                    ..Hooks::QUIET
+                },
+            )
+            .unwrap();
+            let dependent = rows
+                .iter()
+                .find(|row| row.id.starts_with("develop."))
+                .unwrap();
+            assert_eq!(
+                dependent.outcome,
+                if mode == Mode::Plan {
+                    Outcome::Planned
+                } else {
+                    Outcome::Blocked
+                }
+            );
+            assert_eq!(applied.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                reads.load(Ordering::SeqCst),
+                1,
+                "a completed root probe is not replayed"
+            );
+            let heard = heard.lock().unwrap();
+            assert_eq!(heard.len(), rows.len());
+            assert_eq!(
+                heard
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len(),
+                rows.len()
+            );
+            if mode == Mode::Apply && toolset_locked {
+                let source = rows
+                    .iter()
+                    .find(|row| row.id == crate::init_toolset::ID)
+                    .unwrap();
+                assert!(source.stood_aside.is_some());
+                assert_eq!(dependent.stood_aside, source.stood_aside);
+            }
         }
     }
 
@@ -9101,8 +9575,8 @@ mod tests {
     /// A run aterm decided at this Mac's console (the follow-up of a person's package install,
     /// [`Decider::Aterm`]) puts no question of macOS's on the screen: Rust in Spotlight asks
     /// Spotlight for none of the person's build folders. Without the LAN broker the vault's look
-    /// never runs, whoever decided the run, and the row waits for the broker (deferred, the run
-    /// exits 0). NEGATIVE CONTROL: the person's own run at the console searches for them.
+    /// never runs, whoever decided the run, and its subscriber keeps the join waiting for the
+    /// broker (the run exits 0). NEGATIVE CONTROL: the person's own run searches for them.
     #[test]
     fn a_run_aterm_decided_raises_no_question_of_macos() {
         const MDFIND: &str =
@@ -9161,7 +9635,8 @@ mod tests {
                 crate::init_secrets::waits_for_lan_broker(row),
                 "{decided:?}: {row:?}"
             );
-            assert_eq!(row.outcome, Outcome::Deferred, "{row:?}");
+            assert_eq!(row.outcome, Outcome::Blocked, "{row:?}");
+            assert!(crate::init_secrets::finishes_by_itself(row), "{row:?}");
             assert_eq!(status(&rows, Action::Apply), 0, "{rows:?}");
         }
     }

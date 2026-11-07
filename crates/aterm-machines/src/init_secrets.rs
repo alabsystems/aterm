@@ -1239,8 +1239,9 @@ pub fn items_at(
     if mode != Mode::Apply || (vault.is_some() && !asks) {
         return Ok(Secrets::not_applicable(user, UNCONFIGURED));
     }
-    // The ALab vault's look reaches the LAN; a `--vault` does only where it names a URL there.
-    let reaches_lan = vault.is_none_or(|typed| crate::lan_reach::on_the_lan(typed.trim()));
+    // A named LAN vault waits without changing anything. The implicit default retains its
+    // guarded bootstrap and subscriber below, so the broker's arrival can finish that join.
+    let reaches_lan = vault.is_some_and(|typed| crate::lan_reach::on_the_lan(typed.trim()));
     if let Some(why) = reaches_lan.then(broker_unready).flatten() {
         return Ok(Secrets::note(
             user,
@@ -1734,6 +1735,48 @@ impl Vault {
                 }
                 Ok(())
             };
+            if let Some(why) = self.ops.broker_unready() {
+                // Keep the admitted default join in its existing recovery owner without
+                // discovering or reaching any peer before the broker can serve the LAN.
+                let subscribed = self.subscribe(&|| admitted().map_err(|why| why.to_string()));
+                current()?;
+                let owner = match &subscribed {
+                    Ok(true) => Some(self.ops.subscriber()),
+                    _ => None,
+                };
+                // Starting the subscriber can publish this very default vault. That is
+                // progress for the ordinary read-back, never authority for another effect.
+                let now = self.ops.configured().map_err(|why| why.to_string())?;
+                current()?;
+                if let Some(now) = now {
+                    if aterm_secrets::client::alab_vault(&now)
+                        && selected_vault(&self.source, Path::new(&self.user.home), Some(&now))?
+                            .is_some()
+                    {
+                        return Ok(());
+                    }
+                    return Err("the vault source changed while bootstrap was starting".into());
+                }
+                let running = subscribed?
+                    && !self.ops.turned_off()
+                    && owner
+                        .transpose()
+                        .map_err(|why| why.to_string())?
+                        .is_some_and(|state| idle(&state).is_none());
+                let mut aside = self.aside.lock().unwrap_or_else(PoisonError::into_inner);
+                let why = match aside.take() {
+                    Some(previous) => {
+                        format!("{}; {}", previous.why(), lan_broker_absent(&why))
+                    }
+                    None => lan_broker_absent(&why),
+                };
+                *aside = Some(if running {
+                    StoodAside::Waiting(why)
+                } else {
+                    StoodAside::Offline(why)
+                });
+                return Ok(());
+            }
             match self
                 .ops
                 .native_bootstrap(&admitted)
@@ -2582,6 +2625,8 @@ pub(crate) mod tests {
         unkept: Mutex<Option<String>>,
         /// A file the vault wrote is changed as the subscriber is installed.
         spoiled_by_install: Mutex<bool>,
+        /// The subscriber publishes a source before its installer returns.
+        published_by_install: Mutex<Option<Status>>,
         /// What `fleeting` answers: this aterm runs from a copy that goes away, and every
         /// install is refused as `aterm_secrets::service::service_program` refuses it.
         fleeting: Mutex<Option<PathBuf>>,
@@ -2979,6 +3024,9 @@ pub(crate) mod tests {
                 // As `aterm_secrets::service::install`: the subscriber installed is on
                 // again, and the person's record that it was off goes.
                 *self.turned_off.lock().unwrap() = false;
+                if let Some(status) = self.published_by_install.lock().unwrap().take() {
+                    *self.statuses.lock().unwrap() = vec![Ok(status)].into();
+                }
             }
             installed
         }
@@ -3275,8 +3323,12 @@ pub(crate) mod tests {
         fn run(&self, cmd: &Cmd) -> Result<Ran, RunFailed> {
             self.inner.run(cmd)
         }
-        fn run_tty(&self, cmd: &Cmd) -> Result<Option<i32>, RunFailed> {
-            self.inner.run_tty(cmd)
+        fn run_tty(
+            &self,
+            cmd: &Cmd,
+            before: &mut dyn FnMut() -> Result<(), RunFailed>,
+        ) -> Result<Option<i32>, RunFailed> {
+            self.inner.run_tty(cmd, before)
         }
         fn read_file(&self, path: &Path) -> io::Result<Vec<u8>> {
             self.inner.read_file(path)
@@ -3986,9 +4038,8 @@ pub(crate) mod tests {
 
     /// Every LAN act of aterm's on a Mac goes through the root LAN broker (or, before one is
     /// installed, the allowed direct path, which no test has), so without either no look for the
-    /// ALab vault runs, wherever the run is, and the row waits for the broker (deferred,
-    /// not failed). NEGATIVE CONTROL: with the `broker_unready` gate removed from `items_at`, the run
-    /// looks (one probe) and the test fails; with the broker there, it looks and joins.
+    /// ALab vault runs. The local bootstrap intent and its running subscriber retain the join
+    /// for the broker's arrival; with the broker there, the pass looks and joins immediately.
     #[test]
     fn without_the_lan_broker_no_look_runs_and_the_row_waits_for_it() {
         for here in [Here::Person, Here::Session, Here::Remote, Here::Unbidden] {
@@ -3998,13 +4049,115 @@ pub(crate) mod tests {
             ops.broker_absent();
             ops.alab_answers();
             let rows = run_at(&sys, &ops, Mode::Apply, here);
-            assert_eq!(rows[0].outcome, Outcome::Deferred, "{here:?}: {rows:?}");
-            assert_eq!(rows[0].why.as_deref(), Some(absent().as_str()), "{here:?}");
-            assert!(waits_for_lan_broker(&rows[0]), "{here:?}");
+            assert_eq!(
+                *ops.prepared.lock().unwrap(),
+                1,
+                "{here:?}: bootstrap intent"
+            );
+            assert_eq!(ops.installs(), 1, "{here:?}: recovery owner");
+            assert!(idle(&ops.subscriber().unwrap()).is_none(), "{here:?}");
             assert_eq!(ops.probes(), 0, "{here:?}: no look");
+            assert_eq!(
+                *ops.native_tries.lock().unwrap(),
+                0,
+                "{here:?}: no native ask"
+            );
+            assert_eq!(*ops.reached.lock().unwrap(), 0, "{here:?}: no HTTP");
             assert!(ops.joins().is_empty(), "{here:?}");
             assert_eq!(asked(&sys), 0, "{here:?}: {:?}", sys.calls());
+            assert_eq!(rows[0].outcome, Outcome::Blocked, "{here:?}: {rows:?}");
+            assert!(waits_for_lan_broker(&rows[0]), "{here:?}");
+            assert!(finishes_by_itself(&rows[0]), "{here:?}: {rows:?}");
         }
+
+        // Neither a failed installation nor a failed start promises an autonomous finish.
+        for fails_to_start in [false, true] {
+            let ops = Scripted::new(vec![Ok(unconfigured())]);
+            ops.broker_absent();
+            if fails_to_start {
+                *ops.dies.lock().unwrap() = Some("subscriber ended during startup".into());
+            } else {
+                *ops.installed.lock().unwrap() =
+                    Some(Err(aterm_secrets::Error::new("subscriber install failed")));
+            }
+            let rows = run_at(&fake(), &ops, Mode::Apply, Here::Session);
+            assert_eq!(rows[0].outcome, Outcome::Failed, "{rows:?}");
+            assert!(!finishes_by_itself(&rows[0]), "{rows:?}");
+        }
+
+        // A source that cannot be kept, or an owner that ended after the probe, remains offline.
+        for fleeting in [false, true] {
+            let ops = Scripted::new(vec![Ok(unconfigured())]);
+            ops.broker_absent();
+            if fleeting {
+                *ops.fleeting.lock().unwrap() =
+                    Some("/Volumes/aterm/aterm.app/Contents/MacOS/aterm".into());
+            } else {
+                *ops.readings.lock().unwrap() = [Ok(installed_state()), Ok(State::Absent)].into();
+            }
+            let rows = run_at(&fake(), &ops, Mode::Apply, Here::Session);
+            assert_eq!(rows[0].outcome, Outcome::Blocked, "{rows:?}");
+            assert!(matches!(rows[0].stood_aside, Some(StoodAside::Offline(_))));
+            assert!(!finishes_by_itself(&rows[0]), "{rows:?}");
+        }
+
+        // The installed owner can finish before its start is read back. Its admitted default
+        // uses the full ordinary probe; a competing source never becomes this run's success.
+        for same_default in [false, true] {
+            let ops = Scripted::new(vec![Ok(unconfigured())]);
+            ops.broker_absent();
+            let mut after = configured_alab(Membership::In { seq: 7, heard: 0 });
+            if !same_default {
+                let config = after.config.as_mut().unwrap();
+                config.name = "other".into();
+                config.source = Source::Url("https://other.example/v1/other".into());
+            }
+            *ops.published_by_install.lock().unwrap() = Some(after);
+            let rows = run_at(&fake(), &ops, Mode::Apply, Here::Session);
+            assert_eq!(
+                rows[0].outcome,
+                if same_default {
+                    Outcome::Changed
+                } else {
+                    Outcome::Failed
+                },
+                "{rows:?}",
+            );
+            assert_eq!(ops.installs(), 1);
+            assert_eq!(ops.probes(), 0);
+            assert_eq!(*ops.native_tries.lock().unwrap(), 0);
+            assert_eq!(*ops.reached.lock().unwrap(), 0);
+            assert!(ops.joins().is_empty());
+            assert!(!finishes_by_itself(&rows[0]), "{rows:?}");
+        }
+
+        let sys = fake();
+        let context = ctx(&[user("alice", 501)]);
+        let ops = Scripted::new(vec![Ok(unconfigured())]);
+        ops.broker_absent();
+        let item = selected(
+            &context,
+            ops.clone(),
+            aterm_secrets::ALAB_DEFAULT_URL,
+            Duration::ZERO,
+            Replaces::Read(None),
+        )
+        .unwrap();
+        assert!(matches!(item.probe(&sys, &context), Probe::Change { .. }));
+        let stopped = item.apply_guarded(&sys, &context, &|| {
+            if ops.installs() == 0 {
+                Ok(())
+            } else {
+                Err("late Stop".into())
+            }
+        });
+        assert_eq!(ops.installs(), 1);
+        assert!(stopped.is_err());
+        assert!(item.stood_aside().is_none());
+        assert_eq!(*ops.native_tries.lock().unwrap(), 0);
+        assert_eq!(*ops.reached.lock().unwrap(), 0);
+        assert!(ops.joins().is_empty());
+
         let sys = fake();
         let ops = Scripted::new(vec![Ok(unconfigured())]);
         ops.alab_answers();

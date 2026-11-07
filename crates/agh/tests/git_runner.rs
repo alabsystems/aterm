@@ -398,6 +398,259 @@ fn incremental_source(world: &World) -> (PathBuf, PathBuf, String, String) {
     (remote, source, before, after)
 }
 
+fn native_object_fact_queries(specs: &[ChildSpec]) -> (Vec<String>, Vec<(String, String)>) {
+    let kinds = specs
+        .iter()
+        .flat_map(|spec| spec.args.windows(3))
+        .filter(|args| args[0] == "cat-file" && args[1] == "-t")
+        .map(|args| args[2].to_str().unwrap().to_owned())
+        .collect();
+    let ancestry = specs
+        .iter()
+        .flat_map(|spec| spec.args.windows(3))
+        .filter(|args| args[0] == "--is-ancestor")
+        .map(|args| {
+            (
+                args[1].to_str().unwrap().to_owned(),
+                args[2].to_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    (kinds, ancestry)
+}
+
+/// Shared immutable facts avoid duplicate Git calls, but each namespace still
+/// decides its own policy. Repeating a call must query its private view again.
+#[test]
+fn native_push_reuses_object_facts_without_reusing_reference_policies() {
+    use agh::policy::{RouteRequest, RouteTarget};
+
+    let world = World::canonical("native-object-facts");
+    common::canonical_repos(&world.fake);
+    let (remote, source, before, after) = incremental_source(&world);
+    host_git(&remote, &["update-ref", "refs/aterm/judged", &before]);
+    host_git(&remote, &["update-ref", "refs/tags/locked", &before]);
+    host_git(&source, &["tag", "-a", "payload", "-m", "payload", &after]);
+    let tag = host_git(&source, &["rev-parse", "refs/tags/payload"]);
+    let source_refs = host_git(&source, &["show-ref"]);
+    let source_config = std::fs::read(source.join(".git/config")).unwrap();
+    let remote_refs = host_git(&remote, &["show-ref"]);
+    let gh = world
+        .client(git_env())
+        .git_remote_for_tests("fixture-dev/app", &remote)
+        .build();
+    let slug = common::slug("fixture-dev/app");
+    let permit = common::permit(&gh, &RouteRequest::write(RouteTarget::Repo(slug.clone())));
+
+    for full in [false, true] {
+        let batch = if full {
+            push_batch(&[
+                ("refs/heads/new", ABSENT, &after),
+                ("refs/aterm/new", ABSENT, &after),
+            ])
+        } else {
+            push_batch(&[
+                ("refs/heads/main", &before, &after),
+                ("refs/aterm/judged", &before, &after),
+            ])
+        };
+        for _ in 0..2 {
+            let first = gh.fx().children_run().len();
+            gh.refs(&slug).check_push(&permit, &source, &batch).unwrap();
+            let calls = gh.fx().children_run();
+            let expected = if full {
+                (vec![after.clone()], Vec::new())
+            } else {
+                (
+                    vec![after.clone(), before.clone()],
+                    vec![(before.clone(), after.clone())],
+                )
+            };
+            assert_eq!(native_object_fact_queries(&calls[first..]), expected);
+            assert_eq!(host_git(&remote, &["show-ref"]), remote_refs);
+        }
+    }
+    let first = gh.fx().children_run().len();
+    gh.refs(&slug)
+        .check_push(
+            &permit,
+            &source,
+            &push_batch(&[("refs/aterm/a-tag", ABSENT, &tag)]),
+        )
+        .unwrap();
+    assert_eq!(
+        native_object_fact_queries(&gh.fx().children_run()[first..]),
+        (vec![tag.clone()], Vec::new()),
+    );
+    assert_eq!(host_git(&remote, &["show-ref"]), remote_refs);
+    for (batch, expected) in [
+        (
+            push_batch(&[
+                ("refs/heads/main", &before, &after),
+                ("refs/tags/locked", &before, &after),
+            ]),
+            (
+                vec![after.clone(), before.clone()],
+                vec![(before.clone(), after.clone())],
+            ),
+        ),
+        (
+            push_batch(&[
+                ("refs/aterm/a-tag", ABSENT, &tag),
+                ("refs/heads/z-tag", ABSENT, &tag),
+            ]),
+            (vec![tag.clone()], Vec::new()),
+        ),
+    ] {
+        let first = gh.fx().children_run().len();
+        let error = gh
+            .refs(&slug)
+            .check_push(&permit, &source, &batch)
+            .unwrap_err();
+        assert_eq!(error.kind, Kind::Refused);
+        assert_eq!(error.side_effect, SideEffect::None);
+        let calls = gh.fx().children_run();
+        assert_eq!(native_object_fact_queries(&calls[first..]), expected);
+        assert!(
+            !calls[first..]
+                .iter()
+                .any(|spec| spec.args.iter().any(|arg| arg == "push"))
+        );
+        assert_eq!(host_git(&remote, &["show-ref"]), remote_refs);
+    }
+    assert_eq!(host_git(&source, &["show-ref"]), source_refs);
+    assert_eq!(
+        std::fs::read(source.join(".git/config")).unwrap(),
+        source_config
+    );
+}
+
+/// Distinct successful pairs stay valid. Sharing either endpoint, or reversing
+/// the ordered pair, does not reuse a fact about a different ancestry relation.
+#[test]
+fn native_push_ancestry_facts_require_both_ordered_endpoints() {
+    use agh::policy::{RouteRequest, RouteTarget};
+
+    let world = World::canonical("native-ancestry-facts");
+    common::canonical_repos(&world.fake);
+    let (remote, source, before, after) = incremental_source(&world);
+    let root = host_git(&source, &["rev-parse", &format!("{before}^")]);
+    let old_tree = host_git(&source, &["rev-parse", &format!("{before}^{{tree}}")]);
+    let new_tree = host_git(&source, &["rev-parse", &format!("{after}^{{tree}}")]);
+    let later = host_git(
+        &source,
+        &["commit-tree", &new_tree, "-p", &after, "-m", "later"],
+    );
+    let fork = host_git(
+        &source,
+        &["commit-tree", &old_tree, "-p", &before, "-m", "fork"],
+    );
+    let sibling = host_git(
+        &source,
+        &["commit-tree", &old_tree, "-p", &root, "-m", "sibling"],
+    );
+    let gh = world
+        .client(git_env())
+        .git_remote_for_tests("fixture-dev/app", &remote)
+        .build();
+    let slug = common::slug("fixture-dev/app");
+    let permit = common::permit(&gh, &RouteRequest::write(RouteTarget::Repo(slug.clone())));
+    let cases = [
+        (
+            "shared before, both advance",
+            &before,
+            &after,
+            &before,
+            &later,
+            true,
+            vec![after.clone(), before.clone(), later.clone()],
+        ),
+        (
+            "shared after, both advance",
+            &before,
+            &later,
+            &after,
+            &later,
+            true,
+            vec![later.clone(), before.clone(), after.clone()],
+        ),
+        (
+            "different before, second diverges",
+            &before,
+            &after,
+            &fork,
+            &after,
+            false,
+            vec![after.clone(), before.clone(), fork.clone()],
+        ),
+        (
+            "different after, second diverges",
+            &before,
+            &after,
+            &before,
+            &sibling,
+            false,
+            vec![after.clone(), before.clone(), sibling.clone()],
+        ),
+        (
+            "reversed pair",
+            &before,
+            &after,
+            &after,
+            &before,
+            false,
+            vec![after.clone(), before.clone()],
+        ),
+    ];
+    for (name, first_before, first_after, second_before, second_after, allowed, kinds) in cases {
+        // Seed the owned remote's exact BEFORE values before the caller takes authority.
+        host_git(&remote, &["update-ref", "refs/heads/a", first_before]);
+        host_git(
+            &remote,
+            &[
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                &source.to_string_lossy(),
+                &format!("+{second_before}:refs/heads/z"),
+            ],
+        );
+        let remote_refs = host_git(&remote, &["show-ref"]);
+        let batch = push_batch(&[
+            ("refs/heads/a", first_before, first_after),
+            ("refs/heads/z", second_before, second_after),
+        ]);
+        let first = gh.fx().children_run().len();
+        let result = gh.refs(&slug).check_push(&permit, &source, &batch);
+        assert_eq!(result.is_ok(), allowed, "{name}");
+        if let Err(error) = result {
+            assert_eq!(error.kind, Kind::Refused, "{name}");
+            assert_eq!(error.side_effect, SideEffect::None, "{name}");
+        }
+        let calls = gh.fx().children_run();
+        assert_eq!(
+            native_object_fact_queries(&calls[first..]),
+            (
+                kinds,
+                vec![
+                    (first_before.clone(), first_after.clone()),
+                    (second_before.clone(), second_after.clone()),
+                ]
+            ),
+            "{name}"
+        );
+        assert_eq!(
+            calls[first..]
+                .iter()
+                .filter(|spec| spec.args.iter().any(|arg| arg == "push"))
+                .count(),
+            usize::from(allowed),
+            "{name}"
+        );
+        assert_eq!(host_git(&remote, &["show-ref"]), remote_refs, "{name}");
+    }
+}
+
 #[test]
 fn native_push_phase_observation_preserves_success_refusal_and_failure() {
     use agh::git::NativePushPhase::{Connectivity, MetadataPack, MetadataVerify};

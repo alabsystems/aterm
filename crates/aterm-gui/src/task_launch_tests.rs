@@ -1487,10 +1487,25 @@ fn a_launchers_install_names_its_child_on_the_timeline() {
     };
     let h = crate::stub_session(1);
     let child = || h.ctx.timeline.lock().unwrap().worker_install_child();
+    h.ctx.timeline.lock().unwrap().mark_task(
+        &TaskMark::new(TaskState::Working),
+        &Default::default(),
+        Instant::now(),
+        0,
+    );
     {
         let _mark = InstallingMark::of(&h.ctx);
         assert_eq!(child(), None, "CONTROL: nothing spawned yet");
-        install_with(&stub, &layout, "codex", &h.ctx, _mark.mark).expect("the stub exits clean");
+        install_with(
+            &stub,
+            &layout,
+            "codex",
+            &h.ctx,
+            _mark.mark,
+            _mark.task_entered,
+            &std::cell::Cell::new(false),
+        )
+        .expect("the stub exits clean");
         let pid = std::fs::read_to_string(&said).expect("the stub ran");
         assert_eq!(child(), Some(pid.trim().parse().expect("a pid")));
     }
@@ -1501,7 +1516,19 @@ fn a_launchers_install_names_its_child_on_the_timeline() {
     let newer = InstallingMark::of(&h.ctx);
     let mark = store.install_mark.get().unwrap();
     assert_eq!(mark, old.mark);
-    assert!(install_with(&stub, &layout, "codex", &h.ctx, mark).is_err());
+    assert!(
+        install_with(
+            &stub,
+            &layout,
+            "codex",
+            &h.ctx,
+            mark,
+            store.install_entered.get(),
+            &store.cancelled
+        )
+        .is_err()
+    );
+    assert!(store.cancelled.get());
     assert!(!said.exists(), "a stale admission starts no child");
     drop(old);
     assert!(
@@ -1512,6 +1539,111 @@ fn a_launchers_install_names_its_child_on_the_timeline() {
             .worker_installing_at(newer.mark)
     );
     drop(newer);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_obsolete_install_closes_its_pipe_and_waits_for_cooperative_retirement() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let witness = dir.path().join("pid");
+    let retired = dir.path().join("retired");
+    let stub = dir.path().join("atpkg-fake");
+    let cat = aterm_uds::deadline::stand_in(Path::new("/bin/cat"));
+    std::fs::write(&stub, format!("#!/bin/sh\necho $$ > '{}'\n[ $# -eq 0 ] && exit 0\n'{}' >/dev/null\necho retired > '{}'\nprintf 'atpkg: seed-done: partial'\nexit 0\n", witness.display(), cat.display(), retired.display())).unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    aterm_uds::deadline::output_until(
+        &mut crate::qos::atpkg_command(&stub),
+        Instant::now() + aterm_spec::wait::FIRST_EXEC,
+    )
+    .unwrap();
+    let layout = atpkg::store::Layout {
+        prefix: dir.path().to_path_buf(),
+    };
+    for mode in 0..3 {
+        std::fs::remove_file(&witness).unwrap();
+        let _ = std::fs::remove_file(&retired);
+        let h = crate::stub_session(1);
+        h.ctx.timeline.lock().unwrap().mark_task(
+            &TaskMark::new(TaskState::Working),
+            &Default::default(),
+            Instant::now(),
+            0,
+        );
+        let mark = InstallingMark::of(&h.ctx);
+        let ctx = h.ctx.clone();
+        let path = witness.clone();
+        let controller = std::thread::spawn(move || {
+            let until = Instant::now() + Duration::from_secs(60);
+            while !path.is_file() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let ran = path.is_file();
+            let mut timeline = ctx.timeline.lock().unwrap();
+            if mode == 1 {
+                timeline.set_worker_installing(true);
+                let epoch = timeline.worker_install_mark();
+                assert!(timeline.set_worker_install_child(epoch, 123));
+            } else {
+                timeline.mark_task(
+                    &TaskMark::new(TaskState::Stalled),
+                    &Default::default(),
+                    Instant::now(),
+                    0,
+                );
+                if mode == 2 {
+                    timeline.mark_task(
+                        &TaskMark::new(TaskState::Working),
+                        &Default::default(),
+                        Instant::now(),
+                        0,
+                    );
+                }
+            }
+            assert!(ran, "install execution hang detector");
+        });
+        let cancelled = std::cell::Cell::new(false);
+        let result = install_with(
+            &stub,
+            &layout,
+            "codex",
+            &h.ctx,
+            mark.mark,
+            mark.task_entered,
+            &cancelled,
+        );
+        controller.join().unwrap();
+        assert!(cancelled.get());
+        assert!(
+            result.is_err(),
+            "even exit zero after cancellation cannot admit the worker"
+        );
+        assert!(retired.is_file(), "the root finished after its pipe closed");
+        let pid = std::fs::read_to_string(&witness)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            aterm_uds::process::process_presence(pid),
+            aterm_uds::process::ProcessPresence::Absent
+        );
+        drop(mark);
+        if mode == 1 {
+            let timeline = h.ctx.timeline.lock().unwrap();
+            assert!(timeline.worker_installing());
+            assert_eq!(timeline.worker_install_child(), Some(123));
+        } else {
+            assert_eq!(
+                h.ctx.timeline.lock().unwrap().task().unwrap().state,
+                if mode == 2 {
+                    TaskState::Working
+                } else {
+                    TaskState::Stalled
+                }
+            );
+        }
+    }
 }
 
 #[test]
@@ -3072,6 +3204,66 @@ fn native_google_worker_installs_before_preparing_its_guard() {
     }
 }
 
+#[test]
+fn an_install_refusal_cannot_mark_a_replacement_between_observation_and_commit() {
+    use aterm_agent::harness::worker::Refused;
+    for mode in 0..3 {
+        let h = crate::stub_session(1);
+        h.ctx.timeline.lock().unwrap().mark_task(
+            &TaskMark::new(TaskState::Working),
+            &Default::default(),
+            Instant::now(),
+            0,
+        );
+        let guard = InstallingMark::of(&h.ctx);
+        let owner = Some((guard.mark, guard.task_entered.unwrap()));
+        drop(guard);
+        let result = take_admission::<()>(
+            &h.ctx,
+            1,
+            Program::Codex,
+            Err(Refused::Program("synthetic install refusal".into())),
+            owner,
+            || {
+                let mut timeline = h.ctx.timeline.lock().unwrap();
+                if mode == 1 {
+                    timeline.set_worker_installing(true);
+                } else if mode == 2 {
+                    timeline.mark_task(
+                        &TaskMark::new(TaskState::Stalled),
+                        &Default::default(),
+                        Instant::now(),
+                        0,
+                    );
+                    timeline.mark_task(
+                        &TaskMark::new(TaskState::Working),
+                        &Default::default(),
+                        Instant::now(),
+                        0,
+                    );
+                }
+                None
+            },
+        );
+        assert!(result.is_none());
+        let timeline = h.ctx.timeline.lock().unwrap();
+        let task = timeline.task().unwrap();
+        assert_eq!(
+            task.state,
+            if mode == 0 {
+                TaskState::Stalled
+            } else {
+                TaskState::Working
+            }
+        );
+        assert_eq!(
+            task.attention,
+            mode == 0,
+            "only the original working episode takes the refusal and attention"
+        );
+    }
+}
+
 /// An admission's reason atpkg keeps a program off this Mac reaches the session's timeline, where
 /// the startup deadline reads it (`harness_host::kept_off_held`). CONTROL: a program that is there
 /// clears what an earlier admission left.
@@ -3087,6 +3279,7 @@ fn an_admissions_kept_off_reason_reaches_the_timeline() {
             admit_prepared_worker(agy, agy.plain(), None, &|_| {}, &|| (), store, |starter| {
                 Ok((starter, ()))
             }),
+            None,
             || panic!("only a refusal reads the member"),
         )
         .expect("admitted");

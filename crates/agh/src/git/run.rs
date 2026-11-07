@@ -1955,7 +1955,7 @@ mod unix {
         batch: &crate::github::refs::AtomicRefBatch,
         dry_run: bool,
     ) -> Result<ChildOut> {
-        use std::collections::BTreeMap;
+        use std::collections::{BTreeMap, BTreeSet};
         const ZERO: &str = "0000000000000000000000000000000000000000";
         let dir = screened(children, run, dir)?;
         let canonical = crate::fx::canon::git_request(run);
@@ -2162,13 +2162,22 @@ mod unix {
                     checked("connectivity", args, scratch)
                 })?;
         }
+        // The admitted private object view stays fixed through these queries.
+        // Share successful facts, while deciding each reference's policy separately.
+        let mut commit_facts = BTreeMap::<String, bool>::new();
+        let mut is_commit = |name: &str, oid: &str| -> Result<bool> {
+            if let Some(commit) = commit_facts.get(oid) {
+                return Ok(*commit);
+            }
+            let commit = checked(name, vec![os("cat-file"), os("-t"), os(oid)], scratch)?.stdout
+                == b"commit\n";
+            commit_facts.insert(oid.to_owned(), commit);
+            Ok(commit)
+        };
+        let mut ancestor_pairs = BTreeSet::new();
         for (i, u) in batch.updates().iter().enumerate() {
-            let kind = checked(
-                &format!("kind-{i}"),
-                vec![os("cat-file"), os("-t"), os(&u.after)],
-                scratch,
-            )?;
-            if u.reference.starts_with("refs/heads/") && kind.stdout != b"commit\n" {
+            let after_is_commit = is_commit(&format!("kind-{i}"), &u.after)?;
+            if u.reference.starts_with("refs/heads/") && !after_is_commit {
                 return Err(Error::refused("a branch must point directly at a commit"));
             }
             if u.before == ZERO {
@@ -2179,18 +2188,17 @@ mod unix {
             }
             // Every mutable namespace advances through commit ancestry; an
             // existing non-commit custom ref is immutable as well.
-            if kind.stdout != b"commit\n" {
+            if !after_is_commit {
                 return Err(Error::refused(
                     "an existing ref can advance only to a descendant commit",
                 ));
             }
-            let before_kind = checked(
-                &format!("before-kind-{i}"),
-                vec![os("cat-file"), os("-t"), os(&u.before)],
-                scratch,
-            )?;
-            if before_kind.stdout != b"commit\n" {
+            if !is_commit(&format!("before-kind-{i}"), &u.before)? {
                 return Err(Error::refused("an existing non-commit ref is immutable"));
+            }
+            let pair = (u.before.as_str(), u.after.as_str());
+            if ancestor_pairs.contains(&pair) {
+                continue;
             }
             let ancestry = step(
                 &format!("ancestry-{i}"),
@@ -2205,7 +2213,9 @@ mod unix {
                 scratch,
             )?;
             match ancestry.code {
-                Some(0) => {}
+                Some(0) => {
+                    ancestor_pairs.insert(pair);
+                }
                 Some(1) => {
                     return Err(Error::refused(
                         "native push refuses a non-fast-forward update",

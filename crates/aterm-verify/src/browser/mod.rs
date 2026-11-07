@@ -383,8 +383,8 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
 
 /// Build both wasm modules and assemble the site in `site`.
 fn build_site(ctx: &Ctx, r: &mut Report, site: &Path, t0: Instant) -> Option<Cost> {
-    let rustup = match crate::perf::wasm::build_tools(false) {
-        Ok(rustup) => rustup,
+    let toolchain = match crate::perf::wasm::build_tools(&ctx.root, false) {
+        Ok(toolchain) => toolchain,
         Err(refused) => {
             match refused.status {
                 Status::Skip { why, fix } | Status::CouldNotRun { why, fix } => {
@@ -399,7 +399,7 @@ fn build_site(ctx: &Ctx, r: &mut Report, site: &Path, t0: Instant) -> Option<Cos
             return None;
         }
     };
-    let modules = crate::wasm_smoke::build_dev(ctx, r, &rustup, "browser", LABEL)?;
+    let modules = crate::wasm_smoke::build_dev(ctx, r, &toolchain, "browser", LABEL)?;
     let built_s = t0.elapsed().as_secs_f64();
     let t_bind = Instant::now();
     if let Err(why) = assemble(&ctx.root, &modules, site) {
@@ -832,7 +832,7 @@ fn session(
         "engine": name,
         "adapter": gpu.adapter,
         "user_agent": gpu.user_agent,
-        "build": "dev (wasm32, rustup stable)",
+        "build": "dev (wasm32, the checkout's stock pin)",
         "build_and_tools_s": built.cost.map_or(Value::Null, |c| json!((c.built_s * 1e3).round() / 1e3)),
         "bind_ms": built.cost.map_or(Value::Null, |c| json!(c.bind_ms)),
         "browser_ready_ms": session.ready_ms.map_or(Value::Null, |v| json!(v)),

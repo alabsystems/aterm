@@ -49,6 +49,12 @@ pub mod tag;
 mod durable;
 mod hash;
 mod http;
+mod operation;
+#[cfg(unix)]
+pub use operation::OperationCancellation;
+pub use operation::{
+    check_operation, operation_active, operation_cancelled, run_operation_command,
+};
 mod privatedir;
 mod sentinel;
 mod source;

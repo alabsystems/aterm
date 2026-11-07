@@ -3002,16 +3002,26 @@ fn a_chip_s_menu_settles_the_session_field_it_opens_over() {
     let tab = app.windows[&wid].tab_set.active().unwrap().id;
 
     assert!(app.begin_session_rename(wid, tab));
+    app.windows.get_mut(&wid).unwrap().strip_press = Some((Instant::now(), tab));
     assert!(app.windows[&wid].rename_edit.is_some(), "CONTROL");
     app.open_front_autopilot_menu().unwrap();
     assert!(app.windows[&wid].rename_edit.is_none(), "Autopilot's");
+    assert!(
+        app.windows[&wid].strip_press.is_none(),
+        "Autopilot's menu breaks the strip's double-click streak"
+    );
     app.close_autopilot_menu();
 
     assert!(app.begin_session_rename(wid, tab));
+    app.windows.get_mut(&wid).unwrap().strip_press = Some((Instant::now(), tab));
     assert!(app.windows[&wid].rename_edit.is_some(), "CONTROL");
     let fact = crate::claude_lights::Fact::TopEffort;
     app.open_fact_menu_keeping_note(wid, session, fact, (3, 3), false);
     assert!(app.windows[&wid].rename_edit.is_none(), "a fact's");
+    assert!(
+        app.windows[&wid].strip_press.is_none(),
+        "a fact's menu breaks the strip's double-click streak"
+    );
 }
 
 /// Both cards up, the tab's is on top and takes the keys, so it is the one a client reads and

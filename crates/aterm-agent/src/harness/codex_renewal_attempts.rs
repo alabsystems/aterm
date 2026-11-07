@@ -13,6 +13,10 @@ const MAX_RECORD: usize = 32 * 1024;
 #[path = "codex_renewal_attempts_tests.rs"]
 mod tests;
 
+#[path = "codex_renewal_completion.rs"]
+mod completion;
+pub use completion::CompletionProgress;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AttemptRef {

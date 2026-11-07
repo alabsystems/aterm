@@ -199,8 +199,13 @@ impl Item for ScrollDirection {
         self.activate(sys)
     }
 
-    fn refresh(&self, sys: &dyn System, _ctx: &Ctx) -> Option<Result<(), String>> {
-        Some(self.activate(sys))
+    fn refresh_guarded(
+        &self,
+        sys: &dyn System,
+        _ctx: &Ctx,
+        current: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Option<Result<(), String>> {
+        Some(current().and_then(|()| self.activate(sys)))
     }
 }
 

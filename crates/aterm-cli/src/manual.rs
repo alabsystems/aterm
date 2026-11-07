@@ -3487,12 +3487,14 @@ SLOW FIRST RUNS (macOS's first-run check, not a wall)
      own child. `aterm ctl @self sys left` shows what waits (`state=program-check`,
      `end=-`) and what waits behind it.
   5. A program held since before the `syspolicyd` running now started (it crashed and
-     launchd started another, so `status` reads `syspolicyd=ok`) most likely sent its
-     check to a `syspolicyd` that is no longer running. `targo --unverified verify`
-     ends its own such stage child COULD NOT RUN once the new one has run 10 min (the
-     bound on a first exec) with no queue. Run the check again on the same tree: no
-     restart is needed, and a build that rewrites that binary first could land on a
-     check the new one took from its queue and has not finished.
+     launchd started another, so `status` reads `syspolicyd=ok`, and its
+     `syspolicyd_pid=` and `syspolicyd_up_ms=` name the new one and how long it has
+     run) most likely sent its check to a `syspolicyd` that is no longer running.
+     `targo --unverified verify` ends its own such stage child COULD NOT RUN once the
+     new one has run 10 min (the bound on a first exec) with no queue. Run the check
+     again on the same tree: no restart is needed, and a build that rewrites that
+     binary first could land on a check the new one took from its queue and has not
+     finished.
 
 GOTCHAS
   * `probe=pending` or a folder's `unknown` means unmeasured, not `denied`.

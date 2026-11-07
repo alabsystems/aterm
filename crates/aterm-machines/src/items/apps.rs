@@ -3076,8 +3076,12 @@ pub(crate) mod tests {
             fn run(&self, c: &Cmd) -> Result<Ran, crate::port::RunFailed> {
                 self.0.run(c)
             }
-            fn run_tty(&self, c: &Cmd) -> Result<Option<i32>, crate::port::RunFailed> {
-                self.0.run_tty(c)
+            fn run_tty(
+                &self,
+                c: &Cmd,
+                before: &mut dyn FnMut() -> Result<(), crate::port::RunFailed>,
+            ) -> Result<Option<i32>, crate::port::RunFailed> {
+                self.0.run_tty(c, before)
             }
             fn read_file(&self, p: &Path) -> std::io::Result<Vec<u8>> {
                 self.0.read_file(p)
@@ -3660,8 +3664,12 @@ pub(crate) mod tests {
             fn run(&self, c: &Cmd) -> Result<Ran, crate::port::RunFailed> {
                 self.inner.run(c)
             }
-            fn run_tty(&self, c: &Cmd) -> Result<Option<i32>, crate::port::RunFailed> {
-                self.inner.run_tty(c)
+            fn run_tty(
+                &self,
+                c: &Cmd,
+                before: &mut dyn FnMut() -> Result<(), crate::port::RunFailed>,
+            ) -> Result<Option<i32>, crate::port::RunFailed> {
+                self.inner.run_tty(c, before)
             }
             fn read_file(&self, p: &Path) -> std::io::Result<Vec<u8>> {
                 self.inner.read_file(p)

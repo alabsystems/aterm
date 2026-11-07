@@ -11,6 +11,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::perf::LaneRun;
+use crate::rustup::Toolchain;
 use crate::wasm_page::{Browser, Page, Refused};
 
 /// The toy's crate name, which is also its module's file stem.
@@ -60,11 +61,11 @@ pub(crate) fn gate(root: &Path, work: &Path, record: bool, log: &mut String) -> 
         Ok(browser) => browser,
         Err(refused) => return refused.verdict("the toy's driver"),
     };
-    let rustup = match crate::perf::wasm::build_tools(false) {
-        Ok(rustup) => rustup,
+    let toolchain = match crate::perf::wasm::build_tools(root, false) {
+        Ok(toolchain) => toolchain,
         Err(unrun) => return unrun,
     };
-    match run(root, &rustup, &browser, work, record, log) {
+    match run(root, &toolchain, &browser, work, record, log) {
         Ok(()) => LaneRun::pass(),
         Err(refused) => refused.verdict("the toy's driver"),
     }
@@ -72,14 +73,14 @@ pub(crate) fn gate(root: &Path, work: &Path, record: bool, log: &mut String) -> 
 
 fn run(
     root: &Path,
-    rustup: &Path,
+    toolchain: &Toolchain,
     browser: &Browser,
     work: &Path,
     record: bool,
     log: &mut String,
 ) -> Result<(), Refused> {
     let failed = Refused::Failed;
-    let module = build(root, rustup, work, log).map_err(failed)?;
+    let module = build(root, toolchain, work, log).map_err(failed)?;
     let bytes = crate::read_regular(&module)
         .map_err(|e| failed(format!("could not read {}: {e}", module.display())))?;
     let found = host_paths(&bytes, root);
@@ -299,25 +300,29 @@ fn host_paths(bytes: &[u8], root: &Path) -> Vec<String> {
     found
 }
 
-fn build(root: &Path, rustup: &Path, work: &Path, log: &mut String) -> Result<PathBuf, String> {
+fn build(
+    root: &Path,
+    toolchain: &Toolchain,
+    work: &Path,
+    log: &mut String,
+) -> Result<PathBuf, String> {
     let manifest = stage(root, &work.join("stage"))?;
-    build_staged(rustup, &manifest, &work.join("target"), "the toy", log)
+    build_staged(toolchain, &manifest, &work.join("target"), "the toy", log)
 }
 
 /// Build the staged crate at `manifest` (`what`, for the log) for wasm32,
-/// release, on stable, into `target`, with stable's library sources at the path
-/// its standard library was built at ([`crate::rustup::Toolchain::std_source_remap`]),
+/// release, on the stock pin `toolchain`, into `target`, with the pin's library sources at the
+/// path its standard library was built at ([`Toolchain::std_source_remap`]),
 /// so no host path reaches the module; the module cargo wrote.
 pub(super) fn build_staged(
-    rustup: &Path,
+    toolchain: &Toolchain,
     manifest: &Path,
     target: &Path,
     what: &str,
     log: &mut String,
 ) -> Result<PathBuf, String> {
     // STOCK EXCEPTION: Trust lacks a wasm32 std (module doc).
-    let stable = crate::rustup::Toolchain::resolve(rustup, "stable")?;
-    let remap = stable.std_source_remap()?;
+    let remap = toolchain.std_source_remap()?;
     let neutral = aterm_tempfile::Builder::new()
         .prefix("aterm-wasm-glue-")
         .tempdir()
@@ -325,9 +330,9 @@ pub(super) fn build_staged(
     let _ = writeln!(
         log,
         "  building {what} (wasm32, release) on {}",
-        stable.name
+        toolchain.name
     );
-    let built = stable
+    let built = toolchain
         .cargo()
         .env_remove("RUSTFLAGS")
         .env("CARGO_ENCODED_RUSTFLAGS", remap)
@@ -353,7 +358,7 @@ pub(super) fn build_staged(
                 String::from_utf8_lossy(&o.stderr).trim_end()
             ));
         }
-        Err(e) => return Err(format!("could not run {}: {e}", stable.cargo.display())),
+        Err(e) => return Err(format!("could not run {}: {e}", toolchain.cargo.display())),
     }
     Ok(target.join(format!("wasm32-unknown-unknown/release/{STEM}.wasm")))
 }

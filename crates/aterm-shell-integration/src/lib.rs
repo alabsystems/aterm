@@ -1071,16 +1071,20 @@ unset __aterm_spare_n __aterm_spare_go __aterm_spare_cd __aterm_spare_o
 macro_rules! bash_debug_trap_handover {
     () => {
         "\
-# The DEBUG trap the startup files set, handed to the integration: a `.` hides it.
-{ __aterm_rc_flags=$-; builtin set +xv; } 2>/dev/null
+# The DEBUG trap the startup files set, handed to the integration: a `.` hides it. Bash runs
+# the trap before each command here, so what it prints must stay out of the text read: the
+# file is `trap -p`'s own redirect, which bash makes after the trap ran (a `{ }` group's is
+# made before), and functrace is off for the `$(…)`, which it would hand the trap to.
+{ __aterm_rc_flags=$-; builtin set +xvT; } 2>/dev/null
 if [ -z \"${ATERM_SHELL_INTEGRATION_INSTALLED:-}\" ]; then
   __aterm_rc_debug_handed=1
   if [ -z \"${ATERM_REKEY_PATH:-}\" ] ||
-     ! { builtin trap -p DEBUG; } 2>/dev/null >|\"$ATERM_REKEY_PATH.trap\"; then
+     ! builtin trap -p DEBUG 2>/dev/null >|\"$ATERM_REKEY_PATH.trap\"; then
     __aterm_rc_debug_trap=$(builtin trap -p DEBUG 2>/dev/null)
   fi
   builtin trap - DEBUG
 fi
+case $__aterm_rc_flags in *T*) builtin set -T ;; esac
 case $__aterm_rc_flags in
   *x*v*|*v*x*) builtin unset __aterm_rc_flags; builtin set -xv ;;
   *x*) builtin unset __aterm_rc_flags; builtin set -x ;;

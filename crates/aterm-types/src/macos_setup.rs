@@ -593,6 +593,12 @@ pub const ADMITTED_NAME_RULE_REFUSED: &str = "/private/etc/sudoers.d/.aterm-admi
 /// other end said nothing, and the window ends the tab with [`COMMAND_LINE_TOOLS_NOT_FINISHED`].
 pub const COMMAND_LINE_TOOLS_TAB: &str = "ATERM_COMMAND_LINE_TOOLS_TAB";
 
+/// The dedicated Mac Setup tab's program arguments, shared with its owned lab responder.
+pub const COMMAND_LINE_TOOLS_ARGS: [&str; 3] = ["init", "--only", "base.clt"];
+
+/// The dedicated setup run's `sudo -p` prompt, in its tab and on a person's terminal.
+pub const MAC_SETUP_PASSWORD_PROMPT: &str = "Mac password: ";
+
 /// The line the window types into the Mac Setup tab once it landed, which starts the
 /// install ([`COMMAND_LINE_TOOLS_TAB`]): nothing runs before the window's landing check passes.
 pub const COMMAND_LINE_TOOLS_TAB_GO: &str = "install";

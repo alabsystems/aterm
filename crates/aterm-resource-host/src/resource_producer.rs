@@ -118,7 +118,12 @@ impl TransportProof {
     /// Fresh non-interactive validation before GO. This performs no challenge or
     /// resource mutation and never interprets identity as permission to signal.
     pub(crate) fn validate(&self) -> io::Result<()> {
-        self.validate_until(Instant::now() + Duration::from_millis(100))
+        self.validate_at(Instant::now())
+    }
+    fn validate_at(&self, started: Instant) -> io::Result<()> {
+        // Recheck the original native identities, image and peer socket. Wall
+        // time detects a hang; scheduler delay alone is no changed provenance.
+        self.validate_until(started + Duration::from_secs(60))
     }
     fn validate_until(&self, deadline: Instant) -> io::Result<()> {
         let (helper, producer) = capture(

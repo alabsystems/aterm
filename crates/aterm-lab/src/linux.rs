@@ -162,10 +162,11 @@ reserved guest directory; historical ~/aterm-lane directories are retained.
                            chrome-headless-shell linux64 on SwiftShader, aarch64 Firefox under Xvfb and WebKit's
                            WPE, headless.
                            Exit 0 pass, 1 a row failed, 3 NOT RUN. Report and frames: $LAB_STATE/linux/
-  vz-agent                 cross-build the vz guest agent (crates/aterm-vz-agent; STOCK EXCEPTION: rustup stable,
-                           static aarch64-unknown-linux-musl, linked by its rust-lld) and place it at
-                           ~/Library/Caches/aterm/vz.noindex/agent/<sha256>/; prints the sha256. NOT RUN without
-                           the musl std (targo --unverified verify provision --linux)
+  vz-agent                 cross-build the vz guest agent (crates/aterm-vz-agent; STOCK EXCEPTION: the
+                           checkout's stock pin, static aarch64-unknown-linux-musl, linked by its rust-lld)
+                           and place it at ~/Library/Caches/aterm/vz.noindex/agent/<sha256>/; prints the
+                           sha256. NOT RUN without the pin's musl std (targo --unverified verify provision
+                           --linux)
   vz-host [place]          build the vz helper (crates/aterm-vz's aterm-vz-host, the dev profile) and place its copy,
                            signed ad hoc with com.apple.security.virtualization only, under the vz state's host/<sha256>/;
                            prints the sha256

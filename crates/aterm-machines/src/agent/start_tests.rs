@@ -29,8 +29,12 @@ impl System for Faults {
     fn run(&self, c: &Cmd) -> Result<Ran, RunFailed> {
         self.inner.run(c)
     }
-    fn run_tty(&self, c: &Cmd) -> Result<Option<i32>, RunFailed> {
-        self.inner.run_tty(c)
+    fn run_tty(
+        &self,
+        c: &Cmd,
+        before: &mut dyn FnMut() -> Result<(), RunFailed>,
+    ) -> Result<Option<i32>, RunFailed> {
+        self.inner.run_tty(c, before)
     }
     fn read_file(&self, p: &Path) -> io::Result<Vec<u8>> {
         self.inner.read_file(p)

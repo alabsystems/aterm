@@ -57,17 +57,18 @@ impl Capture {
     }
 }
 
-/// The root is never reaped before its group's termination is requested. Its reserved PID is
-/// the authority for every group signal, including a normal exit with inherited pipes open.
-struct Run {
+/// Forced retirement requests group termination while the unreaped root reserves its ID.
+/// Cooperative retirement requests its owner's stop and retains the actual root through cleanup.
+struct Run<'a> {
     child: Child,
     input: Option<Secret>,
     to_child: Option<File>,
     sent: usize,
     reaped: bool,
+    retire: Option<&'a mut dyn FnMut()>,
 }
 
-impl Run {
+impl Run<'_> {
     fn settle(&mut self) {
         self.settle_with(Child::wait);
     }
@@ -81,7 +82,11 @@ impl Run {
             return;
         }
         if self.child.owns_unreaped() {
-            super::children::kill_group(&mut self.child);
+            if let Some(retire) = self.retire.as_mut() {
+                retire();
+            } else {
+                super::children::kill_group(&mut self.child);
+            }
         }
         let mut exit = self
             .child
@@ -151,7 +156,7 @@ impl Run {
     }
 }
 
-impl Drop for Run {
+impl Drop for Run<'_> {
     fn drop(&mut self) {
         self.settle();
     }
@@ -179,6 +184,7 @@ pub(super) fn output_with_input_until_watching(
     let status = run_with_input_until_watching(
         cmd,
         Some(input),
+        None,
         Some(deadline),
         |_| {},
         |stream, chunk| {
@@ -196,6 +202,7 @@ pub(super) fn output_with_input_until_watching(
             Ok(())
         },
         stopped,
+        None,
     )?;
     Ok(status.map(|status| Output {
         status,
@@ -211,16 +218,43 @@ pub(super) fn stream_until_stopped(
     output: impl FnMut(ChildOutput, &[u8]) -> io::Result<()>,
     stopped: impl FnMut() -> bool,
 ) -> io::Result<Option<std::process::ExitStatus>> {
-    run_with_input_until_watching(cmd, None, deadline, spawned, output, stopped)
+    run_with_input_until_watching(cmd, None, None, deadline, spawned, output, stopped, None)
 }
 
+pub(super) fn stream_with_stdin_until_stopped(
+    cmd: &mut Command,
+    stdin: Stdio,
+    deadline: Option<Instant>,
+    spawned: impl FnOnce(u32),
+    output: impl FnMut(ChildOutput, &[u8]) -> io::Result<()>,
+    stopped: impl FnMut() -> bool,
+    retire: Option<&mut dyn FnMut()>,
+) -> io::Result<Option<std::process::ExitStatus>> {
+    run_with_input_until_watching(
+        cmd,
+        None,
+        Some(stdin),
+        deadline,
+        spawned,
+        output,
+        stopped,
+        retire,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one owner shares input, observation, stop and retirement policies"
+)]
 fn run_with_input_until_watching(
     cmd: &mut Command,
     input: Option<Secret>,
+    stdin: Option<Stdio>,
     deadline: Option<Instant>,
     spawned: impl FnOnce(u32),
     mut output: impl FnMut(ChildOutput, &[u8]) -> io::Result<()>,
     mut stopped: impl FnMut() -> bool,
+    retire: Option<&mut dyn FnMut()>,
 ) -> io::Result<Option<std::process::ExitStatus>> {
     if !cfg!(any(target_vendor = "apple", target_os = "linux")) {
         return Err(io::Error::new(
@@ -236,11 +270,13 @@ fn run_with_input_until_watching(
     }
     let child = cmd
         .process_group(0)
-        .stdin(if input.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
+        .stdin(stdin.unwrap_or_else(|| {
+            if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            }
+        }))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
@@ -250,6 +286,7 @@ fn run_with_input_until_watching(
         to_child: None,
         sent: 0,
         reaped: false,
+        retire,
     };
     spawned(run.child.id());
     if run.input.is_some() {

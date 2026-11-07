@@ -1216,75 +1216,95 @@ fn an_integrated_bash_keeps_the_users_err_trap_errexit_and_functrace_as_bare_bas
     }
 }
 
+/// The wrapper hands the rc's `DEBUG` trap to the integration as the rc set it, in the session file
+/// exactly when there is one: with no flag and under functrace, and for a trap that prints (one that
+/// sets the window title), which bash runs before each of the hand-over's own commands. The shell has
+/// functrace at its prompt as bash alone has it after that rc (bash 3.2 turns it on for `extdebug` only
+/// once the rc has run).
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_chains_the_debug_trap_its_rc_set() {
+    const TRAP: &str = r#"printf "\033]2;%s\a" "$BASH_COMMAND"; [[ $BASH_COMMAND != "echo typed"* ]] ||
+  echo "DBG'\''$((40+2))""#;
     let mut shells = ShellLanes::default();
     for bash in shells.bashes() {
-        let fx = LiveFixture::new();
-        std::fs::write(
-            fx.home.join(".bashrc"),
-            "HISTCONTROL=ignorespace\n\
-             trap '[[ $BASH_COMMAND != \"echo typed\"* ]] ||\n  echo \"DBG'\\''$((40+2))\"' DEBUG\n",
-        )
-        .expect(".bashrc");
-        let ours = install_script_set(&fx.base).expect("install");
-        let unhanded = folder_with_edits(&fx.base, "00000000000000ac", &[]);
-        let rcfile = unhanded.join("bash").join(BASH_LOADER_FILE);
-        let wrapper = std::fs::read_to_string(&rcfile).expect("the control's loader");
-        assert_eq!(
-            wrapper.matches(bash_debug_trap_handover!()).count(),
-            1,
-            "the hand-over moved — keep the control in step"
-        );
-        std::fs::write(&rcfile, wrapper.replace(bash_debug_trap_handover!(), "")).expect("rcfile");
-        let rekey_dir = fx.base.join("rekey");
-        std::fs::create_dir_all(&rekey_dir).expect("re-key dir");
-        let sid = "s-0123456789abcdef0123";
-        let rekey = rekey_dir.join(sid);
-        let trap_file = rekey_dir.join(format!("{sid}{DEBUG_TRAP_SUFFIX}"));
-        let rekey = rekey.to_str().expect("UTF-8");
-        for (dir, channel, fixed) in [
-            (&unhanded, true, false),
-            (&ours, true, true),
-            (&ours, false, true),
-        ] {
-            let _ = std::fs::remove_file(&trap_file);
-            let extra: &[(&str, &str)] = if channel {
-                &[(REKEY_PATH_VAR, rekey)]
-            } else {
-                &[]
-            };
-            let mut sh = spawn_pty_shell(ShellType::Bash, bash, &fx, dir, extra);
-            let from = sh.type_at_prompt(b" echo typed$((6*7))\r");
-            let ran = sh.wait_for_after("typed42", from);
-            let done = sh.wait_for_after("\x1b]133;A", ran);
-            let text = stdout_between(&sh, from, done);
-            let (chained, marked) = (text.contains("DBG'42"), text.contains("\x1b]133;C"));
-            if fixed {
-                assert!(
-                    chained && marked,
-                    "{bash} (channel {channel}): the rc's DEBUG trap ran (chained {chained}) and \
-                     aterm marked the command (marked {marked})\n{}",
-                    sh.transcript()
-                );
-                let handed = std::fs::read_to_string(&trap_file).ok();
-                assert_eq!(
-                    handed.as_deref(),
-                    channel.then_some(
-                        "trap -- '[[ $BASH_COMMAND != \"echo typed\"* ]] ||\n  echo \"DBG'\\''$((40+2))\"' DEBUG\n"
-                    ),
-                    "{bash} (channel {channel}): the wrapper hands the trap over in the session \
-                     file exactly when there is one"
-                );
-            } else {
-                assert!(
-                    !(chained && marked),
-                    "{bash}: the control must lose the rc's trap or aterm's mark\n{}",
-                    sh.transcript()
-                );
+        for flag in ["", "set -T\n", "shopt -s extdebug\n"] {
+            let fx = LiveFixture::new();
+            std::fs::write(
+                fx.home.join(".bashrc"),
+                format!("HISTCONTROL=ignorespace\n{flag}trap '{TRAP}' DEBUG\n"),
+            )
+            .expect(".bashrc");
+            let ours = install_script_set(&fx.base).expect("install");
+            let unhanded = folder_with_edits(&fx.base, "00000000000000ac", &[]);
+            let rcfile = unhanded.join("bash").join(BASH_LOADER_FILE);
+            let wrapper = std::fs::read_to_string(&rcfile).expect("the control's loader");
+            assert_eq!(
+                wrapper.matches(bash_debug_trap_handover!()).count(),
+                1,
+                "the hand-over moved — keep the control in step"
+            );
+            std::fs::write(&rcfile, wrapper.replace(bash_debug_trap_handover!(), ""))
+                .expect("rcfile");
+            let rekey_dir = fx.base.join("rekey");
+            std::fs::create_dir_all(&rekey_dir).expect("re-key dir");
+            let sid = "s-0123456789abcdef0123";
+            let rekey = rekey_dir.join(sid);
+            let trap_file = rekey_dir.join(format!("{sid}{DEBUG_TRAP_SUFFIX}"));
+            let rekey = rekey.to_str().expect("UTF-8");
+            let expected = format!("trap -- '{TRAP}' DEBUG\n");
+            let case = format!("{bash} {flag:?}");
+            for (dir, channel, fixed) in [
+                (&unhanded, true, false),
+                (&ours, true, true),
+                (&ours, false, true),
+            ] {
+                if !fixed && !flag.is_empty() {
+                    continue;
+                }
+                let _ = std::fs::remove_file(&trap_file);
+                let extra: &[(&str, &str)] = if channel {
+                    &[(REKEY_PATH_VAR, rekey)]
+                } else {
+                    &[]
+                };
+                let mut sh = spawn_pty_shell(ShellType::Bash, bash, &fx, dir, extra);
+                let from = sh.type_at_prompt(b" echo typed$((6*7))\r");
+                let ran = sh.wait_for_after("typed42", from);
+                let done = sh.wait_for_after("\x1b]133;A", ran);
+                let text = stdout_between(&sh, from, done);
+                let (chained, marked) = (text.contains("DBG'42"), text.contains("\x1b]133;C"));
+                if fixed {
+                    assert!(
+                        chained && marked,
+                        "{case} (channel {channel}): the rc's DEBUG trap ran (chained {chained}) \
+                         and aterm marked the command (marked {marked})\n{}",
+                        sh.transcript()
+                    );
+                    let handed = std::fs::read_to_string(&trap_file).ok();
+                    assert_eq!(
+                        handed.as_deref(),
+                        channel.then_some(expected.as_str()),
+                        "{case} (channel {channel}): the wrapper hands the trap over in the \
+                         session file exactly when there is one"
+                    );
+                    let at = sh.len();
+                    let stop = sh.run_line(r#"/bin/echo "t=[${-//[!T]/}]""#, "0");
+                    let flags = stdout_between(&sh, at, stop);
+                    let bare = if flag.is_empty() { "t=[]" } else { "t=[T]" };
+                    assert!(
+                        flags.contains(bare),
+                        "{case}: functrace after the rc: {flags:?}"
+                    );
+                } else {
+                    assert!(
+                        !(chained && marked),
+                        "{case}: the control must lose the rc's trap or aterm's mark\n{}",
+                        sh.transcript()
+                    );
+                }
+                sh.finish();
             }
-            sh.finish();
         }
     }
 }
@@ -1984,19 +2004,38 @@ fn an_integrated_bash_runs_bash_preexec_and_reports_each_command() {
     }
 }
 
-/// Under functrace a `DEBUG` trap is handed to every function, so an rc's trap would also run for each
-/// command of aterm's helpers. It stays out of them and goes on running in a person's own prompt hook,
-/// which sees functrace on, as the next line does. A function wrapping aterm's trap there never reports
-/// one of aterm's own commands as a line.
+/// An rc's `DEBUG` trap that aterm chains runs for the commands a bare bash runs it for, never for one of
+/// aterm's own: not in aterm's functions, which functrace hands the trap to, not in a body a prompt
+/// reloads, and not for the entries aterm puts in `PROMPT_COMMAND` and `PS0`, which it reaches with no flag
+/// at all, for the call a person's wrapper of `PROMPT_COMMAND` makes, or in the `$(…)` of the prompt aterm
+/// draws, which functrace hands it to as well. With no flag aterm's own entry stands in for the top level
+/// of a scalar prompt command, whose commands run in one of aterm's functions, and for no array's or absent
+/// one. Under functrace it goes on running in a person's own prompt hook and at the top level of their
+/// prompt command, and both see functrace on, as the next line does. Bash-preexec's `PS0` hook leaves
+/// the trap armed itself, as a bare bash has it, so there it runs in aterm's helpers too. A function that
+/// wraps aterm's hook never reports one of aterm's own commands as a line.
 #[cfg(unix)]
 #[test]
-fn an_integrated_bash_under_functrace_keeps_an_rcs_trap_out_of_its_helpers() {
+fn an_integrated_bash_keeps_an_rcs_trap_out_of_aterms_own_commands() {
     const RC: &str = r#"
-set -T
-rc_hook=0 rc_helper=0
+rc_hook=0 rc_helper=0 rc_top=0 rc_stand=0
 hook() { hook_t=${-//[!T]/}; : in-hook; }
-trap 'case " ${FUNCNAME[*]-} " in *" hook "*) rc_hook=$((rc_hook+1)) ;; *" __aterm_osc "*|*" __aterm_encode_cmd "*) rc_helper=$((rc_helper+1)) ;; esac' DEBUG
+trap 'rc_f=${FUNCNAME[0]-}; [[ $rc_f != __aterm_preexec_run ]] || rc_f=${FUNCNAME[2]-}
+case $rc_f:$BASH_COMMAND in
+    hook:*) rc_hook=$((rc_hook+1)) ;;
+    __aterm_body_prompt_command:pc_top=1 | :pc_top=1) rc_top=$((rc_top+1)) ;;
+    __aterm_body_prompt_command:hook | __aterm_bp_preexec:* | :__aterm_rc_*) ;;
+    :__aterm_prompt_command) if [[ $- == *T* ]]; then rc_helper=$((rc_helper+1)); else rc_stand=$((rc_stand+1)); fi ;;
+    __aterm_*:* | *:__aterm_* | source:*) rc_helper=$((rc_helper+1)); (( ! BASH_SUBSHELL )) || printf x >>~/.rc-sub ;;
+esac' DEBUG
 "#;
+    const SCALAR: &str = "PROMPT_COMMAND='pc_top=1; hook'\n";
+    const ARRAY: &str = "if (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1) )); \
+        then PROMPT_COMMAND=(pc_top=1 hook); pc_array=1; else PROMPT_COMMAND='pc_top=1; hook'; fi\n";
+    const NONE: &str = "";
+    // Until the loader takes the trap the rc armed, bash runs it for the hand-over's own lines
+    // (`__aterm_rc_*`), as for any line after the rc; from the loader's last line on it is
+    // aterm's chain, and the top level of a file aterm sources has the frame `source`.
     let lines = [
         ("echo one$((40+2))", "0", "echo\\x20one$((40+2))"),
         ("false", "1", "false"),
@@ -2004,88 +2043,289 @@ trap 'case " ${FUNCNAME[*]-} " in *" hook "*) rc_hook=$((rc_hook+1)) ;; *" __ate
     ];
     let mut shells = ShellLanes::default();
     for bash in shells.bashes() {
-        for (joined, setup) in [
-            (false, "PROMPT_COMMAND=hook\n".to_owned()),
-            (
-                true,
-                format!(
-                    "__bp_newest=1\n{BASH_PREEXEC_SHAPE}\
-                     PROMPT_COMMAND=\"$PROMPT_COMMAND\"'; hook'\n"
+        for traced in [true, false] {
+            for (joined, setup) in [
+                (false, SCALAR.to_owned()),
+                (false, ARRAY.to_owned()),
+                (false, NONE.to_owned()),
+                (
+                    true,
+                    format!(
+                        "__bp_newest=1\n{BASH_PREEXEC_SHAPE}\
+                         PROMPT_COMMAND=\"$PROMPT_COMMAND\"'; pc_top=1; hook'\n"
+                    ),
                 ),
-            ),
-        ] {
-            let case = format!("{bash} joined={joined}");
+            ] {
+                let flag = if traced { "set -T\n" } else { "" };
+                // aterm's own prompt runs its segments in `$(…)`, where functrace hands the
+                // trap on too: the array rows draw it.
+                let style = if setup == ARRAY { "standard" } else { "none" };
+                let case =
+                    format!("{bash} traced={traced} joined={joined} style={style} {setup:?}");
+                let fx = LiveFixture::new();
+                let dir = install_script_set(&fx.base).expect("install");
+                std::fs::write(
+                    fx.home.join(".bashrc"),
+                    format!("HISTFILE=/dev/null\n{flag}{setup}{RC}"),
+                )
+                .expect(".bashrc");
+                let mut sh = spawn_pty_shell(
+                    ShellType::Bash,
+                    bash,
+                    &fx,
+                    &dir,
+                    &[("ATERM_CHILD", "1"), ("ATERM_PROMPT_STYLE", style)],
+                );
+                sh.wait_for_line_editor();
+                let from = sh.len();
+                let mut end = from;
+                for (line, status, _) in lines {
+                    let typed = sh.type_at_prompt(format!("{line}\r").as_bytes());
+                    let done = if status.is_empty() {
+                        typed
+                    } else {
+                        sh.wait_for_after(&format!("\x1b]133;D;{status}"), typed)
+                    };
+                    end = sh.wait_for_after("\x1b]133;A", done);
+                }
+                let reported: Vec<String> = stdout_between(&sh, from, end)
+                    .split("\x1b]633;E;")
+                    .skip(1)
+                    .map(|rest| rest.split([';', '\x07']).next().unwrap_or("").to_owned())
+                    .collect();
+                let typed = lines.map(|(_, _, reported)| reported);
+                assert!(
+                    reported.iter().all(|line| typed.contains(&line.as_str())),
+                    "{case}: a command of aterm's reported as a line: {reported:?}"
+                );
+                let out = read_counts(&mut sh);
+                let read = |word: &str| count_after(&out, word, &case);
+                let armed_itself = out.contains("_ps0]");
+                if !armed_itself {
+                    assert_eq!(read("helper="), 0, "{case}: {out:?}");
+                    let sub = std::fs::read(fx.home.join(".rc-sub")).unwrap_or_default();
+                    assert!(
+                        sub.is_empty(),
+                        "{case}: in a `$(…)` of aterm's prompt: {sub:?}"
+                    );
+                }
+                // With no flag a bare bash runs the trap at the top level of the person's
+                // prompt command: an array's elements run there themselves, and aterm's own entry
+                // stands in for a scalar's, whose commands run in one of aterm's functions. With
+                // no prompt command it runs for none.
+                if !traced && !joined {
+                    let array = out.contains("array=[1]");
+                    let scalar = setup != NONE && !array;
+                    assert_eq!(
+                        read("stand=") > 0,
+                        scalar,
+                        "{case}: aterm's entry in PROMPT_COMMAND: {out:?}"
+                    );
+                    assert_eq!(
+                        read("top=") > 0,
+                        array,
+                        "{case}: the rc's trap at the prompt command's top level: {out:?}"
+                    );
+                }
+                // bash-preexec's `DEBUG` hook runs the rc's trap itself, once a line, from
+                // `__aterm_bp_preexec`.
+                if !traced || setup == NONE || (joined && !armed_itself) {
+                    sh.finish();
+                    continue;
+                }
+                assert!(out.contains("hook_t=[T] now=[T]"), "{case}: {out:?}");
+                assert!(
+                    read("hook=") > 0,
+                    "{case}: the rc's trap left the hook: {out:?}"
+                );
+                assert!(
+                    read("top=") > 0,
+                    "{case}: the rc's trap left the prompt command: {out:?}"
+                );
+                if joined || setup != SCALAR {
+                    sh.finish();
+                    continue;
+                }
+                // A body the host points the shell at is aterm's own, sourced in its hook.
+                folder_with_edits(&fx.base, "00000000000000ad", &[]);
+                let pointer = fx.home.join("body-pointer");
+                std::fs::write(&pointer, "00000000000000ad\n").expect("body pointer");
+                sh.run_line(
+                    &format!("__aterm_body_pointer='{}'; rc_helper=0", pointer.display()),
+                    "0",
+                );
+                let out = read_counts(&mut sh);
+                let at = sh.len();
+                let stop = sh.run_line(r#"/bin/echo "rev=[$__aterm_body_rev]""#, "0");
+                let rev = stdout_between(&sh, at, stop);
+                assert!(
+                    rev.contains("rev=[00000000000000ad]"),
+                    "{case}: no reload: {rev:?}"
+                );
+                assert_eq!(
+                    count_after(&out, "helper=", &case),
+                    0,
+                    "{case}: in the body the shell took: {out:?}"
+                );
+                // Starship's shape: a function calling the prompt command, then going on past it.
+                let from = sh.run_line(
+                    r#"_pp=$PROMPT_COMMAND; wrap() { eval "$_pp"; after=1; }; PROMPT_COMMAND=wrap; rc_helper=0"#,
+                    "0",
+                );
+                sh.type_at_prompt(b"echo beyond$((40+2))\r");
+                let at = sh.wait_for_after("beyond42", from);
+                let end = sh.wait_for_after("\x1b]133;A", at);
+                let wrapped = stdout_between(&sh, from, end);
+                let lines: Vec<&str> = wrapped
+                    .split("\x1b]633;E;")
+                    .skip(1)
+                    .map(|rest| rest.split([';', '\x07']).next().unwrap_or(""))
+                    .collect();
+                assert_eq!(lines, ["echo\\x20beyond$((40+2))"], "{case}: {wrapped:?}");
+                let out = read_counts(&mut sh);
+                assert_eq!(
+                    count_after(&out, "helper=", &case),
+                    0,
+                    "{case}: under a wrapper: {out:?}"
+                );
+                sh.finish();
+            }
+        }
+    }
+}
+
+/// A running shell keeps the loader it started with and takes each new body at a prompt, so the body's
+/// own entry points declare aterm's mark themselves: under a trampoline that predates it, an rc's trap
+/// still runs for none of the body's commands.
+#[cfg(unix)]
+#[test]
+fn an_older_trampoline_keeps_an_rcs_trap_out_of_the_bodys_hooks() {
+    const RC: &str = r#"
+set -T
+rc_body=0
+hook() { : in-hook; }
+PROMPT_COMMAND='pc_top=1; hook'
+trap 'rc_f=${FUNCNAME[0]-}; [[ $rc_f != __aterm_preexec_run ]] || rc_f=${FUNCNAME[2]-}
+case $rc_f:$BASH_COMMAND in
+    __aterm_body_prompt_command:pc_top=1 | __aterm_body_prompt_command:hook) ;;
+    __aterm_prompt_command:* | __aterm_ps0:* | __aterm_body_check:*) ;;
+    __aterm_*:*) rc_body=$((rc_body+1)) ;;
+esac' DEBUG
+"#;
+    // The loader's trampolines as a shell started before they declared the mark keeps them.
+    let older: &[(&str, &str)] = &[
+        (
+            " __aterm_lastarg=$_ __aterm_flags=$- __aterm_hook_live=1; set +axv;",
+            " __aterm_lastarg=$_ __aterm_flags=$-; set +xv;",
+        ),
+        (
+            "{ local __aterm_flags=$- __aterm_hook_live=1; set +axv; } 2>/dev/null\n    if declare -F __aterm_body_ps0",
+            "{ local __aterm_flags=$-; set +xv; } 2>/dev/null\n    if declare -F __aterm_body_ps0",
+        ),
+    ];
+    let mut shells = ShellLanes::default();
+    for bash in shells.bashes() {
+        let fx = LiveFixture::new();
+        let dir = folder_with_edits(
+            &fx.base,
+            "00000000000000bb",
+            &[("bash", scripts::BASH, older)],
+        );
+        std::fs::write(fx.home.join(".bashrc"), format!("HISTFILE=/dev/null\n{RC}"))
+            .expect(".bashrc");
+        let mut sh = spawn_pty_shell(ShellType::Bash, bash, &fx, &dir, &[("ATERM_CHILD", "1")]);
+        sh.wait_for_line_editor();
+        sh.run_line("rc_body=0", "0");
+        sh.run_line("echo one$((40+2))", "0");
+        sh.run_line("false", "1");
+        let start = sh.len();
+        let stop = sh.run_line(r#"/bin/echo "body=$rc_body""#, "0");
+        let out = stdout_between(&sh, start, stop);
+        assert_eq!(count_after(&out, "body=", bash), 0, "{bash}: {out:?}");
+        sh.finish();
+    }
+}
+
+/// Functrace hands aterm's own `DEBUG` trap to every `$(…)` and subshell, the prompt's own among them,
+/// and changes none of aterm's marks: each line is marked as with no flag, a command in the prompt's
+/// `$(…)` as no line.
+#[cfg(unix)]
+#[test]
+fn an_integrated_bash_under_functrace_marks_each_line_as_without_it() {
+    let lines = [
+        "echo one$((40+2))",
+        "echo a | /bin/cat",
+        "(exit 3)",
+        "false",
+    ];
+    let marks = |out: &str| -> Vec<String> {
+        let field = |rest: &str| rest.split(';').next().unwrap_or("").to_owned();
+        out.split("\x1b]")
+            .skip(1)
+            .filter_map(|osc| {
+                let osc = osc.split('\x07').next().unwrap_or("");
+                if let Some(line) = osc.strip_prefix("633;E;") {
+                    Some(format!("E {}", field(line)))
+                } else if let Some(status) = osc.strip_prefix("133;D;") {
+                    Some(format!("D {}", field(status)))
+                } else {
+                    osc.starts_with("133;C").then(|| "C".to_owned())
+                }
+            })
+            .collect()
+    };
+    let mut shells = ShellLanes::default();
+    for bash in shells.bashes() {
+        let seen = ["", "set -T\n"].map(|flag| {
             let fx = LiveFixture::new();
             let dir = install_script_set(&fx.base).expect("install");
             std::fs::write(
                 fx.home.join(".bashrc"),
-                format!("HISTFILE=/dev/null\n{setup}{RC}"),
+                format!("HISTFILE=/dev/null\n{flag}seg() {{ printf s; }}\nPS1='$(seg)\\$ '\n"),
             )
             .expect(".bashrc");
             let mut sh = spawn_pty_shell(ShellType::Bash, bash, &fx, &dir, &[("ATERM_CHILD", "1")]);
             sh.wait_for_line_editor();
             let from = sh.len();
             let mut end = from;
-            for (line, status, _) in lines {
+            for line in lines {
                 let typed = sh.type_at_prompt(format!("{line}\r").as_bytes());
-                let done = if status.is_empty() {
-                    typed
-                } else {
-                    sh.wait_for_after(&format!("\x1b]133;D;{status}"), typed)
-                };
-                end = sh.wait_for_after("\x1b]133;A", done);
+                end = sh.wait_for_after("\x1b]133;A", typed);
             }
-            let reported: Vec<String> = stdout_between(&sh, from, end)
-                .split("\x1b]633;E;")
-                .skip(1)
-                .map(|rest| rest.split([';', '\x07']).next().unwrap_or("").to_owned())
-                .collect();
-            let typed = lines.map(|(_, _, reported)| reported);
-            assert!(
-                reported.iter().all(|line| typed.contains(&line.as_str())),
-                "{case}: a command of aterm's reported as a line: {reported:?}"
-            );
-            let start = sh.len();
-            let stop = sh.run_line(
-                r#"/bin/echo "helper=$rc_helper hook=$rc_hook hook_t=[$hook_t] now=[${-//[!T]/}]""#,
-                "0",
-            );
-            let out = stdout_between(&sh, start, stop);
-            let read = |word: &str| -> u32 {
-                out.split(word)
-                    .filter_map(|rest| {
-                        let digits: String =
-                            rest.chars().take_while(char::is_ascii_digit).collect();
-                        digits.parse().ok()
-                    })
-                    .next()
-                    .unwrap_or_else(|| panic!("{case}: {out:?}"))
-            };
-            assert_eq!(read("helper="), 0, "{case}: {out:?}");
-            assert!(out.contains("hook_t=[T] now=[T]"), "{case}: {out:?}");
-            if joined {
-                sh.finish();
-                continue;
-            }
-            assert!(
-                read("hook=") > 0,
-                "{case}: the rc's trap left the hook: {out:?}"
-            );
-            let from = sh.run_line(
-                r#"w() { local a=$1; eval -- "$WT"; : "$a"; }; eval "WT=($(trap -p DEBUG))"; WT=("${WT[2]}"); trap 'w "$_"' DEBUG"#,
-                "0",
-            );
-            sh.type_at_prompt(b"echo wrapped$((40+2))\r");
-            let at = sh.wait_for_after("wrapped42", from);
-            let end = sh.wait_for_after("\x1b]133;A", at);
-            let wrapped = stdout_between(&sh, from, end);
-            for rest in wrapped.split("\x1b]633;E;").skip(1) {
-                let line = rest.split([';', '\x07']).next().unwrap_or("");
-                assert_eq!(line, "echo\\x20wrapped$((40+2))", "{case}: {wrapped:?}");
-            }
+            let seen = marks(&stdout_between(&sh, from, end));
             sh.finish();
-        }
+            seen
+        });
+        assert!(
+            seen[0].contains(&"E false".to_owned()),
+            "{bash}: no line marked: {:?}",
+            seen[0]
+        );
+        assert_eq!(seen[1], seen[0], "{bash}: under functrace");
     }
+}
+
+/// Types the line that prints the rc trap's counters, and returns what it printed.
+#[cfg(unix)]
+fn read_counts(sh: &mut LiveShell) -> String {
+    let start = sh.len();
+    let stop = sh.run_line(
+        r#"/bin/echo "helper=$rc_helper hook=$rc_hook top=$rc_top stand=$rc_stand array=[${pc_array-}] hook_t=[${hook_t-}] now=[${-//[!T]/}] proc=[${__bp_hook_preexec_proc-}]""#,
+        "0",
+    );
+    stdout_between(sh, start, stop)
+}
+
+/// The number printed after `word`, past the typed line's own echo of it.
+#[cfg(unix)]
+fn count_after(out: &str, word: &str, case: &str) -> u32 {
+    out.split(word)
+        .filter_map(|rest| {
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse().ok()
+        })
+        .next()
+        .unwrap_or_else(|| panic!("{case}: {out:?}"))
 }
 
 /// `__aterm_untraced` runs a command spelled `"$@"`, which reads as a top-level line once functrace is
@@ -2119,5 +2359,198 @@ fn an_integrated_bash_reports_a_typed_dollar_at_line() {
             );
             sh.finish();
         }
+    }
+}
+
+/// Bash 3.2 keeps the frames of a function a Ctrl-C ended in `FUNCNAME`, so with no functrace aterm never
+/// reads them, and the next line still reports. `kill -INT $$` from a builtin is a Ctrl-C with no race.
+#[cfg(unix)]
+#[test]
+fn an_integrated_bash_reports_the_line_after_a_function_a_ctrl_c_ended() {
+    let mut shells = ShellLanes::default();
+    for bash in shells.bashes() {
+        let fx = LiveFixture::new();
+        let dir = install_script_set(&fx.base).expect("install");
+        std::fs::write(
+            fx.home.join(".bashrc"),
+            "HISTFILE=/dev/null\ntrap ': rc' DEBUG\nstop() { kill -INT $$; : unreached; }\n",
+        )
+        .expect(".bashrc");
+        let mut sh = spawn_pty_shell(ShellType::Bash, bash, &fx, &dir, &[("ATERM_CHILD", "1")]);
+        sh.wait_for_line_editor();
+        let typed = sh.type_at_prompt(b"stop\r");
+        sh.wait_for_after("\x1b]133;A", typed);
+        let from = sh.len();
+        let end = sh.run_line("/bin/echo after-stop", "0");
+        let out = stdout_between(&sh, from, end);
+        assert!(
+            out.contains("\x1b]633;E;/bin/echo\\x20after-stop"),
+            "{bash}: the line lost its marks: {out:?}"
+        );
+        sh.finish();
+    }
+}
+
+/// An rc that leaves `set -a` on exports what the person sets, their prompt command's too, as a bare
+/// bash does, and none of aterm's own state: no variable or function of aterm's, so not the typed line,
+/// and not the capability nonce, also where the rc sourced the integration itself. A shell whose
+/// trampoline predates this keeps `set -a` on too, and the body it reloads exports none of its
+/// functions; so does a shell that inherited the mark of an
+/// integrated shell (a nested bash or a multiplexer's pane), whose load stops at that mark.
+#[cfg(unix)]
+#[test]
+fn an_integrated_bash_under_allexport_exports_none_of_aterms_state() {
+    // The PROMPT_COMMAND trampoline as a shell started before it turned allexport off keeps it.
+    let older: &[(&str, &str)] = &[(
+        "__aterm_hook_live=1; set +axv; } 2>/dev/null\n    __aterm_in_prompt_cmd=1",
+        "__aterm_hook_live=1; set +xv; } 2>/dev/null\n    __aterm_in_prompt_cmd=1",
+    )];
+    let mut shells = ShellLanes::default();
+    for bash in shells.bashes() {
+        for flag in ["", "set -T\n"] {
+            for shape in ["current", "older", "by hand"] {
+                let case = format!("{bash} {flag:?} {shape}");
+                let fx = LiveFixture::new();
+                let dir = if shape == "older" {
+                    folder_with_edits(
+                        &fx.base,
+                        "00000000000000bc",
+                        &[("bash", scripts::BASH, older)],
+                    )
+                } else {
+                    install_script_set(&fx.base).expect("install")
+                };
+                std::fs::write(
+                    fx.home.join(".bashrc"),
+                    format!(
+                        "HISTFILE=/dev/null\n{flag}set -a\nPROMPT_COMMAND='pc_mine=1'\n{}",
+                        if shape == "by hand" {
+                            ". \"$ATERM_SHELL_INTEGRATION_DIR/aterm_shell_integration.bash\"\n"
+                        } else {
+                            ""
+                        }
+                    ),
+                )
+                .expect(".bashrc");
+                let mut sh = spawn_pty_shell(
+                    ShellType::Bash,
+                    bash,
+                    &fx,
+                    &dir,
+                    &[("ATERM_SHELL_NONCE", REKEY_OLD), ("ATERM_CHILD", "1")],
+                );
+                sh.wait_for_line_editor();
+                sh.run_line("mine=1", "0");
+                let from = sh.len();
+                let end = sh.run_line(
+                    &format!(
+                        "/bin/echo \"ours=$(/usr/bin/env | /usr/bin/grep -cE '^(BASH_FUNC_)?__aterm') \
+                         nonce=$(/usr/bin/env | /usr/bin/grep -c {REKEY_OLD}) \
+                         mine=$(/usr/bin/env | /usr/bin/grep -cE '^(pc_)?mine=') flags=[$-]\""
+                    ),
+                    "0",
+                );
+                let out = stdout_between(&sh, from, end);
+                let flags = out
+                    .rsplit("flags=[")
+                    .next()
+                    .and_then(|f| f.split(']').next());
+                assert!(
+                    flags.is_some_and(|f| f.contains('a')),
+                    "{case}: `set -a` left on: {out:?}"
+                );
+                assert_eq!(count_after(&out, "mine=", &case), 2, "{case}: {out:?}");
+                // An older trampoline's own state goes on being exported until the shell restarts.
+                if shape != "older" {
+                    assert_eq!(count_after(&out, "ours=", &case), 0, "{case}: {out:?}");
+                    assert_eq!(count_after(&out, "nonce=", &case), 0, "{case}: {out:?}");
+                }
+                if shape == "older" {
+                    folder_with_edits(&fx.base, "00000000000000bd", &[]);
+                    let pointer = fx.home.join("body-pointer");
+                    std::fs::write(&pointer, "00000000000000bd\n").expect("body pointer");
+                    sh.run_line(
+                        &format!("true; __aterm_body_pointer='{}'", pointer.display()),
+                        "0",
+                    );
+                    let at = sh.len();
+                    let stop = sh.run_line(
+                        r#"/bin/echo "rev=[$__aterm_body_rev] fns=$(/usr/bin/env | /usr/bin/grep -c '^BASH_FUNC___aterm') flags=[$-]""#,
+                        "0",
+                    );
+                    let reload = stdout_between(&sh, at, stop);
+                    assert!(
+                        reload.contains("rev=[00000000000000bd]"),
+                        "{case}: no reload: {reload:?}"
+                    );
+                    assert_eq!(count_after(&reload, "fns=", &case), 0, "{case}: {reload:?}");
+                    let flags = reload
+                        .rsplit("flags=[")
+                        .next()
+                        .and_then(|f| f.split(']').next());
+                    assert!(
+                        flags.is_some_and(|f| f.contains('a')),
+                        "{case}: after the reload: {reload:?}"
+                    );
+                }
+                if shape == "current" {
+                    let at = sh.len();
+                    let stop = sh.run_line(
+                        r#"true; ( unset -f __aterm_prompt_command; . "$ATERM_SHELL_INTEGRATION_DIR/aterm_shell_integration.bash"; /bin/echo "nested=[$-]" )"#,
+                        "0",
+                    );
+                    let nested = stdout_between(&sh, at, stop);
+                    let flags = nested
+                        .rsplit("nested=[")
+                        .next()
+                        .and_then(|f| f.split(']').next());
+                    assert!(
+                        flags.is_some_and(|f| f.contains('a')),
+                        "{case}: `set -a` past a load that stopped at the mark: {nested:?}"
+                    );
+                }
+                sh.finish();
+            }
+        }
+    }
+}
+
+/// A bash 5 in posix mode prints a `DEBUG` trap nobody set as `trap -- - DEBUG`, and that `-` is no
+/// handler to run: chained, it answered every command with `-: command not found`. A live shell an
+/// older loader left holding that `-` is cleared by the body it takes next.
+#[cfg(unix)]
+#[test]
+fn an_integrated_bash_in_posix_mode_runs_no_trap_it_was_not_given() {
+    let mut shells = ShellLanes::default();
+    for bash in shells.bashes() {
+        let fx = LiveFixture::new();
+        let dir = install_script_set(&fx.base).expect("install");
+        std::fs::write(
+            fx.home.join(".bashrc"),
+            "HISTFILE=/dev/null\nset -o posix\n",
+        )
+        .expect(".bashrc");
+        let mut sh = spawn_pty_shell(ShellType::Bash, bash, &fx, &dir, &[("ATERM_CHILD", "1")]);
+        sh.wait_for_line_editor();
+        let from = sh.len();
+        let end = sh.run_line("/bin/echo posix-ran", "0");
+        let out = stdout_between(&sh, from, end);
+        assert!(out.contains("posix-ran"), "{bash}: {out:?}");
+        assert!(!out.contains("command not found"), "{bash}: {out:?}");
+
+        let body = dir.join("aterm_shell_integration_body.bash");
+        sh.run_line(
+            &format!("__aterm_prev_debug_handler=-; . '{}'", body.display()),
+            "",
+        );
+        let from = sh.len();
+        let end = sh.run_line("/bin/echo posix-reloaded", "0");
+        let out = stdout_between(&sh, from, end);
+        assert!(out.contains("posix-reloaded"), "{bash}: {out:?}");
+        assert!(
+            !out.contains("command not found"),
+            "{bash}: the body kept the older loader's `-`: {out:?}"
+        );
+        sh.finish();
     }
 }

@@ -662,7 +662,7 @@ pub(crate) mod tests {
     /// (during the pass it ended, or after the one that finished and before the next), and the
     /// stop is sent again once it lets them go. In a live run that ends the run as the stop
     /// would have, before any row is reported, so the said line is what the person sees of the
-    /// row; the Fake records the stop sent again instead, so its row reads Failed. NEGATIVE
+    /// row; the Fake records the stop sent again instead. NEGATIVE
     /// CONTROL: with no stop both passes run to the end, nothing is said and nothing is sent
     /// again.
     #[test]
@@ -703,7 +703,9 @@ pub(crate) mod tests {
                     heard.lock().unwrap().push((line.to_owned(), sys.calls()));
                 })
             });
-            let row = run_on(&item, Mode::Apply, &sys);
+            // Exercise the item's stop boundaries directly: the setup engine also checks
+            // stops before entering an item, which would consume this scripted sequence.
+            let applied = item.apply_with_guards(&*sys, &|| Ok(()), &|| Ok(()));
             assert_eq!(*store.ended.lock().unwrap(), ended, "{stop_after:?}");
             assert_eq!(store.ran.lock().unwrap().len(), ran, "{stop_after:?}");
             let calls = sys.calls();
@@ -716,7 +718,7 @@ pub(crate) mod tests {
             let heard = heard.lock().unwrap().clone();
             match when {
                 Some(when) => {
-                    assert_eq!(row.outcome, Outcome::Failed, "{row:?}");
+                    assert!(applied.is_err(), "{applied:?}");
                     let [(line, held)] = heard.as_slice() else {
                         panic!("{stop_after:?}: one line said: {heard:?}");
                     };
@@ -732,7 +734,7 @@ pub(crate) mod tests {
                     );
                 }
                 None => {
-                    assert_eq!(row.outcome, Outcome::Changed, "{row:?}");
+                    assert!(applied.is_ok(), "{applied:?}");
                     assert!(heard.is_empty(), "{heard:?}");
                 }
             }

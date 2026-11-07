@@ -8,7 +8,7 @@ mod bash;
 mod fish;
 mod place;
 mod rows;
-pub mod stable;
+pub mod stock;
 #[cfg(test)]
 mod tests;
 
@@ -19,7 +19,7 @@ use aterm_uds::host::When;
 
 pub use place::SCRATCH_PREFIX;
 pub use rows::{Anchor, Archive, Engine, Holds, Install, MICROSOFT_TEAM, ROWS, Row, row};
-pub use stable::{CELL_TARGETS, LINUX_LANE_TARGETS, WasmClause, wasm_clause};
+pub use stock::{CELL_TARGETS, LINUX_LANE_TARGETS};
 
 /// System `curl` binary path.
 pub(crate) const CURL: &str = "/usr/bin/curl";
@@ -144,7 +144,7 @@ pub trait Host {
     fn targo(&self) -> Result<PathBuf, String>;
 
     /// The rustup the rustup row drives.
-    fn rustup(&self) -> &dyn stable::Rustup;
+    fn rustup(&self) -> &dyn stock::Rustup;
 }
 
 /// Where a run puts things on this machine, and for which host.
@@ -156,10 +156,10 @@ pub struct Machine {
     pub tooling: PathBuf,
     /// The browser lane's cache.
     pub browser: PathBuf,
-    /// The checkout, whose `publish/config.sh` names the wasm32 pin.
+    /// The checkout, whose stock pin the rustup row puts in place ([`stock::stock_pin`]).
     pub repo: PathBuf,
     /// rustup's home and how the `rustup` row is resolved (its copy looked for in `tooling`).
-    pub homes: stable::Homes,
+    pub homes: stock::Homes,
 }
 
 impl Machine {
@@ -247,13 +247,16 @@ channel and authenticate their selected bytes with held leases. Other checkout
 tools are fetched or built whole into this user's cache with pinned SHA-256 and a
 stamp.json (pwsh also requires Microsoft's Developer ID). The rustup
 row copies the pinned rustup-init in as `rustup` (its self-install never runs, and
-nothing is written to CARGO_HOME), then has that copy add stable with clippy, its cross
-targets and the wasm32 pin to rustup's own home where they are missing (auto-install
-off first in a home it never ran in). It reads the network.
+nothing is written to CARGO_HOME), then has that copy add the checkout's stock pin
+(aterm_toolchain::rustup::STOCK_PIN, the release publish/config.sh's wasm32 clause
+builds on) with clippy and every cell's std, and the release chain's stable with its
+x86_64 slice's std on a Mac, to rustup's own home where they are missing (auto-install
+off first in a home it never ran in); no dev lane rides stable. It reads the network.
 
   (no ROW)    the rows every checkout needs
   --linux     and the Linux lane's VM: lima, Ubuntu's pinned image for its own VM, and
-              stable's aarch64-unknown-linux-musl std, which its guest agent is built against
+              the stock pin's aarch64-unknown-linux-musl std, which its guest agent is built
+              against
   --release   and a release host's tools: OpenSSL 3 for source signing, and the
               standalone CPython and Lean project builder the publication engine runs on
   --check     authenticate what is present; install no payloads (signed metadata
@@ -474,7 +477,7 @@ pub fn check(row: &Row, machine: &Machine, host: &dyn Host) -> State {
 
 /// Where `row` stands on `machine` for `opts`, without payload installation.
 /// Managed rows still authenticate metadata and take temporary leases.
-/// `--linux` also holds rustup to [`stable::LINUX_LANE_TARGETS`].
+/// `--linux` also holds rustup to [`stock::LINUX_LANE_TARGETS`].
 pub fn check_for(row: &Row, opts: &Options, machine: &Machine, host: &dyn Host) -> State {
     if let Install::Managed { prerequisite, .. } = row.install {
         return managed_row(prerequisite, machine, host, false);
@@ -512,23 +515,24 @@ fn not_complete(name: &str, t: &Target) -> String {
     }
 }
 
-/// The rustup row, read only: its copy `t`, then what rustup's home lacks, read through the
-/// rustup the `rustup` row resolves (where none does, what a run reads once it is placed);
-/// `linux` holds stable to the Linux lane's targets too.
+/// The rustup row, read only: its copy `t`, then what rustup's home lacks of the stock pin and
+/// the release chain's toolchain, read through the rustup the `rustup` row resolves (where none
+/// does, what a run reads once it is placed); `linux` holds the stock pin to the Linux lane's
+/// targets too.
 fn rustup_check(t: &Target, linux: bool, machine: &Machine, host: &dyn Host) -> State {
-    let pin = match stable::wasm_pin_wanted(&machine.repo) {
+    let pin = match stock::stock_pin(&machine.repo) {
         Ok(pin) => pin,
-        Err(why) => return State::Missing(format!("rustup: the wasm32 pin — {why}")),
+        Err(refused) => return State::Missing(format!("rustup: the stock pin — {refused}")),
     };
     let mut lacks = Vec::new();
     let placed = complete(t);
     if !placed {
         lacks.push(format!("place {}", not_complete("rustup", t)));
     }
-    match stable::missing(&machine.homes, host.rustup(), pin.as_deref(), linux) {
+    match stock::missing(&machine.homes, host.rustup(), Some(&pin), linux) {
         Ok(steps) => lacks.extend(steps),
         Err(_) if !placed => lacks.push(format!(
-            "then read {} for stable and the wasm32 pin",
+            "then read {} for the stock pin and the release chain's stable",
             machine.homes.rustup_home.display()
         )),
         Err(absent) => lacks.push(absent.why),
@@ -546,7 +550,7 @@ pub fn provide(row: &Row, machine: &Machine, host: &dyn Host, say: &mut dyn FnMu
 }
 
 /// Provide `row` on `machine` for a run asked for `opts`: leave it where it is complete,
-/// else fetch or build it. `--linux` adds the Linux lane's stable targets to the rustup row.
+/// else fetch or build it. `--linux` adds the Linux lane's targets to the rustup row's stock pin.
 pub fn provide_for(
     row: &Row,
     opts: &Options,
@@ -640,8 +644,8 @@ fn managed_row(
 pub(crate) const RUSTUP_PROXIES: [&str; 2] = ["cargo", "rustc"];
 
 /// The rustup row: its copy `t` placed ([`place_rustup`]) where it is not complete, then
-/// [`stable::run`] with the rustup the `rustup` row resolves; `linux` adds the Linux lane's
-/// stable targets.
+/// [`stock::run`] with the rustup the `rustup` row resolves; `linux` adds the Linux lane's
+/// targets to the stock pin.
 fn rustup_row(
     row: &Row,
     t: &Target,
@@ -663,7 +667,7 @@ fn rustup_row(
         }
         true
     };
-    match stable::run(&machine.repo, &machine.homes, host.rustup(), linux, say) {
+    match stock::run(&machine.repo, &machine.homes, host.rustup(), linux, say) {
         Ok(acquired) if acquired.is_empty() && !placed => State::Present(exe),
         Ok(_) => State::Placed(exe),
         Err(why) => State::Failed(format!("{}: {why}", row.name)),
@@ -1015,7 +1019,7 @@ pub fn run(opts: &Options, machine: &Machine, host: &dyn Host, say: &mut dyn FnM
 /// This machine.
 pub struct System {
     repo: PathBuf,
-    rustup: stable::System,
+    rustup: stock::System,
     held: std::cell::RefCell<Vec<atpkg::prerequisite::HeldSet>>,
 }
 
@@ -1025,7 +1029,7 @@ impl System {
     pub fn new(repo: &Path) -> Self {
         Self {
             repo: repo.to_path_buf(),
-            rustup: stable::System,
+            rustup: stock::System,
             held: std::cell::RefCell::default(),
         }
     }
@@ -1142,7 +1146,7 @@ impl Host for System {
         }
     }
 
-    fn rustup(&self) -> &dyn stable::Rustup {
+    fn rustup(&self) -> &dyn stock::Rustup {
         &self.rustup
     }
 }
@@ -1177,7 +1181,7 @@ pub fn this_machine(repo: &Path) -> Option<Machine> {
     let tooling = aterm_uds::host::tooling_dir()?;
     Some(Machine {
         platform: platform_of(std::env::consts::OS, std::env::consts::ARCH, translated()),
-        homes: stable::Homes::from_env(&home, &tooling),
+        homes: stock::Homes::from_env(&home, &tooling),
         tooling,
         browser: crate::browser::chromium::host_cache_root()?,
         repo: repo.to_path_buf(),

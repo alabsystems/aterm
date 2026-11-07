@@ -79,18 +79,33 @@ pub(crate) fn curl_command(args: &[&str], url: &str) -> Command {
 #[cfg_attr(trust_verify, trust::skip)]
 fn curl_fetch(args: &[&str], url: &str) -> Result<std::process::Output, String> {
     use aterm_uds::spawnfd::Stdio;
-    curl_command(args, url)
-        .stdout(Stdio::piped())
+    let mut cmd = curl_command(args, url);
+    cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("spawn curl: {e}"))
+        .stdin(Stdio::null());
+    crate::run_operation_command(&mut cmd).map_err(|e| format!("spawn curl: {e}"))
 }
 
-/// How often [`curl_fetch_until`] looks at its stop flag.
-const STOP_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+/// [`curl_fetch`] that retires its owned child when either source or operation stops.
+#[cfg(unix)]
+#[cfg_attr(trust_verify, trust::skip)]
+fn curl_fetch_until(
+    args: &[&str],
+    url: &str,
+    stop: &std::sync::atomic::AtomicBool,
+) -> Result<std::process::Output, String> {
+    use aterm_uds::spawnfd::Stdio;
+    let mut cmd = curl_command(args, url);
+    cmd.stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null());
+    crate::operation::run_command_until(&mut cmd, || {
+        stop.load(std::sync::atomic::Ordering::Acquire)
+    })
+    .map_err(|e| format!("curl stopped or failed: {e}"))
+}
 
-/// [`curl_fetch`] that ends the child as soon as `stop` is set, looking every [`STOP_POLL`].
+#[cfg(not(unix))]
 #[cfg_attr(trust_verify, trust::skip)]
 fn curl_fetch_until(
     args: &[&str],
@@ -125,7 +140,7 @@ fn curl_fetch_until(
                 let _ = child.kill();
                 break child.wait().map_err(|e| format!("wait for curl: {e}"))?;
             }
-            Ok(None) => std::thread::sleep(STOP_POLL),
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
             Err(e) => return Err(format!("wait for curl: {e}")),
         }
     };
@@ -916,12 +931,18 @@ fn download_to_resumable_with_stop(
             download_resume_args_https_only(&cap, &max_time, part_s, offset, stall)
         };
         let attempt_began = std::time::Instant::now();
-        let out = match stop {
+        let attempt = match stop {
             _ if lane == ResumeLane::VendorDirect => vendor_fetch(&args, asset_url),
             Some(stop) => curl_fetch_until(&args, asset_url, stop),
             None => curl_fetch(&args, asset_url),
-        }
-        .map_err(HttpError::Transport)?;
+        };
+        let out = match attempt {
+            Err(_) if stop.is_some_and(|stop| stop.load(std::sync::atomic::Ordering::Acquire)) => {
+                clear_sink(&part, sink);
+                return Err(HttpError::Transport(DOWNLOAD_STOPPED.to_string()));
+            }
+            result => result.map_err(HttpError::Transport)?,
+        };
         if !out.status.success()
             && stop.is_some_and(|stop| stop.load(std::sync::atomic::Ordering::Acquire))
         {
@@ -1412,12 +1433,11 @@ fn vendor_command(args: &[&str], url: &str) -> Command {
 #[cfg_attr(trust_verify, trust::skip)]
 fn vendor_fetch(args: &[&str], url: &str) -> Result<std::process::Output, String> {
     use aterm_uds::spawnfd::Stdio;
-    vendor_command(args, url)
-        .stdin(Stdio::null())
+    let mut cmd = vendor_command(args, url);
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| format!("spawn curl: {e}"))
+        .stderr(Stdio::piped());
+    crate::run_operation_command(&mut cmd).map_err(|e| format!("spawn curl: {e}"))
 }
 
 /// A fresh private directory for one vendor request's body and header dump, removed on

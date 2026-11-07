@@ -412,7 +412,7 @@ pub fn seal_batch(
             })
         }
         Signing::Terminal => sys
-            .run_tty(&cmd)
+            .run_tty(&cmd, &mut || Ok(()))
             .map_err(|e| e.to_string())
             .and_then(|s| match s {
                 Some(0) => Ok(()),

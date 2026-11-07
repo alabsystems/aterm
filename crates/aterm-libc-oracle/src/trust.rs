@@ -171,7 +171,7 @@ impl Stock {
     }
 }
 
-/// Locates the rustup toolchain `name` (`stable` or `<name>-<host>`).
+/// Locates the rustup toolchain `name` (`name` itself, a linked toolchain, or `<name>-<host>`).
 /// # Errors
 /// When rustup holds no such toolchain.
 pub fn stock(name: &str, host: &str) -> Result<Stock, CouldNotRun> {
@@ -201,7 +201,12 @@ pub fn stock(name: &str, host: &str) -> Result<Stock, CouldNotRun> {
                     "no rustup toolchain `{name}` under {} for the cells this box is not native to",
                     toolchains.display()
                 ),
-                format!("rustup toolchain install {name}, or name another with --stock"),
+                if name == aterm_toolchain::rustup::STOCK_PIN {
+                    "targo --unverified verify provision rustup, or name another with --stock"
+                        .to_string()
+                } else {
+                    format!("rustup toolchain install {name}, or name another with --stock")
+                },
             )
         })
 }

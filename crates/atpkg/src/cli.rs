@@ -619,6 +619,23 @@ pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
     let lane = LaneFlags::take(&mut args);
+    #[cfg(unix)]
+    let _cancellation = if lane.cancel_stdin {
+        match aterm_update_core::OperationCancellation::from_stdin() {
+            Ok(scope) => Some(scope),
+            Err(error) => {
+                eprintln!("atpkg: cancellation pipe: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+    #[cfg(not(unix))]
+    if lane.cancel_stdin {
+        eprintln!("atpkg: cooperative cancellation is unavailable on this platform");
+        return ExitCode::FAILURE;
+    }
     if let Some(path) = lane.progress_file {
         let _ = PROGRESS_FILE.set(path);
     }
@@ -714,7 +731,7 @@ pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
     let mut machine_edit = machine_edit_for_request(
         &args,
         install_request.as_ref(),
-        under_private_state_root(),
+        under_private_state_root() || lane.cancel_stdin,
         machine_table_changed,
         MachineEdit::start,
     );
@@ -723,7 +740,7 @@ pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
         .as_ref()
         .filter(|request| request.whole())
         .and_then(|_| WholePreparation::start());
-    let mut store_lock = if verb.is_some_and(verb_mutates_store) {
+    let store_lock = if verb.is_some_and(verb_mutates_store) {
         match mutator_store_lock(link_request.as_ref().and_then(|r| r.if_prefix)) {
             Ok(guard) => guard,
             Err(code) => {
@@ -753,6 +770,14 @@ pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
     } else {
         None
     };
+    let mut store_lock = StoreOperation::new(
+        store_lock,
+        #[cfg(unix)]
+        _cancellation,
+    );
+    if aterm_update_core::operation_cancelled() {
+        return ExitCode::FAILURE;
+    }
     if let Some(request) = link_request.as_ref().filter(|r| r.if_checkout.is_some()) {
         let Some(guard) = store_lock.as_mut() else {
             eprintln!("atpkg: conditional link requires a configured package store");
@@ -789,10 +814,20 @@ pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
         roll_forward_interrupted_activations(&layout, || cached_index(&layout));
     }
     let _meter = pass_layout.and_then(|layout| typed_pass_meter(verb.unwrap_or_default(), &layout));
-    let code = match (install_request, update_request) {
-        (Some(request), _) => cmd_install_request(request),
-        (None, Some(request)) => request.run(prepared_update),
-        (None, None) => run_verb(verb, &args),
+    let code = if aterm_update_core::operation_cancelled() {
+        ExitCode::FAILURE
+    } else {
+        match (install_request, update_request) {
+            (Some(request), _) => cmd_install_request(request),
+            (None, Some(request)) => request.run(prepared_update),
+            (None, None) => run_verb(verb, &args),
+        }
+    };
+    let code = if aterm_update_core::operation_cancelled() {
+        eprintln!("atpkg: package operation cancelled");
+        ExitCode::FAILURE
+    } else {
+        code
     };
     #[cfg(target_os = "macos")]
     if let Some((layout, before)) = agents_before {
@@ -802,6 +837,40 @@ pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
         record.end(exit_code_u8(code));
     }
     code
+}
+
+/// Keep the writer lock until cooperative helper retirement is complete on every return path.
+pub(crate) struct StoreOperation {
+    lock: Option<crate::lock::StoreLock>,
+    #[cfg(unix)]
+    cancellation: Option<aterm_update_core::OperationCancellation>,
+}
+
+impl StoreOperation {
+    pub(crate) fn new(
+        lock: Option<crate::lock::StoreLock>,
+        #[cfg(unix)] cancellation: Option<aterm_update_core::OperationCancellation>,
+    ) -> Self {
+        Self {
+            lock,
+            #[cfg(unix)]
+            cancellation,
+        }
+    }
+
+    fn as_ref(&self) -> Option<&crate::lock::StoreLock> {
+        self.lock.as_ref()
+    }
+    fn as_mut(&mut self) -> Option<&mut crate::lock::StoreLock> {
+        self.lock.as_mut()
+    }
+}
+
+impl Drop for StoreOperation {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        self.cancellation.take();
+    }
 }
 
 fn run_verb(verb: Option<&str>, args: &[String]) -> ExitCode {
@@ -1189,6 +1258,7 @@ struct LaneFlags {
     no_init: bool,
     published_index_hint: Option<u64>,
     defer_busy_flip: bool,
+    cancel_stdin: bool,
 }
 
 impl LaneFlags {
@@ -1205,6 +1275,9 @@ impl LaneFlags {
         lane.head_watch = take_flag(args, HEAD_WATCH_FLAG);
         lane.wait_lock = take_wait_lock_flag(args);
         lane.no_init = take_flag(args, NO_INIT_FLAG);
+        lane.cancel_stdin = args.first().is_some_and(|verb| verb == "install")
+            && take_flag(args, CANCEL_STDIN_FLAG);
+        lane.no_init |= lane.cancel_stdin;
         if args.first().is_some_and(|verb| verb == "update") {
             lane.published_index_hint = take_published_index_hint_flag(args);
             lane.defer_busy_flip = take_flag(args, DEFER_BUSY_FLIP_FLAG);
@@ -1711,6 +1784,10 @@ mod stand_down_after_wait_tests {
 
 /// The environment variable a spawner sets beside `--wait-lock` to its own pid, so the waiter's "my window is gone" compares against a fact.
 pub const SPAWNER_PID_ENV: &str = "ATPKG_SPAWNER_PID";
+
+/// Private owner-held pipe on stdin; EOF requests cooperative package cancellation.
+/// This dedicated install applies no unrelated machine plan or trailing setup pass.
+pub const CANCEL_STDIN_FLAG: &str = "--cancel-stdin";
 
 /// The [`SPAWNER_PID_ENV`] value of a pass detached on purpose.
 pub const SPAWNER_DETACHED: &str = "detached";
@@ -3032,7 +3109,7 @@ fn mutator_store_lock(
             },
             || {
                 WAITED_FOR_LOCK.store(true, std::sync::atomic::Ordering::Relaxed);
-                !parent_is_gone()
+                !parent_is_gone() && !aterm_update_core::operation_cancelled()
             },
         ),
         None if person => crate::lock::lock_store_waiting(
@@ -3045,7 +3122,7 @@ fn mutator_store_lock(
                 }
                 *spinner.borrow_mut() = shown;
             },
-            || true,
+            || !aterm_update_core::operation_cancelled(),
         ),
         None => crate::lock::try_lock_store(&layout),
     };
@@ -7923,6 +8000,7 @@ fn do_install_with_index(
     pre_resolved: Option<crate::TrustedIndex>,
     seams: &PassSeams<'_>,
 ) -> Result<crate::InstallReport, crate::FlowError> {
+    aterm_update_core::check_operation().map_err(|e| crate::FlowError::Download(e.to_string()))?;
     let before = crate::active_builds(layout);
     let installed = before.get(program).copied();
     let floor = build_floor(layout);
@@ -7982,6 +8060,11 @@ fn do_install_with_index(
         ),
     };
     drop(pass);
+    if aterm_update_core::operation_cancelled() {
+        return Err(crate::FlowError::Download(
+            "package operation cancelled".into(),
+        ));
+    }
     match &result {
         Ok(r) if r.vendor.is_some() => {}
         Ok(r) => {
@@ -8002,7 +8085,7 @@ fn do_install_with_index(
                 },
                 outcome,
             );
-            if !r.already_current {
+            if !r.already_current && !aterm_update_core::operation_active() {
                 warm_alab_landed(layout, &before, seams.warm_agents);
                 let channel = last_verified_channel(layout);
                 let _ = crate::gc::run_keeping_pinned_partials(layout, channel.as_ref(), &|p| {
@@ -8024,7 +8107,7 @@ fn do_install_with_index(
     // Outside the typed pass, as an index-owned landing's sweep and hooks are above: they write no
     // progress and have no bound of their own, which aterm-gui's
     // `harness_host::INSTALL_QUIET_LIMIT` allows only past the pass's end.
-    if let Some(door_pass) = door_pass {
+    if let Some(door_pass) = door_pass.filter(|_| !aterm_update_core::operation_active()) {
         let _ = settle_vendor_pass(layout, &door_pass, seams);
     }
     result
@@ -8070,9 +8153,14 @@ fn install_vendor_door(
             | crate::vendor_direct::lane::Verdict::Tombstoned { .. }
             | crate::vendor_direct::lane::Verdict::AlabTombstoned { .. }
     );
+    if aterm_update_core::operation_cancelled() {
+        return (outcome.into_install(layout), pass);
+    }
     record_vendor_status(layout, &outcome, now);
     note_landed(&mut pass, &outcome);
-    warm_landed(layout, &mut pass, seams);
+    if !aterm_update_core::operation_active() {
+        warm_landed(layout, &mut pass, seams);
+    }
     (outcome.into_install(layout), pass)
 }
 
@@ -8495,8 +8583,10 @@ fn cmd_install_with_index(
                     crate::flow::DepResult::AlreadyPresent(_) => {}
                 }
             }
-            reassert_rustup_seam(layout);
-            let _ = reconcile_exec_roots(layout, crate::seam::Depth::Shallow);
+            if !aterm_update_core::operation_active() {
+                reassert_rustup_seam(layout);
+                let _ = reconcile_exec_roots(layout, crate::seam::Depth::Shallow);
+            }
             ExitCode::SUCCESS
         }
         Err(crate::FlowError::Linked(p)) => {

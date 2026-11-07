@@ -2040,7 +2040,10 @@ fn run_install(
                 "sudo asks for {}'s password on {}:",
                 req.user, req.address
             );
-            return match sys.run_tty(&remote_sh(master, &install_command(install, sudo), true)) {
+            return match sys.run_tty(
+                &remote_sh(master, &install_command(install, sudo), true),
+                &mut || Ok(()),
+            ) {
                 Ok(Some(0)) => Ok(()),
                 Ok(code) => Err(format!(
                     "the install command line failed (status {code:?}); {left}"

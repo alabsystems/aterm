@@ -138,7 +138,7 @@ impl Install {
 }
 
 /// What the tab's program gives `aterm`: the install item alone, with its one password prompt.
-pub(crate) const ARGS: [&str; 3] = ["init", "--only", "base.clt"];
+pub(crate) const ARGS: [&str; 3] = aterm_types::macos_setup::COMMAND_LINE_TOOLS_ARGS;
 
 /// The tab's fixed title, which the page names ([`crate::system_state::TOOLS_PASSWORD_HEADLINE`]).
 pub(crate) const TAB_TITLE: &str = "Mac Setup";

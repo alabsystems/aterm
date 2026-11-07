@@ -234,7 +234,7 @@ fn make_key(sys: &dyn System, path: &Path, comment: &str, asked: bool) -> Result
             .arg(path.as_os_str())
     };
     if asked {
-        return match sys.run_tty(&keygen(&["-t", "ed25519"])) {
+        return match sys.run_tty(&keygen(&["-t", "ed25519"]), &mut || Ok(())) {
             Ok(Some(0)) => require_passphrase(sys, path),
             Ok(code) => Err(format!("did not make the key (status {code:?})")),
             Err(e) => Err(e.to_string()),
@@ -252,6 +252,7 @@ fn add_passphrase(sys: &dyn System, path: &Path) -> Result<(), String> {
         &Cmd::new("/usr/bin/ssh-keygen")
             .args(["-p", "-f"])
             .arg(path.as_os_str()),
+        &mut || Ok(()),
     ) {
         Ok(Some(0)) => require_passphrase(sys, path),
         Ok(code) => Err(format!("did not change the passphrase (status {code:?})")),
@@ -2978,10 +2979,10 @@ fn person_signing<'a>(env: &Env<'a>) -> Result<(Signing, Option<AgentKey<'a>>), 
         "The signing key goes into ssh-agent for this walk (removed when it ends, or after an \
          hour if the walk is interrupted); ssh-add asks its passphrase:"
     );
-    match env
-        .sys
-        .run_tty(&ssh_add(&sock, &["-t", AGENT_KEY_LIFETIME]).arg(key.as_os_str()))
-    {
+    match env.sys.run_tty(
+        &ssh_add(&sock, &["-t", AGENT_KEY_LIFETIME]).arg(key.as_os_str()),
+        &mut || Ok(()),
+    ) {
         Ok(Some(0)) => Ok((
             Signing::Agent,
             Some(AgentKey {

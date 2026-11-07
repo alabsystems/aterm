@@ -4515,7 +4515,12 @@ impl App {
                 return self.press_claude_glass_hit(wid, session, url, at);
             }
             // A cell a rewritten row vacated takes the press: nothing of Claude's is under it.
-            return self.glass_swallows_at(wid, x, y);
+            let swallowed = self.glass_swallows_at(wid, x, y);
+            if swallowed && self.inline_rename_edit(wid).is_some() {
+                self.clear_strip_press(wid);
+                self.settle_rename_edit(wid);
+            }
+            return swallowed;
         };
         let secondary = cfg!(target_os = "macos")
             && self
@@ -4531,13 +4536,23 @@ impl App {
             }
             // A secondary click (control-click on macOS) is a right-click: on the switch or the
             // ⬆️ it turns nothing and asks for no move, as a right-click there does.
-            GlassAt::Switch(_) | GlassAt::Upgrade if secondary => true,
+            GlassAt::Switch(_) | GlassAt::Upgrade if secondary => {
+                if self.inline_rename_edit(wid).is_some() {
+                    self.clear_strip_press(wid);
+                    self.settle_rename_edit(wid);
+                }
+                true
+            }
             GlassAt::Switch(face) => {
                 self.press_switch_as_clicked(wid, session, face, at);
                 true
             }
             GlassAt::Upgrade => self.press_upgrade_arrow(wid, session),
             GlassAt::Fact(..) if secondary => {
+                if self.inline_rename_edit(wid).is_some() {
+                    self.clear_strip_press(wid);
+                    self.settle_rename_edit(wid);
+                }
                 self.open_fact_menu_at(wid, x, y);
                 true
             }
@@ -4546,7 +4561,13 @@ impl App {
             }
             // The label is hover only: its press, and its release, go nowhere. The lockup's is the
             // pane's, as before the rule wore one.
-            GlassAt::Label => true,
+            GlassAt::Label => {
+                if self.inline_rename_edit(wid).is_some() {
+                    self.clear_strip_press(wid);
+                    self.settle_rename_edit(wid);
+                }
+                true
+            }
             GlassAt::Mark => false,
         }
     }
@@ -8516,6 +8537,14 @@ mod gesture_tests {
             Some(Autopilot::Land),
             "the click still steps the word"
         );
+        app.pool
+            .get(session)
+            .expect("session")
+            .ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .set_program(PGID, Some("claude".into()));
         frame(&mut app, wid);
         rename(&mut app, "gap");
         let light = hit(&app, wid, MODE);
@@ -8525,6 +8554,39 @@ mod gesture_tests {
         app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
         assert!(app.inline_rename_edit(wid).is_none(), "the blank: closed");
         assert_eq!(pinned(&app).as_deref(), Some("gap"));
+        let b = &app.windows[&wid].claude_lights.border_toggles[0];
+        let label = (b.frame_row, b.label.as_ref().expect("top label").start);
+        rename(&mut app, "label");
+        let (x, y) = px_of(&app, wid, label);
+        app.on_cursor_moved(wid, x, y);
+        app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
+        app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
+        assert!(app.inline_rename_edit(wid).is_none(), "the label: closed");
+        assert_eq!(pinned(&app).as_deref(), Some("label"));
+        let ctx = app.pool.get(session).expect("session").ctx.clone();
+        crate::session_timeline::claim_supervisor(
+            &ctx,
+            &crate::harness_host::holder(),
+            None,
+            None,
+            crate::metrics::now_us(),
+        )
+        .expect("the claim");
+        frame(&mut app, wid);
+        rename(&mut app, "swallowed");
+        let (x, y) = px_of(&app, wid, (light.0 + 1, 20));
+        assert!(
+            app.glass_swallows_at(wid, x, y),
+            "control: vacated mode-row cell is swallowed"
+        );
+        app.on_cursor_moved(wid, x, y);
+        app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
+        app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
+        assert!(
+            app.inline_rename_edit(wid).is_none(),
+            "the vacated mode row: closed"
+        );
+        assert_eq!(pinned(&app).as_deref(), Some("swallowed"));
         assert!(
             pty(&mut reader, 0).is_empty(),
             "nothing reached the program"

@@ -3754,14 +3754,14 @@ pub fn export_outcome(
     )
 }
 
-/// The wasm32 clause of `publish/config.sh`'s `CHECK_CMD_DEFAULT` and the stock channel it names: one reader, aterm-verify's, whose `verify provision` acquires the pin.
-pub use aterm_verify::rustup::WasmClause;
+/// The wasm32 clause of `publish/config.sh`'s `CHECK_CMD_DEFAULT` and the stock channel it names: one reader, aterm-toolchain's (`aterm_toolchain::rustup::wasm_clause`), which also holds the checkout's stock pin to that channel for the dev lanes and the `verify provision` that acquires it.
+pub use aterm_toolchain::rustup::WasmClause;
 
-/// Read the wasm32 clause out of `config` (the engine's own line shape, `CHECK_CMD_DEFAULT="…"`), with every refusal the stage would meet for it (`aterm_verify::rustup::wasm_clause`, as a release refusal).
+/// Read the wasm32 clause out of `config` (the engine's own line shape, `CHECK_CMD_DEFAULT="…"`), with every refusal the stage would meet for it (`aterm_toolchain::rustup::wasm_clause`, as a release refusal).
 /// # Errors
 /// No clause; no stock channel; no target-add before it; no `RUSTC` naming the pin's own rustc.
 pub fn wasm_clause(config: &str) -> Result<WasmClause, Refusal> {
-    aterm_verify::rustup::wasm_clause(config).map_err(|e| Refusal::new(e.why, e.remedy))
+    aterm_toolchain::rustup::wasm_clause(config).map_err(|e| Refusal::new(e.why, e.remedy))
 }
 
 fn source_attestation_findings(release: &aterm_json::Value) -> Vec<String> {
@@ -4367,32 +4367,17 @@ impl Backend for Real {
     }
 
     fn fetch(&mut self) -> Result<String, Refusal> {
-        let fetched = self.remote_git(&["fetch", "-q", "origin", "main"]);
-        if !fetched.as_ref().is_ok_and(|o| o.status.success()) {
-            return Err(Refusal::new(
-                "cannot fetch origin — there are no offline releases (the bump, the stage and \
-                 the claim are pushes)",
-                "check the network and your git credentials",
-            ));
-        }
-        let tags = self.remote_git(&["ls-remote", "--tags", "origin"]);
-        match tags {
-            Ok(out) if out.status.success() => {
-                self.origin_tags = String::from_utf8_lossy(&out.stdout).into_owned();
-            }
-            _ => {
-                return Err(Refusal::new(
-                    "cannot list origin's tags",
-                    "check the network and your git credentials",
-                ));
-            }
-        }
-        self.git_out(&["rev-parse", "origin/main"]).ok_or_else(|| {
-            Refusal::new(
-                "origin/main does not resolve",
-                "git fetch origin main by hand",
-            )
-        })
+        let origin = crate::github_remote::Remote::origin(&self.repo)
+            .and_then(|remote| remote.fetch_origin())
+            .map_err(|why| {
+                Refusal::new(
+                    "cannot refresh origin through agh",
+                    "check the reported native routing or source-state refusal, then re-run",
+                )
+                .detail([why])
+            })?;
+        self.origin_tags = origin.tags;
+        Ok(origin.main)
     }
 
     fn head(&mut self) -> String {
@@ -4441,28 +4426,7 @@ impl Backend for Real {
     }
 
     fn origin_tag_now(&mut self, tag: &str) -> Result<Option<String>, String> {
-        let want = format!("refs/tags/{tag}");
-        let out = self
-            .remote_git(&["ls-remote", "--tags", "origin", &want])
-            .map_err(|e| e.to_string())?;
-        if !out.status.success() {
-            return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
-        }
-        let text = String::from_utf8_lossy(&out.stdout).into_owned();
-        let peeled = format!("{want}^{{}}");
-        let mut plain = None;
-        for line in text.lines() {
-            let Some((sha, name)) = line.split_once('\t') else {
-                continue;
-            };
-            if name == peeled {
-                return Ok(Some(sha.to_string()));
-            }
-            if name == want {
-                plain = Some(sha.to_string());
-            }
-        }
-        Ok(plain)
+        crate::github_remote::Remote::origin(&self.repo)?.tag(tag)
     }
 
     fn local_tag(&mut self, tag: &str) -> bool {

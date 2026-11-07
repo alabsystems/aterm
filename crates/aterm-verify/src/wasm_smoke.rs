@@ -3,7 +3,8 @@
 
 //! Web module host boundary checks ([`crate::wasm_page`], [`crate::perf::wasm::replay`]).
 //!
-//! STOCK EXCEPTION: Trust has no wasm32 std, so the build rides rustup's `stable`.
+//! STOCK EXCEPTION: Trust has no wasm32 std, so the build rides the checkout's stock pin
+//! ([`crate::rustup::stock_pin`]).
 
 use std::path::{Path, PathBuf};
 
@@ -14,6 +15,7 @@ use crate::exec::{self, Cmd};
 use crate::ladder::Report;
 use crate::perf::Status;
 use crate::plan::Lane;
+use crate::rustup::Toolchain;
 use crate::stages::lane_jobs;
 use crate::wasm_page::{self, Browser, Page, Refused};
 
@@ -24,31 +26,25 @@ pub(crate) fn build_dir(ctx: &Ctx) -> PathBuf {
     crate::plan::cells_dir(ctx).join("wasm-smoke")
 }
 
-/// Both web modules built in the DEV profile for wasm32 on rustup's stable, into [`build_dir`]:
-/// the directory the `.wasm` files land in, or `None` once a refusal is recorded on `r`.
+/// Both web modules built in the DEV profile for wasm32 on the stock pin `toolchain`, into
+/// [`build_dir`]: the directory the `.wasm` files land in, or `None` once a refusal is recorded
+/// on `r`.
 pub(crate) fn build_dev(
     ctx: &Ctx,
     r: &mut Report,
-    rustup: &Path,
+    toolchain: &Toolchain,
     check: &str,
     label: &str,
 ) -> Option<PathBuf> {
-    let stable = match crate::rustup::Toolchain::resolve(rustup, "stable") {
-        Ok(tc) => tc,
-        Err(why) => {
-            r.cannot_run(format!("{label} — {why}"));
-            return None;
-        }
-    };
     let target_dir = build_dir(ctx);
     let cwd = ctx.scratch.join(check);
     if let Err(e) = std::fs::create_dir_all(&cwd) {
         r.cannot_run(format!("{label} — could not create {}: {e}", cwd.display()));
         return None;
     }
-    let mut build = Cmd::new(&stable.cargo)
-        .env("RUSTC", &stable.rustc)
-        .env("RUSTUP_TOOLCHAIN", &stable.name)
+    let mut build = Cmd::new(&toolchain.cargo)
+        .env("RUSTC", &toolchain.rustc)
+        .env("RUSTUP_TOOLCHAIN", &toolchain.name)
         .env("CARGO_TARGET_DIR", &target_dir)
         .args([
             "build",
@@ -69,14 +65,17 @@ pub(crate) fn build_dev(
     if let Some(jobs) = lane_jobs(Lane::CellsTarget, ctx.build_jobs_ceiling()) {
         build = build.env("CARGO_BUILD_JOBS", jobs.to_string());
     }
-    if let Some((var, value)) = stable.loader_env() {
+    if let Some((var, value)) = toolchain.loader_env() {
         build = build.env(var, value);
     }
     let built = exec::run(&build, ctx.exec_env());
     if !built.ok {
         r.fail_child(
             &built,
-            format!("{check} build (aterm-wasm + aterm-gpu-web, wasm32 dev, on stable)"),
+            format!(
+                "{check} build (aterm-wasm + aterm-gpu-web, wasm32 dev, on {})",
+                toolchain.name
+            ),
         );
         r.raw(built.output.as_str());
         return None;
@@ -92,8 +91,8 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
             return could_not_run(r, &why);
         }
     };
-    let rustup = match crate::perf::wasm::build_tools(false) {
-        Ok(rustup) => rustup,
+    let toolchain = match crate::perf::wasm::build_tools(&ctx.root, false) {
+        Ok(toolchain) => toolchain,
         Err(refused) => {
             match refused.status {
                 Status::CouldNotRun { why, fix } => {
@@ -109,7 +108,7 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
             return;
         }
     };
-    let Some(modules) = build_dev(ctx, r, &rustup, "wasm-smoke", LABEL) else {
+    let Some(modules) = build_dev(ctx, r, &toolchain, "wasm-smoke", LABEL) else {
         return;
     };
     let site = build_dir(ctx).join("bound");

@@ -146,7 +146,7 @@ pub const CHECKS: [Spec; 19] = [
         stages: &[StageId::ForeignCells],
         reach: Reach::TreeOrPackages,
         needs: &["rustup"],
-        also: "stable's foreign stds and clippy",
+        also: "the checkout's stock pin with its foreign stds and clippy",
         runs: "every forge cell but this machine's own (or each --cell), its whole graph linted for its \
                own triple (-p: those crates alone); with a Windows cell and no -p or pulled selection \
                ruling them out, both windows-sys oracles (aterm-win32-oracle's oracle and oracle-052) \
@@ -158,7 +158,7 @@ pub const CHECKS: [Spec; 19] = [
         stages: &[StageId::WasmSmoke],
         reach: Reach::WholeTree,
         needs: &["chrome-headless-shell", "rustup"],
-        also: "stable's wasm32",
+        also: "the stock pin's wasm32 std",
         runs: "both web modules (dev) in headless Chromium: their host boundary, then the CPU \
                replay; with test when aterm-wasm, aterm-gpu-web or aterm-wasm-abi is selected \
                (STOCK EXCEPTION)",
@@ -169,7 +169,7 @@ pub const CHECKS: [Spec; 19] = [
         stages: &[StageId::WasmGlue],
         reach: Reach::WholeTree,
         needs: &["chrome-headless-shell", "rustup"],
-        also: "stable's wasm32",
+        also: "the stock pin's wasm32 std",
         runs: "`verify glue` on aterm-wasm-abi's toy: goldens, its driver in headless Chromium, a planted bug (STOCK EXCEPTION)",
     },
     Spec {
@@ -178,7 +178,7 @@ pub const CHECKS: [Spec; 19] = [
         stages: &[StageId::BrowserLane],
         reach: Reach::WholeTree,
         needs: &["chrome-headless-shell", "firefox", "rustup"],
-        also: "stable's wasm32; on macOS and Linux arm64 Playwright's WebKit (`verify provision`), whose rows keep windows on macOS, and on macOS the system Safari, whose `safaridriver` an administrator enables once (`sudo safaridriver --enable`)",
+        also: "the stock pin's wasm32 std; on macOS and Linux arm64 Playwright's WebKit (`verify provision`), whose rows keep windows on macOS, and on macOS the system Safari, whose `safaridriver` an administrator enables once (`sudo safaridriver --enable`)",
         runs: "both web modules (dev) in headless Chromium, WebGL2 on ANGLE Metal (macOS) and SwiftShader, in headless Firefox, in Playwright's WebKit (on macOS it keeps a window: a named skip under --no-windows; on Linux, WPE, headless), and on macOS in the system Safari over safaridriver (its window takes the desk: it holds the quiet machine, and is a named skip under --no-windows); the GPU module on the page and in a worker (init_offscreen): a WebGL2 boot, GPU vs CPU pixels, GPU vs the recorded wgpu-WebGL frames (STOCK EXCEPTION)",
     },
     Spec {
@@ -843,7 +843,7 @@ mod tests {
         assert_eq!(
             with_pulled(&RELEASE, true, |_| true),
             RELEASE,
-            "release runs its set: a stable wasm32 std is no release prerequisite"
+            "release runs its set: the stock pin's wasm32 std is no release prerequisite"
         );
     }
 }
