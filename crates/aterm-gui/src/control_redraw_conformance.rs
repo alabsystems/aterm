@@ -133,7 +133,6 @@ pub(super) fn registered_session(local_id: u64, term: &Arc<Mutex<Terminal>>) -> 
         screen_moves: Default::default(),
         job_feed: Default::default(),
         ran: Default::default(),
-        box_banner: Default::default(),
         update_parked: Default::default(),
         watchers: observed.watchers,
         frame: Default::default(),

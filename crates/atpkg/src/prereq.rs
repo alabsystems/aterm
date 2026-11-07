@@ -280,7 +280,7 @@ pub fn probe_cached(path_var: Option<&OsStr>, host: &CcHost, cache: Option<&CcCa
 /// the Command Line Tools receipt's time, the SDK a build would fall back to and the `PATH`
 /// the build sees. `None` when the compiler cannot be read or an explicit SDK is used:
 /// changes within that SDK have no Apple install receipt to retire a cached success.
-/// The executable-output policy domain retires verdicts made by the weaker output check.
+/// The fresh-output policy domain retires verdicts made by weaker output checks.
 fn cc_key(
     located: &Located,
     path_var: Option<&OsStr>,
@@ -316,7 +316,7 @@ fn cc_key(
             .unwrap_or_default()
     }
     crate::probe_cache::key([
-        Some("executable-link-v1".to_owned()),
+        Some("fresh-executable-link-v1".to_owned()),
         Some(kind.to_owned()),
         crate::probe_cache::identity(cc),
         Some(developer_dir.display().to_string()),
@@ -442,8 +442,9 @@ fn holds_clang(developer: &Path) -> bool {
 const PROBE_SOURCE: &str = "#include <stdio.h>\nint main(void) { return 0; }\n";
 
 /// Make `cc` compile and link [`PROBE_SOURCE`] in a private directory under
-/// `host.tmp_root`, within `host.bound`: `Ready { driver: resolved }` only when it exits 0
-/// and wrote a non-empty executable program, which is never run. The directory is always removed.
+/// `host.tmp_root`, each attempt within `host.bound`: `Ready { driver: resolved }` only when it exits 0
+/// and wrote a non-empty executable program into this attempt's fresh output namespace.
+/// The program is never run. Its private directory's guard attempts cleanup on return.
 fn build_probe(cc: &Path, resolved: PathBuf, path_var: Option<&OsStr>, host: &CcHost) -> CcVerdict {
     let scratch = match aterm_tempfile::Builder::new()
         .prefix("atpkg-cc-")
@@ -461,9 +462,20 @@ fn build_probe(cc: &Path, resolved: PathBuf, path_var: Option<&OsStr>, host: &Cc
             };
         }
     };
-    let dir = scratch.path();
+    build_probe_in(cc, resolved, path_var, host, scratch.path())
+}
+
+/// Compile inside the caller's fresh private directory; a retry creates its own exclusive
+/// output directory instead of depending on removal of a failed attempt's artifact.
+fn build_probe_in(
+    cc: &Path,
+    resolved: PathBuf,
+    path_var: Option<&OsStr>,
+    host: &CcHost,
+    dir: &Path,
+) -> CcVerdict {
     let source = dir.join("probe.c");
-    let program = dir.join("probe.out");
+    let mut program = dir.join("probe.out");
     let write_source = || -> std::io::Result<()> {
         use std::io::Write as _;
         let mut opts = std::fs::OpenOptions::new();
@@ -482,9 +494,9 @@ fn build_probe(cc: &Path, resolved: PathBuf, path_var: Option<&OsStr>, host: &Cc
             why: format!("could not write {}: {error}", source.display()),
         };
     }
-    let run_cc = |sdkroot: Option<&Path>| {
+    let run_cc = |sdkroot: Option<&Path>, program: &Path| {
         let mut cmd = aterm_uds::spawnfd::command(cc);
-        cmd.arg("-o").arg(&program).arg(&source).current_dir(dir);
+        cmd.arg("-o").arg(program).arg(&source).current_dir(dir);
         cmd.env_remove("DEVELOPER_DIR").env_remove("SDKROOT");
         if let Some(developer) = host.developer_override() {
             cmd.env("DEVELOPER_DIR", developer);
@@ -497,7 +509,7 @@ fn build_probe(cc: &Path, resolved: PathBuf, path_var: Option<&OsStr>, host: &Cc
         }
         crate::doctor::output_bounded_capturing(&mut cmd, host.bound)
     };
-    let mut result = run_cc(None);
+    let mut result = run_cc(None, &program);
     if matches!(&result, Some(out) if !out.status.success())
         && host.sdkroot().is_none()
         && host
@@ -508,8 +520,18 @@ fn build_probe(cc: &Path, resolved: PathBuf, path_var: Option<&OsStr>, host: &Cc
         let developer_dir = host.developer_dir();
         let sdk = developer_dir.join("SDKs/MacOSX.sdk");
         if sdk.is_dir() {
-            let _ = std::fs::remove_file(&program);
-            result = run_cc(Some(&sdk));
+            let fresh = dir.join("sdk-fallback");
+            if let Err(error) = std::fs::create_dir(&fresh) {
+                return CcVerdict::Unproven {
+                    driver: resolved,
+                    why: format!(
+                        "could not create fresh probe output directory {}: {error}",
+                        fresh.display()
+                    ),
+                };
+            }
+            program = fresh.join("probe.out");
+            result = run_cc(Some(&sdk), &program);
         }
     }
     match result {
@@ -644,6 +666,76 @@ mod tests {
             bound: ANSWER,
             tmp_root,
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_sdk_retry_cannot_accept_an_unremovable_failed_attempts_output() {
+        struct Unflag(PathBuf);
+        impl Drop for Unflag {
+            fn drop(&mut self) {
+                let _ = crate::platform::set_file_flags(&self.0, 0);
+            }
+        }
+        let root = scratch("sdk-fresh-output");
+        let bin = root.join("bin");
+        let cc = bin.join("cc");
+        let developer = root.join("developer");
+        std::fs::create_dir_all(developer.join("SDKs/MacOSX.sdk")).unwrap();
+        script(
+            &cc,
+            "if [ -n \"$SDKROOT\" ]; then\n  if [ -f \"$0.write-fallback\" ]; then printf fresh > \"$2\"; /bin/chmod +x \"$2\"; fi\n  exit 0\nfi\nprintf stale > \"$2\"\n/bin/chmod +x \"$2\"\n/usr/bin/chflags uchg \"$2\" || exit 2\nexit 1",
+        );
+        let host = CcHost {
+            shim_dir: Some(bin),
+            default_developer_dir: developer,
+            ..plain_host(&root)
+        };
+        for emits in [false, true] {
+            let dir = root.join(if emits { "fresh" } else { "stale" });
+            std::fs::create_dir_all(&dir).unwrap();
+            let failed_output = dir.join("probe.out");
+            let _unflag = Unflag(failed_output.clone());
+            if emits {
+                std::fs::write(cc.with_file_name("cc.write-fallback"), b"yes").unwrap();
+            }
+            let verdict = build_probe_in(&cc, cc.clone(), None, &host, &dir);
+            assert!(
+                std::fs::remove_file(&failed_output)
+                    .is_err_and(|error| { error.kind() == std::io::ErrorKind::PermissionDenied }),
+                "the immutable fixture blocks unlink"
+            );
+            if emits {
+                assert_eq!(verdict, CcVerdict::Ready { driver: cc.clone() });
+            } else {
+                assert!(matches!(verdict, CcVerdict::Broken { .. }), "{verdict:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_sdk_retry_refuses_an_existing_output_namespace() {
+        let root = scratch("occupied-sdk-output");
+        let bin = root.join("bin");
+        let cc = bin.join("cc");
+        script(&cc, "if [ -n \"$SDKROOT\" ]; then exit 0; fi; exit 1");
+        let developer = root.join("developer");
+        std::fs::create_dir_all(developer.join("SDKs/MacOSX.sdk")).unwrap();
+        let host = CcHost {
+            shim_dir: Some(bin),
+            default_developer_dir: developer,
+            ..plain_host(&root)
+        };
+        let dir = root.join("probe");
+        let occupied = dir.join("sdk-fallback/probe.out");
+        std::fs::create_dir_all(occupied.parent().unwrap()).unwrap();
+        std::fs::write(&occupied, b"old executable").unwrap();
+        std::fs::set_permissions(&occupied, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(
+            build_probe_in(&cc, cc.clone(), None, &host, &dir),
+            CcVerdict::Unproven { .. }
+        ));
+        assert_eq!(std::fs::read(&occupied).unwrap(), b"old executable");
     }
 
     #[test]
@@ -1157,7 +1249,7 @@ mod tests {
     }
 
     #[test]
-    fn a_verdict_kept_before_executable_output_was_required_is_not_reused() {
+    fn verdicts_kept_before_the_current_output_policy_are_not_reused() {
         let root = scratch("old-output-policy");
         let bin = root.join("bin");
         let cc = bin.join("cc");
@@ -1180,8 +1272,7 @@ mod tests {
             .map(|path| crate::probe_cache::identity(path).unwrap_or_else(|| "absent".to_owned()))
             .collect::<Vec<_>>()
             .join(" ");
-        // The old cache format had these seven parts and no acceptance-policy domain.
-        let old_key = crate::probe_cache::key([
+        let old_parts = [
             Some("plain".to_owned()),
             crate::probe_cache::identity(&cc),
             Some(developer.display().to_string()),
@@ -1189,18 +1280,26 @@ mod tests {
             Some("no receipt".to_owned()),
             Some("no sdk".to_owned()),
             Some(bin.display().to_string()),
-        ])
-        .unwrap();
-        crate::probe_cache::put(&cache.file, &old_key, &cc.to_string_lossy());
-        for calls in [2, 4] {
-            assert!(matches!(
-                probe_cached(Some(bin.as_os_str()), &host, Some(&cache)),
-                CcVerdict::Broken { .. }
-            ));
-            assert_eq!(
-                std::fs::read_to_string(&asked).unwrap().lines().count(),
-                calls
-            );
+        ];
+        for (epoch, domain) in [None, Some("executable-link-v1")].into_iter().enumerate() {
+            let old_key = crate::probe_cache::key(
+                domain
+                    .into_iter()
+                    .map(|domain| Some(domain.to_owned()))
+                    .chain(old_parts.iter().cloned()),
+            )
+            .unwrap();
+            crate::probe_cache::put(&cache.file, &old_key, &cc.to_string_lossy());
+            for calls in [2, 4] {
+                assert!(matches!(
+                    probe_cached(Some(bin.as_os_str()), &host, Some(&cache)),
+                    CcVerdict::Broken { .. }
+                ));
+                assert_eq!(
+                    std::fs::read_to_string(&asked).unwrap().lines().count(),
+                    epoch * 4 + calls
+                );
+            }
         }
         let _ = std::fs::remove_dir_all(&root);
     }

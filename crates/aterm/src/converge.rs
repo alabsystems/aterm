@@ -33,10 +33,10 @@
 use aterm_machines::init::{Base, BaseLock};
 use aterm_machines::sync::{
     AccountsRead, AwakeRead, FabricRead, FleetDone, FleetRead, GithubRead, IdentityRead, NodeRead,
-    PeersDone, PeersRead, Ports, ReleaseRead, RequestsRead, SharedRead, StewardLeaseRead,
-    StewardRevokeRead, StewardStandbyServerRead, VaultRead,
+    PeersDone, PeersRead, Ports, ReleaseRead, RequestsRead, SharedDone, SharedRead,
+    StewardLeaseRead, StewardRevokeRead, StewardStandbyServerRead, VaultRead,
 };
-use aterm_secrets::client::Foundable;
+use aterm_secrets::client::{Foundable, NotFounded};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -332,6 +332,70 @@ fn unseen_read(
             Some(why) => SharedRead::Deferred(format!("{due}; {why}")),
         },
     }
+}
+
+/// `sync.shared-data`'s read of `observed`, the vault's Commons control as this Mac sees it once
+/// a sync that held the vault's state lock let it go, waited for up to
+/// [`aterm_secrets::commons::SETTLE`] ([`aterm_secrets::commons::observe_until_settled`]):
+/// a state still busy reads busy and reads nothing else, which fails no founding read back over
+/// it; a Mac no control record reaches reads as [`unseen_read`] says, through its vault's config
+/// (`vault`), whether it founds (`foundable`) and what a founding waits on (`waits`); one it
+/// reaches reads visible.
+fn shared_read(
+    observed: aterm_secrets::commons::Observation,
+    vault: impl FnOnce() -> Result<Option<aterm_secrets::client::Config>, String>,
+    foundable: impl FnOnce() -> Result<Foundable, String>,
+    waits: impl FnOnce(&aterm_secrets::client::Config, &str) -> Option<String>,
+) -> Result<SharedRead, String> {
+    use aterm_secrets::commons::{Observation, Unavailable};
+    Ok(match observed {
+        Observation::Unavailable(Unavailable::Busy) => SharedRead::Busy(format!(
+            "{} ({}): the next pass reads it",
+            Unavailable::Busy.explanation(),
+            Unavailable::Busy.code()
+        )),
+        Observation::Unavailable(reason) => {
+            let unseen = format!("{} ({})", reason.explanation(), reason.code());
+            let vault = match reason {
+                Unavailable::ControlNotVisible => vault()?,
+                _ => None,
+            };
+            match vault {
+                Some(vault) => unseen_read(unseen, foundable()?, |what| waits(&vault, what)),
+                None => SharedRead::Unavailable(unseen),
+            }
+        }
+        Observation::Visible(snapshot) => SharedRead::Visible(format!(
+            "vault {}'s Commons control, seq {}: this Mac enrolls itself while a window runs",
+            snapshot.vault(),
+            snapshot.sequence()
+        )),
+    })
+}
+
+/// What `sync.shared-data`'s apply says of `done`: what it founded or finished; a founding that
+/// stands until a person changes something waits for them; one that may pass by itself is the
+/// error the next pass tries again.
+fn found_said(
+    done: Result<aterm_secrets::client::CommonsInit, NotFounded>,
+) -> Result<SharedDone, String> {
+    let done = match done {
+        Ok(done) => done,
+        Err(NotFounded::Stands(why)) => return Ok(SharedDone::Waiting(why)),
+        Err(NotFounded::Again(why)) => return Err(why),
+    };
+    let network = aterm_codec::hex::encode_lower(&done.network);
+    Ok(SharedDone::Done(
+        match (done.published, done.approved.as_slice()) {
+            (true, []) => format!("founded Commons network {network}"),
+            (true, approved) => format!(
+                "founded Commons network {network}, approving {}: this Mac as its founder, \
+                 the rest by the vault's open policy",
+                approved.join(", ")
+            ),
+            (false, _) => format!("finished Commons network {network}, founded already"),
+        },
+    ))
 }
 
 /// The accounts' places: the harness environment, the home and the roster.
@@ -1977,43 +2041,24 @@ impl Ports for Live {
     }
 
     fn shared_data(&self) -> Result<SharedRead, String> {
-        use aterm_secrets::commons::{Observation, Unavailable};
         let config = aterm_types::dirs::aterm_config_path()
             .ok_or("no config path: neither $XDG_CONFIG_HOME nor $HOME is set")?;
         if !aterm_db::runtime::enabled(&config).map_err(|why| why.to_string())? {
             return Ok(SharedRead::Off);
         }
         let paths = vault_paths()?;
-        Ok(
-            match aterm_secrets::commons::observe(&paths).map_err(|why| why.to_string())? {
-                Observation::Unavailable(reason) => {
-                    let unseen = format!("{} ({})", reason.explanation(), reason.code());
-                    let vault = match reason {
-                        Unavailable::ControlNotVisible => vault_config(&paths)?,
-                        _ => None,
-                    };
-                    match vault {
-                        Some(vault) => unseen_read(
-                            unseen,
-                            aterm_secrets::client::commons_foundable(&paths)
-                                .map_err(|why| why.to_string())?,
-                            |what| {
-                                publish_waits(
-                                    &vault,
-                                    what,
-                                    aterm_machines::lan_reach::broker_unready,
-                                )
-                            },
-                        ),
-                        None => SharedRead::Unavailable(unseen),
-                    }
-                }
-                Observation::Visible(snapshot) => SharedRead::Visible(format!(
-                    "vault {}'s Commons control, seq {}: this Mac enrolls itself while a window runs",
-                    snapshot.vault(),
-                    snapshot.sequence()
-                )),
-            },
+        // A sync that holds the vault's state lock for a moment (the subscriber applying the
+        // version a founding just published) is waited out, so a founding read back is read
+        // settled; one held past the wait reads busy, which fails no founding.
+        shared_read(
+            aterm_secrets::commons::observe_until_settled(
+                &paths,
+                std::time::Instant::now() + aterm_secrets::commons::SETTLE,
+            )
+            .map_err(|why| why.to_string())?,
+            || vault_config(&paths),
+            || aterm_secrets::client::commons_foundable(&paths).map_err(|why| why.to_string()),
+            |vault, what| publish_waits(vault, what, aterm_machines::lan_reach::broker_unready),
         )
     }
 
@@ -2036,19 +2081,10 @@ impl Ports for Live {
         )
     }
 
-    fn found_commons(&self) -> Result<String, String> {
-        let done = aterm_secrets::client::admin_commons_found_by_default(&vault_paths()?)
-            .map_err(|why| why.to_string())?;
-        let network = aterm_codec::hex::encode_lower(&done.network);
-        Ok(match (done.published, done.approved.as_slice()) {
-            (true, []) => format!("founded Commons network {network}"),
-            (true, approved) => format!(
-                "founded Commons network {network}, approving {}: this Mac as its founder, \
-                 the rest by the vault's open policy",
-                approved.join(", ")
-            ),
-            (false, _) => format!("finished Commons network {network}, founded already"),
-        })
+    fn found_commons(&self) -> Result<SharedDone, String> {
+        found_said(aterm_secrets::client::admin_commons_found_by_default(
+            &vault_paths()?,
+        ))
     }
 
     fn release(&self) -> Result<ReleaseRead, String> {
@@ -2985,6 +3021,82 @@ mod tests {
                 SharedRead::Unavailable(why) if why.starts_with(&unseen())
             ),
             "a busy read founds nothing and fails nothing"
+        );
+    }
+
+    /// A state that stays busy past the wait reads busy, never unavailable (which a read-back
+    /// reads as a failure), and reads nothing else; any other unavailable reading but an unseen
+    /// control record reads unavailable, reading no founding.
+    /// NEGATIVE CONTROL: a busy observation read as unavailable fails the founding read back.
+    #[test]
+    fn a_busy_state_reads_busy_and_reads_nothing_else() {
+        use aterm_secrets::commons::{Observation, Unavailable};
+        let no_vault = || -> Result<Option<aterm_secrets::client::Config>, String> {
+            panic!("this read reads no vault")
+        };
+        let never = || -> Result<Foundable, String> { panic!("this read reads no founding") };
+        let no_wait = |_: &aterm_secrets::client::Config, _: &str| -> Option<String> {
+            panic!("this read asks nothing a founding waits on")
+        };
+        let read = shared_read(
+            Observation::Unavailable(Unavailable::Busy),
+            no_vault,
+            never,
+            no_wait,
+        )
+        .unwrap();
+        assert!(
+            matches!(&read, SharedRead::Busy(why) if why.contains("(vault-busy)")),
+            "{read:?}"
+        );
+        let unconfigured = shared_read(
+            Observation::Unavailable(Unavailable::Unconfigured),
+            no_vault,
+            never,
+            no_wait,
+        )
+        .unwrap();
+        assert!(
+            matches!(&unconfigured, SharedRead::Unavailable(why) if why.contains("(vault-unconfigured)")),
+            "{unconfigured:?}"
+        );
+    }
+
+    /// The apply's report names what it founded or finished; a founding that stands for a person
+    /// waits for them, and one that may pass is the next pass's error.
+    /// NEGATIVE CONTROL: a report that reads a standing refusal as passing promises it a retry.
+    #[test]
+    fn the_apply_says_what_it_founded_and_what_stands() {
+        let done = |published: bool, approved: &[&str]| {
+            Ok(aterm_secrets::client::CommonsInit {
+                network: [7; 16],
+                authority: [1; 32],
+                genesis: [2; 32],
+                eligible: 3,
+                published,
+                approved: approved.iter().map(|host| (*host).to_owned()).collect(),
+            })
+        };
+        let said = |done| match found_said(done) {
+            Ok(SharedDone::Done(said)) => said,
+            other => panic!("{other:?}"),
+        };
+        let network = "07".repeat(16);
+        assert_eq!(
+            said(done(true, &[])),
+            format!("founded Commons network {network}")
+        );
+        assert!(said(done(true, &["m1", "m2"])).ends_with(
+            "approving m1, m2: this Mac as its founder, the rest by the vault's open policy"
+        ));
+        assert!(said(done(false, &[])).contains("founded already"));
+        assert_eq!(
+            found_said(Err(NotFounded::Stands("answered 403".to_owned()))),
+            Ok(SharedDone::Waiting("answered 403".to_owned()))
+        );
+        assert_eq!(
+            found_said(Err(NotFounded::Again("timed out".to_owned()))),
+            Err("timed out".to_owned())
         );
     }
 

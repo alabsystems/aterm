@@ -3639,7 +3639,6 @@ fn fx_carried_state_desk() -> FxDesk {
             release_ms / 1_000 + 3_600,
         )),
         done: None,
-        box_receipt: None,
     }
     .row();
     record.task = Some(format!(

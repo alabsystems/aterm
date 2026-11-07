@@ -370,6 +370,13 @@ pub struct HostStep {
     pub repeat: bool,
 }
 
+/// The word a host step's [`HostStep::line`] names its step by (`<what> step=<word>`, as the
+/// window's host spells it).
+fn host_step_word(line: &str) -> Option<&str> {
+    line.split_whitespace()
+        .find_map(|w| w.strip_prefix("step="))
+}
+
 /// Turn-end policy context offered to [`IdleHost::at_idle_on`] at an idle point.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct IdlePoint {
@@ -7893,6 +7900,9 @@ impl<C: Ctl> Session<'_, C> {
                 }
                 if step.moved {
                     self.turn_end.host_moved();
+                }
+                if host_step_word(&step.line).is_some_and(crate::harness::upgrade_drive::started) {
+                    self.turn_end.harness_started();
                 }
                 if let Some(kind) = step.typed {
                     self.host_turn(kind, point.screen.seq);

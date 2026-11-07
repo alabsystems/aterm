@@ -172,7 +172,6 @@ fn handed(master: i32, rows: Rows) -> Adopted {
         task: rows.task,
         autopilot_end: rows.end,
         wakes: rows.wakes,
-        box_receipt: None,
     }
 }
 

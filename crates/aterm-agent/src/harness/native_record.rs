@@ -17,6 +17,7 @@ struct State {
     native: Option<Binding>,
     prepare: String,
     completed: Option<Box<Prepare>>,
+    noexec: Option<Box<Prepare>>,
     observation: Option<SavedObservation>,
     rollback: bool,
     retired: bool,
@@ -40,6 +41,7 @@ impl State {
             native: st.native.clone(),
             prepare: st.native_prepare.clone(),
             completed: st.native_completed_prepare.clone(),
+            noexec: st.native_noexec_prepare.clone(),
             observation: st.native_observation.clone(),
             rollback: st.native_rollback,
             retired: st.native_retired_unissued,
@@ -221,6 +223,7 @@ pub(super) fn restore_inactive(
     next.native = current.native.clone();
     next.native_prepare.clone_from(&current.native_prepare);
     next.native_completed_prepare = current.native_completed_prepare.clone();
+    next.native_noexec_prepare = current.native_noexec_prepare.clone();
     next.native_observation = current.native_observation.clone();
     next.native_rollback = current.native_rollback;
     next.native_retired_unissued = current.native_retired_unissued;

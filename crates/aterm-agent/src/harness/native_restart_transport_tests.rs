@@ -21,6 +21,12 @@ mod legacy;
 #[path = "native_restart_pairing_tests.rs"]
 mod pairing;
 
+#[path = "native_completion_recovery_tests.rs"]
+mod completion;
+
+#[path = "native_noexec_recovery_tests.rs"]
+mod noexec;
+
 const SID: &str = "s-native-transport";
 
 #[test]
@@ -1111,8 +1117,9 @@ fn unproven_completed_history_never_restores_raw_fallback_after_native_coordinat
     let command = planned();
     let (mut st, back) = state(&command);
     st.native_coordination = true;
-    st.native = Some(binding());
-    st.native_prepare = "retained uncertain original".into();
+    let bound = bound_record(&opts);
+    st.native = bound.native;
+    st.native_prepare = bound.native_prepare;
     assert_eq!(
         terminal_reply(
             &mut st,

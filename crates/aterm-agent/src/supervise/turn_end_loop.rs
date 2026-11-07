@@ -893,6 +893,73 @@ impl<C: Ctl> Session<'_, C> {
             from: open.from,
             to: open.to,
             back_at: open.back_at_unix.map(|unix| self.instant_of(unix)),
+            proc: open.proc,
+            unproven: false,
+        }
+    }
+
+    /// The model switch in force, scoped to the agent process the host names
+    /// ([`TurnEndState::agent_process`]); a move or an end is written for a loop that follows.
+    fn scope_model_switch(&mut self, host: Option<&Arc<dyn IdleHost>>, seq: u64) {
+        if self.turn_end.model_switch().is_none() {
+            return;
+        }
+        let Some(h) = host else {
+            return;
+        };
+        let (Some(pid), Some(start)) = (h.agent_pid(), h.agent_started()) else {
+            return;
+        };
+        self.scope_model_switch_to(h, pid, start, seq);
+    }
+
+    /// [`Self::scope_model_switch`] at the process (`pid`, started at `start` unix seconds) the
+    /// host's point read named ([`IdleHost::agent_resumed`]), when the switch is not in it: the
+    /// host forgets an exited agent's snapshot, so the reading at a new program's first point may
+    /// name no process, and the host reads it only then. A switch already in that process is
+    /// left as it stands: that process keeps the switch's return on any conversation it holds.
+    fn scope_model_switch_at_point(
+        &mut self,
+        h: &Arc<dyn IdleHost>,
+        pid: u32,
+        start: i64,
+        seq: u64,
+    ) {
+        let elsewhere = self.turn_end.model_switch().is_some_and(|m| {
+            m.proc
+                .as_ref()
+                .is_none_or(|p| (p.pid, p.start) != (pid, start))
+        });
+        if elsewhere {
+            self.scope_model_switch_to(h, pid, start, seq);
+        }
+    }
+
+    /// [`Self::scope_model_switch`] at the process the host named, with the conversation it names.
+    fn scope_model_switch_to(&mut self, h: &Arc<dyn IdleHost>, pid: u32, start: i64, seq: u64) {
+        use super::super::policy::turn_end::{
+            RULE_MODEL_FALLBACK, RULE_MODEL_RESTORE, SwitchScope,
+        };
+        let conversation = h.agent_conversation();
+        match self
+            .turn_end
+            .agent_process(pid, start, conversation.as_deref(), || h.relaunch_owed())
+        {
+            None => {}
+            Some(SwitchScope::Moved(p)) => self.ledger_row(
+                RULE_MODEL_FALLBACK,
+                approvals::Outcome::Waiting,
+                "",
+                &approvals::switch_process_reason(&p),
+                seq,
+            ),
+            Some(SwitchScope::Closed) => self.ledger_row(
+                RULE_MODEL_RESTORE,
+                approvals::Outcome::Waiting,
+                "",
+                approvals::SWITCH_CLOSED,
+                seq,
+            ),
         }
     }
 
@@ -1676,6 +1743,9 @@ impl<C: Ctl> Session<'_, C> {
             self.turn_end.agent_started(at);
             self.turn_end.agent_started_unix(started);
         }
+        if check == Check::Decide {
+            self.scope_model_switch(opts.idle_host.as_ref(), screen.seq);
+        }
         if check == Check::Decide && self.turn_end.reads_opening() {
             self.turn_end.opening_read(reader.opening(&screen.rows));
         }
@@ -2421,6 +2491,13 @@ impl<C: Ctl> Session<'_, C> {
                 let at = self.instant_of(started);
                 self.turn_end.agent_started(at);
                 self.turn_end.agent_started_unix(started);
+            }
+            // The model switch is scoped to that process too, before the point is decided: a fresh
+            // program the reading could not name never has the switch's return made onto it.
+            if let Some(cur) = current
+                && let Some(started) = cur.started
+            {
+                self.scope_model_switch_at_point(host, cur.pid, started, seq);
             }
         }
         let awaited = self.turn_end.account_answer_awaited(r);

@@ -320,7 +320,7 @@ pub(super) fn prepare(
                 if let Ok(Some(retired)) = retire_stale_ready(ctx, env, proof, current, &receipt) {
                     return retired.reply();
                 }
-                return receipt_reply(&receipt);
+                return acknowledged_receipt_reply(env, &receipt);
             }
         }
         Err(_) => return WAITING.into(),
@@ -508,7 +508,7 @@ pub(super) fn retire_ready(
         let mut retired = receipt.clone();
         retired.phase = Phase::Retired;
         renewal::write_receipt(env, &retired)?;
-        let _cleanup = writer.retire_pool_record(&retired);
+        writer.retire_pool_record(&retired)?;
         Ok(Some(retired))
     })
     .map(Option::flatten)

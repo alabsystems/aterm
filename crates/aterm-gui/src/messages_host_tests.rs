@@ -3723,7 +3723,6 @@ fn an_unchanged_managed_current_is_recorded_once_and_news_again() {
         task: None,
         autopilot_end: None,
         wakes: None,
-        box_receipt: None,
     }];
     assert!(
         app.post_managed_current(

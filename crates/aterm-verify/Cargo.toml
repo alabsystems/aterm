@@ -35,6 +35,10 @@ harness = false
 name = "git_helper_auth"
 harness = false
 
+[[bench]]
+name = "native_http_publisher"
+harness = false
+
 # First-party crates (and the workspace's libc, which is crates/aterm-libc),
 # each serving a check the CLI runs in-process. Every one is also a workspace
 # member that `lint` and `test` compile, so a compile break in any of them

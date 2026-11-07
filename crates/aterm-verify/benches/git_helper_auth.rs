@@ -6,6 +6,10 @@
 //! These ref-only fixtures implement neither pack upload nor atomic append nor TLS.
 
 #[cfg(all(unix, debug_assertions))]
+#[path = "support/git_provenance.rs"]
+mod git_provenance;
+
+#[cfg(all(unix, debug_assertions))]
 mod native {
     use agh::config::{self, Dirs};
     use agh::git::{GitOut, GitRun, HelperCommand};
@@ -19,7 +23,7 @@ mod native {
     use std::io::Write as _;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     const SLUG: &str = "fixture-dev/app";
     const SHA: &str = "1234567890123456789012345678901234567890";
@@ -212,27 +216,7 @@ read = ["anonymous"]
             };
             // The runner resolves Git independently of fixture_git. Query the actual
             // recorded executable under its exact environment, outside the timer.
-            let children = self.client.fx().children_run();
-            let first = children.first().ok_or("runner recorded no Git child")?;
-            let same_program = children.iter().all(|child| child.program == first.program);
-            let mut command = aterm_uds::spawnfd::command(&first.program);
-            command
-                .env_clear()
-                .envs(first.env.iter().cloned())
-                .arg("--version");
-            let version = aterm_uds::deadline::output_until_complete_stdout(
-                &mut command,
-                Instant::now() + Duration::from_secs(60),
-            )?;
-            let version_text = String::from_utf8(version.stdout)?;
-            let version_text = version_text.trim();
-            let version_valid = version.status.success()
-                && version_text.starts_with("git version ")
-                && version_text.lines().count() == 1
-                && version_text.len() <= 128;
-            let actual_git = json!({"version":if version_valid {Some(version_text)} else {None},
-                "recorded_children":children.len(),"same_program":same_program,
-                "version_probe_valid":version_valid,"probe_outside_timing":true});
+            let (actual_git, git_valid) = crate::git_provenance::recorded_git(&self.client)?;
             let refs = self.fake.git_refs(SLUG);
             let main_stable = refs
                 .iter()
@@ -276,8 +260,7 @@ read = ["anonymous"]
                                 && out.stdout.contains("refs/tags/v1")))
                 })
             };
-            let valid = same_program
-                && version_valid
+            let valid = git_valid
                 && result_ok
                 && first_anonymous
                 && identity_ok

@@ -99,22 +99,26 @@ pub fn display_columns_with(text: &str, ambiguous: AmbiguousWidth) -> usize {
 
 /// Whether every byte is in `0x20..=0x7e`, using safe eight-byte array reads.
 fn printable_ascii(bytes: &[u8]) -> bool {
-    const HIGH: u64 = 0x8080_8080_8080_8080;
     let (words, tail) = bytes.as_chunks::<8>();
     for word in words {
-        let word = u64::from_ne_bytes(*word);
-        if word & HIGH != 0 {
-            return false;
-        }
-        // Each lane is now <= 0x7f, so neither addition carries into another lane.
-        // Adding 0x60 sets the high bit at 0x20; adding 1 sets it only at DEL.
-        if word.wrapping_add(0x6060_6060_6060_6060) & HIGH != HIGH
-            || word.wrapping_add(0x0101_0101_0101_0101) & HIGH != 0
-        {
+        if !printable_word(word) {
             return false;
         }
     }
     tail.iter().all(|byte| matches!(byte, b' '..=b'~'))
+}
+
+#[inline(always)]
+fn printable_word(bytes: &[u8; 8]) -> bool {
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    let word = u64::from_ne_bytes(*bytes);
+    if word & HIGH != 0 {
+        return false;
+    }
+    // Each lane is now <= 0x7f, so neither addition carries into another lane.
+    // Adding 0x60 sets the high bit at 0x20; adding 1 sets it only at DEL.
+    word.wrapping_add(0x6060_6060_6060_6060) & HIGH == HIGH
+        && word.wrapping_add(0x0101_0101_0101_0101) & HIGH == 0
 }
 
 /// Map a byte offset in lowercased text back to `original` in O(C).
@@ -202,11 +206,11 @@ fn stored_coordinates(
     offset: usize,
     grapheme: &str,
     current: Option<CellSpan>,
-    previous: Option<CellSpan>,
+    previous: usize,
 ) -> (usize, usize) {
     match current {
         None => (0, 0),
-        Some(cell) if offset == cell.byte => (cell.col, previous.map_or(0, |cell| cell.end_col)),
+        Some(cell) if offset == cell.byte => (cell.col, previous),
         Some(cell) if offset < cell.end => {
             let folded = grapheme.chars().next().is_some_and(|c| char_width(c) > 0);
             if folded {
@@ -220,6 +224,7 @@ fn stored_coordinates(
 }
 
 /// Project one stored-cell span, walking only through its furthest endpoint.
+#[inline]
 pub(crate) fn stored_span(
     text: &str,
     cells: &LineCells,
@@ -230,23 +235,72 @@ pub(crate) fn stored_span(
     if cells.is_identity(text.len()) {
         return (start.min(len), end.min(len));
     }
-    let mut spans = cells.iter().take_while(|cell| cell.byte < text.len());
-    let mut next = spans.next();
-    let mut previous: Option<CellSpan> = None;
-    let mut cell: Option<CellSpan> = None;
+    projected_stored_span(text, cells, start, end, len)
+}
+
+/// Two printable ASCII characters break regardless of earlier Unicode context.
+/// Retaining the second character also resets the iterator's contextual state.
+#[inline]
+fn local_ascii_boundary(bytes: &[u8], at: usize) -> bool {
+    matches!(bytes[at], b' '..=b'~') && (at == 0 || matches!(bytes[at - 1], b' '..=b'~'))
+}
+
+// Keep the run/grapheme cursors' frame off direct identity lookups.
+#[inline(never)]
+fn projected_stored_span(
+    text: &str,
+    cells: &LineCells,
+    start: usize,
+    end: usize,
+    len: usize,
+) -> (usize, usize) {
+    if start >= len && end >= len {
+        let (cell, _) = cells.cell_and_previous(usize::MAX, text.len());
+        let total = narrow(cell.map_or(0, |cell| cell.end_col)) as usize;
+        return (total, total);
+    }
+    let mut retained: (Option<CellSpan>, usize) = (None, 0);
+    let bytes = text.as_bytes();
+    let mut base = 0;
     let mut columns = text.grapheme_indices();
-    let mut current = columns.next();
+    let mut current = None;
+    let mut started = false;
+    let mut anchor = 0;
     let mut lookup = |byte| {
         if byte < len {
-            while current.is_some_and(|(offset, _)| offset < byte) {
-                current = columns.next();
-            }
-            if let Some((offset, grapheme)) = current {
-                while next.is_some_and(|cell| cell.byte <= offset) {
-                    previous = cell;
-                    cell = next;
-                    next = spans.next();
+            let boundary = if local_ascii_boundary(bytes, byte) {
+                anchor = byte;
+                Some((byte, &text[byte..byte + 1]))
+            } else {
+                // A UTF-8 character starts at most three bytes before an interior
+                // byte. Keep a proven ASCII predecessor for following extenders.
+                let mut char_start = byte;
+                while bytes[char_start] & 0xc0 == 0x80 {
+                    char_start -= 1;
                 }
+                if char_start > 0 && local_ascii_boundary(bytes, char_start - 1) {
+                    anchor = anchor.max(char_start - 1);
+                }
+                if !started || anchor > base {
+                    base = anchor;
+                    columns = text[base..].grapheme_indices();
+                    current = columns.next();
+                    started = true;
+                }
+                let relative = byte - base;
+                while current.is_some_and(|(offset, _)| offset < relative) {
+                    current = columns.next();
+                }
+                current.map(|(offset, grapheme)| (base + offset, grapheme))
+            };
+            if let Some((offset, grapheme)) = boundary {
+                if !retained
+                    .0
+                    .is_some_and(|cell| offset >= cell.byte && offset < cell.end)
+                {
+                    retained = cells.cell_and_previous(offset, text.len());
+                }
+                let (cell, previous) = retained;
                 let (start, before) = stored_coordinates(offset, grapheme, cell, previous);
                 return ClusterColumns {
                     offset,
@@ -255,9 +309,7 @@ pub(crate) fn stored_span(
                 };
             }
         }
-        if let Some(last) = spans.by_ref().last().or(next.take()) {
-            cell = Some(last);
-        }
+        let (cell, _) = cells.cell_and_previous(usize::MAX, text.len());
         let total = cell.map_or(0, |cell| cell.end_col);
         ClusterColumns {
             offset: text.len(),
@@ -437,11 +489,11 @@ impl ColumnMap {
         }
         let mut spans = cells.iter().take_while(|cell| cell.byte < text.len());
         let mut next = spans.next();
-        let mut previous: Option<CellSpan> = None;
+        let mut previous = 0;
         let mut current: Option<CellSpan> = None;
         for (offset, grapheme) in text.grapheme_indices() {
             while next.is_some_and(|cell| cell.byte <= offset) {
-                previous = current;
+                previous = current.map_or(0, |cell| cell.end_col);
                 current = next;
                 next = spans.next();
             }
@@ -711,7 +763,7 @@ fn lower_byte_len(ch: char) -> usize {
 mod tests {
     #[test]
     fn one_shot_stored_projection_matches_maps_for_every_endpoint_pair() {
-        for text in [
+        let mut texts: Vec<String> = [
             "",
             "abcde",
             "éx日a",
@@ -720,7 +772,21 @@ mod tests {
             "\t\ra\n",
             "👩🏽‍💻→aaaaa",
             "\u{301}a→İ",
-        ] {
+            "\u{600}a\u{301}bc",
+            "\u{600}ab\u{301}cd",
+            "🇦🇧a\u{600}bc🇨🇩",
+            "न्दीab👩🏽‍💻cd\u{301}",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        for prefix in ["a", "abcdefgh"] {
+            for shape in SHAPES {
+                texts.push(format!("{prefix}{shape}tail"));
+            }
+        }
+        for text in &texts {
+            let text = text.as_str();
             for shape in 0..9 {
                 let mut cells = LineCells::new();
                 if shape == 6 {
@@ -739,7 +805,7 @@ mod tests {
                         }
                         let width = (i + shape) % 3;
                         cells.push(byte..byte + ch.len_utf8(), col, width);
-                        col += width + usize::from(shape == 3);
+                        col = col.saturating_add(width + usize::from(shape == 3));
                     }
                 }
                 let map = ColumnMap::with_cells(text, &cells);
@@ -754,6 +820,41 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn local_ascii_boundaries_and_resets_match_full_unicode_segmentation() {
+        use aterm_grapheme::GraphemeClusters;
+
+        for context in ["", "\u{600}", "\u{301}", "\r\n", "🇦", "🇦🇧", "👩🏽‍💻", "न्दी"]
+        {
+            for left in b' '..=b'~' {
+                for right in b' '..=b'~' {
+                    let text = format!(
+                        "{context}{}{}\u{301}🇦🇧न्दी",
+                        char::from(left),
+                        char::from(right)
+                    );
+                    let at = context.len() + 1;
+                    assert!(super::local_ascii_boundary(text.as_bytes(), at));
+                    let full: Vec<_> = text
+                        .grapheme_indices()
+                        .filter(|(byte, _)| *byte >= at)
+                        .collect();
+                    let suffix: Vec<_> = text[at..]
+                        .grapheme_indices()
+                        .map(|(byte, g)| (at + byte, g))
+                        .collect();
+                    assert_eq!(full, suffix, "{text:?}");
+                }
+            }
+        }
+        let text = "\u{600}a";
+        assert!(!super::local_ascii_boundary(
+            text.as_bytes(),
+            "\u{600}".len()
+        ));
+        assert_eq!(text.grapheme_indices().count(), 1);
     }
 
     #[test]

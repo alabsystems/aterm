@@ -23,7 +23,7 @@ pub(super) mod fixture;
 mod observation;
 pub(super) use observation::observe_live;
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 #[path = "native_retirement_debt_tests.rs"]
 mod retirement_debt_tests;
 
@@ -47,6 +47,7 @@ pub(super) fn coordinated(st: &St) -> bool {
         || st.native.is_some()
         || !st.native_prepare.is_empty()
         || st.native_completed_prepare.is_some()
+        || st.native_noexec_prepare.is_some()
         || st.native_observation.is_some()
         || super::native_record::was_coordinated(st)
 }
@@ -123,22 +124,41 @@ fn terminal_reply(st: &mut St, reply: &Reply) -> Option<Recovery> {
     if st.native_retired_unissued {
         return Some(Recovery::Held);
     }
+    // Without a retained operation, replies carry no authority to change state.
+    // Duplicate terminal replies can only acknowledge an existing matching kind.
+    if st.native.is_none() && st.native_prepare.is_empty() {
+        return match reply {
+            Reply::Decision(Decision::ProvenNotCommittedRollbackSafe)
+                if noexec_prepare(st).is_some() =>
+            {
+                Some(Recovery::Cancelled)
+            }
+            Reply::Committed(_) | Reply::RestartCommitted(_) if completed_inactive(st) => {
+                Some(Recovery::Completed)
+            }
+            Reply::ColdRestartCommitted { .. }
+                if completed_inactive(st)
+                    && st.native_completed_prepare.as_ref().is_some_and(|prepare| {
+                        matches!(prepare.plan, NativePlan::Restart { cold: Some(_), .. })
+                    }) =>
+            {
+                Some(Recovery::Completed)
+            }
+            _ => None,
+        };
+    }
+    if let Some(noexec) = &st.native_noexec_prepare {
+        let active = retained_prepare(st).ok()?;
+        if noexec.id == active.id {
+            return None;
+        }
+    }
     if matches!(
         reply,
         Reply::Decision(Decision::Retired(native_act::Retirement::NotGranted))
     ) {
         st.native_retired_unissued = true;
         return Some(Recovery::Held);
-    }
-    if matches!(reply, Reply::ColdRestartCommitted { .. })
-        && !matches!(Request::parse(&st.native_prepare),
-            Some(Request::Prepare(prepare))
-                if matches!(prepare.plan, NativePlan::Restart { cold: Some(_), .. }))
-        && !st.native_completed_prepare.as_ref().is_some_and(|prepare| {
-            matches!(prepare.plan, NativePlan::Restart { cold: Some(_), .. })
-        })
-    {
-        return None;
     }
     let outcome = match reply {
         Reply::Decision(Decision::ProvenNotCommittedRollbackSafe) => Recovery::Cancelled,
@@ -148,10 +168,26 @@ fn terminal_reply(st: &mut St, reply: &Reply) -> Option<Recovery> {
         Reply::Decision(Decision::Retired(_)) => Recovery::Retired,
         _ => return None,
     };
-    if outcome == Recovery::Completed {
-        if let Some(Request::Prepare(prepare)) = Request::parse(&st.native_prepare) {
-            st.native_completed_prepare = Some(prepare);
+    let prepare = retained_prepare(st).ok()?;
+    if matches!(reply, Reply::ColdRestartCommitted { .. })
+        && !matches!(&prepare.plan, NativePlan::Restart { cold: Some(_), .. })
+    {
+        return None;
+    }
+    let noexec = if outcome == Recovery::Cancelled {
+        if st
+            .native_completed_prepare
+            .as_ref()
+            .is_some_and(|done| done.id == prepare.id)
+        {
+            return None;
         }
+        Some(prepare.clone())
+    } else {
+        None
+    };
+    if outcome == Recovery::Completed {
+        st.native_completed_prepare = Some(prepare);
         st.native_observation = match reply {
             Reply::RestartCommitted(observation) => Some((**observation).clone()),
             Reply::ColdRestartCommitted { observation, .. } => observation.as_deref().cloned(),
@@ -163,11 +199,17 @@ fn terminal_reply(st: &mut St, reply: &Reply) -> Option<Recovery> {
     }
     st.native = None;
     st.native_prepare.clear();
+    st.native_noexec_prepare = noexec;
     // Completion retains the phase of the command that actually ran. The
     // renewal caller and durable observation must distinguish a live rollback
     // vendor from a successful forward replacement after this capability closes.
     if outcome != Recovery::Completed {
         st.native_rollback = false;
+    }
+    if outcome == Recovery::Cancelled
+        && matches!(st.phase, super::upgrade::Phase::Relaunched { .. })
+    {
+        st.stop("native-cancelled-before-mutation", upgrade_drive::now_s());
     }
     if outcome == Recovery::Completed
         && !matches!(
@@ -551,6 +593,7 @@ fn begin_plan(
             },
         });
         st.native_prepare = request.encode().ok_or("native-plan")?;
+        st.native_noexec_prepare = None;
         st.native_coordination = true;
     }
     let tab = st.tab.clone();
@@ -630,6 +673,10 @@ pub(super) fn recover(
     if opts.dry_run {
         return Err("native-dry-run");
     }
+    if noexec_prepare(st).is_some() && st.tab == tab {
+        upgrade_drive::save_checked(opts, session, st).map_err(|_| "native-unsaved")?;
+        return Ok(Recovery::Cancelled);
+    }
     let prepare = retained_prepare(st)?;
     let expected_id = prepare.id.clone();
     let request = Request::Prepare(prepare);
@@ -668,6 +715,42 @@ pub(super) fn retained_prepare(st: &St) -> Result<Box<Prepare>, &'static str> {
         return Err("native-plan");
     }
     Ok(prepare)
+}
+
+/// A positive terminal fact, never an inference from absent execution evidence.
+/// Ordinary lifecycle changes may follow it; they do not reopen its capability.
+pub(super) fn noexec_prepare(st: &St) -> Option<&Prepare> {
+    let prepare = st.native_noexec_prepare.as_deref()?;
+    Request::Prepare(Box::new(prepare.clone())).encode()?;
+    (st.native_coordination
+        && st.native.is_none()
+        && st.native_prepare.is_empty()
+        && !st.native_retired_unissued
+        && st.native_account_candidate.is_none()
+        && !st.native_rollback
+        && st
+            .native_completed_prepare
+            .as_ref()
+            .is_none_or(|done| done.id != prepare.id)
+        && (st.native_completed_prepare.is_some()
+            || (st.native_observation.is_none()
+                && !matches!(st.phase, super::upgrade::Phase::Relaunched { .. }))))
+    .then_some(prepare)
+}
+
+fn completed_inactive(st: &St) -> bool {
+    st.native_completed_prepare
+        .as_ref()
+        .is_some_and(|prepare| Request::Prepare(prepare.clone()).encode().is_some())
+        && st.native_noexec_prepare.is_none()
+        && st.native.is_none()
+        && st.native_prepare.is_empty()
+        && !st.native_retired_unissued
+        && st.native_account_candidate.is_none()
+        && matches!(
+            st.phase,
+            super::upgrade::Phase::Relaunched { .. } | super::upgrade::Phase::Done
+        )
 }
 
 pub(super) fn abort(
@@ -775,7 +858,11 @@ pub(super) fn complete(
         return false;
     }
     let Some(binding) = st.native.clone() else {
-        return st.native_prepare.is_empty();
+        return if coordinated(st) {
+            completed_inactive(st)
+        } else {
+            st.native_prepare.is_empty()
+        };
     };
     let Ok(prepare) = retained_prepare(st) else {
         return false;
@@ -938,7 +1025,8 @@ mod tests {
             ..St::default()
         };
         let back = st.signalled(4242, "", 400, "tab", "exact-forward".into(), 8);
-        st.native_prepare = "original-id-and-plan deadline-us=123".into();
+        st.native_prepare = super::retirement_debt_tests::pending().native_prepare;
+        st.native_coordination = true;
         st.native = Some(Binding {
             id: "ab".repeat(16),
             capability: "cd".repeat(32),

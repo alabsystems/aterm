@@ -111,7 +111,8 @@ pub use fleet::{
 #[cfg(any(test, debug_assertions))]
 pub use fleet::{test_alab_fleet, test_hold_state_lock, test_with_denied_nodes_busy};
 pub use foundation::{
-    CommonsInit, Foundable, admin_commons_found_by_default, admin_commons_init, commons_foundable,
+    CommonsInit, Foundable, NotFounded, admin_commons_found_by_default, admin_commons_init,
+    commons_foundable,
 };
 pub use genesis::{SignedGenesis, admin_sign_genesis, seed_vault_genesis};
 #[cfg(any(test, debug_assertions))]

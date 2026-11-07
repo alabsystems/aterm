@@ -3830,8 +3830,8 @@ pub(crate) struct ShownProgram {
     /// ([`crate::needs::ProgramClaimFact::key`]).
     pub(crate) seq: u64,
     /// The engine's sequence where the report shown began (`ProgramStateReport::began`, a
-    /// re-send of it looked past): where it stands in the program's output, as the engine's
-    /// notification admission judges by it ([`crate::box_banner`]).
+    /// re-send of it looked past): where it stands in the program's output, which a
+    /// program-claim need carries ([`crate::needs::ProgramClaimFact::report`]).
     pub(crate) report: u64,
     since: std::time::Instant,
     since_continuous_ms: Option<u64>,
@@ -4638,8 +4638,26 @@ impl SessionTimeline {
     }
 
     /// Note the atpkg child the launcher's install just spawned (`task_launch::install_with`).
-    pub(crate) fn set_worker_install_child(&mut self, pid: u32) {
+    pub(crate) fn set_worker_install_child(&mut self, mark: u64, pid: u32) -> bool {
+        if !self.worker_installing_at(mark) {
+            return false;
+        }
         self.worker_install_child = Some(pid);
+        true
+    }
+
+    /// Whether this exact launcher episode still owns the installation state.
+    pub(crate) const fn worker_installing_at(&self, mark: u64) -> bool {
+        self.worker_installing && self.worker_install_mark == mark
+    }
+
+    /// Release an episode without clearing a replacement launcher's installation.
+    pub(crate) fn end_worker_install(&mut self, mark: u64) -> bool {
+        if !self.worker_installing_at(mark) {
+            return false;
+        }
+        self.set_worker_installing(false);
+        true
     }
 
     /// The atpkg child the worker's launcher is installing its program by, whose pass on atpkg's

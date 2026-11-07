@@ -937,13 +937,14 @@ fn run_worker_launch(work: &Launch) {
             return;
         }
     };
+    let store = AtpkgStore::new(&work.ctx);
     let admission = admit_prepared_worker(
         cli,
         caller,
         aterm_types::dirs::home_dir().as_deref(),
         &|note| note_launch(&work.ctx, note),
-        &|| InstallingMark::of(&work.ctx),
-        &AtpkgStore(&work.ctx),
+        &|| store.installing(),
+        &store,
         |admitted| {
             #[cfg(unix)]
             let admitted = match codex_source.as_mut() {
@@ -1199,7 +1200,25 @@ pub(crate) trait ProgramStore {
 
 /// atpkg's own store, and its verified install run as `aterm pkg install <program>` runs it, for
 /// the launcher of the session it holds.
-pub(crate) struct AtpkgStore<'a>(&'a SessionCtx);
+pub(crate) struct AtpkgStore<'a> {
+    ctx: &'a SessionCtx,
+    install_mark: std::cell::Cell<Option<u64>>,
+}
+
+impl<'a> AtpkgStore<'a> {
+    fn new(ctx: &'a SessionCtx) -> Self {
+        Self {
+            ctx,
+            install_mark: std::cell::Cell::new(None),
+        }
+    }
+
+    fn installing(&self) -> InstallingMark<'a> {
+        let guard = InstallingMark::of(self.ctx);
+        self.install_mark.set(Some(guard.mark));
+        guard
+    }
+}
 
 impl AtpkgStore<'_> {
     /// The atpkg that installs here, or why none can: none beside aterm, an inert package
@@ -1234,7 +1253,8 @@ impl ProgramStore for AtpkgStore<'_> {
 
     fn install(&self, program: &str) -> Result<(), String> {
         let (atpkg, layout) = Self::installer()?;
-        install_with(&atpkg, &layout, program, self.0)
+        let mark = self.install_mark.get().ok_or("no owned install episode")?;
+        install_with(&atpkg, &layout, program, self.ctx, mark)
     }
 }
 
@@ -1259,7 +1279,16 @@ fn install_with(
     layout: &atpkg::store::Layout,
     program: &str,
     ctx: &SessionCtx,
+    mark: u64,
 ) -> Result<(), String> {
+    if !ctx
+        .timeline
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .worker_installing_at(mark)
+    {
+        return Err("the install episode no longer owns this launch".into());
+    }
     let mut cmd = crate::qos::atpkg_command(atpkg);
     cmd.args(crate::pass_lead(
         aterm_types::dirs::runs_under_private_state_root(),
@@ -1275,7 +1304,7 @@ fn install_with(
             ctx.timeline
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .set_worker_install_child(pid);
+                .set_worker_install_child(mark, pid);
         },
     )
     .map_err(|e| format!("it could not run: {e}"))?;
@@ -1508,26 +1537,28 @@ pub(crate) const fn refused_why(refused: &aterm_agent::harness::worker::Refused)
 /// ([`crate::session_timeline::SessionTimeline::worker_install_mark`]), so no install's silence
 /// counts against the sign-in check after it. The mark lives only in this process, so a seamless
 /// update's successor, which has no launcher, judges the worker as usual.
-pub(crate) struct InstallingMark<'a>(&'a SessionCtx);
+pub(crate) struct InstallingMark<'a> {
+    ctx: &'a SessionCtx,
+    mark: u64,
+}
 
 impl<'a> InstallingMark<'a> {
     /// Set the mark on `ctx`'s timeline.
     pub(crate) fn of(ctx: &'a SessionCtx) -> Self {
-        ctx.timeline
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .set_worker_installing(true);
-        Self(ctx)
+        let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        timeline.set_worker_installing(true);
+        let mark = timeline.worker_install_mark();
+        Self { ctx, mark }
     }
 }
 
 impl Drop for InstallingMark<'_> {
     fn drop(&mut self) {
-        self.0
+        self.ctx
             .timeline
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .set_worker_installing(false);
+            .end_worker_install(self.mark);
     }
 }
 

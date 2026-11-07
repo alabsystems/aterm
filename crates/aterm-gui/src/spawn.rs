@@ -599,8 +599,6 @@ pub(crate) struct SessionFactory {
     pub(crate) sandbox_wrap: Option<String>,
     /// Engine config (scrollback/cursor/theme/palette) applied to each tab's `Terminal`.
     pub(crate) terminal_config: Option<aterm_core::config::TerminalConfig>,
-    /// Whether program-state projection can keep an adopted box receipt standing.
-    pub(crate) tab_status: bool,
     /// Whether shell spawns may inject OSC 133/633 integration, with a fresh nonce per tab.
     /// A direct command never receives it, even when this policy permits worker shells.
     pub(crate) integrate: bool,
@@ -705,7 +703,6 @@ impl SessionFactory {
             cwd,
             sandbox_wrap,
             terminal_config: _,
-            tab_status: _,
             integrate,
             lat_epoch: _,
             loop_idle: _,
@@ -1307,8 +1304,6 @@ pub(crate) struct Adopted {
     pub autopilot_end: Option<String>,
     /// The record's book of declared wakes (`SessionRecord::wakes`), unparsed.
     pub wakes: Option<String>,
-    /// The actual queued box receipt from the handoff's status row, bound before reads.
-    pub box_receipt: Option<crate::box_banner::Receipt>,
 }
 
 /// Seed a seamless update's carried end, or a proven self-claim's carried face, onto an adopted
@@ -1729,7 +1724,6 @@ pub(crate) fn spawn_session(
         .as_ref()
         .and_then(|adopted| adopted.autopilot_end.clone());
     let adopt_wakes: Option<String> = adopt.as_ref().and_then(|adopted| adopted.wakes.clone());
-    let adopt_box_receipt = adopt.as_ref().and_then(|adopted| adopted.box_receipt);
     let substitute = records_shell_start(adopt.is_some(), factory.exec_command.as_deref())
         .then(|| {
             substitute_shell(
@@ -2043,7 +2037,6 @@ pub(crate) fn spawn_session(
             );
             Arc::new(ran)
         },
-        box_banner: Default::default(),
         update_parked: Default::default(),
         watchers: observed.watchers,
         frame: Default::default(),
@@ -2137,10 +2130,6 @@ pub(crate) fn spawn_session(
             factory.shell_children,
         );
         factory.edge_inbox.push(id);
-    }
-    if factory.tab_status {
-        ctx.box_banner
-            .adopt(adopt_box_receipt, term_lock(&term).program_state());
     }
     if let Some(debt) = carried_render_debt {
         seed_adopted_render_debt(&term, &ctx.timeline, debt);
@@ -5459,14 +5448,7 @@ pub(crate) fn arm_host_reach(
     {
         term_lock(term).authorize_clipboard_access(ClipboardAccess::Query);
     }
-    configure_notifications(
-        term,
-        reach,
-        &factory.notify_tx,
-        id,
-        witness,
-        &ctx.box_banner,
-    );
+    configure_notifications(term, reach, &factory.notify_tx, id, witness);
     configure_kitty_file_transfer(term, reach, factory.allow_kitty_file_transfer);
     configure_bell(term, proxy, id, window, witness);
     #[cfg(target_os = "linux")]
@@ -5544,47 +5526,35 @@ fn install_clipboard(
     });
 }
 
-fn configure_notifications(
+pub(crate) fn configure_notifications(
     term: &Arc<Mutex<Terminal>>,
     reach: HostReach,
     notify_tx: &notify::Notifier,
     id: u64,
     witness: &Arc<crate::spare::Witness>,
-    banner: &Arc<crate::box_banner::BoxBanner>,
 ) {
     if reach == HostReach::Refused {
         return;
     }
     let mut t = term_lock(term);
-    // One banner per box: codex's own notification for a box the herald told is dropped, and
-    // only one the queue took tells a box.
-    t.set_notification_admission(banner.admission());
     let tx = notify_tx.clone();
     let w = Arc::clone(witness);
-    let told = Arc::clone(banner);
     t.set_notification_callback(move |body| {
         w.host_effects.fetch_add(1, Ordering::Relaxed);
-        told.deliver(|| {
-            tx.try_send(notify::NotifyMsg::program(id, None, body.to_string()))
-                .is_ok()
-        });
+        let _ = tx.try_send(notify::NotifyMsg::program(id, None, body.to_string()));
     });
     let tx = notify_tx.clone();
     let w = Arc::clone(witness);
-    let told = Arc::clone(banner);
     t.set_advanced_notification_callback(move |n| {
         if !n.has_content() {
             return;
         }
         w.host_effects.fetch_add(1, Ordering::Relaxed);
-        told.deliver(|| {
-            tx.try_send(notify::NotifyMsg::program(
-                id,
-                n.title,
-                n.body.unwrap_or_default(),
-            ))
-            .is_ok()
-        });
+        let _ = tx.try_send(notify::NotifyMsg::program(
+            id,
+            n.title,
+            n.body.unwrap_or_default(),
+        ));
     });
 }
 
@@ -10469,14 +10439,7 @@ mod host_reach_tests {
                 None,
             )));
             let (tx, notices) = super::notify::Notifier::channel();
-            configure_notifications(
-                &term,
-                host_reach(mode),
-                &tx,
-                1,
-                &Arc::default(),
-                &Arc::default(),
-            );
+            configure_notifications(&term, host_reach(mode), &tx, 1, &Arc::default());
             term_lock(&term).apply_policy_engine(aterm_policy::engine::PolicyEngine::new(
                 aterm_policy::profiles::standard(),
             ));
@@ -10498,12 +10461,11 @@ mod host_reach_tests {
         }
     }
 
-    /// ONE BANNER PER BOX, WIRED: the session's notification path asks its `BoxBanner`, so a
-    /// program notification written while the `blocked` report the herald told stands posts
-    /// nothing, OSC 9, OSC 99 and OSC 777 alike, and every one passes again once the report
-    /// moves. NEGATIVE CONTROL: the same notifications before the herald told the box post.
+    /// A PROGRAM'S NOTIFICATION PASSES WHILE ITS BOX STANDS: a codex `blocked` report standing in
+    /// the session holds none of its program's notifications off. OSC 9, OSC 99 and OSC 777 are
+    /// each queued once, with their words, while the box stands, and again once it is answered.
     #[test]
-    fn a_box_the_herald_told_posts_no_program_notification() {
+    fn a_program_notification_passes_while_its_box_stands() {
         const BLOCKED: &[u8] = b"\x1b]7501;state=blocked:app=codex:kind=permission\x1b\\";
         const WORKING: &[u8] = b"\x1b]7501;state=working:app=codex\x1b\\";
         let term = Arc::new(Mutex::new(new_live_terminal(
@@ -10513,88 +10475,40 @@ mod host_reach_tests {
             None,
         )));
         let (tx, notices) = super::notify::Notifier::channel();
-        let banner = Arc::new(crate::box_banner::BoxBanner::default());
-        configure_notifications(
-            &term,
-            host_reach(Cm::User),
-            &tx,
-            1,
-            &Arc::default(),
-            &banner,
+        configure_notifications(&term, host_reach(Cm::User), &tx, 1, &Arc::default());
+        term_lock(&term).process(&[WORKING, BLOCKED].concat());
+        assert!(
+            term_lock(&term)
+                .program_state()
+                .state
+                .is_some_and(|report| report.state
+                    == aterm_core::terminal::program_state::ProgramStateWord::Blocked),
+            "PRECONDITION: the box stands"
         );
-        term_lock(&term).process(BLOCKED);
-        assert_eq!(
-            posted(&term, &notices),
-            NOTICES.len(),
-            "CONTROL: nobody told it"
-        );
-        let report = term_lock(&term).program_state().began;
-        banner.herald(report, |_| ((), true));
-        assert_eq!(posted(&term, &notices), 0, "the box the herald told");
+        for notice in NOTICES {
+            term_lock(&term).process(notice);
+            let passed: Vec<(u64, String)> = notices
+                .try_iter()
+                .map(|msg| {
+                    (
+                        msg.session,
+                        [msg.title.unwrap_or_default(), msg.body].join(" "),
+                    )
+                })
+                .collect();
+            let escaped = notice.escape_ascii().to_string();
+            assert_eq!(passed.len(), 1, "{escaped}: queued while the box stands");
+            assert_eq!(passed[0].0, 1, "{escaped}: the session's own");
+            assert!(
+                passed[0].1.contains("from the tab"),
+                "{escaped}: {passed:?}"
+            );
+        }
         term_lock(&term).process(WORKING);
         assert_eq!(
             posted(&term, &notices),
             NOTICES.len(),
-            "the box was answered"
-        );
-    }
-
-    /// Other tabs' notices hold every program slot of the process-wide queue when a codex tab
-    /// writes its box's notification: the queue refuses it, so it told nothing and the herald
-    /// tells the box. Once a slot is free the next box's notification is queued and tells it.
-    /// NEGATIVE CONTROL: counting the box told at the admission leaves it with no banner.
-    #[test]
-    fn a_notification_the_full_queue_refuses_tells_no_box() {
-        const BLOCKED: &[u8] = b"\x1b]7501;state=blocked:app=codex:kind=permission\x1b\\";
-        const WORKING: &[u8] = b"\x1b]7501;state=working:app=codex\x1b\\";
-        const NOTICE: &[u8] = b"\x1b]9;Approval requested\x07";
-        let term = Arc::new(Mutex::new(new_live_terminal(
-            24,
-            80,
-            Some(&notifications_allowed()),
-            None,
-        )));
-        let (tx, notices) = super::notify::Notifier::channel();
-        let banner = Arc::new(crate::box_banner::BoxBanner::default());
-        configure_notifications(
-            &term,
-            host_reach(Cm::User),
-            &tx,
-            1,
-            &Arc::default(),
-            &banner,
-        );
-        let other_tabs = (0..)
-            .take_while(|_| {
-                tx.try_send(super::notify::NotifyMsg::program(2, None, "flood".into()))
-                    .is_ok()
-            })
-            .count();
-        assert!(
-            other_tabs > 0,
-            "PRECONDITION: the other tabs filled the queue"
-        );
-        term_lock(&term).process(&[WORKING, NOTICE, BLOCKED].concat());
-        let report = term_lock(&term).program_state().began;
-        assert!(
-            banner.herald(report, |told| (!told, false)),
-            "a box whose notification the full queue refused is aterm's to tell"
-        );
-        assert_eq!(
-            notices.try_iter().count(),
-            other_tabs,
-            "only the other tabs'"
-        );
-        term_lock(&term).process(&[WORKING, NOTICE, BLOCKED].concat());
-        let report = term_lock(&term).program_state().began;
-        assert_eq!(
-            notices.try_iter().count(),
-            1,
-            "CONTROL: a free slot queues it"
-        );
-        assert!(
-            banner.herald(report, |told| (told, false)),
-            "CONTROL: a queued notification told its box"
+            "and once the box is answered"
         );
     }
 }

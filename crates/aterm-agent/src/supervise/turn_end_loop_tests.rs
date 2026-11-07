@@ -5966,6 +5966,7 @@ fn a_model_switch_is_read_back_by_a_loop_that_starts_after_it() {
                     back_at_unix: Some(back_at),
                     asked: true,
                     made_unix: made,
+                    proc: None,
                 }),
                 "{tag} {legacy}"
             );
@@ -15799,6 +15800,10 @@ struct AccountHost {
     /// host answers [`IdleHost::restart_left`]; and the one the last restart's report named.
     left_on_restart: std::sync::Mutex<VecDeque<u32>>,
     left: std::sync::Mutex<Option<u32>>,
+    /// The process (pid, start in unix seconds, conversation) the host reads only once the point
+    /// asks whether the agent resumes ([`IdleHost::agent_resumed`]), as a window's host refreshes
+    /// the snapshot it forgot at the last agent's exit; it is named from then on.
+    late_agent: std::sync::Mutex<Option<(u32, i64, Option<&'static str>)>>,
 }
 
 impl AccountHost {
@@ -15979,6 +15984,19 @@ impl IdleHost for AccountHost {
     }
     fn restart_left(&self) -> Option<crate::supervise::custody::Process> {
         self.left.lock().unwrap().map(|pid| (Some(pid), None))
+    }
+    /// [`Self::late_agent`], read now; with none set, no snapshot is read here (the trait's own
+    /// answer).
+    fn agent_resumed(&self) -> Option<AgentResumed> {
+        let (pid, started, conversation) = self.late_agent.lock().unwrap().take()?;
+        *self.pid.lock().unwrap() = Some(pid);
+        *self.started.lock().unwrap() = Some(started);
+        *self.conversation.lock().unwrap() = conversation.map(str::to_string);
+        Some(AgentResumed {
+            pid,
+            started: Some(started),
+            resumed: false,
+        })
     }
     fn account(&self, point: AccountPoint) -> Option<AccountAdvice> {
         let at = match point {
@@ -20586,6 +20604,278 @@ fn an_account_move_made_closes_the_model_switch_for_the_loop_after_it() {
     write(&[switch(1_000), moved(2_000, me), switch(3_000)]);
     assert_eq!(open(), standing);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The agent process a test host names: its pid, start (unix seconds) and conversation.
+type NamedAgent = (Option<u32>, Option<i64>, Option<&'static str>);
+
+/// What one point decides of a model switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwitchAt {
+    /// Its return to the model it left is made (`model-restore@v1`).
+    Restores,
+    /// Its return waits for the point the process is named on a conversation; the switch stands.
+    Holds,
+    /// The switch is over: a closing row, and nothing restored.
+    Closes,
+}
+
+#[test]
+fn a_model_switch_is_its_relaunched_process_and_another_program_in_the_tab_closes_it() {
+    use crate::supervise::approvals::{Ledger, Outcome, Row, model_switch_reason};
+    use crate::supervise::policy::turn_end::{RULE_MODEL_FALLBACK, RULE_MODEL_RESTORE};
+    use SwitchAt::{Closes, Holds, Restores};
+    const SID: &str = "@s-1";
+    let back_at = ACCOUNT_NOW - 600;
+    let p1: NamedAgent = (Some(4100), Some(ACCOUNT_NOW - 7_100), Some("conv-a"));
+    let b: NamedAgent = (Some(4200), Some(ACCOUNT_NOW - 300), Some("conv-b"));
+    let restores = |a: &TurnEndAction| {
+        matches!(
+            a,
+            TurnEndAction::Restart {
+                why: Restart::ModelBack { .. },
+                rule_id: RULE_MODEL_RESTORE,
+                ..
+            }
+        )
+    };
+    let named = |host: &AccountHost, (pid, started, conversation): NamedAgent| {
+        *host.pid.lock().unwrap() = pid;
+        *host.started.lock().unwrap() = started;
+        *host.conversation.lock().unwrap() = conversation.map(str::to_string);
+    };
+    let at = |s: &mut Session<'_, Mock>, opts: &SuperviseOpts, seq: u64| {
+        let point = point_at(s, ended("Fixed the parser."), seq);
+        s.turn_end_at_point(&point, Some(Duration::from_secs(300)), opts)
+            .expect("a decision")
+    };
+    let closed = |ledger: &std::path::Path| {
+        std::fs::read_to_string(ledger)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains(RULE_MODEL_RESTORE) && l.contains("\"decision\":\"waiting\""))
+            .count()
+    };
+    // A loop on the session, seeded from the ledger, whose host owes a relaunch's continuation
+    // (`owed`) and, where `step` names one, first takes a step of its own at a point of `p1`'s
+    // with that word (the harness's own relaunch, or a typed line). Then each process in
+    // `agents` is named at a point of its own: what each point decides of the switch. Under
+    // `late` each is named only once its point asks the host whether it resumes, the reading
+    // there naming none ([`AccountHost::late_agent`]).
+    let run = |ledger: &std::path::Path,
+               agents: &[NamedAgent],
+               owed: bool,
+               step: Option<&'static str>,
+               late: bool| {
+        let host = AccountHost::scripted(&[], &[]);
+        host.relaunch_owed.store(owed, Ordering::SeqCst);
+        let opts = account_opts(&host);
+        let mut m = Mock::new(vec![ended("Fixed the parser.")]);
+        let mut s = session(&mut m, Some(SID.to_string()));
+        s.set_clock(ACCOUNT_NOW, PDT);
+        s.set_zone_lookup(test_zones);
+        s.ledger = Ledger::open(Some(ledger), Some(SID), &mut Vec::new());
+        s.seed_model_switch(ledger);
+        if let Some(word) = step {
+            named(&host, p1);
+            *host.step.lock().unwrap() = Some(word);
+            host.carry.store(true, Ordering::SeqCst);
+            let rows = ended("Fixed the parser.");
+            let mut point = point_at(&s, rows.clone(), 101);
+            point.screen.cursor_row = rows
+                .iter()
+                .rposition(|r| r.starts_with('❯'))
+                .expect("caret");
+            point.screen.cursor_col = 2;
+            s.host_steps_here(&point, &opts, &mut false, &mut Alone)
+                .expect("the host's step");
+            assert_eq!(
+                host.said("carry-on").len(),
+                1,
+                "the step {word} was taken: {:?}",
+                s.withheld
+            );
+        }
+        let mut decided = Vec::new();
+        for (n, agent) in agents.iter().enumerate() {
+            if late {
+                named(&host, (None, None, None));
+                let (Some(pid), Some(started), conversation) = *agent else {
+                    panic!("a process named at its point has a pid and a start: {agent:?}");
+                };
+                *host.late_agent.lock().unwrap() = Some((pid, started, conversation));
+            } else {
+                named(&host, *agent);
+            }
+            let before = closed(ledger);
+            let a = at(&mut s, &opts, 102 + n as u64);
+            decided.push(match (restores(&a), closed(ledger) > before) {
+                (true, false) => Restores,
+                (false, false) => Holds,
+                (false, true) => Closes,
+                (true, true) => panic!("restored and closed at one point: {a:?}"),
+            });
+        }
+        decided
+    };
+    // The ledger an earlier loop left: the fallback's relaunch onto opus, back at a reset now
+    // past, and (`stamped`) a point the relaunched process `p1` had since, A's.
+    let switched = |tag: &str, stamped: bool| {
+        let (dir, ledger) = ledger_at(&format!("switch-process-{tag}"));
+        let made = ACCOUNT_NOW - 7_200;
+        let row = Row {
+            rule_id: RULE_MODEL_FALLBACK,
+            outcome: Outcome::Typed,
+            command: "relaunch --model opus",
+            reason: &model_switch_reason(Some("sonnet"), Some(back_at), made),
+            box_seq: 90,
+        }
+        .to_json(made * 1000, Some(SID));
+        std::fs::write(&ledger, row + "\n").expect("the ledger");
+        if stamped {
+            let first = run(&ledger, &[p1], false, None, false);
+            assert_eq!(first, [Restores], "its own process restores");
+        }
+        (dir, ledger)
+    };
+    let unnamed: NamedAgent = (Some(4300), Some(ACCOUNT_NOW - 200), None);
+    let resumed_a: NamedAgent = (Some(4300), Some(ACCOUNT_NOW - 200), Some("conv-a"));
+    let elsewhere: NamedAgent = (Some(4300), Some(ACCOUNT_NOW - 200), Some("conv-z"));
+    let mut wrong = Vec::new();
+    for (n, (case, agents, owed, step, want)) in [
+        (
+            "the person's fresh program, B",
+            vec![b],
+            false,
+            None,
+            vec![Closes],
+        ),
+        (
+            "B, after a step of the host's that typed a line and started nothing",
+            vec![b],
+            false,
+            Some("continued"),
+            vec![Closes],
+        ),
+        (
+            "control: the relaunched process",
+            vec![p1],
+            false,
+            None,
+            vec![Restores],
+        ),
+        (
+            "control: the relaunched process after a /clear",
+            vec![(p1.0, p1.1, Some("conv-a2"))],
+            false,
+            None,
+            vec![Restores],
+        ),
+        (
+            "control: a relaunch that resumed A",
+            vec![resumed_a],
+            false,
+            None,
+            vec![Restores],
+        ),
+        (
+            "another process whose conversation the host does not name yet, then A's",
+            vec![unnamed, resumed_a],
+            false,
+            None,
+            vec![Holds, Restores],
+        ),
+        (
+            "another process whose conversation the host does not name yet, then another's",
+            vec![unnamed, (unnamed.0, unnamed.1, Some("conv-b"))],
+            false,
+            None,
+            vec![Holds, Closes],
+        ),
+        (
+            "a relaunch the host still owes, on a conversation the switch's process never named",
+            vec![elsewhere],
+            true,
+            None,
+            vec![Restores],
+        ),
+        (
+            "a relaunch the host's own step started afresh, on a new conversation",
+            vec![(Some(4300), Some(ACCOUNT_NOW - 200), Some("conv-n"))],
+            false,
+            Some("done:fresh"),
+            vec![Restores],
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (dir, ledger) = switched(&format!("case-{n}"), true);
+        let got = run(&ledger, &agents, owed, step, false);
+        let keeps = !want.contains(&Closes);
+        let rows = closed(&ledger);
+        let open = crate::supervise::approvals::open_model_switch(&ledger, Some(SID)).is_some();
+        let _ = std::fs::remove_dir_all(&dir);
+        if got != want || rows != usize::from(!keeps) || open != keeps {
+            wrong.push(format!(
+                "{case}: {got:?}, closing rows {rows}, open for the loop after {open}"
+            ));
+        }
+    }
+    // THE PROCESS NAMED ONLY AT ITS POINT: a window's host forgets an exited agent's snapshot, so
+    // the reading at a new program's first point names no process, and the host reads it only
+    // when the point asks whether it resumes (`IdleHost::agent_resumed`). The switch is scoped
+    // there too, before the point is decided.
+    for (n, (case, agents, want)) in [
+        (
+            "the person's fresh program, B, named only at its point",
+            vec![b],
+            vec![Closes],
+        ),
+        (
+            "control: a relaunch that resumed A, named only at its point",
+            vec![resumed_a],
+            vec![Restores],
+        ),
+        (
+            "another process whose conversation the host does not name yet, then A's, each named \
+             only at its point",
+            vec![unnamed, resumed_a],
+            vec![Holds, Restores],
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (dir, ledger) = switched(&format!("late-{n}"), true);
+        let got = run(&ledger, &agents, false, None, true);
+        let keeps = !want.contains(&Closes);
+        let rows = closed(&ledger);
+        let open = crate::supervise::approvals::open_model_switch(&ledger, Some(SID)).is_some();
+        let _ = std::fs::remove_dir_all(&dir);
+        if got != want || rows != usize::from(!keeps) || open != keeps {
+            wrong.push(format!(
+                "{case}: {got:?}, closing rows {rows}, open for the loop after {open}"
+            ));
+        }
+    }
+    let (dir, ledger) = switched("legacy", false);
+    let got = run(&ledger, &[b], false, None, false);
+    if got != [Restores] || closed(&ledger) != 0 {
+        wrong.push(format!(
+            "control: a switch no loop scoped to a process, as an older build wrote it: {got:?}"
+        ));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    let (dir, ledger) = switched("same-loop", false);
+    let got = run(&ledger, &[p1, b], false, None, false);
+    if got != [Restores, Closes] {
+        wrong.push(format!(
+            "the loop that saw the relaunched process, at B's point: {got:?}"
+        ));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 #[test]
@@ -34077,6 +34367,8 @@ fn a_move_put_off_after_its_claim_is_asked_as_itself_whatever_acts_come_between(
             from: Some("claude-opus-5-5".to_string()),
             to: "claude-sonnet-5-5".to_string(),
             back_at: Some(now),
+            proc: None,
+            unproven: false,
         });
         let mut heard = Heard::default();
         for acts in [2, 1, 2, 1, 0] {

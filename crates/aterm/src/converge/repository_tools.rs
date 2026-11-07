@@ -55,7 +55,7 @@ impl Prerequisites {
     pub(super) fn live() -> Self {
         Self::new(
             Arc::new(Live::new()),
-            crate::doctor::toolset(BaseLock::Try),
+            crate::doctor::toolset(BaseLock::Try).default_selected("git"),
             Box::new(capture),
         )
     }
@@ -76,7 +76,7 @@ impl Prerequisites {
 }
 
 /// Package choices are read afresh, including a damaged removal record. The actual
-/// seed/update commands retain their own policy checks under the package store lock.
+/// selected update retains its own policy checks under the package store lock.
 fn packages() -> Result<(), Gate> {
     let cfg = atpkg::config::load();
     let layout = atpkg::store::resolve_from(&cfg);
@@ -275,9 +275,10 @@ impl Item for Prerequisites {
         match self.toolset.probe(self.sys.as_ref(), &ready.ctx) {
             // The aggregate counts active packages. A missing ready marker or an
             // unusable executable can still require the signed install/update path.
-            Probe::Ok { .. } => Probe::Change {
+            Probe::Ok { .. } | Probe::Change { .. } => Probe::Change {
                 from: "the active toolset has no usable Git for repository setup".into(),
-                to: "retry its admitted unattended package attempt".into(),
+                to: "install the selected managed Git without waiting for unrelated packages"
+                    .into(),
             },
             probe => probe,
         }
@@ -424,7 +425,8 @@ mod tests {
                 update_flags: &["--defer-busy-flip"],
                 left_for_next_pass: |_| Vec::new(),
             },
-        );
+        )
+        .default_selected("git");
         let check_sys = Arc::clone(&sys);
         let check_choices = Arc::clone(&choices);
         let capture: Capture = Box::new(move |_| {
@@ -477,7 +479,7 @@ mod tests {
         );
         assert_eq!(
             *choices.calls.lock().unwrap(),
-            ["seed", "update --defer-busy-flip"]
+            ["update --defer-busy-flip --default-selected git"]
         );
         let (sys, choices, empty) = fixture();
         inventory(&sys, "/fixture/repository-user", None);
@@ -617,10 +619,14 @@ mod tests {
                     update_flags: &[],
                     left_for_next_pass: |_| Vec::new(),
                 },
-            );
+            ).default_selected("git");
             assert!(matches!(item.probe(), Probe::Change { .. }));
             let result = item.apply();
-            assert_eq!(*choices.calls.lock().unwrap(), ["seed"], "{change}");
+            assert_eq!(
+                *choices.calls.lock().unwrap(),
+                ["update --default-selected git"],
+                "{change}"
+            );
             if change == "writer" {
                 assert!(
                     result.is_err(),
@@ -632,7 +638,7 @@ mod tests {
                 assert!(matches!(item.stood_aside(), Some(StoodAside::Waiting(_))));
                 assert!(
                     matches!(item.probe(), Probe::Deferred { .. }),
-                    "the full boundary refuses {change} and starts no update pass"
+                    "the full boundary refuses {change} after the owned selected update"
                 );
             }
         }
@@ -712,13 +718,17 @@ mod tests {
                 update_flags: &[],
                 left_for_next_pass: |_| Vec::new(),
             },
-        );
+        )
+        .default_selected("git");
         assert!(
             matches!(item.probe(), Probe::Change { .. }),
             "missing Git must get one bounded attempt despite aggregate completeness"
         );
         item.apply().unwrap();
-        assert_eq!(*choices.calls.lock().unwrap(), ["seed"]);
+        assert_eq!(
+            *choices.calls.lock().unwrap(),
+            ["update --default-selected git"]
+        );
 
         // A native Git can be installed yet incapable of the read-only object
         // operations required by this private inventory. Presence is not readiness.
@@ -799,7 +809,10 @@ mod tests {
         choices.calls.lock().unwrap().clear();
         assert!(matches!(item.probe(), Probe::Change { .. }));
         item.apply().unwrap();
-        assert_eq!(*choices.calls.lock().unwrap(), ["seed", "update"]);
+        assert_eq!(
+            *choices.calls.lock().unwrap(),
+            ["update --default-selected git"]
+        );
         assert!(
             matches!(item.probe(), Probe::Ok { .. }),
             "normal package update selects capable managed Git"

@@ -45,9 +45,9 @@ impl Service {
         if durable.is_some() {
             self.seed.intent.cancellation_persisted();
             super::super::reconcile_extinct(ctx);
+            self.finished.store(true, Ordering::Release);
+            retire_pins(ctx, &self.seed.intent);
         }
-        self.finished.store(true, Ordering::Release);
-        retire_pins(ctx, &self.seed.intent);
         Ok(durable.is_some())
     }
 }
@@ -139,6 +139,11 @@ pub(in crate::native_act) fn observe_terminal_by(
         return false;
     };
     if root.phase != Phase::Committing {
+        if !renewal::with_receipt_writer(&env, |writer| writer.acknowledge(&root))
+            .is_ok_and(|result| result.is_some())
+        {
+            return false;
+        }
         if !settle_terminal_native(ctx, &service.seed, kernel) {
             return false;
         }

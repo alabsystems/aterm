@@ -33,6 +33,17 @@ struct CellRun {
 }
 
 impl CellRun {
+    /// Decode the last cell starting at or before `at`, and the cursor before it.
+    #[inline(always)]
+    fn pair_at_byte(self, at: usize, preceding: usize) -> (Option<CellSpan>, usize) {
+        // Recording checked positive byte strides and counts; the caller chose
+        // this run by its start byte. Cell decoding retains saturation.
+        let i = ((at - self.byte) / self.bytes as usize).min(self.count as usize - 1) as u32;
+        let cell = self.cell(i);
+        let before = if i > 0 { cell.col } else { preceding };
+        (Some(cell), before)
+    }
+
     #[inline]
     const fn cell(self, i: u32) -> CellSpan {
         let i = i as usize;
@@ -301,6 +312,38 @@ impl LineCells {
         stored_span(text, self, start_byte, end_byte)
     }
 
+    /// Last cell starting at or before `byte` and the cursor after its predecessor,
+    /// restricted to starts below `len`. Byte order is independent of columns.
+    #[inline(always)]
+    pub(crate) fn cell_and_previous(&self, byte: usize, len: usize) -> (Option<CellSpan>, usize) {
+        let Some(at) = len.checked_sub(1).map(|last| byte.min(last)) else {
+            return (None, 0);
+        };
+        let Some(head) = self.head.filter(|head| head.byte <= at) else {
+            return (None, 0);
+        };
+        if self.tail.first().is_none_or(|run| run.byte > at) {
+            return head.pair_at_byte(at, 0);
+        }
+        // Grow from the front before bisecting: early endpoints need not search
+        // a long row's whole tail, and late endpoints still skip repeated runs.
+        let mut first = 1;
+        let mut end = 1;
+        while end < self.tail.len() && self.tail[end].byte <= at {
+            first = end + 1;
+            end = end.saturating_mul(2).saturating_add(1).min(self.tail.len());
+        }
+        let count = first + self.tail[first..end].partition_point(|run| run.byte <= at);
+        let (run, preceding) = match self.tail[..count].split_last() {
+            Some((run, earlier)) => {
+                let previous = earlier.last().copied().unwrap_or(head);
+                (*run, previous.cell(previous.count).col)
+            }
+            None => (head, 0),
+        };
+        run.pair_at_byte(at, preceding)
+    }
+
     /// Every cell, in line order.
     pub(crate) fn iter(&self) -> impl Iterator<Item = CellSpan> + '_ {
         self.runs()
@@ -311,6 +354,86 @@ impl LineCells {
 #[cfg(test)]
 mod tests {
     use super::{CellSpan, LineCells};
+
+    #[test]
+    fn arithmetic_cell_lookup_matches_expansion_with_gaps_and_saturation() {
+        let check = |cells: &LineCells| {
+            let expanded: Vec<_> = cells.iter().collect();
+            let bound = expanded.last().map_or(0, |cell| cell.end);
+            let mut points = vec![0, 1, usize::MAX];
+            for cell in &expanded {
+                points.extend([
+                    cell.byte.saturating_sub(1),
+                    cell.byte,
+                    cell.byte.saturating_add(1),
+                    cell.end,
+                ]);
+            }
+            points.sort_unstable();
+            points.dedup();
+            for len in [
+                0,
+                1,
+                4,
+                bound / 2,
+                bound,
+                bound.saturating_add(1),
+                usize::MAX,
+            ] {
+                for &byte in &points {
+                    let mut eligible = expanded
+                        .iter()
+                        .rev()
+                        .filter(|cell| cell.byte <= byte && cell.byte < len);
+                    let expected = (
+                        eligible.next().copied(),
+                        eligible.next().map_or(0, |cell| cell.end_col),
+                    );
+                    assert_eq!(
+                        cells.cell_and_previous(byte, len),
+                        expected,
+                        "byte={byte} len={len} cells={expanded:?}"
+                    );
+                }
+            }
+        };
+        for runs in [0, 1, 2, 3, 7, 8, 9, 15, 16, 17, 65, 129] {
+            let mut cells = LineCells::new();
+            let mut byte = 3;
+            for run in 0..runs {
+                let stride = run % 3 + 1;
+                let count = run % 7 + 1;
+                let col = if run % 3 == 0 {
+                    usize::MAX - 3
+                } else {
+                    run % 5
+                };
+                cells.push_repeated(byte..byte + stride, col, run % 4, count);
+                byte += stride * count + run % 2;
+            }
+            check(&cells);
+        }
+        let mut saturated = LineCells::new();
+        saturated.push_repeated(usize::MAX - 7..usize::MAX - 5, usize::MAX - 3, 2, 7);
+        check(&saturated);
+
+        // A full-width repetition count remains one inline run.
+        let count = u32::MAX as usize;
+        let cells = LineCells::identity(count);
+        for byte in [0, 1, 7, count - 2, count, usize::MAX] {
+            let at = byte.min(count - 1);
+            let cell = |byte| CellSpan {
+                byte,
+                end: byte + 1,
+                col: byte,
+                end_col: byte + 1,
+            };
+            assert_eq!(
+                cells.cell_and_previous(byte, usize::MAX),
+                (Some(cell(at)), at)
+            );
+        }
+    }
 
     fn spans(cells: &LineCells) -> Vec<(usize, usize, usize, usize)> {
         cells

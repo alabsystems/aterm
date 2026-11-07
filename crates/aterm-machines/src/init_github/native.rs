@@ -34,8 +34,9 @@ const GITHUB_STEP: &str = "github.sign-in";
 /// Preserved checkout work is separate from the credential's sign-in remedy.
 const REPOSITORIES_STEP: &str = "github.repositories";
 
-/// The automatic lane can publish a complete count only after the captured default
-/// source's pinned credential route also works. Missing work is left to the native
+/// A nonempty automatic selection can publish a complete count only after the captured
+/// default source's pinned credential route also works. Empty selection checks no sign-in.
+/// Missing work is left to the native
 /// batch's ordinary route check, rather than invoking the helper twice before cloning.
 /// # Errors
 /// The account, source, checkouts or credential route cannot be read safely, the route
@@ -68,7 +69,7 @@ pub(crate) fn automatic_inventory_counts_captured(
     let standing = repos::partition(sys, &captured.user, listed)?;
     let counts = (standing.present.len(), listed.len());
     // capture_ready released the shared materialization lock before any helper runs.
-    let lookups = if counts.0 == counts.1 {
+    let lookups = if !listed.is_empty() && counts.0 == counts.1 {
         let helper = super::helper(sys, &captured.user);
         Some(Git::for_user(sys, &captured.user).lookups(
             sys,
@@ -430,6 +431,17 @@ impl InitialRepositoryInputs {
         self.local.as_ref().err().map(|block| block.why.as_str())
     }
 
+    /// An admitted default selection with no repository work. This supplies no
+    /// credential-route or source-currency evidence; callers retain those fences.
+    pub(crate) fn selects_no_repositories(&self) -> bool {
+        self.local.as_ref().is_ok_and(|local| {
+            local
+                .inventory
+                .as_ref()
+                .is_some_and(|inventory| inventory.repositories().is_empty())
+        })
+    }
+
     pub(crate) fn validate_default_context(
         &self,
         sys: &dyn System,
@@ -489,10 +501,7 @@ impl InitialRepositoryInputs {
         if sys.euid() != user.uid {
             return Err(String::from("repository setup must run as its local user").into());
         }
-        if !repos::git_installed(sys) {
-            return Err(Block::of(Wait::GitReadiness)(repos::no_git(sys).into()));
-        }
-        repos::admit_home(sys, user)?;
+        repos::admit_destination(sys, user)?;
         let configured = configuration(sys, user).map_err(Block::of(Wait::Settings))?;
         let source = configured.clone().unwrap_or_else(|| Github {
             account: String::new(),
@@ -509,6 +518,13 @@ impl InitialRepositoryInputs {
         } else {
             None
         };
+        if inventory
+            .as_ref()
+            .is_none_or(|inventory| !inventory.repositories().is_empty())
+            && !repos::git_installed(sys)
+        {
+            return Err(Block::of(Wait::GitReadiness)(repos::no_git(sys).into()));
+        }
         Ok(LocalInputs {
             configured,
             token,
@@ -607,6 +623,10 @@ impl Item for NativeRepositories {
             }
             let check = (|| {
                 let (plan, standing) = self.read(sys)?;
+                if plan.empty_inventory {
+                    self.ensure_current(sys).map_err(Block::from)?;
+                    return Ok((plan, standing, None));
+                }
                 if let Some(why) = repos::named(&standing.git_waits) {
                     return Err(Block::of(Wait::GitReadiness)(why));
                 }
@@ -629,7 +649,7 @@ impl Item for NativeRepositories {
                         .unwrap_or_default();
                     return Err(Block::of(Wait::DiskSpace)(why));
                 }
-                Ok::<_, Block>((plan, standing, lookups))
+                Ok::<_, Block>((plan, standing, Some(lookups)))
             })();
             let (plan, standing, lookups) = match check {
                 Ok(read) => read,
@@ -638,6 +658,12 @@ impl Item for NativeRepositories {
                     self.reading.set(block.wait.map(Reading::Waits));
                     return block.probe(self.unasked, sys.macos());
                 }
+            };
+            let Some(lookups) = lookups else {
+                return Probe::NotApplicable {
+                    why: "the private inventory selects no repositories; GitHub sign-in was not checked"
+                        .into(),
+                };
             };
             let ready = lookups.ready();
             let count = plan.repositories.len();
@@ -799,6 +825,10 @@ impl NativeRepositories {
             Ok(())
         };
         current()?;
+        if plan.empty_inventory {
+            self.carry(Carried::Applied(plan));
+            return Ok(());
+        }
         if let Some(why) = repos::named(&standing.git_waits) {
             self.reading.set(Some(Reading::Waits(Wait::GitReadiness)));
             return Err(why);
@@ -978,6 +1008,8 @@ impl NativeRepositories {
 struct Plan {
     token: Arc<Secret>,
     repositories: Vec<repos::Repo>,
+    /// Only a captured private selection can establish no work without checking GitHub.
+    empty_inventory: bool,
     /// The listed repositories left out because another takes their folder
     /// ([`repos::Inventory::notes`]).
     notes: Vec<String>,
@@ -1117,6 +1149,7 @@ impl NativeRepositories {
             self.ensure_current(sys).map_err(Block::from)?;
             return Ok(Plan {
                 token,
+                empty_inventory: repositories.is_empty(),
                 repositories,
                 notes: Vec::new(),
             });
@@ -1180,6 +1213,7 @@ impl NativeRepositories {
         self.ensure_current(sys).map_err(Block::from)?;
         Ok(Plan {
             token,
+            empty_inventory: false,
             repositories: listed.repositories,
             notes: listed.notes,
         })
@@ -1293,17 +1327,21 @@ pub(super) mod tests {
             home.join(crate::init_github::TOKEN_FILE).to_str().unwrap(),
         );
         answer(sys, user, "/user", aterm_json::json!({"login": user.name}));
+        present_repository(sys, user, name);
+        script::lookups_hold(sys, user, GITHUB, &user.name, TOKEN);
+        script::alike(sys, user);
+    }
+
+    fn present_repository(sys: &Fake, user: &User, name: &str) {
         answer(
             sys,
             user,
             &format!("{ACCESSIBLE}&page=1"),
             aterm_json::json!([repository(&user.name, name, 1)]),
         );
-        let path = home.join(name);
+        let path = Path::new(&user.home).join(name);
         sys.stat_of(path.to_str().unwrap(), stat(true, 0o700));
         super::repos::tests::script_existing(sys, user, &path, name);
-        script::lookups_hold(sys, user, GITHUB, &user.name, TOKEN);
-        script::alike(sys, user);
     }
 
     #[test]
@@ -2049,6 +2087,126 @@ pub(super) mod tests {
                     .any(|call| call.contains("credential fill") || call.contains(" clone "))
             );
         }
+
+        // A fully materialized empty selection owes no repository or sign-in
+        // work, including on an account where Git and its helper are absent.
+        let fixture = readback_fixture(false);
+        let empty = aterm_json::json!({"schema":2,"account":"alice","repositories":[]});
+        let source_text = format!(
+            "gh_access_token={TOKEN}\ngithub-repositories.json={empty}\nunrelated=before\n"
+        );
+        aterm_uds::atomic_file::write(&fixture.source, source_text.as_bytes(), 0o600).unwrap();
+        client::sync(&fixture.paths, None).unwrap();
+        metadata(&fixture.sys, &fixture.who, aterm_json::json!([]));
+        fixture
+            .sys
+            .remove(&aterm_types::installed_command::legacy(Path::new(&fixture.who.home))[0])
+            .unwrap();
+        fixture.sys.simulate(|_, command| {
+            panic!(
+                "an empty repository selection started {}",
+                command.display()
+            )
+        });
+        let config = client::config(&fixture.paths).unwrap().unwrap();
+        let captured = client::with_materialization_ready_for_entries(
+            &fixture.paths,
+            &config,
+            &super::super::VAULT_INPUT_ENTRIES,
+            || {
+                InitialRepositoryInputs::capture(&fixture.sys, &fixture.ctx)
+                    .map_err(aterm_secrets::Error::new)
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let state = aterm_tempfile::tempdir().unwrap();
+        for legacy in [false, true] {
+            if legacy {
+                crate::init::owe_clone(state.path(), &Holds::NONE).unwrap();
+            }
+            let checked = std::cell::Cell::new(false);
+            let read = crate::init::owed_clone_captured(
+                &fixture.sys,
+                state.path(),
+                &Holds::NONE,
+                captured.inputs.clone(),
+                || {
+                    checked.set(true);
+                    captured
+                        .snapshot
+                        .is_current_now(&fixture.paths)
+                        .map_err(|why| why.to_string())
+                },
+            )
+            .unwrap();
+            assert!(
+                checked.get(),
+                "empty work still requires the full vault fence"
+            );
+            assert!(matches!(read, OwedClone::Nothing(_)), "{legacy}: {read:?}");
+            assert!(matches!(
+                crate::init::owed_clone(&fixture.sys, state.path(), &Holds::NONE).unwrap(),
+                OwedClone::Nothing(_)
+            ));
+        }
+        for mode in [Mode::Plan, Mode::Apply] {
+            let paths = fixture.paths.clone();
+            let snapshot = captured.snapshot.clone();
+            let rows = run_captured(
+                &fixture.sys,
+                &fixture.ctx,
+                mode,
+                RepositoryWork::Repair,
+                captured.inputs.clone(),
+                Box::new(move || {
+                    snapshot
+                        .is_current_now(&paths)
+                        .map_err(|why| why.to_string())
+                }),
+            )
+            .unwrap();
+            assert_eq!(stage(&rows).outcome, crate::model::Outcome::NotApplicable);
+            assert!(Reading::of(stage(&rows)).is_none());
+        }
+        let mut holds = Holds::NONE;
+        holds.off.set(Setting::Repositories, true);
+        assert!(matches!(
+            crate::init::owed_clone_captured(
+                &fixture.sys,
+                state.path(),
+                &holds,
+                captured.inputs.clone(),
+                || Ok(true),
+            )
+            .unwrap(),
+            OwedClone::Held(_)
+        ));
+        aterm_uds::atomic_file::write(
+            &fixture.source,
+            source_text
+                .replace(TOKEN, "fixture-rotated-token")
+                .as_bytes(),
+            0o600,
+        )
+        .unwrap();
+        client::sync(&fixture.paths, None).unwrap();
+        assert!(matches!(
+            crate::init::owed_clone_captured(
+                &fixture.sys,
+                state.path(),
+                &Holds::NONE,
+                captured.inputs,
+                || {
+                    captured
+                        .snapshot
+                        .is_current_now(&fixture.paths)
+                        .map_err(|why| why.to_string())
+                },
+            )
+            .unwrap(),
+            OwedClone::Waiting(_)
+        ));
     }
 
     #[test]
@@ -2879,7 +3037,20 @@ pub(super) mod tests {
             (sys, item)
         };
         let cases: Vec<(&str, (Fake, NativeRepositories), Option<Wait>)> = vec![
-            ("no git", bare(), Some(Wait::GitReadiness)),
+            (
+                "no git",
+                {
+                    let (sys, item) = bare();
+                    source(&sys, "/Users//alice/.secrets/gh_access_token");
+                    metadata(
+                        &sys,
+                        &item.user,
+                        aterm_json::json!([repository("alice", "ready", 1)]),
+                    );
+                    (sys, item)
+                },
+                Some(Wait::GitReadiness),
+            ),
             (
                 "no token yet",
                 {
@@ -3160,12 +3331,7 @@ pub(super) mod tests {
     fn a_keychain_helper_aterm_did_not_write_neither_stops_the_stage_nor_is_asked() {
         let context = crate::items::defaults::tests::ctx(&[user("alice", 501)]);
         let (sys, item) = fixture();
-        answer(
-            &sys,
-            &item.user,
-            &format!("{ACCESSIBLE}&page=1"),
-            aterm_json::json!([]),
-        );
+        present_repository(&sys, &item.user, "ready");
         script::unconfigured(&sys, &item.user);
         script::lookups_hold(&sys, &item.user, GITHUB, "alice", TOKEN);
         let rows = run(&sys, &context, Mode::Apply).unwrap();
@@ -3244,12 +3410,7 @@ pub(super) mod tests {
             );
         };
         let (sys, item) = fixture();
-        answer(
-            &sys,
-            &item.user,
-            &format!("{ACCESSIBLE}&page=1"),
-            aterm_json::json!([]),
-        );
+        present_repository(&sys, &item.user, "ready");
         script::lookups_hold(&sys, &item.user, GITHUB, "alice", TOKEN);
         match item.probe(&sys, &context(&item)) {
             Probe::Ok { now } => assert!(now.contains("hands back the synced token"), "{now}"),
@@ -3264,12 +3425,7 @@ pub(super) mod tests {
             (None, "hands back no token"),
         ] {
             let (sys, item) = fixture();
-            answer(
-                &sys,
-                &item.user,
-                &format!("{ACCESSIBLE}&page=1"),
-                aterm_json::json!([]),
-            );
+            present_repository(&sys, &item.user, "ready");
             match held {
                 Some(held) => script::lookups_hold(&sys, &item.user, GITHUB, "alice", held),
                 None => script::lookups_hold_nothing(&sys, &item.user),
@@ -4936,7 +5092,8 @@ pub(super) mod tests {
 
     /// `aterm init`'s default stage on a Mac the vault wrote no GitHub token to asks nobody
     /// anything: its row is not applicable, and neither git nor GitHub is asked. An explicit
-    /// request for the stage waits for Git's automatic installation on that Mac (the control).
+    /// request with a token and selected repository waits for Git's automatic installation
+    /// on that Mac (the control).
     #[test]
     fn init_s_default_stage_without_a_token_is_not_applicable_and_asks_nothing() {
         let (sys, bare) = bare();
@@ -4955,6 +5112,12 @@ pub(super) mod tests {
                     && !call.contains(crate::items::github::CLT_GIT)),
             "{:?}",
             sys.calls()
+        );
+        source(&sys, "/Users//alice/.secrets/gh_access_token");
+        metadata(
+            &sys,
+            &bare.user,
+            aterm_json::json!([repository("alice", "ready", 1)]),
         );
         assert!(matches!(
             item(&bare.user, None, false, RepositoryWork::Refresh, None).probe(&sys, &context),

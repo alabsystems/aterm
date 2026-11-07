@@ -843,6 +843,9 @@ pub fn prepare_restart(
 ) -> Result<(), &'static str> {
     use super::{native_act, upgrade_drive};
     let encoded = restart_wire(prepare).ok_or("restart-plan")?;
+    if opts.dry_run {
+        return Err("restart-dry-run");
+    }
     let key = format!("renewal-{}", prepare.id);
     let native_act::NativePlan::Restart {
         process,
@@ -875,6 +878,11 @@ pub fn prepare_restart(
             native_coordination: true,
             ..Default::default()
         });
+    if state.native_completed_prepare.is_some() || state.native_noexec_prepare.is_some() {
+        return recover_completion(opts, sid, prepare, &state)
+            .map(|_| ())
+            .ok_or("restart-completion");
+    }
     if !matching_restart(&state, prepare) {
         return Err("restart-plan");
     }
@@ -930,6 +938,10 @@ pub fn reconcile_restart(
     let Ok(Some(mut state)) = upgrade_drive::load_record(opts, &key) else {
         return;
     };
+    if state.native_completed_prepare.is_some() || state.native_noexec_prepare.is_some() {
+        let _completion = recover_completion(opts, sid, prepare, &state);
+        return;
+    }
     if !matching_restart(&state, prepare) {
         return;
     }
@@ -973,11 +985,19 @@ fn drive_admitted(
     }
     let key = format!("renewal-{}", prepare.id);
     let mut state = upgrade_drive::load_record(opts, &key).ok()??;
+    if state.native_completed_prepare.is_some() || state.native_noexec_prepare.is_some() {
+        return recover_completion(opts, sid, prepare, &state);
+    }
     if !matching_restart(&state, prepare) {
         return None;
     }
     let mut client = upgrade_drive::connect(opts, sid).ok()?;
     native_restart::recover(opts, &key, &mut client, sid, &mut state).ok()?;
+    if state.native_completed_prepare.is_some() || state.native_noexec_prepare.is_some() {
+        // Even a terminal receipt without an observation must survive reload.
+        upgrade_drive::save_checked(opts, &key, &state).ok()?;
+        return completion_value(&state, sid, prepare);
+    }
     drive_connection(opts, sid, prepare, state, client, signal_original)
 }
 
@@ -998,8 +1018,15 @@ pub(super) fn drive_connection(
     signal_original: bool,
 ) -> Option<RestartCompletion> {
     use super::{native_act, native_restart, upgrade_drive};
+    restart_wire(prepare)?;
+    if opts.dry_run {
+        return None;
+    }
+    if state.native_completed_prepare.is_some() || state.native_noexec_prepare.is_some() {
+        return recover_completion(opts, sid, prepare, &state);
+    }
     let key = format!("renewal-{}", prepare.id);
-    if !matching_restart(&state, prepare) || opts.dry_run {
+    if !matching_restart(&state, prepare) {
         return None;
     }
     if state.native_retired_unissued {
@@ -1024,7 +1051,7 @@ pub(super) fn drive_connection(
             && native_restart::abort(opts, &key, &mut client, sid, &mut state)
         {
             upgrade_drive::save_checked(opts, &key, &state).ok()?;
-            return Some(RestartCompletion::NotStarted);
+            return completion_value(&state, sid, prepare);
         }
     }
     if state.native_retired_unissued {
@@ -1034,14 +1061,14 @@ pub(super) fn drive_connection(
     let started = std::time::Instant::now();
     while native_act::monotonic_us().is_some_and(|now| now < prepare.deadline_us) {
         if native_restart::complete(opts, &key, &mut client, sid, &mut state) {
+            // Preserve closure even when the host has no usable observation.
+            // A later read must remain inert instead of replaying the operation.
             upgrade_drive::save_checked(opts, &key, &state).ok()?;
-            return state.native_observation.map(|observation| {
-                if state.native_rollback {
-                    RestartCompletion::Rollback(observation)
-                } else {
-                    RestartCompletion::Forward(observation)
-                }
-            });
+            return completion_value(&state, sid, prepare);
+        }
+        if state.native_noexec_prepare.is_some() {
+            upgrade_drive::save_checked(opts, &key, &state).ok()?;
+            return completion_value(&state, sid, prepare);
         }
         if state.native_retired_unissued {
             upgrade_drive::save_checked(opts, &key, &state).ok()?;
@@ -1190,21 +1217,48 @@ fn history_lines(reader: impl std::io::BufRead, intent: &Intent) -> Option<Histo
     })
 }
 
-/// Positive completion retained by the private restart record. Reading this
-/// does not prepare, signal or launch anything, including after a host crash.
-pub fn completed_restart(
-    opts: &super::upgrade_drive::Opts,
-    id: &str,
+fn completed_header_matches(
+    state: &super::upgrade_drive::St,
+    sid: &str,
+    expected: &super::native_act::Prepare,
+) -> bool {
+    use super::{native_act::NativePlan, upgrade::Phase};
+    restart_wire(expected).is_some()
+        && state.tab == sid
+        && state.native_coordination
+        && state.native.is_none()
+        && state.native_prepare.is_empty()
+        && !state.native_retired_unissued
+        && state.native_account_candidate.is_none()
+        && matches!(state.phase, Phase::Relaunched { .. } | Phase::Done)
+        && state.native_completed_prepare.as_deref() == Some(expected)
+        && state.native_noexec_prepare.is_none()
+        && matches!(&expected.plan, NativePlan::Restart { rollback, .. }
+            if !state.native_rollback || rollback.is_some())
+}
+
+/// Validate historical completion data for this exact operation. This neither
+/// proves current process liveness nor grants native execution authority.
+fn completed_state(
+    state: &super::upgrade_drive::St,
+    sid: &str,
+    expected: &super::native_act::Prepare,
 ) -> Option<(bool, super::native_observe::SavedObservation)> {
-    let state = super::upgrade_drive::load_record(opts, &format!("renewal-{id}")).ok()??;
-    let prepare = state.native_completed_prepare.as_ref()?;
-    if prepare.id != id {
+    use super::native_act::NativePlan;
+    if !completed_header_matches(state, sid, expected) {
         return None;
     }
-    let observed = state.native_observation?;
-    let super::native_act::NativePlan::Restart {
-        forward, rollback, ..
-    } = &prepare.plan
+    let observed = state.native_observation.as_ref()?;
+    // The observation's own codec validates bounds and pairs its independent
+    // registration and binding IDs/epochs. Its ID is not the native operation ID.
+    observed.encode()?;
+    let NativePlan::Restart {
+        process,
+        shell,
+        forward,
+        rollback,
+        ..
+    } = &expected.plan
     else {
         return None;
     };
@@ -1213,8 +1267,215 @@ pub fn completed_restart(
     } else {
         forward
     };
-    (observed.registration.vendor.image == command.image)
-        .then_some((!state.native_rollback, observed))
+    let vendor = &observed.registration.vendor;
+    (observed.registration.host_epoch == expected.host_epoch
+        && &observed.registration.shell == shell
+        && vendor.pid != shell.pid
+        && vendor.parent == shell.pid
+        && vendor.session == shell.session
+        && vendor.group == vendor.pid
+        && (vendor.pid != process.pid || vendor.birth != process.birth)
+        && &vendor.image == command.settled())
+    .then(|| (!state.native_rollback, observed.clone()))
+}
+
+/// A fresh read must acknowledge its own durable save before publishing the
+/// completion. A failed barrier or a newer writer keeps this attempt inert.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeCompletionRecovery",
+        action = "NextFault",
+        reason = "The harness selects malformed retained data or mismatched caller evidence"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeCompletionRecovery",
+        action = "Rollback",
+        reason = "An earlier host execution completed in the rollback phase"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeCompletionRecovery",
+        action = "Wrapper",
+        reason = "The planner captured a command with a separate settled image"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeCompletionRecovery",
+        action = "Dry",
+        reason = "The caller supplies options forbidding durable changes"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeCompletionRecovery",
+        action = "Live",
+        reason = "The caller supplies ordinary execution options"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeCompletionRecovery",
+        action = "FailBarrier",
+        reason = "The injected filesystem refuses the directory durability barrier"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeCompletionRecovery",
+        action = "RepairBarrier",
+        reason = "The injected filesystem resumes acknowledging directory durability"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeCompletionRecovery",
+        action = "Attempt",
+        project = "aterm_agent::harness::native_restart::transport_tests::completion::transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeNoexecRecovery",
+        action = "NextFault",
+        reason = "The caller or retained record supplies mismatched recovery evidence"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeNoexecRecovery",
+        action = "Expire",
+        reason = "The original host deadline passes before a later historical read"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeNoexecRecovery",
+        action = "Dry",
+        reason = "The caller supplies dry-run options"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeNoexecRecovery",
+        action = "Live",
+        reason = "The caller supplies ordinary execution options"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeNoexecRecovery",
+        action = "FailBarrier",
+        reason = "The filesystem refuses the directory durability barrier"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeNoexecRecovery",
+        action = "RepairBarrier",
+        reason = "The filesystem resumes acknowledging directory durability"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeNoexecRecovery",
+        action = "Attempt",
+        project = "aterm_agent::harness::native_restart::transport_tests::noexec::transition"
+    )
+)]
+pub(super) fn recover_completion(
+    opts: &super::upgrade_drive::Opts,
+    sid: &str,
+    expected: &super::native_act::Prepare,
+    state: &super::upgrade_drive::St,
+) -> Option<RestartCompletion> {
+    if opts.dry_run {
+        return None;
+    }
+    let noexec = noexec_state(state, sid, expected);
+    if !noexec && !completed_header_matches(state, sid, expected) {
+        return None;
+    }
+    let completion = completion_value(state, sid, expected);
+    if !noexec && state.native_observation.is_some() && completion.is_none() {
+        return None;
+    }
+    super::upgrade_drive::save_checked(opts, &format!("renewal-{}", expected.id), state).ok()?;
+    completion
+}
+
+fn noexec_state(
+    state: &super::upgrade_drive::St,
+    sid: &str,
+    expected: &super::native_act::Prepare,
+) -> bool {
+    restart_wire(expected).is_some()
+        && state.tab == sid
+        && super::native_restart::noexec_prepare(state) == Some(expected)
+}
+
+fn completion_value(
+    state: &super::upgrade_drive::St,
+    sid: &str,
+    expected: &super::native_act::Prepare,
+) -> Option<RestartCompletion> {
+    if noexec_state(state, sid, expected) {
+        return Some(RestartCompletion::NotStarted);
+    }
+    let (forward, observation) = completed_state(state, sid, expected)?;
+    Some(if forward {
+        RestartCompletion::Forward(observation)
+    } else {
+        RestartCompletion::Rollback(observation)
+    })
+}
+
+/// Revalidate and durably acknowledge the private restart record for the full
+/// expected request and session, without preparing, signalling or launching
+/// anything, including after a host crash or the original deadline.
+pub fn restart_completion(
+    opts: &super::upgrade_drive::Opts,
+    sid: &str,
+    expected: &super::native_act::Prepare,
+) -> Option<RestartCompletion> {
+    if opts.dry_run {
+        return None;
+    }
+    restart_wire(expected)?;
+    let state =
+        super::upgrade_drive::load_record(opts, &format!("renewal-{}", expected.id)).ok()??;
+    recover_completion(opts, sid, expected, &state)
+}
+
+/// The observation-only view excludes attempts proven never to have started.
+pub fn completed_restart(
+    opts: &super::upgrade_drive::Opts,
+    sid: &str,
+    expected: &super::native_act::Prepare,
+) -> Option<(bool, super::native_observe::SavedObservation)> {
+    match restart_completion(opts, sid, expected)? {
+        RestartCompletion::Forward(observation) => Some((true, observation)),
+        RestartCompletion::Rollback(observation) => Some((false, observation)),
+        RestartCompletion::NotStarted => None,
+    }
 }
 
 /// Read only the existing Codex per-tab native completion ledger. A raw line,

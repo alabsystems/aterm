@@ -629,15 +629,13 @@ fn the_final_claim_fence_refuses_contention_and_holds_its_locks_through_the_writ
         ctx: parked.ctx.clone(),
         topics: crate::fabric::render_topics(&parked.ctx.fabric.topics()),
     }];
-    for busy in ["meta", "timeline", "banner"] {
+    for busy in ["meta", "timeline"] {
         let meta = (busy == "meta").then(|| parked.ctx.meta.lock().unwrap());
         let timeline = (busy == "timeline").then(|| parked.ctx.timeline.lock().unwrap());
-        let banner = (busy == "banner").then(|| parked.ctx.box_banner.try_guard().unwrap());
         let mut wrote = false;
         let refused = super::with_handoff_claims(&sources, || wrote = true);
         assert_eq!(refused, None);
         assert!(!wrote, "a contended claim fence cannot write a Commit");
-        drop(banner);
         drop(timeline);
         drop(meta);
         let written = super::with_handoff_claims(&sources, || {
@@ -649,7 +647,6 @@ fn the_final_claim_fence_refuses_contention_and_holds_its_locks_through_the_writ
                 parked.ctx.timeline.try_lock(),
                 Err(std::sync::TryLockError::WouldBlock)
             ));
-            assert!(parked.ctx.box_banner.try_guard().is_none());
             Err::<(), _>("fixture write failure")
         });
         assert_eq!(written, Some(Err("fixture write failure")));
@@ -661,75 +658,7 @@ fn the_final_claim_fence_refuses_contention_and_holds_its_locks_through_the_writ
             parked.ctx.timeline.try_lock().is_ok(),
             "rollback can acquire timeline"
         );
-        assert!(
-            parked.ctx.box_banner.try_guard().is_some(),
-            "rollback can acquire banner state"
-        );
     }
-}
-
-#[test]
-fn a_notice_admitted_after_the_manifest_stands_commit_down() {
-    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
-    let parked = Parked::new(b"");
-    let expected = parked
-        .app
-        .pending_update_handoff
-        .as_ref()
-        .unwrap()
-        .carried_claims[0]
-        .clone();
-    let mut sources = [super::HandoffClaimSource {
-        expected,
-        ctx: parked.ctx.clone(),
-        topics: crate::fabric::render_topics(&parked.ctx.fabric.topics()),
-    }];
-    assert_eq!(
-        super::with_handoff_claims(&sources, || "unchanged"),
-        Some("unchanged")
-    );
-    let report = crate::term_lock(&parked.term).program_state();
-    assert!(
-        parked.ctx.box_banner.admit(&report),
-        "the program notification passed after capture"
-    );
-    let mut wrote = false;
-    assert_eq!(super::with_handoff_claims(&sources, || wrote = true), None);
-    assert!(
-        !wrote,
-        "the manifest cannot lose the admitted notice's custody"
-    );
-    sources[0].expected = sources[0]
-        .expected
-        .clone()
-        .with_banner(parked.ctx.box_banner.snapshot());
-    assert_eq!(
-        super::with_handoff_claims(&sources, || "recaptured"),
-        Some("recaptured")
-    );
-    assert!(
-        parked.ctx.box_banner.admit(&report),
-        "another notice may leave the same seq standing"
-    );
-    assert_eq!(
-        super::with_handoff_claims(&sources, || "stale"),
-        None,
-        "the revision detects equal-valued repeated notices"
-    );
-    sources[0].expected = sources[0]
-        .expected
-        .clone()
-        .with_banner(parked.ctx.box_banner.snapshot());
-    assert_eq!(
-        super::with_handoff_claims(&sources, || "current"),
-        Some("current")
-    );
-    parked.ctx.box_banner.herald(7, |_| ((), true));
-    assert_eq!(
-        super::with_handoff_claims(&sources, || "stale"),
-        None,
-        "a newly queued box receipt cannot be omitted by Commit"
-    );
 }
 
 #[test]

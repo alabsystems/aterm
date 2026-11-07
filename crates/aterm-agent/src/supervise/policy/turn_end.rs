@@ -12702,6 +12702,34 @@ pub struct ModelSwitch {
     pub from: Option<String>,
     pub to: String,
     pub back_at: Option<Instant>,
+    /// The agent process the switch is in ([`TurnEndState::agent_process`]); `None` until the
+    /// host names one.
+    pub proc: Option<SwitchProc>,
+    /// The host names another process than [`Self::proc`] and no conversation of it yet: the
+    /// switch's return waits until it does, as that process may be another program.
+    pub unproven: bool,
+}
+
+/// The agent process a model switch is in, as its host names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwitchProc {
+    pub pid: u32,
+    /// When it started, unix seconds.
+    pub start: i64,
+    /// The conversation it holds, once the host names one.
+    pub conversation: Option<String>,
+}
+
+/// What [`TurnEndState::agent_process`] did to the model switch in force.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SwitchScope {
+    /// The switch is in this process now: the first the host named, a relaunch that resumed its
+    /// conversation, one the harness started or owes a continuation for, or a conversation its
+    /// process opened (a `/clear`).
+    Moved(SwitchProc),
+    /// Another process on another conversation, which the harness did not start, runs in the tab
+    /// (a program the person started): the switch is over.
+    Closed,
 }
 
 /// How far past a turn's busy work a person's keystroke still counts as their hand in it.
@@ -13264,6 +13292,10 @@ pub struct TurnEndState {
     agent_start_unix: Option<i64>,
     after: Option<&'static str>,
     model: Option<ModelSwitch>,
+    /// The harness started a new agent process while a model switch stood, and the host has not
+    /// named it yet: a step of the host's whose word says so, or this loop's own restart
+    /// ([`Self::harness_started`]). It carries the switch, as every relaunch keeps `--model`.
+    started_by_harness: bool,
     fallback_unmade: bool,
     fallback_unasked: bool,
     fallback_unix: Option<i64>,
@@ -13554,6 +13586,7 @@ impl TurnEndState {
             agent_start_unix: None,
             after: None,
             model: None,
+            started_by_harness: false,
             fallback_unmade: false,
             fallback_unasked: false,
             fallback_unix: None,
@@ -20072,6 +20105,74 @@ impl TurnEndState {
         self.agent_start_unix
     }
 
+    /// THE HOST NAMES THE AGENT'S PROCESS (`pid`, started at `start` unix seconds) and the
+    /// conversation it holds. A model switch rides every process the harness starts from the one
+    /// its relaunch started, as each relaunch keeps the fallback's `--model`: one that resumes
+    /// its conversation (a crash's, a stall's, an upgrade's, this loop's memory or lost-input
+    /// restart), one the host still owes a continuation for (`owed`, asked only here), and one
+    /// the harness started since the last process the host named ([`Self::harness_started`]: an
+    /// upgrade's or a restart's that starts afresh on a new conversation). Any other process on
+    /// another conversation is a program started apart from it, the person's own in the same tab
+    /// on its launch's model: the switch is over, its bucket falls back as any does, and nothing
+    /// restores it at `back_at`. Another process whose conversation the host does not name yet
+    /// holds the switch's return ([`ModelSwitch::unproven`]) until it does; one that names a
+    /// conversation where the switch's process never named its own (or a host that names
+    /// conversations for neither) takes the switch on, as nothing tells the two apart. A
+    /// crash's or a stall's relaunch of a conversation nobody asked anything starts afresh and
+    /// reaches the loop by no step: it ends the switch as another program would.
+    pub fn agent_process(
+        &mut self,
+        pid: u32,
+        start: i64,
+        conversation: Option<&str>,
+        owed: impl FnOnce() -> bool,
+    ) -> Option<SwitchScope> {
+        let m = self.model.as_mut()?;
+        let now = SwitchProc {
+            pid,
+            start,
+            conversation: conversation.map(str::to_string),
+        };
+        let started = std::mem::take(&mut self.started_by_harness);
+        let moved = match &m.proc {
+            None => true,
+            Some(was) if (was.pid, was.start) == (pid, start) => {
+                now.conversation.is_some() && was.conversation != now.conversation
+            }
+            Some(was) => match (&was.conversation, &now.conversation) {
+                (Some(_), None) => {
+                    m.unproven = true;
+                    self.started_by_harness = started;
+                    return None;
+                }
+                (None, None) => true,
+                (Some(held), Some(named)) if held == named => true,
+                (None, Some(_)) => true,
+                (Some(_), Some(_)) => {
+                    if !started && !owed() {
+                        self.model = None;
+                        self.fallback_unasked = false;
+                        return Some(SwitchScope::Closed);
+                    }
+                    true
+                }
+            },
+        };
+        m.unproven = false;
+        moved.then(|| {
+            m.proc = Some(now.clone());
+            SwitchScope::Moved(now)
+        })
+    }
+
+    /// THE HARNESS STARTED A NEW AGENT PROCESS: a step of the host's whose word says so
+    /// ([`crate::harness::upgrade_drive::started`]), or this loop's own restart made (a memory
+    /// restart's, a lost line's). While a model switch stands, the next other process the host
+    /// names is that one ([`Self::agent_process`]).
+    pub const fn harness_started(&mut self) {
+        self.started_by_harness = self.model.is_some();
+    }
+
     /// THE RELAUNCH'S START-UP UNDER A LIMIT: a usage limit, spend limit or
     /// model bucket ([`named_class`]) met under an agent whose screen is all
     /// its evidence ([`screen_alone`]: Muse Code, agy), whose
@@ -20286,6 +20387,7 @@ impl TurnEndState {
             self.account_startup = self.account.is_some();
         }
         match why {
+            Restart::Memory | Restart::InputLost { .. } if made => self.harness_started(),
             Restart::Memory | Restart::InputLost { .. } => {}
             Restart::Model { to } if made => {
                 let track = self.wall.as_ref().filter(|t| t.class == WallClass::Model);
@@ -20305,6 +20407,8 @@ impl TurnEndState {
                     from,
                     to: to.clone(),
                     back_at,
+                    proc: None,
+                    unproven: false,
                 });
                 self.fallback_unasked = true;
                 if let Some(t) = &mut self.wall {
@@ -22464,6 +22568,7 @@ fn act_past_walls(
     if let Some(m) = &state.model
         && let Some(at) = m.back_at
         && now >= at
+        && !m.unproven
         && reading.restartable
         && !matches!(cont, TurnEndAction::Escalate { .. })
     {

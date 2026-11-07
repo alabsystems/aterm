@@ -1376,3 +1376,108 @@ fn a_glance_at_rest_costs_nothing_and_a_moved_bar_composes_once() {
         "the key moved with the verdict"
     );
 }
+
+#[test]
+fn agy_bare_while_off_with_a_goal_costs_nothing_at_rest() {
+    let agy_rows: Vec<String> = include_str!("../../aterm-phase/src/fixtures/agy-1.4.0-idle.txt")
+        .lines()
+        .filter(|l| !l.starts_with("# "))
+        .map(str::to_owned)
+        .collect();
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let session = app.focused_session_id(wid).expect("the front session");
+    let _host = hosted(&mut app);
+    assert!(app.apply_term_resize(wid, ROWS, COLS));
+    let ctx = app.pool.get(session).expect("session").ctx.clone();
+    crate::session_timeline::claim_supervisor(
+        &ctx,
+        &crate::harness_host::holder(),
+        None,
+        None,
+        crate::metrics::now_us(),
+    )
+    .expect("the claim");
+    {
+        let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        timeline.note_foreground_group(4242);
+        timeline.set_program(4242, Some("agy".into()));
+    }
+    publish(
+        &app,
+        session,
+        FooterFacts {
+            goal: Some("implement the aos aterm vision".into()),
+            ..facts()
+        },
+    );
+    feed(&app, session, &agy_rows);
+    for _ in 0..2 {
+        refill(&mut app, wid);
+        let _ = pass(&mut app, wid);
+    }
+    let top_row = app.windows[&wid]
+        .claude_lights
+        .border_toggles
+        .iter()
+        .find(|b| b.session == session)
+        .expect("the switch")
+        .term_row;
+    assert!(
+        glass_row(&app, wid, top_row).contains("\u{25ce} implement the aos aterm vision"),
+        "CONTROL: the goal is on the top rule while the harness is on"
+    );
+
+    app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
+        crate::app_config::HarnessPolicy::read("[harness]\nenabled = false\n"),
+    );
+    for _ in 0..2 {
+        refill(&mut app, wid);
+        let _ = pass(&mut app, wid);
+    }
+    assert!(
+        !glass_row(&app, wid, top_row).contains('\u{25ce}'),
+        "the goal is hidden while the agy harness switch is off"
+    );
+    let off_key = pass(&mut app, wid);
+    for i in 0..30 {
+        assert_eq!(
+            cost(&mut app, wid),
+            Cost::default(),
+            "bare while off with a goal, frame {i}"
+        );
+    }
+    assert_eq!(
+        pass(&mut app, wid),
+        off_key,
+        "the repaint key stands while off"
+    );
+
+    publish(
+        &app,
+        session,
+        FooterFacts {
+            goal: Some("ship the next milestone".into()),
+            ..facts()
+        },
+    );
+    assert_eq!(
+        pass_key(&app, wid),
+        off_key,
+        "a goal change while bare and off does not move the repaint key"
+    );
+
+    app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
+        crate::app_config::HarnessPolicy::read("[harness]\nenabled = true\n"),
+    );
+    assert_ne!(
+        pass_key(&app, wid),
+        off_key,
+        "turning the harness back on moves the repaint key"
+    );
+    let _ = pass(&mut app, wid);
+    assert!(
+        glass_row(&app, wid, top_row).contains("\u{25ce} ship the next milestone"),
+        "the updated goal is laid once the harness switch is back on"
+    );
+}

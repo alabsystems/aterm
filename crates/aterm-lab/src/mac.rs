@@ -122,6 +122,7 @@ pub(crate) fn prep_name(image: &str, prep: &Prep) -> String {
 
 pub const USAGE: &str = "\
 targo --unverified lab mac <verb> — the macOS guest lane: a disposable tart VM (Apple's Virtualization framework)
+  provision     locate Tart or fetch the pinned version when absent; no app build, image pull, VM clone or boot
   dmg [--image REF] [--fda] [--keep]
                 the disk-image acceptance in a fresh guest: atpkg's, aterm-containment's, aterm-uds' and
                 aterm-update's dmg_acceptance benches, built here with --no-run (nothing is attached on this
@@ -149,6 +150,7 @@ pub const CLEAN_USAGE: &str = "\
 /// Usage, or the lane could not run.
 pub fn cmd_mac(args: &[String]) -> Res {
     match args.first().map(String::as_str) {
+        Some("provision") => cmd_provision(&args[1..]),
         Some("dmg") => cmd_dmg(&args[1..]),
         Some("nux") => crate::mac_nux::cmd_nux(&args[1..]),
         Some("runtime") => crate::mac_runtime::run(&args[1..]),
@@ -165,6 +167,17 @@ pub fn cmd_mac(args: &[String]) -> Res {
             "mac: unknown verb '{other}' ({LAB} mac help)"
         ))),
     }
+}
+
+fn cmd_provision(args: &[String]) -> Res {
+    if let Some(extra) = args.first() {
+        return Err(Fail::usage(format!(
+            "mac provision: unexpected '{extra}' ({LAB} mac help)"
+        )));
+    }
+    let tart = tart_to_run()?;
+    println!("mac provision: Tart resolved at {tart}; no VM images pulled or VMs started");
+    Ok(0)
 }
 
 pub(crate) fn not_run(why: impl std::fmt::Display) -> Fail {
@@ -229,6 +242,8 @@ pub fn signing_team(report: &str) -> Option<&str> {
 /// The download, or a digest or signature that does not match (NOT RUN, what it wrote removed).
 fn fetch_tart(cache: &Path) -> Result<String, Fail> {
     let fail = |why: String| not_run(format!("fetching tart {TART_VERSION}: {why}"));
+    crate::util::create_private_dir_all(cache)
+        .map_err(|error| fail(format!("{}: {error}", cache.display())))?;
     let url =
         format!("https://github.com/cirruslabs/tart/releases/download/{TART_VERSION}/tart.tar.gz");
     println!("mac: no tart here: fetching {url} into {}", cache.display());

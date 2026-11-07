@@ -5183,8 +5183,25 @@ impl Backend for Real {
                 })?
             }
         };
-        let landed = crate::fixtures::land(&git, &staged, &pins, crate::ledger::MAX_CLAIM_ATTEMPTS)
-            .map_err(|e| Refusal::new(e.to_string(), again()))?;
+        let targo = prover.bin.join("targo");
+        let mut reader = crate::fixtures::MainReader::new(&self.repo);
+        let log = self.step_log(self.step);
+        let landed = crate::fixtures::land(
+            &git,
+            &staged,
+            &pins,
+            crate::ledger::MAX_CLAIM_ATTEMPTS,
+            &mut |preview| match &mut reader {
+                Ok(reader) => reader.read(&targo, preview, &pins, &mut |cmd| {
+                    self.captured(self.step, prover, &log, cmd)
+                }),
+                Err(why) => crate::fixtures::Reading {
+                    answers: Err(why.to_string()),
+                    checks: format!("COULD NOT RUN: {why}"),
+                },
+            },
+        )
+        .map_err(|e| Refusal::new(e.to_string(), again()))?;
         words.push(landed.words(&pins));
         Ok(words.join("; "))
     }

@@ -772,13 +772,12 @@ impl Drawn {
     }
 }
 
-/// Mutable claim, hold, Autopilot and box-receipt state sampled at handoff park.
+/// Mutable claim, hold and Autopilot state sampled at handoff park.
 #[cfg(unix)]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CarriedClaims {
     pub local_id: u64,
     meta: crate::session_timeline::SessionMeta,
-    banner: crate::box_banner::Snapshot,
     topics: Vec<String>,
     attention_owners: Vec<String>,
     supervisor: Option<String>,
@@ -791,13 +790,6 @@ pub(crate) struct CarriedClaims {
 
 #[cfg(unix)]
 impl CarriedClaims {
-    /// The actual box-notification receipt state beside the parked record.
-    #[must_use]
-    pub(crate) const fn with_banner(mut self, banner: crate::box_banner::Snapshot) -> Self {
-        self.banner = banner;
-        self
-    }
-
     /// These claims with session's self-claim face `face` beside them.
     #[must_use]
     pub(crate) const fn with_self_face(
@@ -813,7 +805,6 @@ impl CarriedClaims {
     pub(crate) fn of_record(record: &SessionRecord) -> Self {
         Self {
             local_id: record.local_id,
-            banner: Default::default(),
             meta: crate::session_timeline::SessionMeta {
                 user_title: record.user_title.clone(),
                 description: record.description.clone(),
@@ -849,7 +840,6 @@ impl CarriedClaims {
         Self {
             local_id,
             meta: drawn.meta,
-            banner: ctx.box_banner.snapshot(),
             topics: drawn.topics,
             attention_owners: drawn.attention_owners,
             supervisor: drawn.supervisor.as_deref().map(lease_holder),
@@ -862,7 +852,7 @@ impl CarriedClaims {
         }
     }
 
-    /// Project the final Commit while its caller holds the session and box-receipt locks.
+    /// Project the final Commit while its caller holds the session's meta and timeline locks.
     /// Topics were sampled under the fabric hold fence before those locks were acquired.
     #[must_use]
     pub(crate) fn of_guarded(
@@ -870,7 +860,6 @@ impl CarriedClaims {
         meta: &crate::session_timeline::SessionMeta,
         timeline: &crate::session_timeline::SessionTimeline,
         topics: Vec<String>,
-        banner: crate::box_banner::Snapshot,
         now_us: u64,
         own_holder: &str,
     ) -> Self {
@@ -885,7 +874,6 @@ impl CarriedClaims {
         Self {
             local_id,
             meta: meta.sanitized(),
-            banner,
             topics,
             attention_owners: meta.handoff_attention_owners(),
             claim_known: claim_known && !(supervisor.is_none() && reexec),
@@ -2020,7 +2008,6 @@ fn handle_ran(
         screen_moves: Default::default(),
         job_feed: Default::default(),
         ran,
-        box_banner: Default::default(),
         update_parked: Default::default(),
         watchers: observed.watchers,
         frame: Default::default(),

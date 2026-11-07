@@ -121,8 +121,8 @@ pub struct OutputStateRepr {
         serde(default, skip_serializing_if = "Option::is_none")
     )]
     pub program_state: Option<String>,
-    /// The source episode of `program_state`, for matching a carried box receipt.
-    /// Restore still assigns its own local report sequence.
+    /// The source episode of `program_state`, which a restore keeps as the report's
+    /// `ProgramStateReport::restored_from`. Restore still assigns its own local report sequence.
     #[cfg_attr(
         feature = "serde",
         serde(

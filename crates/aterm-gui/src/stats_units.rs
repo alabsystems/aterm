@@ -85,13 +85,6 @@ pub(crate) struct UnitFacts<'a> {
 /// reads devices (macOS and Linux, A1 §4.4). Each changes seldom or never: none is a reading the
 /// units draw. A1's step R5 plans both deck forms from these facts in its laws; step R6 plans the
 /// painted deck with them as it paints the units.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "A1 step R6 plans the painted deck with the host's facts"
-    )
-)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HostFacts {
     clusters: Vec<usize>,
@@ -100,15 +93,21 @@ pub(crate) struct HostFacts {
     disk: bool,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "A1 step R6 plans the painted deck with the host's facts"
-    )
-)]
+// Outside tests only `of` and `facts` reach the struct, and neither reaches the other, so each
+// carries its own expectation: once R6 calls one, that one goes unfulfilled and fails the lint,
+// where one expectation on the impl would stay fulfilled while the other is dead. The struct
+// carries none: rustc 1.96 and earlier (the cells lint on rustup's unpinned `stable`, which can be
+// one) count what an expected-dead item names as live, so an expectation on the struct as well
+// goes unfulfilled there (`docs/measured/main-reds-2026-10-20.md` §1.1).
 impl HostFacts {
     /// What `snap` reads of the machine.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "A1 step R6 builds the painted deck's facts from the host's reading"
+        )
+    )]
     pub(crate) fn of(snap: &Snapshot) -> Self {
         let clusters = snap
             .cpu
@@ -140,6 +139,13 @@ impl HostFacts {
     }
 
     /// The facts the planner reads.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "A1 step R6 plans the painted deck with the host's facts"
+        )
+    )]
     pub(crate) fn facts(&self) -> UnitFacts<'_> {
         UnitFacts {
             clusters: &self.clusters,

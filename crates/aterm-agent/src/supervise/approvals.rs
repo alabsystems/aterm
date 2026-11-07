@@ -659,6 +659,12 @@ impl CutWork {
                 let model = switch.open.as_ref().map_or(0, |s| {
                     s.to.len()
                         .saturating_add(s.from.as_ref().map_or(0, String::len))
+                        .saturating_add(
+                            s.proc
+                                .as_ref()
+                                .and_then(|p| p.conversation.as_ref())
+                                .map_or(0, String::len),
+                        )
                 });
                 bytes
                     .checked_add(sid.as_ref().map_or(0, String::len))?
@@ -3129,10 +3135,31 @@ pub struct OpenSwitch {
     pub back_at_unix: Option<i64>,
     pub asked: bool,
     pub made_unix: i64,
+    /// The agent process the switch is in, by its newest [`switch_process_reason`] row.
+    pub proc: Option<super::policy::turn_end::SwitchProc>,
 }
 
 pub const FALLBACK_ASKED: &str =
     "a turn was asked on the fallback: the bucket it left is a wall again";
+
+const SWITCH_RUNS: &str = "the model switch is in the agent process";
+
+/// The reason of the row that puts the open model switch in `p`
+/// ([`super::policy::turn_end::SwitchScope::Moved`]).
+#[must_use]
+pub fn switch_process_reason(p: &super::policy::turn_end::SwitchProc) -> String {
+    format!(
+        "{SWITCH_RUNS} (proc={}@{} conversation={})",
+        p.pid,
+        p.start,
+        p.conversation.as_deref().unwrap_or("-")
+    )
+}
+
+/// The reason of the row that closes the open model switch
+/// ([`super::policy::turn_end::SwitchScope::Closed`]).
+pub const SWITCH_CLOSED: &str =
+    "the model switch is over: another program, on another conversation, runs in the tab";
 
 #[must_use]
 pub fn open_model_switch_in(body: &str, sid: Option<&str>) -> Option<OpenSwitch> {
@@ -3156,19 +3183,46 @@ struct SwitchWalk {
 
 impl SwitchWalk {
     fn reads(line: &str) -> bool {
-        line.contains(",\"decision\":\"typed\",") || line.contains(FALLBACK_ASKED)
+        line.contains(",\"decision\":\"typed\",")
+            || line.contains(FALLBACK_ASKED)
+            || line.contains(SWITCH_RUNS)
+            || line.contains(SWITCH_CLOSED)
     }
 
     fn step(&mut self, v: &aterm_json::Value) {
-        use super::policy::turn_end::{RULE_ACCOUNT, RULE_MODEL_FALLBACK, RULE_MODEL_RESTORE};
+        use super::policy::turn_end::{
+            RULE_ACCOUNT, RULE_MODEL_FALLBACK, RULE_MODEL_RESTORE, SwitchProc,
+        };
         let text = |k: &str| v.get(k).and_then(aterm_json::Value::as_str);
         if text("decision") != Some("typed") {
-            if text("decision") == Some("waiting")
-                && text("rule_id") == Some(RULE_MODEL_FALLBACK)
-                && text("reason") == Some(FALLBACK_ASKED)
-                && let Some(open) = &mut self.open
-            {
-                open.asked = true;
+            if text("decision") != Some("waiting") {
+                return;
+            }
+            let reason = text("reason").unwrap_or("");
+            match text("rule_id") {
+                Some(RULE_MODEL_RESTORE) if reason == SWITCH_CLOSED => self.open = None,
+                Some(RULE_MODEL_FALLBACK) => {
+                    let Some(open) = &mut self.open else {
+                        return;
+                    };
+                    if reason == FALLBACK_ASKED {
+                        open.asked = true;
+                    } else if reason.starts_with(SWITCH_RUNS)
+                        && let Some((pid, start)) = switch_field(reason, "proc")
+                            .as_deref()
+                            .and_then(|p| p.split_once('@'))
+                            .and_then(|(pid, start)| {
+                                Some((crate::parse_uint(pid)?, crate::parse_int(start)?))
+                            })
+                    {
+                        open.proc = Some(SwitchProc {
+                            pid,
+                            start,
+                            conversation: switch_field(reason, "conversation"),
+                        });
+                    }
+                }
+                _ => {}
             }
             return;
         }
@@ -3193,14 +3247,7 @@ impl SwitchWalk {
                     return;
                 };
                 let reason = text("reason").unwrap_or("");
-                let field = |name: &str| {
-                    let at = reason.find(&format!("{name}="))? + name.len() + 1;
-                    let word: String = reason[at..]
-                        .chars()
-                        .take_while(|c| !c.is_whitespace() && *c != ')')
-                        .collect();
-                    (word != "-" && !word.is_empty()).then_some(word)
-                };
+                let field = |name: &str| switch_field(reason, name);
                 if !reason.contains("model switch:") {
                     return;
                 }
@@ -3213,6 +3260,7 @@ impl SwitchWalk {
                     made_unix: field("made")
                         .and_then(|w| crate::parse_int(&w))
                         .unwrap_or_else(|| written.div_euclid(1000)),
+                    proc: None,
                 });
             }
             _ => {
@@ -3222,6 +3270,16 @@ impl SwitchWalk {
             }
         }
     }
+}
+
+/// The word after `name=` in a switch row's reason, up to a space or `)`; `-` is none.
+fn switch_field(reason: &str, name: &str) -> Option<String> {
+    let at = reason.find(&format!("{name}="))? + name.len() + 1;
+    let word: String = reason[at..]
+        .chars()
+        .take_while(|c| !c.is_whitespace() && *c != ')')
+        .collect();
+    (word != "-" && !word.is_empty()).then_some(word)
 }
 
 #[must_use]

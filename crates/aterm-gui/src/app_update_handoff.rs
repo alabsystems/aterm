@@ -1606,7 +1606,6 @@ fn handoff_claim_sources(
 struct HandoffClaimGuards<'a> {
     meta: std::sync::MutexGuard<'a, crate::session_timeline::SessionMeta>,
     timeline: std::sync::MutexGuard<'a, crate::session_timeline::SessionTimeline>,
-    banner: std::sync::MutexGuard<'a, crate::box_banner::Snapshot>,
 }
 
 /// Keep the final claim and metadata comparison true through the atomic Commit write.
@@ -1627,7 +1626,6 @@ fn with_handoff_claims<R>(sources: &[HandoffClaimSource], write: impl FnOnce() -
             Some(HandoffClaimGuards {
                 meta: try_guard(&source.ctx.meta)?,
                 timeline: try_guard(&source.ctx.timeline)?,
-                banner: source.ctx.box_banner.try_guard()?,
             })
         })
         .collect::<Option<Vec<_>>>()?;
@@ -1639,7 +1637,6 @@ fn with_handoff_claims<R>(sources: &[HandoffClaimSource], write: impl FnOnce() -
             &guards.meta,
             &guards.timeline,
             source.topics.clone(),
-            *guards.banner,
             now_us,
             &own_holder,
         ) != source.expected
@@ -5539,9 +5536,7 @@ impl App {
         let manifest = stamp_fg_holders(manifest, &fg_holders);
         let manifest = stamp_render_debts(manifest, &render_debts);
         let manifest = stamp_journal_keys(manifest, &self.journal_keys());
-        let status = self.status_carry_snapshots();
-        let manifest = stamp_status_seen(manifest, &status);
-        let carried_claims = stamp_claim_banners(carried_claims, &status);
+        let manifest = stamp_status_seen(manifest, &self.status_carry_snapshots());
         let manifest = stamp_autopilot_end(manifest, &self.end_carry_rows());
 
         let layout = self.capture_handoff_layout();
@@ -7194,9 +7189,7 @@ impl App {
         let manifest = stamp_fg_holders(manifest, &fg_holders);
         let manifest = stamp_render_debts(manifest, &render_debts);
         let manifest = stamp_journal_keys(manifest, &self.journal_keys());
-        let status = self.status_carry_snapshots();
-        let manifest = stamp_status_seen(manifest, &status);
-        let carried_claims = stamp_claim_banners(carried_claims, &status);
+        let manifest = stamp_status_seen(manifest, &self.status_carry_snapshots());
         let manifest = stamp_autopilot_end(manifest, &self.end_carry_rows());
         let carry_lone_lists = policy.grant_desk || same_image.is_some();
         let layout = self.capture_handoff_layout_for(carry_lone_lists);
@@ -9510,41 +9503,15 @@ fn stamp_fg_holders(
 #[cfg(unix)]
 fn stamp_status_seen(
     mut manifest: crate::session_store::SessionHandoff,
-    rows: &[(
-        u64,
-        crate::status_item::StatusCarry,
-        crate::box_banner::Snapshot,
-    )],
+    rows: &[(u64, crate::status_item::StatusCarry)],
 ) -> crate::session_store::SessionHandoff {
     for record in &mut manifest.sessions {
         record.status_seen = rows
             .iter()
-            .find(|(local_id, _, _)| *local_id == record.local_id)
-            .and_then(|(_, carry, _)| carry.row());
+            .find(|(local_id, _)| *local_id == record.local_id)
+            .and_then(|(_, carry)| carry.row());
     }
     manifest
-}
-
-#[cfg(unix)]
-fn stamp_claim_banners(
-    claims: Vec<crate::session_store::CarriedClaims>,
-    rows: &[(
-        u64,
-        crate::status_item::StatusCarry,
-        crate::box_banner::Snapshot,
-    )],
-) -> Vec<crate::session_store::CarriedClaims> {
-    claims
-        .into_iter()
-        .map(|claim| {
-            let banner = rows
-                .iter()
-                .find(|(id, _, _)| *id == claim.local_id)
-                .map(|(_, _, banner)| *banner)
-                .unwrap_or_default();
-            claim.with_banner(banner)
-        })
-        .collect()
 }
 
 #[cfg(unix)]

@@ -388,7 +388,7 @@ pub(crate) struct Escalation {
     /// The notification title ([`headline`]).
     pub headline: &'static str,
     /// The engine's sequence of the program's own `blocked` report a program-claim need stands
-    /// on ([`crate::needs::Need::report`]): the box [`crate::box_banner`] keeps to one banner.
+    /// on ([`crate::needs::Need::report`]), which the herald's log line names it by ([`herald_log_line`]).
     pub report: Option<u64>,
     /// Each need an ask stands for, by its own words ([`need_ids`]); empty for every other kind, which keeps one notice per transition.
     pub needs: Vec<NeedId>,
@@ -573,8 +573,6 @@ pub(crate) struct HeraldOutcome {
 pub(crate) enum Spent {
     /// The human is looking at the tab in the active app.
     Looking,
-    /// The program's own notification told this box ([`crate::box_banner`]).
-    Told,
 }
 
 /// Why a transition into an escalation posted nothing (test-visible).
@@ -584,13 +582,11 @@ pub(crate) enum HeraldQuiet {
     Same,
     /// The human is looking at the tab in the active app.
     Looking,
-    /// The program's own notification told this box ([`crate::box_banner`]).
-    Told,
     /// Desktop alerts are off.
     Disabled,
     /// [`NOTIFY_SESSION_FLOOR`] or [`NOTIFY_BURST`] held it back, or the notifier's queue refused this session's notice less than [`NOTIFY_RETRY`] ago (another session's refusal holds nothing here): it is owed, and posted (coalesced) when the limit allows ([`Herald::due`]).
     Limited,
-    /// Every need the transition stands for was told already ([`Told`]): the same need back, re-counted or re-ordered, or a set that lost a need. Decided before the look, the program's own notification and the setting, so it is the same with alerts off.
+    /// Every need the transition stands for was told already ([`Told`]): the same need back, re-counted or re-ordered, or a set that lost a need. Decided before the look and the setting, so it is the same with alerts off.
     ToldOnce,
 }
 
@@ -610,7 +606,7 @@ struct HeraldSlot {
 /// The most need ids one session's told memory keeps ([`Told`]); the oldest goes first, and its need can be told again.
 pub(crate) const TOLD_MAX: usize = 32;
 
-/// ONE SESSION'S TOLD-ONCE MEMORY (design §14.18): the ids ([`NeedId`]) of the asks its owner was told of — a notice queued, or spent on their look, the program's own notification or alerts off — since their last turn in the tab ([`Escalation::owner_turn`]) and the agent's last take-down (the escalation gone), with each told escalation's key. A seamless update carries its ids in the session's status row ([`StatusCarry::told_ids`]) and a quit in the tab's restore leaf (`TerminalLeafRestore::told`), and the next process keeps them ([`Herald::adopt`]) until the owner's first turn there, or a take-down after the first need it notes.
+/// ONE SESSION'S TOLD-ONCE MEMORY (design §14.18): the ids ([`NeedId`]) of the asks its owner was told of — a notice queued, or spent on their look or alerts off — since their last turn in the tab ([`Escalation::owner_turn`]) and the agent's last take-down (the escalation gone), with each told escalation's key. A seamless update carries its ids in the session's status row ([`StatusCarry::told_ids`]) and a quit in the tab's restore leaf (`TerminalLeafRestore::told`), and the next process keeps them ([`Herald::adopt`]) until the owner's first turn there, or a take-down after the first need it notes.
 #[derive(Debug, Default)]
 struct Told {
     /// The owner's turn the memory is kept under.
@@ -757,14 +753,12 @@ pub(crate) struct StatusCarry {
     pub held: Option<(HoldWord, i64)>,
     /// The done the owner looked at: its task's `since_unix_ms`, the wall-clock instant the record entered it (carried exactly, unlike its entry rev).
     pub done: Option<u64>,
-    /// An actual queued box banner, independent of `told`'s looking/settings cases.
-    pub box_receipt: Option<crate::box_banner::Receipt>,
 }
 
 impl StatusCarry {
     /// The row: `need=<word>@<unix s>`, `told=1`, `told_ids=<hex>[,<hex>…]` ([`told_ids_row`]),
-    /// `hold=<word>@<unix s>`, `done=<unix ms>` and an actual queued banner's
-    /// `box=<kind>@<source episode>`, each only when it holds; `None` for nothing known.
+    /// `hold=<word>@<unix s>` and `done=<unix ms>`, each only when it holds; `None` for nothing
+    /// known.
     #[cfg(any(unix, test))]
     pub(crate) fn row(&self) -> Option<String> {
         let mut parts = Vec::new();
@@ -783,9 +777,6 @@ impl StatusCarry {
         if let Some(ms) = self.done {
             parts.push(format!("done={ms}"));
         }
-        if let Some(receipt) = self.box_receipt {
-            parts.push(format!("box={}", receipt.row()));
-        }
         (!parts.is_empty()).then(|| parts.join(" "))
     }
 
@@ -800,7 +791,6 @@ impl StatusCarry {
             Some((word.to_string(), at.parse::<i64>().ok()?))
         };
         let mut carry = Self::default();
-        let mut box_seen = false;
         for (key, value) in row.split_whitespace().filter_map(|t| t.split_once('=')) {
             match key {
                 "need" => {
@@ -814,12 +804,6 @@ impl StatusCarry {
                         stamped(value).and_then(|(w, at)| Some((HoldWord::parse(&w)?, at)));
                 }
                 "done" => carry.done = digits(value).then(|| value.parse().ok()).flatten(),
-                "box" => {
-                    carry.box_receipt = (!box_seen)
-                        .then(|| crate::box_banner::Receipt::parse(value))
-                        .flatten();
-                    box_seen = true;
-                }
                 _ => {}
             }
         }
@@ -964,7 +948,6 @@ impl Herald {
             told_ids: self.told_ids(session, owner_turn),
             held: since.held,
             done: None,
-            box_receipt: None,
         }
     }
 
@@ -1243,7 +1226,6 @@ impl Herald {
             let first_quiet = slot.first_quiet(now);
             let why = match spent {
                 Spent::Looking => HeraldQuiet::Looking,
-                Spent::Told => HeraldQuiet::Told,
             };
             return quiet(self, why, first_quiet);
         }
@@ -1437,10 +1419,6 @@ pub(crate) fn herald_log_line(
         };
         match quiet? {
             HeraldQuiet::Looking => (first, "not queued: looking".to_string()),
-            HeraldQuiet::Told => (
-                first,
-                "not queued: the program's own notification told it".to_string(),
-            ),
             HeraldQuiet::Disabled => (
                 first,
                 "not queued: suppressed by desktop_alerts = false".to_string(),
@@ -6728,7 +6706,6 @@ mod tests {
             told_ids: vec![0x1f, u64::MAX],
             held: Some((HoldWord::Local, 90)),
             done: Some(1_000_000),
-            box_receipt: crate::box_banner::Receipt::parse("permission@7"),
         };
         assert_eq!(StatusCarry::parse(&full.row().expect("a row")), full);
         let untold = StatusCarry {
@@ -6738,20 +6715,15 @@ mod tests {
         };
         assert_eq!(StatusCarry::parse(&untold.row().expect("a row")), untold);
         assert_eq!(StatusCarry::default().row(), None);
-        for row in [
-            "box=permission@0",
-            "box=permission@wrong",
-            "box=later@7",
-            "box=permission@7 box=permission@7",
-            "box=permission@7 box=later@7",
-            "box=later@7 box=permission@7",
-        ] {
-            assert_eq!(
-                StatusCarry::parse(row).box_receipt,
-                None,
-                "{row}: malformed or duplicate receipts keep fallback"
-            );
-        }
+        assert_eq!(
+            StatusCarry::parse("need=frozen@100 box=permission@7 done=5"),
+            StatusCarry {
+                need: Some((NeedWord::Frozen, 100)),
+                done: Some(5),
+                ..StatusCarry::default()
+            },
+            "an older parent's box= part is read past"
+        );
         assert_eq!(
             StatusCarry::parse("told=1 done=5"),
             StatusCarry {

@@ -27,20 +27,52 @@ fn one_shot_projection_does_not_allocate_a_column_map() {
 #[ignore = "manual before/after one-shot selection projection measurement"]
 fn selection_projection_cost() {
     const REPEATS: usize = 256;
-    for shape in ["ascii", "unicode", "alternating"] {
+    for shape in [
+        "identity",
+        "ascii",
+        "unicode",
+        "alternating",
+        "unicode-middle",
+        "unicode-suffix",
+        "combining-suffix",
+        "control-suffix",
+        "cjk",
+        "combining",
+        "prepend",
+        "zwj",
+    ] {
         for length in [64, 4096] {
             let text = match shape {
-                "ascii" => "x".repeat(length),
+                "identity" | "ascii" => "x".repeat(length),
                 "unicode" => format!("é{}", "x".repeat(length)),
+                "unicode-middle" => {
+                    format!("{}é{}", "x".repeat(length / 2), "x".repeat(length / 2))
+                }
+                "unicode-suffix" => format!("{}é", "x".repeat(length)),
+                "combining-suffix" => format!("{}\u{301}", "x".repeat(length)),
+                "control-suffix" => format!("{}\r\n", "x".repeat(length)),
+                "cjk" => "日本".repeat(length / 2),
+                "combining" => "e\u{301}".repeat(length / 2),
+                "prepend" => "\u{600}a".repeat(length / 2),
+                "zwj" => "👩🏽‍💻".repeat(length / 2),
                 _ => "éx".repeat(length / 2),
             };
             for merged in [false, true] {
-                let mut cells = LineCells::new();
-                if merged {
-                    cells.push(0..text.len(), 7, 3);
+                if shape == "identity" && merged {
+                    continue;
+                }
+                let mut cells = if shape == "identity" {
+                    LineCells::identity(text.len())
                 } else {
-                    for (col, (byte, ch)) in text.char_indices().enumerate() {
-                        cells.push(byte..byte + ch.len_utf8(), 2 * col, 2);
+                    LineCells::new()
+                };
+                if shape != "identity" {
+                    if merged {
+                        cells.push(0..text.len(), 7, 3);
+                    } else {
+                        for (col, (byte, ch)) in text.char_indices().enumerate() {
+                            cells.push(byte..byte + ch.len_utf8(), 2 * col, 2);
+                        }
                     }
                 }
                 for place in ["front", "middle", "end"] {

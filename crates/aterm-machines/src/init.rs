@@ -1815,7 +1815,7 @@ const CLONE_OWED: &str = "clone-owed";
 /// What `sync.clone` reads of the clone an `aterm init` owes ([`owed_clone`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OwedClone {
-    /// No clone was requested and no vault inventory can be verified here.
+    /// No clone was requested, no inventory can be verified here, or its selection is empty.
     Nothing(String),
     /// The private vault inventory was read and every repository verified locally.
     Verified { present: usize, total: usize },
@@ -2018,6 +2018,25 @@ fn owed_clone_with(
     {
         return Ok(OwedClone::Held(line));
     }
+    // Live callers already captured the default source. A standalone legacy
+    // read captures it once here and reuses it in its ordinary Person readback.
+    let owned = if inputs.is_none() && crate::init_github::uses_vault_inventory(sys, &ctx)? {
+        Some(crate::init_github::InitialRepositoryInputs::capture_ready(
+            sys, &ctx,
+        )?)
+    } else {
+        None
+    };
+    let inputs = inputs.or(owned.as_ref());
+    if let Some(inputs) = inputs.filter(|inputs| inputs.selects_no_repositories()) {
+        return Ok(if inputs.is_current_now(sys)? {
+            OwedClone::Nothing("the private inventory selects no repositories".into())
+        } else {
+            OwedClone::Waiting(
+                "repository inputs changed while the empty selection was read".into(),
+            )
+        });
+    }
     // The default toolset provisions managed Git independently of this pass. A ready managed
     // Git is preferred; developer tools or the distribution's Git are usable fallbacks. Keep
     // the clone owed while none is ready, then retry without another vault change.
@@ -2153,16 +2172,14 @@ fn automatic_clone(
             "waiting for the vault's GitHub credential".into(),
         ));
     }
-    if crate::items::github::installed_git(sys).is_none() {
-        return Ok(OwedClone::Waiting(
-            "waiting for an installed git to clone the vault's repositories".into(),
-        ));
-    }
     let counted = match inputs {
         Some(inputs) => crate::init_github::automatic_inventory_counts_captured(sys, &ctx, inputs),
         None => crate::init_github::automatic_inventory_counts(sys, &ctx),
     };
     match counted {
+        Ok(Some((0, 0))) => Ok(OwedClone::Nothing(
+            "the private inventory selects no repositories".into(),
+        )),
         Ok(Some((present, total))) if present == total => {
             Ok(OwedClone::Verified { present, total })
         }

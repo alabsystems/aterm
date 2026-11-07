@@ -5,8 +5,6 @@
 
 use aterm_search::{BudgetedSearch, LineCells};
 
-#[test]
-#[ignore = "manual before/after dense incremental column projection measurement"]
 fn dense_column_projection_cost() {
     const ROWS: usize = 16;
     const CHARS: usize = 512;
@@ -113,6 +111,9 @@ fn nonmatching_rows_do_not_allocate_columns_per_row() {
 #[test]
 #[ignore = "manual before/after incremental column projection measurement"]
 fn incremental_column_projection_cost() {
+    // Instructions are process-wide: the dense and incremental samples must
+    // share one test, so a name filter cannot schedule them concurrently.
+    dense_column_projection_cost();
     const ROWS: usize = 256;
     for (mode, sensitive, regex) in [
         ("literal", true, false),

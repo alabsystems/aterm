@@ -232,7 +232,8 @@ fn a_non_utf8_stderr_byte_does_not_drop_the_refusal() {
         .stderr(aterm_uds::spawnfd::Stdio::piped())
         .spawn()
         .expect("the fake atpkg child spawns");
-    let said = read_pass_stderr(child.stderr.take().expect("piped stderr"));
+    let (said, unread) = read_pass_stderr(child.stderr.take().expect("piped stderr"));
+    assert!(!unread);
     assert_eq!(child.wait().ok().and_then(|s| s.code()), Some(1));
     assert!(
         said.contains("the prefix is not writable")
@@ -244,4 +245,231 @@ fn a_non_utf8_stderr_byte_does_not_drop_the_refusal() {
         "the card quotes the refusal: {:?}",
         pass_said_detail(&said)
     );
+}
+
+#[test]
+fn a_large_pass_stderr_is_drained_and_keeps_a_bounded_failure_tail() {
+    use std::io::Read as _;
+    let suffix = "\natpkg: refusing to mutate the store — final failure\n";
+    let mut pipe = std::io::repeat(b'x')
+        .take((super::PASS_STDERR_KEEP * 16) as u64)
+        .chain(std::io::Cursor::new(suffix.as_bytes()));
+    let (said, unread) = read_pass_stderr(&mut pipe);
+    assert!(!unread);
+    assert!(said.len() <= super::PASS_STDERR_KEEP + super::PASS_STDERR_OMITTED.len());
+    assert!(said.ends_with(suffix), "the failure at the end survives");
+    assert_eq!(
+        pipe.read(&mut [0]).unwrap(),
+        0,
+        "the whole pipe was drained"
+    );
+}
+
+#[test]
+fn oversized_stdout_supplies_no_partial_marker_and_cannot_prove_a_clean_pass() {
+    use std::io::Read as _;
+    let start = format!("atpkg: {}", atpkg::cli::NET_STARTING_MARKER);
+    let end = format!("\natpkg: {}complete", atpkg::cli::SEED_DONE_MARKER);
+    let pipe = std::io::Cursor::new(start.into_bytes())
+        .chain(std::io::repeat(b'x').take((super::PASS_STDOUT_LINE_MAX + 1) as u64))
+        .chain(std::io::Cursor::new(end.into_bytes()));
+    let mut pipe = std::io::BufReader::new(pipe);
+    let mut posted = Vec::new();
+    let seen = read_seed_markers(&mut pipe, |event| posted.push(event));
+    assert!(
+        !seen.saw_start,
+        "an oversized frame supplies no announcement"
+    );
+    assert!(
+        seen.saw_terminal,
+        "the complete frame after it is still read"
+    );
+    assert!(matches!(posted.as_slice(), [Wake::PkgSeedDone { .. }]));
+    assert_eq!(pipe.read(&mut [0]).unwrap(), 0);
+    let run = super::PassRun {
+        seen,
+        code: Some(0),
+        holder_advanced: false,
+        said: String::new(),
+        pass_seq_before: None,
+    };
+    assert!(
+        !run.clean(),
+        "discarded protocol data supplies no success proof"
+    );
+    assert_eq!(run.verdict(), PassVerdict::Refused);
+    assert!(!run.why().is_empty());
+}
+
+#[test]
+fn an_unterminated_stdout_marker_lost_to_io_error_cannot_prove_success() {
+    struct BrokenAtEnd(std::io::Cursor<Vec<u8>>);
+    impl std::io::Read for BrokenAtEnd {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = std::io::Read::read(&mut self.0, buf)?;
+            if n == 0 {
+                return Err(std::io::ErrorKind::Other.into());
+            }
+            Ok(n)
+        }
+    }
+    let data = format!("atpkg: {}partial", atpkg::cli::SEED_DONE_MARKER);
+    let mut posted = Vec::new();
+    let seen = read_seed_markers(
+        std::io::BufReader::new(BrokenAtEnd(std::io::Cursor::new(data.into_bytes()))),
+        |event| posted.push(event),
+    );
+    assert!(
+        posted.is_empty(),
+        "an I/O error is not a complete final frame"
+    );
+    let run = super::PassRun {
+        seen,
+        code: Some(0),
+        holder_advanced: false,
+        said: String::new(),
+        pass_seq_before: None,
+    };
+    assert!(!run.clean());
+    assert_eq!(run.verdict(), PassVerdict::Refused);
+}
+
+#[test]
+fn pass_frame_boundaries_preserve_exact_limits_and_recover_after_interruption() {
+    for data in [b"abc".as_slice(), b"abc\n".as_slice()] {
+        let mut input = std::io::Cursor::new(data);
+        let mut oversized = false;
+        assert_eq!(
+            super::read_pass_marker_line(&mut input, 3, &mut oversized).unwrap(),
+            Some(b"abc".to_vec())
+        );
+        assert_eq!(
+            super::read_pass_marker_line(&mut input, 3, &mut oversized).unwrap(),
+            None
+        );
+        assert!(!oversized);
+    }
+
+    struct InterruptedOnThird {
+        data: std::io::Cursor<&'static [u8]>,
+        reads: usize,
+    }
+    impl std::io::Read for InterruptedOnThird {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reads += 1;
+            if self.reads == 3 {
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            std::io::Read::read(&mut self.data, buf)
+        }
+    }
+    let mut input = std::io::BufReader::with_capacity(
+        2,
+        InterruptedOnThird {
+            data: std::io::Cursor::new(b"overlong\nok\r\nend"),
+            reads: 0,
+        },
+    );
+    let mut oversized = false;
+    assert_eq!(
+        super::read_pass_marker_line(&mut input, 3, &mut oversized).unwrap(),
+        Some(b"ok\r".to_vec())
+    );
+    assert!(oversized);
+    assert_eq!(
+        super::read_pass_marker_line(&mut input, 3, &mut oversized).unwrap(),
+        Some(b"end".to_vec())
+    );
+    assert_eq!(
+        super::read_pass_marker_line(&mut input, 3, &mut oversized).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn unread_stdout_retains_a_bounded_cause_and_never_synthesizes_success() {
+    let said = "🙂".repeat(3000) + " final diagnostic";
+    let run = |seen| super::PassRun {
+        seen,
+        code: Some(0),
+        holder_advanced: false,
+        said: said.clone(),
+        pass_seq_before: None,
+    };
+    let normal = run(SeedMarkers {
+        saw_start: true,
+        ..SeedMarkers::default()
+    });
+    let unread = run(SeedMarkers {
+        saw_start: true,
+        stdout_unread: true,
+        ..SeedMarkers::default()
+    });
+    let why = unread.why();
+    assert!(why.chars().count() <= 2000);
+    assert!(why.ends_with("final diagnostic"));
+    assert_ne!(
+        why,
+        normal.why(),
+        "the protocol fault survives the long stderr tail"
+    );
+    let mut posted = Vec::new();
+    super::report_pass_verdict(super::PassVerb::Seed, &unread, None, |event| {
+        posted.push(event)
+    });
+    assert!(matches!(posted.as_slice(), [Wake::PkgSeedFailed { detail }] if detail == &why));
+    for stocked in [false, true] {
+        assert_eq!(seed_retire(unread.seen, true, stocked), SeedRetire::Failed);
+    }
+}
+
+#[test]
+fn pass_stderr_keeps_partial_diagnostics_after_interruption_and_read_failure() {
+    struct InterruptedThenBroken {
+        data: std::io::Cursor<&'static [u8]>,
+        interrupted: bool,
+    }
+    impl std::io::Read for InterruptedThenBroken {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !std::mem::replace(&mut self.interrupted, true) {
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            let n = std::io::Read::read(&mut self.data, buf)?;
+            if n == 0 {
+                return Err(std::io::ErrorKind::Other.into());
+            }
+            Ok(n)
+        }
+    }
+    let (said, unread) = read_pass_stderr(InterruptedThenBroken {
+        data: std::io::Cursor::new(b"before\xffafter\n"),
+        interrupted: false,
+    });
+    assert_eq!(said, "before\u{fffd}after\n");
+    assert!(unread);
+    for stdout_unread in [false, true] {
+        let run = super::PassRun {
+            seen: SeedMarkers {
+                saw_start: true,
+                stderr_unread: unread,
+                stdout_unread,
+                ..SeedMarkers::default()
+            },
+            code: Some(0),
+            holder_advanced: false,
+            said: said.clone(),
+            pass_seq_before: None,
+        };
+        assert!(!run.clean());
+        assert_eq!(run.verdict(), PassVerdict::Refused);
+        assert_eq!(seed_retire(run.seen, true, true), SeedRetire::Failed);
+        let why = run.why();
+        assert!(why.contains("stderr"));
+        assert!(why.contains("before\u{fffd}after"));
+        let mut events = Vec::new();
+        super::report_pass_verdict(super::PassVerb::Seed, &run, None, |event| {
+            events.push(event)
+        });
+        assert!(matches!(events.as_slice(), [Wake::PkgSeedFailed { detail }] if detail == &why));
+    }
 }

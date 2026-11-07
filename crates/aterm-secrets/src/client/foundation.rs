@@ -26,11 +26,6 @@ const LOCK: &str = "commons-foundation.lock";
 /// each exchange under its request's own deadline (a publication's is `transport::EXCHANGE`).
 const WAITS_OUT: Duration = Duration::from_secs(600);
 
-/// How long a founding's read-back waits for this Mac's subscriber, which the publication
-/// wakes, to let the vault's state lock go ([`installed`]): its apply of one version holds the
-/// lock for a moment.
-const SETTLE: Duration = Duration::from_secs(5);
-
 /// The first release whose approver shares the Commons root with every machine it lets in, an
 /// open approval included (`enrollment::include_approved`), and counts an `Open` decision as
 /// admission. An approver before it records `Open` for a machine an open vault lets in but
@@ -124,6 +119,70 @@ pub enum Foundable {
     Busy,
 }
 
+/// Why a founding by default did not finish ([`admin_commons_found_by_default`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotFounded {
+    /// Asked again it may finish: another founding on this Mac holds its lock, another publish
+    /// landed first, or the vault, the network or a lock did not answer. Why.
+    Again(String),
+    /// Asked again it meets the same answer until a person changes something: why, and what
+    /// changes it.
+    Stands(String),
+}
+
+impl std::fmt::Display for NotFounded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Again(why) | Self::Stands(why) => f.write_str(why),
+        }
+    }
+}
+
+/// A failure on the way, read by its kind ([`next`]): one whose kind says the next try meets
+/// the same answer (the vault server's 403 or 507, say) stands; any other may pass by itself.
+impl From<Error> for NotFounded {
+    fn from(error: Error) -> Self {
+        match next(error.kind()) {
+            Next::Same => Self::Stands(format!(
+                "{error}: asked again, it meets the same answer until someone changes what that \
+                 names; `aterm secrets commons init` shows it whole"
+            )),
+            Next::Passes | Next::Unsaid => Self::Again(error.to_string()),
+        }
+    }
+}
+
+/// What the next try of a step meets after it failed with an error of a kind ([`next`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Next {
+    /// The same answer, until someone changes the server, the vault, its path or this Mac.
+    Same,
+    /// Maybe not: a lock or a writer that lets go, a request past its deadline, a vault that
+    /// moved under the read, or a publish that lost a race.
+    Passes,
+    /// The kind does not say ([`crate::ErrorKind::Other`]): the step that failed tells.
+    Unsaid,
+}
+
+/// What the next try meets after an error of `kind`, as its kind says. Every kind is read here,
+/// so a new one is placed when it is added.
+const fn next(kind: crate::ErrorKind) -> Next {
+    use crate::ErrorKind as Kind;
+    match kind {
+        Kind::Refused | Kind::LabIdentity | Kind::Dropped | Kind::MembershipCapacity => Next::Same,
+        Kind::JournalBusy
+        | Kind::CustodyBusy
+        | Kind::VaultBusy
+        | Kind::VaultChanged
+        | Kind::MembershipHistoryUnavailable
+        | Kind::TimedOut
+        | Kind::JoinQueueIncomplete
+        | Kind::NotStored
+        | Kind::MemberBusy => Next::Passes,
+        Kind::Other => Next::Unsaid,
+    }
+}
+
 /// One founding of this vault's Commons on this Mac at a time: a person's `aterm secrets
 /// commons init` and a window's founding by default each hold it from their read of the vault
 /// and of a kept attempt ([`prepare`]) through the publication that carries it, so neither
@@ -193,9 +252,10 @@ fn refuse_unrelated_history(paths: &Paths) -> crate::Result<()> {
         fsx::Kind::Missing => return Ok(()),
         fsx::Kind::Dir => {}
         fsx::Kind::Symlink | fsx::Kind::File | fsx::Kind::Other => {
-            return Err(Error::new(
-                "Commons foundation cannot replace the existing commons path",
-            ));
+            return Err(Error::new(format!(
+                "Commons foundation cannot replace the existing commons path {}: {MOVE_ASIDE}",
+                commons.display()
+            )));
         }
     }
     let entries = std::fs::read_dir(&commons)
@@ -204,12 +264,24 @@ fn refuse_unrelated_history(paths: &Paths) -> crate::Result<()> {
         let entry = entry.map_err(|error| Error::new(format!("{}: {error}", commons.display())))?;
         if !own_history(&commons, &entry.file_name()) {
             return Err(Error::new(format!(
-                "Commons foundation cannot replace existing local history: {}",
+                "Commons foundation cannot replace existing local history: {}: {MOVE_ASIDE}",
                 entry.path().display()
             )));
         }
     }
     Ok(())
+}
+
+/// What lets a founding go on past local Commons history it does not replace.
+const MOVE_ASIDE: &str = "move it out of the way if nothing of it is kept, and the next founding \
+                          goes on";
+
+/// What lets a founding go on past an attempt this Mac kept under another authority.
+fn kept_elsewhere(paths: &Paths) -> String {
+    format!(
+        "move {} out of the way, and the next founding founds the vault under its own",
+        paths.dir.join(PREPARED).display()
+    )
 }
 
 fn audience(admin: &Admin) -> Audience {
@@ -281,21 +353,28 @@ fn approve(
     Ok(machines.into_iter().map(|machine| machine.name).collect())
 }
 
-/// Why an admin's aterm does not found `doc`'s Commons by itself, where it does not: the control
-/// entry is opaque; the Commons authority is unbound (an unused key may still rotate, so no
-/// founding could be told current); `doc` names an admin besides `own`, the recipient of this
-/// Mac, since two admins founding at once could each publish a first roster under one network
-/// (docs/DESIGN-alab-commons-2026-10-24.md); or the vault is not open. A closed vault's members
-/// wait for a person's approval, which `aterm secrets commons init` gives as it founds, and a
-/// founding by default would leave it none to give: on a root this build founded, that command
-/// approves nothing.
+/// Why an admin's aterm does not found `doc`'s Commons by itself, where it does not, with what
+/// changes that where anything does: the control entry is opaque; the Commons authority is
+/// unbound (an unused key may still rotate, so no founding could be told current); `doc` names
+/// an admin besides `own`, the recipient of this Mac, since two admins founding at once could
+/// each publish a first roster under one network (docs/DESIGN-alab-commons-2026-10-24.md); or
+/// the vault is not open. A closed vault's members wait for a person's approval, which `aterm
+/// secrets commons init` gives as it founds, and a founding by default would leave it none to
+/// give: on a root this build founded, that command approves nothing.
 fn founds_by_default(doc: &Document, bound: bool, own: &str) -> Result<(), String> {
     if doc.commons_audience().is_some() {
-        return Err("its Commons control entry is opaque, and no aterm replaces it".to_owned());
+        return Err(format!(
+            "its Commons control entry is opaque (no descriptor this aterm reads), and no aterm \
+             replaces it: an admin's `aterm secrets edit` that removes its `{}` entry leaves the \
+             vault to be founded",
+            crate::commons::ENTRY
+        ));
     }
     if !bound {
         return Err(
-            "its Commons authority is not bound, so no aterm founds Commons on it".to_owned(),
+            "its Commons authority is not bound, so no aterm founds Commons on it, and no command \
+             binds one to an existing vault"
+                .to_owned(),
         );
     }
     let admins = doc.admins();
@@ -307,7 +386,12 @@ fn founds_by_default(doc: &Document, bound: bool, own: &str) -> Result<(), Strin
     };
     match admins.as_slice() {
         [only] if mine(only) => {}
-        [_] => return Err("this Mac is not its admin".to_owned()),
+        [only] => {
+            return Err(format!(
+                "this Mac is not its admin: `aterm secrets commons init`, run on {only}, founds \
+                 its Commons"
+            ));
+        }
         _ => {
             return Err(format!(
                 "it names {} admins ({}): `aterm secrets commons init`, run on one of them, \
@@ -348,9 +432,10 @@ fn prepare(paths: &Paths, admin: &Admin) -> crate::Result<Descriptor> {
     refuse_unrelated_history(paths)?;
     if let Some(descriptor) = prepared(paths)? {
         if descriptor.trust().authority != admin.commons_authority()? {
-            return Err(Error::new(
-                "retained Commons foundation belongs to another authority",
-            ));
+            return Err(Error::new(format!(
+                "retained Commons foundation belongs to another authority: {}",
+                kept_elsewhere(paths)
+            )));
         }
         return Ok(descriptor);
     }
@@ -412,7 +497,7 @@ fn finish(paths: &Paths, descriptor: &Descriptor, published: bool) -> crate::Res
     let _ = sync(paths, None)?;
     #[cfg(test)]
     tests::synced();
-    let bootstrap = installed(paths, Instant::now() + SETTLE)?;
+    let bootstrap = installed(paths, Instant::now() + crate::commons::SETTLE)?;
     if bootstrap.trust() != descriptor.trust() {
         return Err(Error::new(
             "installed Commons history belongs to another foundation",
@@ -464,15 +549,27 @@ fn finish_published(
     Ok(CommonsInit { approved, ..done })
 }
 
-/// After a founding's publication met another that landed first (the server's 409, which
-/// stored nothing of it): reopen the vault once and finish the root that landed so, if one did
-/// (`vouch` as [`finish_published`]'s); `None` where none did, and the attempt kept in
-/// [`PREPARED`] is published again at the next try.
-fn landed_first(paths: &Paths, vouch: bool) -> crate::Result<Option<CommonsInit>> {
+/// After `commons init`'s publication met another that landed first (the server's 409, which
+/// stored nothing of it): reopen the vault once and finish the root that landed so, if one did,
+/// as `commons init` finishes a published root ([`finish_published`] with `vouch`); `None`
+/// where none did, and the attempt kept in [`PREPARED`] is published again at the next try.
+fn landed_first(paths: &Paths) -> crate::Result<Option<CommonsInit>> {
     let admin = admin_open(paths)?;
     published_root(paths, &admin)?
-        .map(|descriptor| finish_published(paths, &descriptor, vouch))
+        .map(|descriptor| finish_published(paths, &descriptor, true))
         .transpose()
+}
+
+/// [`published_root`] as the founding by default reads it, before it prepares anything and again
+/// once another publish landed first: a root that is not the one this Mac kept or holds custody
+/// of stands, since `commons init` meets the same refusal until a person moves what is in its
+/// way.
+fn root_by_default(paths: &Paths, admin: &Admin) -> Result<Option<Descriptor>, NotFounded> {
+    published_root(paths, admin).map_err(|error| {
+        NotFounded::Stands(format!(
+            "{error}: `aterm secrets commons init` shows the same refusal"
+        ))
+    })
 }
 
 /// Initialize Commons on an existing vault, or finish an earlier uncertain attempt.
@@ -519,7 +616,7 @@ pub fn admin_commons_init(paths: &Paths) -> crate::Result<CommonsInit> {
     let approved = match approve(paths, &admin, &doc, vouched(&admin, &doc)) {
         Ok(approved) => approved,
         Err(error) if error.kind() == crate::ErrorKind::NotStored => {
-            return landed_first(paths, true)?.ok_or_else(|| {
+            return landed_first(paths)?.ok_or_else(|| {
                 Error::of_kind(
                     crate::ErrorKind::NotStored,
                     format!("{error}: another publish landed first: run it again"),
@@ -590,7 +687,9 @@ pub fn commons_foundable(paths: &Paths) -> crate::Result<Foundable> {
         }
         Some(_) => {
             return Ok(Foundable::Elsewhere(format!(
-                "vault {name}: the Commons foundation this Mac kept belongs to another authority"
+                "vault {name}: the Commons foundation this Mac kept belongs to another \
+                 authority: {}",
+                kept_elsewhere(paths)
             )));
         }
     };
@@ -616,35 +715,49 @@ pub fn commons_foundable(paths: &Paths) -> crate::Result<Foundable> {
 /// where a recorded `Manual` would say a person approved them. On a published root it finishes
 /// what it finds and records nothing, where `commons init` adds the approvals an earlier aterm
 /// left out. It founds nothing while another founding on this Mac holds its lock
-/// ([`FoundationLock`]), and a publication that another landed before finishes the root that
-/// landed so, if one did ([`landed_first`]).
+/// ([`FoundationLock`]), and a publication that another landed before reopens the vault once, as
+/// `commons init`'s does ([`landed_first`]), and finishes the root that landed so, if one did.
 ///
 /// # Errors
-/// As [`admin_commons_init`]'s but for its wait on the lock, and where the vault names an admin
-/// besides this Mac or is not open, or this Mac's approver would leave the Macs it lets in later outside Commons
-/// (`approver_strands`), each before anything is prepared or published; where another founding
-/// on this Mac holds its lock, before anything is read; and where another publish landed first
-/// with no root ([`crate::ErrorKind::NotStored`]).
-pub fn admin_commons_found_by_default(paths: &Paths) -> crate::Result<CommonsInit> {
+/// [`NotFounded::Stands`] where the vault names an admin besides this Mac or is not open, its
+/// Commons authority is unbound or its control entry opaque, or this Mac's approver would leave
+/// the Macs it lets in later outside Commons (`approver_strands`), each before anything is
+/// prepared or published; where the published root, read before anything is prepared or after
+/// another publish landed first, is not the one this Mac kept or holds custody of
+/// ([`root_by_default`]); where preparing meets unrelated local Commons history, an
+/// attempt kept under another authority, or another failure whose kind does not say it passes;
+/// and where anything on the way fails with an error whose kind says the next try meets the
+/// same answer (the vault server's 403 or 507, [`crate::ErrorKind::Refused`]).
+/// [`NotFounded::Again`] where another founding on this Mac holds its lock, before anything is
+/// read; where another publish landed first with no root; and where anything else fails (the
+/// vault, the network or a lock did not answer).
+pub fn admin_commons_found_by_default(paths: &Paths) -> Result<CommonsInit, NotFounded> {
     let Some(_founding) = FoundationLock::held_if_free(paths)? else {
-        return Err(Error::new(
+        return Err(NotFounded::Again(
             "another founding of this vault's Commons runs on this Mac now (`aterm secrets \
-             commons init`, or another aterm's pass)",
+             commons init`, or another aterm's pass)"
+                .to_owned(),
         ));
     };
     let admin = admin_open(paths)?;
-    if let Some(descriptor) = published_root(paths, &admin)? {
-        return finish_published(paths, &descriptor, false);
+    if let Some(descriptor) = root_by_default(paths, &admin)? {
+        return finish_published(paths, &descriptor, false).map_err(NotFounded::from);
     }
     let own = machine_identity(paths)?.recipient().to_bech32();
     founds_by_default(&admin.published_doc, admin.commons_bound, &own)
-        .map_err(|why| Error::new(format!("Commons is not founded by default: {why}")))?;
+        .map_err(|why| NotFounded::Stands(format!("Commons is not founded by default: {why}")))?;
     if let Some(why) = approver_strands(paths) {
-        return Err(Error::new(format!(
+        return Err(NotFounded::Stands(format!(
             "Commons is not founded by default: {why}"
         )));
     }
-    let descriptor = prepare(paths, &admin)?;
+    let descriptor = prepare(paths, &admin).map_err(|error| match next(error.kind()) {
+        Next::Passes => NotFounded::Again(error.to_string()),
+        Next::Same | Next::Unsaid => NotFounded::Stands(format!(
+            "Commons is not founded by default: {error}; `aterm secrets commons init` shows the \
+             same refusal"
+        )),
+    })?;
     let mut doc = admin.doc.clone();
     doc.set_entry(
         &audience(&admin),
@@ -661,15 +774,20 @@ pub fn admin_commons_found_by_default(paths: &Paths) -> crate::Result<CommonsIni
         .collect::<Vec<_>>();
     match publish_as(paths, &admin, &doc, false, &admissions, false) {
         Ok(_) => {}
+        // Reopened once, as `commons init` does ([`landed_first`]), the root that landed is
+        // read as the first read reads one: a root that is not the one this Mac kept stands.
         Err(error) if error.kind() == crate::ErrorKind::NotStored => {
-            return landed_first(paths, false)?.ok_or_else(|| {
-                Error::of_kind(
-                    crate::ErrorKind::NotStored,
-                    format!("{error}: another publish landed first"),
-                )
-            });
+            let admin = admin_open(paths)?;
+            return match root_by_default(paths, &admin)? {
+                Some(descriptor) => {
+                    finish_published(paths, &descriptor, false).map_err(NotFounded::from)
+                }
+                None => Err(NotFounded::Again(format!(
+                    "{error}: another publish landed first"
+                ))),
+            };
         }
-        Err(error) => return Err(error),
+        Err(error) => return Err(error.into()),
     }
     let approved = doc
         .machines()

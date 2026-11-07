@@ -1099,6 +1099,14 @@ fn shipped_state_corpus(release: Option<(&str, &Path)>) -> (Corpus, [usize; 3], 
 }
 
 #[test]
+#[ignore = "release after-cut records main's reader without blessing existing cases"]
+fn record_shipped_state_for_landing() {
+    let out = std::env::var_os("ATERM_SHIPPED_STATE_OUT").expect("set ATERM_SHIPPED_STATE_OUT");
+    let (corpus, _, _) = shipped_state_corpus(None);
+    std::fs::write(out, corpus.render()).expect("write main reader's shipped-state answers");
+}
+
+#[test]
 fn state_written_by_shipped_producers_answers_as_recorded() {
     let (corpus, [manifests, layouts, metas], _) = shipped_state_corpus(None);
     assert!(

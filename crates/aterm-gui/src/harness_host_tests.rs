@@ -36072,7 +36072,8 @@ fn installing_session(
     timeline.mark_task(&mark, &Default::default(), Instant::now(), 0);
     timeline.set_worker_installing(true);
     if let Some(child) = child {
-        timeline.set_worker_install_child(child);
+        let mark = timeline.worker_install_mark();
+        assert!(timeline.set_worker_install_child(mark, child));
     }
     drop(timeline);
     h

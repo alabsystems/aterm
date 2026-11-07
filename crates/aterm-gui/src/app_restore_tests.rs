@@ -2775,8 +2775,8 @@ fn an_owner_turn_since_the_last_note_spends_what_a_restart_carries() {
     let carried = |app: &App| {
         app.status_carry_snapshots()
             .into_iter()
-            .find(|(id, _, _)| *id == 0)
-            .map(|(_, carry, _)| carry.told_ids)
+            .find(|(id, _)| *id == 0)
+            .map(|(_, carry)| carry.told_ids)
             .unwrap_or_default()
     };
     assert_eq!(
@@ -4800,7 +4800,6 @@ fn handed_off_shell(local_id: u64) -> crate::spawn::Adopted {
         task: None,
         autopilot_end: None,
         wakes: None,
-        box_receipt: None,
     }
 }
 

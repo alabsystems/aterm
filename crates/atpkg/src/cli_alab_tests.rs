@@ -25,6 +25,8 @@ fn no_processes() -> Option<Vec<std::path::PathBuf>> {
 
 fn seams(trust: &crate::vendor_direct::lane::Trust) -> PassSeams<'_> {
     PassSeams {
+        scope: UpdateScope::Whole,
+        config: None,
         anchor,
         now,
         trust,

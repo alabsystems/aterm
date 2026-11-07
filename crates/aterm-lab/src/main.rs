@@ -1086,13 +1086,14 @@ Outside any lab (no jail, no stub):
   link [--rtt MS] [--take FILE] -- <cmd> [args...]
                                  run <cmd> behind a PTY delaying chunks by RTT/2 each way (default 100 ms)
   mac dmg [--image REF] [--fda] [--keep] | mac nux [--app PATH] [--scenario ROW,...] [--standard-user]
-      [--person | --reader] [--no-clt | --vanilla] [--repeat N] [--record [FILE]] | mac clean
+      [--person | --reader] [--no-clt | --vanilla] [--repeat N] [--record [FILE]] | mac provision | mac clean
                                  the macOS tart guest lane, each run in a fresh clone of a kept SIP-on base: `dmg`, the
                                  dmg_acceptance benches; `nux`, what a person meets on a new Mac (init, doctor, first
                                  launch, terminal and app launch, vault, a vault of the guest's own, successor,
                                  install.sh, and the fault rows: kills, rerun, legacy upgrade, offline, lossy, mDNS,
                                  dmg, agent and SSH, clock) timed in the guest, with a dialog census and the ALab
-                                 guard; `clean`, delete the kept bases (`mac help`; tart fetched when absent)
+                                 guard; `provision`, locate Tart or fetch its pinned version without building an app or starting a guest;
+                                 `clean`, delete the kept bases (`mac help`; tart fetched when absent)
   linux [--gpu] up|down|status|exec|proof|baseline|gone|cpu|a11y|edges|deck|browser|gpu-host|vz-agent|clean|destroy
                                  manage and run the Ubuntu 24.04 Lima VM runtime lane on aarch64 and Rosetta x86_64, or with
                                  --gpu its krunkit instance on this Mac's GPU (`linux help`)

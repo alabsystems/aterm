@@ -3302,7 +3302,9 @@ fn a_sonnet_bucket_under_the_generic_banner_relaunches_on_the_fallback() {
         Some(&ModelSwitch {
             from: Some("sonnet".to_string()),
             to: "opus".to_string(),
-            back_at: Some(reset)
+            back_at: Some(reset),
+            proc: None,
+            unproven: false,
         })
     );
     let none = SupervisorConfig {
@@ -3607,6 +3609,8 @@ fn a_relaunch_where_the_buckets_notice_left_knows_the_bucket() {
         from: Some("sonnet".to_string()),
         to: "opus".to_string(),
         back_at: Some(reset),
+        proc: None,
+        unproven: false,
     };
     let fallback = |a: &TurnEndAction| {
         restarts(
@@ -3919,7 +3923,9 @@ fn a_fable_limit_relaunches_on_opus_and_back_at_its_reset_never_by_model() {
         Some(&ModelSwitch {
             from: Some("fable".to_string()),
             to: "opus".to_string(),
-            back_at: Some(t + 120 * MIN)
+            back_at: Some(t + 120 * MIN),
+            proc: None,
+            unproven: false,
         })
     );
     let bare = TurnEndReading {
@@ -3939,6 +3945,262 @@ fn a_fable_limit_relaunches_on_opus_and_back_at_its_reset_never_by_model() {
         t + 120 * MIN + GRACE
     ));
     assert_eq!(st.model_switch(), None, "nothing switched");
+}
+
+#[test]
+fn a_model_switch_is_its_relaunched_process_and_another_programs_bucket_falls_back() {
+    /// What the switch is to the process named: it rides it (its bucket waits, `back_at`
+    /// restores), it holds its return (its bucket waits, nothing restores yet), or it is over
+    /// (its bucket falls back, nothing restores).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Want {
+        Rides,
+        Holds,
+        Over,
+    }
+    let t = t0();
+    let reset = t + 2 * 24 * 60 * MIN;
+    let a = SwitchProc {
+        pid: 4100,
+        start: 1_000,
+        conversation: Some("conv-a".to_string()),
+    };
+    let switched = |proc: Option<SwitchProc>| {
+        let mut st = TurnEndState::default();
+        st.seed_model(ModelSwitch {
+            from: Some("sonnet".to_string()),
+            to: "opus".to_string(),
+            back_at: Some(reset),
+            proc,
+            unproven: false,
+        });
+        st
+    };
+    // The bucket the switch left, met in the tab after the host names the process.
+    let bucket = TurnEndReading {
+        restartable: true,
+        ..captured(
+            aterm_phase::prompt::fixtures::WALL_SONNET_BUCKET_AUTO_CONTINUE_ARMED_2_1_300,
+            Some(reset),
+            Duration::ZERO,
+        )
+    };
+    let falls_back = |a: &TurnEndAction| {
+        restarts(
+            a,
+            &Restart::Model {
+                to: "opus".to_string(),
+            },
+            RULE_MODEL_FALLBACK,
+        )
+    };
+    let restores = |a: &TurnEndAction| {
+        matches!(
+            a,
+            TurnEndAction::Restart {
+                why: Restart::ModelBack { .. },
+                rule_id: RULE_MODEL_RESTORE,
+                ..
+            }
+        )
+    };
+    let named = |pid, start, conversation: Option<&str>| SwitchProc {
+        pid,
+        start,
+        conversation: conversation.map(str::to_string),
+    };
+    // What the loop saw before the host named the process: nothing, a step of the host's that
+    // started one, or its own restart, made (a memory restart's, a lost line's) or not.
+    let nothing: &dyn Fn(&mut TurnEndState) = &|_: &mut TurnEndState| {};
+    let host_step: &dyn Fn(&mut TurnEndState) = &|st: &mut TurnEndState| st.harness_started();
+    let restart = |why: Restart, made: bool| {
+        move |st: &mut TurnEndState| {
+            st.restarted(&why, made, &idle("Fixed the parser.", Some(JOB)), t);
+        }
+    };
+    let memory_restart = restart(Restart::Memory, true);
+    let memory_restart: &dyn Fn(&mut TurnEndState) = &memory_restart;
+    let lost_line = Restart::InputLost {
+        of: (Some(a.pid), Some(a.start)),
+        line: crate::supervise::custody::LineAsk {
+            at_ms: 900_000,
+            nth: 0,
+        },
+    };
+    let input_lost_restart = restart(lost_line, true);
+    let input_lost_restart: &dyn Fn(&mut TurnEndState) = &input_lost_restart;
+    let memory_unmade = restart(Restart::Memory, false);
+    let memory_unmade: &dyn Fn(&mut TurnEndState) = &memory_unmade;
+    let b = named(4200, 2_000, Some("conv-b"));
+    let p3 = |conversation| named(4300, 3_000, Some(conversation));
+    let mut wrong = Vec::new();
+    let rows = vec![
+        (
+            "the person's fresh program, B",
+            Some(a.clone()),
+            nothing,
+            vec![b.clone()],
+            false,
+            Some(SwitchScope::Closed),
+            Want::Over,
+        ),
+        (
+            "another program under the switch's pid, reused",
+            Some(a.clone()),
+            nothing,
+            vec![named(4100, 5_000, Some("conv-b"))],
+            false,
+            Some(SwitchScope::Closed),
+            Want::Over,
+        ),
+        (
+            "another process whose conversation the host does not name yet",
+            Some(a.clone()),
+            nothing,
+            vec![named(4200, 2_000, None)],
+            false,
+            None,
+            Want::Holds,
+        ),
+        (
+            "a relaunch the host still owes, on a conversation the switch never named",
+            Some(a.clone()),
+            nothing,
+            vec![p3("conv-z")],
+            true,
+            Some(SwitchScope::Moved(p3("conv-z"))),
+            Want::Rides,
+        ),
+        (
+            "a process a step of the host's started, afresh on a new conversation",
+            Some(a.clone()),
+            host_step,
+            vec![p3("conv-n")],
+            false,
+            Some(SwitchScope::Moved(p3("conv-n"))),
+            Want::Rides,
+        ),
+        (
+            "a process this loop's memory restart started, afresh on a new conversation",
+            Some(a.clone()),
+            memory_restart,
+            vec![p3("conv-n")],
+            false,
+            Some(SwitchScope::Moved(p3("conv-n"))),
+            Want::Rides,
+        ),
+        (
+            "a process this loop's lost-input restart started, afresh on a new conversation",
+            Some(a.clone()),
+            input_lost_restart,
+            vec![p3("conv-n")],
+            false,
+            Some(SwitchScope::Moved(p3("conv-n"))),
+            Want::Rides,
+        ),
+        (
+            "control: a memory restart the host did not make, then B",
+            Some(a.clone()),
+            memory_unmade,
+            vec![b.clone()],
+            false,
+            Some(SwitchScope::Closed),
+            Want::Over,
+        ),
+        (
+            "a process a step of the host's started, named first without its conversation",
+            Some(a.clone()),
+            host_step,
+            vec![named(4300, 3_000, None), p3("conv-n")],
+            false,
+            Some(SwitchScope::Moved(p3("conv-n"))),
+            Want::Rides,
+        ),
+        (
+            "control: a step of the host's spent on the switch's own process, then B",
+            Some(a.clone()),
+            host_step,
+            vec![a.clone(), b.clone()],
+            false,
+            Some(SwitchScope::Closed),
+            Want::Over,
+        ),
+        (
+            "control: the relaunched process",
+            Some(a.clone()),
+            nothing,
+            vec![a.clone()],
+            false,
+            None,
+            Want::Rides,
+        ),
+        (
+            "control: the relaunched process after a /clear",
+            Some(a.clone()),
+            nothing,
+            vec![named(4100, 1_000, Some("conv-a2"))],
+            false,
+            Some(SwitchScope::Moved(named(4100, 1_000, Some("conv-a2")))),
+            Want::Rides,
+        ),
+        (
+            "control: a relaunch that resumed A",
+            Some(a.clone()),
+            nothing,
+            vec![p3("conv-a")],
+            false,
+            Some(SwitchScope::Moved(p3("conv-a"))),
+            Want::Rides,
+        ),
+        (
+            "control: a switch no process was named for, as an older build wrote it",
+            None,
+            nothing,
+            vec![b.clone()],
+            false,
+            Some(SwitchScope::Moved(b.clone())),
+            Want::Rides,
+        ),
+        (
+            "control: a host that names a conversation for neither process",
+            Some(named(4100, 1_000, None)),
+            nothing,
+            vec![named(4200, 2_000, None)],
+            false,
+            Some(SwitchScope::Moved(named(4200, 2_000, None))),
+            Want::Rides,
+        ),
+    ];
+    for (case, proc, before, told, owed, scope, want) in rows {
+        let tell = |st: &mut TurnEndState| {
+            before(st);
+            told.iter()
+                .map(|now| {
+                    st.agent_process(now.pid, now.start, now.conversation.as_deref(), || owed)
+                })
+                .last()
+                .flatten()
+        };
+        let mut st = switched(proc.clone());
+        let scoped = tell(&mut st);
+        let open = st.model_switch().is_some();
+        let at_bucket = at(&mut st, &bucket, t);
+        let mut st = switched(proc);
+        tell(&mut st);
+        let back = at(&mut st, &idle("Fixed the parser.", Some(JOB)), reset);
+        let got = match (open, falls_back(&at_bucket), restores(&back)) {
+            (true, false, true) => Some(Want::Rides),
+            (true, false, false) => Some(Want::Holds),
+            (false, true, false) => Some(Want::Over),
+            _ => None,
+        };
+        if scoped != scope || got != Some(want) {
+            wrong.push(format!(
+                "{case}: told {scoped:?}, open {open}, at the bucket {at_bucket:?}, at back_at {back:?}"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 #[test]

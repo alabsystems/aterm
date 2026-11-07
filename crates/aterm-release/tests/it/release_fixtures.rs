@@ -35,6 +35,13 @@ fn pins(build: u64) -> Pins {
     }
 }
 
+fn reader(staged: &fixtures::Staged) -> impl FnMut(&str) -> fixtures::Reading + '_ {
+    |_| fixtures::Reading {
+        answers: Ok(fs::read_to_string(&staged.answers).unwrap()),
+        checks: "PASS (test reader)".into(),
+    }
+}
+
 fn git(cwd: &Path, args: &[&str]) -> String {
     let out = crate::ledger::testing::git()
         .current_dir(cwd)
@@ -379,11 +386,12 @@ fn a_landing_commits_the_staging_and_its_rows_on_main_once() {
         .trim()
         .to_string();
 
-    let landed = fixtures::land(&work, &staged, &pins(7), 5).unwrap();
+    let landed = fixtures::land(&work, &staged, &pins(7), 5, &mut reader(&staged)).unwrap();
     let Landed::Pushed {
         commit,
         attempt,
         answers,
+        ..
     } = &landed
     else {
         panic!("{landed:?}");
@@ -444,7 +452,7 @@ fn a_landing_commits_the_staging_and_its_rows_on_main_once() {
         Some(vec!["history".to_string(), "twelve-panes".to_string()])
     );
 
-    let again = fixtures::land(&work, &staged, &pins(7), 5).unwrap();
+    let again = fixtures::land(&work, &staged, &pins(7), 5, &mut reader(&staged)).unwrap();
     assert!(matches!(again, Landed::Already { .. }), "{again:?}");
     git(&o.work, &["fetch", "-q", "origin", "main"]);
     assert_eq!(
@@ -458,6 +466,341 @@ struct Raced<'a> {
     rival: &'a Path,
     fired: Cell<bool>,
     pushes: RefCell<Vec<String>>,
+}
+
+#[test]
+fn main_reader_answers_replace_line_answers_and_a_named_red_still_lands() {
+    let o = Origin::new();
+    let runs = Cell::new(0);
+    let staged = fixtures::stage(
+        &targo(),
+        &o.work,
+        &o.stage_root(),
+        &pins(7),
+        &mut generator(&["history"], &runs),
+    )
+    .unwrap();
+    let line = fs::read_to_string(&staged.answers).unwrap();
+    let main = line.replace(
+        "v0.6.0/history/manifest\tok\t",
+        "v0.6.0/history/manifest\tok\tMAIN-READER-",
+    );
+    assert_ne!(
+        main, line,
+        "negative control: main and line must answer differently"
+    );
+    let mut reads = 0;
+    let landed = fixtures::land(&Git::new(&o.work), &staged, &pins(7), 5, &mut |preview| {
+        reads += 1;
+        assert_eq!(
+            git(
+                &o.work,
+                &[
+                    "show",
+                    &format!("{preview}:{HANDOFF_FIXTURE_ROOT}/v0.6.0/history/parent.toml")
+                ]
+            )
+            .as_bytes(),
+            fs::read(staged.dir.join("history/parent.toml")).unwrap()
+        );
+        assert_eq!(
+            git(
+                &o.work,
+                &[
+                    "show",
+                    &format!("{preview}:{}", fixtures::SHIPPED_STATE_CORPUS)
+                ]
+            ),
+            corpus()
+        );
+        fixtures::Reading {
+            answers: Ok(main.clone()),
+            checks: "FAIL: restore_claude_auth_tests::new_route".into(),
+        }
+    })
+    .unwrap();
+    assert_eq!(reads, 1, "a FAIL is never re-rolled");
+    assert_eq!(o.on_main(fixtures::SHIPPED_STATE_CORPUS), main.as_bytes());
+    assert!(
+        landed
+            .words(&pins(7))
+            .contains("FAIL: restore_claude_auth_tests::new_route")
+    );
+    assert_eq!(
+        fs::read_to_string(&staged.answers).unwrap(),
+        line,
+        "producer staging is immutable"
+    );
+}
+
+#[test]
+fn an_unavailable_main_reader_never_falls_back_to_the_line_reader() {
+    let o = Origin::new();
+    let runs = Cell::new(0);
+    let staged = fixtures::stage(
+        &targo(),
+        &o.work,
+        &o.stage_root(),
+        &pins(7),
+        &mut generator(&["history"], &runs),
+    )
+    .unwrap();
+    let landed = fixtures::land(&Git::new(&o.work), &staged, &pins(7), 5, &mut |_| {
+        fixtures::Reading {
+            answers: Err("main compile failed".into()),
+            checks: "COULD NOT RUN: main compile failed".into(),
+        }
+    })
+    .unwrap();
+    assert_eq!(
+        o.on_main(fixtures::SHIPPED_STATE_CORPUS),
+        corpus().as_bytes()
+    );
+    assert!(matches!(
+        landed,
+        Landed::Pushed {
+            answers: Answers::Unrecorded(_),
+            ..
+        }
+    ));
+    assert!(landed.words(&pins(7)).contains("main compile failed"));
+    assert!(
+        !o.on_main(&format!(
+            "{HANDOFF_FIXTURE_ROOT}/v0.6.0/history/parent.toml"
+        ))
+        .is_empty()
+    );
+}
+
+#[test]
+fn main_reader_records_then_checks_the_splice_without_blessing_old_answers() {
+    for red in [false, true] {
+        let o = Origin::new();
+        let runs = Cell::new(0);
+        let staged = fixtures::stage(
+            &targo(),
+            &o.work,
+            &o.stage_root(),
+            &pins(7),
+            &mut generator(&["history"], &runs),
+        )
+        .unwrap();
+        let mut calls = 0;
+        let rendered = staged_answers(&["history"]).replace("fnv1a64:6", "fnv1a64:MAIN");
+        let expected = rendered.clone();
+        let landed = fixtures::land(&Git::new(&o.work), &staged, &pins(7), 5, &mut |preview| {
+            fixtures::MainReader::new(&o.work).unwrap().read(&targo(), preview, &pins(7), &mut |cmd| {
+                calls += 1;
+                let tree = cmd.get_current_dir().unwrap();
+                let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+                let stdout = match calls {
+                    1 => {
+                        assert!(args.iter().any(|a| a == "--no-run"));
+                        artifact(tree, &o.work.join("target/debug/deps/aterm_gui-0123456789abcdef"))
+                    }
+                    2 => {
+                        assert!(args.iter().any(|a| a == "--ignored"));
+                        assert!(args.iter().any(|a| a == "serde_corpus_tests::record_shipped_state_for_landing"));
+                        assert_eq!(fs::read_to_string(tree.join(fixtures::SHIPPED_STATE_CORPUS)).unwrap(), corpus());
+                        // Main also changed an old answer. It must remain an oracle,
+                        // not be silently blessed along with the new producer's cases.
+                        fs::write(env_of(cmd, fixtures::ANSWERS_OUT).unwrap(), rendered.replace("fnv1a64:5", "fnv1a64:OLD-MOVED")).unwrap();
+                        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n".into()
+                    }
+                    3 => {
+                        assert_eq!(args, fixtures::consumer_args());
+                        assert_eq!(fs::read_to_string(tree.join(fixtures::SHIPPED_STATE_CORPUS)).unwrap(), expected);
+                        assert!(cmd.get_envs().any(|(k, v)| k == "ATERM_BLESS_SERDE_CORPUS" && v.is_none()));
+                        if red {
+                            "test restore_claude_auth_tests::new_route ... FAILED\ntest result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n".into()
+                        } else {
+                            "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n".into()
+                        }
+                    }
+                    _ => panic!("a consumer FAIL must not be re-rolled"),
+                };
+                Ok(Output { status: exit(i32::from(red && calls == 3)), stdout: stdout.into_bytes(), stderr: Vec::new() })
+            })
+        }).unwrap();
+        assert_eq!(calls, 3, "{}", landed.words(&pins(7)));
+        assert_eq!(
+            o.on_main(fixtures::SHIPPED_STATE_CORPUS),
+            expected.as_bytes()
+        );
+        assert!(landed.words(&pins(7)).contains(if red {
+            "FAIL: restore_claude_auth_tests::new_route"
+        } else {
+            "PASS (2 desk-reader tests)"
+        }));
+        assert_eq!(
+            git(&o.work, &["worktree", "list", "--porcelain"])
+                .lines()
+                .filter(|l| l.starts_with("worktree "))
+                .count(),
+            1
+        );
+    }
+}
+
+/// Exercise the real after-cut reader without publishing or rewriting any producer.
+/// Remove one release's answers from a private git tree, then have main restore them.
+#[test]
+#[ignore = "measures a real GUI compile and consumer sweep; set ATERM_MEASURE_SHIPPED_VERSION"]
+fn measure_main_fixture_reader() {
+    let version = std::env::var("ATERM_MEASURE_SHIPPED_VERSION")
+        .expect("name an existing shipped fixture version");
+    let repo = aterm_tempfile::manifest_dir()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let corpus = fs::read_to_string(repo.join(fixtures::SHIPPED_STATE_CORPUS)).unwrap();
+    let prefix = format!("v{version}/");
+    let without = corpus
+        .lines()
+        .filter(|l| !l.starts_with(&prefix))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    assert_ne!(without, corpus);
+    let git = Git::new(&repo);
+    let blob = git
+        .git_input(&["hash-object", "-w", "--stdin"], without.as_bytes())
+        .unwrap();
+    assert!(blob.success());
+    let base = crate::ledger::rev_parse(&git, "HEAD^{tree}").unwrap();
+    let tree = fixtures::tree_with(
+        &git,
+        Some(&base),
+        &[(fixtures::SHIPPED_STATE_CORPUS, blob.stdout_utf8().trim())],
+    )
+    .unwrap();
+    let preview = crate::ledger::git_ok(
+        &git,
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            "HEAD",
+            "-m",
+            "measure main fixture reader (unreferenced)",
+        ],
+    )
+    .unwrap()
+    .stdout_utf8();
+    let mut reader = fixtures::MainReader::new(&repo).unwrap();
+    let reading = reader.read(
+        &targo(),
+        preview.trim(),
+        &Pins {
+            version: version.clone(),
+            ..pins(7)
+        },
+        &mut |cmd| cmd.output(),
+    );
+    println!("cold: {}", reading.checks);
+    assert!(reading.answers.is_ok(), "{}", reading.checks);
+    assert!(reading.checks.starts_with("PASS"), "{}", reading.checks);
+    // A new tip changes the tree, so it gets a new judgment. Unchanged source
+    // files keep their path and build-script inputs across the checkout.
+    let blob = git
+        .git_input(
+            &["hash-object", "-w", "--stdin"],
+            b"main moved during after-cut\n",
+        )
+        .unwrap();
+    assert!(blob.success());
+    let moved_tree = fixtures::tree_with(
+        &git,
+        Some(&tree),
+        &[("README.md", blob.stdout_utf8().trim())],
+    )
+    .unwrap();
+    let moved = crate::ledger::git_ok(
+        &git,
+        &[
+            "commit-tree",
+            &moved_tree,
+            "-p",
+            preview.trim(),
+            "-m",
+            "measure a changed main tip (unreferenced)",
+        ],
+    )
+    .unwrap()
+    .stdout_utf8();
+    let reading = reader.read(
+        &targo(),
+        moved.trim(),
+        &Pins { version, ..pins(7) },
+        &mut |cmd| cmd.output(),
+    );
+    println!("changed tip, warm source: {}", reading.checks);
+    assert!(reading.checks.starts_with("PASS"), "{}", reading.checks);
+}
+
+#[test]
+fn an_unproven_main_recorder_is_held_before_another_compile() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let o = Origin::new();
+    let runs = Cell::new(0);
+    let staged = fixtures::stage(
+        &targo(),
+        &o.work,
+        &o.stage_root(),
+        &pins(7),
+        &mut generator(&["history"], &runs),
+    )
+    .unwrap();
+    let mut reader = fixtures::MainReader::new(&o.work).unwrap();
+    let mut calls = 0;
+    let landed = fixtures::land(&Git::new(&o.work), &staged, &pins(7), 5, &mut |preview| {
+        let first = reader.read(&targo(), preview, &pins(7), &mut |cmd| {
+            calls += 1;
+            Ok(if calls == 1 {
+                Output {
+                    status: exit(0),
+                    stdout: artifact(
+                        cmd.get_current_dir().unwrap(),
+                        &o.work.join("target/debug/deps/aterm_gui-0123456789abcdef"),
+                    )
+                    .into_bytes(),
+                    stderr: Vec::new(),
+                }
+            } else {
+                assert_eq!(calls, 2);
+                Output {
+                    status: std::process::ExitStatus::from_raw(9),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                }
+            })
+        });
+        assert!(first.answers.is_err());
+        let held = reader.read(&targo(), preview, &pins(7), &mut |_| {
+            panic!("must not replace an unproven executable")
+        });
+        assert!(
+            held.checks.contains("never showed it ran"),
+            "{}",
+            held.checks
+        );
+        held
+    })
+    .unwrap();
+    assert_eq!(calls, 2);
+    assert!(matches!(
+        landed,
+        Landed::Pushed {
+            answers: Answers::Unrecorded(_),
+            ..
+        }
+    ));
+    assert_eq!(
+        o.on_main(fixtures::SHIPPED_STATE_CORPUS),
+        corpus().as_bytes()
+    );
 }
 
 impl GitRunner for Raced<'_> {
@@ -490,7 +833,62 @@ fn a_landing_that_loses_the_race_lands_on_the_winners_tip() {
         fired: Cell::new(false),
         pushes: RefCell::new(Vec::new()),
     };
-    let landed = fixtures::land(&raced, &staged, &pins(7), 5).unwrap();
+    let mut read_tips = Vec::new();
+    let mut source_paths = Vec::new();
+    let mut reader = fixtures::MainReader::new(&o.work).unwrap();
+    let landed = fixtures::land(&raced, &staged, &pins(7), 5, &mut |preview| {
+        let seen = git(&o.work, &["show", &format!("{preview}:README.md")]);
+        read_tips.push(seen.clone());
+        let answers = staged_answers(&["history"]).replace("fnv1a64:6", seen.trim());
+        let reading = reader.read(&targo(), preview, &pins(7), &mut |cmd| {
+            let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy()).collect();
+            let stdout = if args.iter().any(|a| a == "--no-run") {
+                let source = cmd.get_current_dir().unwrap();
+                assert_eq!(
+                    fs::read_to_string(source.join("README.md")).unwrap(),
+                    seen,
+                    "the compiler must see the winner's checked-out source"
+                );
+                source_paths.push(source.to_path_buf());
+                artifact(
+                    source,
+                    &o.work.join("target/debug/deps/aterm_gui-0123456789abcdef"),
+                )
+            } else if args.iter().any(|a| a == "--ignored") {
+                fs::write(env_of(cmd, fixtures::ANSWERS_OUT).unwrap(), &answers).unwrap();
+                "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n"
+                    .into()
+            } else {
+                "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n"
+                    .into()
+            };
+            Ok(Output {
+                status: exit(0),
+                stdout: stdout.into_bytes(),
+                stderr: Vec::new(),
+            })
+        });
+        assert!(reading.checks.starts_with("PASS"), "{}", reading.checks);
+        reading
+    })
+    .unwrap();
+    assert_eq!(read_tips, ["aterm\n", "aterm, moved\n"]);
+    assert_eq!(source_paths.len(), 2);
+    assert_eq!(
+        source_paths[0], source_paths[1],
+        "a lost race must keep the source path"
+    );
+    drop(reader);
+    assert!(
+        !source_paths[0].exists(),
+        "the landing releases its reader worktree"
+    );
+    assert_eq!(
+        o.on_main(fixtures::SHIPPED_STATE_CORPUS),
+        staged_answers(&["history"])
+            .replace("fnv1a64:6", "aterm, moved")
+            .as_bytes()
+    );
     assert!(
         matches!(landed, Landed::Pushed { attempt: 2, .. }),
         "{landed:?}"
@@ -533,7 +931,14 @@ fn a_fixture_directory_on_main_the_gate_refuses_is_never_overwritten() {
     let runs = Cell::new(0);
     let mut run = generator(&["history"], &runs);
     let staged = fixtures::stage(&targo(), &o.work, &o.stage_root(), &pins(7), &mut run).unwrap();
-    fixtures::land(&Git::new(&o.work), &staged, &pins(7), 5).unwrap_err();
+    fixtures::land(
+        &Git::new(&o.work),
+        &staged,
+        &pins(7),
+        5,
+        &mut reader(&staged),
+    )
+    .unwrap_err();
     assert_eq!(
         o.on_main(&format!(
             "{HANDOFF_FIXTURE_ROOT}/v0.6.0/history/parent.toml"
@@ -588,7 +993,14 @@ fn a_landing_whose_corpus_cannot_take_the_answers_lands_the_desks_and_says_so() 
     let runs = Cell::new(0);
     let mut run = generator(&["history"], &runs);
     let staged = fixtures::stage(&targo(), &o.work, &o.stage_root(), &pins(7), &mut run).unwrap();
-    let landed = fixtures::land(&Git::new(&o.work), &staged, &pins(7), 5).unwrap();
+    let landed = fixtures::land(
+        &Git::new(&o.work),
+        &staged,
+        &pins(7),
+        5,
+        &mut reader(&staged),
+    )
+    .unwrap();
     let Landed::Pushed { answers, .. } = &landed else {
         panic!("{landed:?}");
     };

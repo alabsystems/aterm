@@ -341,7 +341,7 @@ fn malformed_write_identities_are_not_read_as_legacy_records() {
 }
 
 #[test]
-fn generation_fences_a_return_to_the_same_inactive_state() {
+fn restored_noexec_fences_a_writer_from_before_the_attempt() {
     let root = aterm_tempfile::tempdir().unwrap();
     let opts = opts(root.path());
     let current = model_level(0, ImagePhase::Forward);
@@ -356,6 +356,7 @@ fn generation_fences_a_return_to_the_same_inactive_state() {
     )
     .unwrap();
     native_record::restore_inactive(&opts, "session", &mut active, Some(&current)).unwrap();
+    assert!(active.native_noexec_prepare.is_some());
     assert!(native_record::generation(&active) > native_record::generation(&stale));
     assert!(upgrade_drive::save_checked(&opts, "session", &stale).is_err());
 }

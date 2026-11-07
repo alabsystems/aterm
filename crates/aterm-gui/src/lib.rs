@@ -165,7 +165,6 @@ mod autopilot;
 mod autopilot_menu;
 mod autopilot_timers;
 mod bell_ledger;
-mod box_banner;
 mod build_badge;
 mod build_info;
 #[cfg(test)]
@@ -5973,8 +5972,6 @@ pub(crate) struct SessionCtx {
     pub(crate) screen_moves: Arc<vitals_host::ScreenMoves>,
     /// What the PTY reader read, for the stuck engine's pass to read at its tick.
     pub(crate) job_feed: Arc<vitals_jobs::JobFeed>,
-    /// Who told the box the program stands on: its own notification or the herald's banner.
-    pub(crate) box_banner: Arc<box_banner::BoxBanner>,
     /// The images the kernel mapped in the session's processes, which a command's detail is confirmed against.
     pub(crate) ran: Arc<command_ran::Ran>,
 }
@@ -15189,7 +15186,6 @@ impl App {
             cwd: None,
             sandbox_wrap: None,
             terminal_config: None,
-            tab_status: true,
             integrate: false,
             lat_epoch: Instant::now(),
             loop_idle: Arc::default(),
@@ -22990,11 +22986,15 @@ impl PassRun {
     }
 
     fn verdict(&self) -> PassVerdict {
+        if self.seen.stdout_unread || self.seen.stderr_unread {
+            return PassVerdict::Refused;
+        }
         classify_pass_exit(self.code, self.seen.saw_start, self.seen.saw_terminal)
     }
 
-    /// What atpkg said, on one line, at most 2000 characters. A long one keeps its end, since atpkg
-    /// closes its stderr with the failure and what follows from it.
+    /// The pass diagnostic, on one line and at most 2000 characters. An unread output cause
+    /// stays before the stderr tail; a long stderr keeps its end, where atpkg closes with the
+    /// failure and what follows from it.
     fn why(&self) -> String {
         let said = self
             .said
@@ -23003,8 +23003,21 @@ impl PassRun {
             .filter(|l| !l.is_empty())
             .collect::<Vec<_>>()
             .join(" | ");
-        let over = said.chars().count().saturating_sub(2000);
-        said.chars().skip(over).collect()
+        let prefix = match (self.seen.stdout_unread, self.seen.stderr_unread) {
+            (true, true) => Some(PASS_OUTPUT_UNREAD),
+            (true, false) => Some(PASS_STDOUT_UNREAD),
+            (false, true) => Some(PASS_STDERR_UNREAD),
+            (false, false) => None,
+        };
+        let reserved = prefix.map_or(0, |prefix| prefix.chars().count().saturating_add(2));
+        let keep = 2000usize.saturating_sub(reserved);
+        let over = said.chars().count().saturating_sub(keep);
+        let tail: String = said.chars().skip(over).collect();
+        match prefix {
+            Some(prefix) if tail.is_empty() => prefix.to_owned(),
+            Some(prefix) => format!("{prefix}: {tail}"),
+            None => tail,
+        }
     }
 
     fn recorded_cached_index_cause(&self, layout: Option<&atpkg::store::Layout>) -> Option<String> {
@@ -23017,7 +23030,11 @@ impl PassRun {
     }
 
     fn clean(&self) -> bool {
-        self.ran() && self.ok() && !self.seen.saw_failure
+        self.ran()
+            && self.ok()
+            && !self.seen.saw_failure
+            && !self.seen.stdout_unread
+            && !self.seen.stderr_unread
     }
 
     fn ran(&self) -> bool {
@@ -23085,7 +23102,19 @@ fn run_pass_child<P: Fn(Wake) + Clone + Send + 'static>(
                 post(tag_first_run(event, first_run));
             });
         }
-        drain.and_then(|h| h.join().ok()).unwrap_or_default()
+        match drain {
+            Some(drain) => match drain.join() {
+                Ok((said, unread)) => {
+                    seen.stderr_unread = unread;
+                    said
+                }
+                Err(_) => {
+                    seen.stderr_unread = true;
+                    String::new()
+                }
+            },
+            None => String::new(),
+        }
     });
     let status = child.wait();
     let holder_advanced = tailer.is_some_and(PkgProgressTailer::finish);
@@ -23126,10 +23155,40 @@ fn tag_first_run(event: Wake, first_run: bool) -> Wake {
     }
 }
 
-fn read_pass_stderr<R: std::io::Read>(mut pipe: R) -> String {
-    let mut bytes = Vec::new();
-    let _ = pipe.read_to_end(&mut bytes);
-    String::from_utf8_lossy(&bytes).into_owned()
+const PASS_STDERR_KEEP: usize = 64 * 1024;
+const PASS_STDERR_OMITTED: &str = "[earlier atpkg output omitted]\n";
+
+/// Drain the entire pipe while retaining only a bounded diagnostic tail. The omission
+/// marker distinguishes lost history from a child that said nothing.
+fn read_pass_stderr<R: std::io::Read>(mut pipe: R) -> (String, bool) {
+    let mut bytes = std::collections::VecDeque::with_capacity(PASS_STDERR_KEEP);
+    let mut chunk = [0; 8192];
+    let mut omitted = false;
+    let mut unread = false;
+    loop {
+        match pipe.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                let cut = bytes
+                    .len()
+                    .saturating_add(n)
+                    .saturating_sub(PASS_STDERR_KEEP);
+                omitted |= cut != 0;
+                bytes.drain(..cut);
+                bytes.extend(&chunk[..n]);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => {
+                unread = true;
+                break;
+            }
+        }
+    }
+    let mut said = String::from_utf8_lossy(bytes.make_contiguous()).into_owned();
+    if omitted {
+        said.insert_str(0, PASS_STDERR_OMITTED);
+    }
+    (said, unread)
 }
 
 fn carry_wait_row(
@@ -23199,7 +23258,11 @@ fn report_pass_verdict(
             aterm_log::warn!("{}", refused_line(verb, unanswered));
             if verb.refusal_is_a_failure() {
                 post(Wake::PkgSeedFailed {
-                    detail: pass_said_detail(&run.said),
+                    detail: if run.seen.stdout_unread || run.seen.stderr_unread {
+                        why.clone()
+                    } else {
+                        pass_said_detail(&run.said)
+                    },
                 });
             }
         }
@@ -24495,11 +24558,76 @@ struct SeedMarkers {
     saw_failure: bool,
     saw_machine_change: bool,
     saw_machine_state: bool,
+    stdout_unread: bool,
+    stderr_unread: bool,
 }
 
-fn read_seed_markers<R: std::io::BufRead>(out: R, mut post: impl FnMut(Wake)) -> SeedMarkers {
+const PASS_STDOUT_LINE_MAX: usize = 8 * 1024 * 1024;
+const PASS_STDOUT_UNREAD: &str = "atpkg stdout contained an unreadable or oversized frame";
+const PASS_STDERR_UNREAD: &str = "atpkg stderr could not be read completely";
+const PASS_OUTPUT_UNREAD: &str = "atpkg stdout and stderr could not be read completely";
+
+/// Read a complete frame, excluding LF. Discard oversized frames through their newline,
+/// never exposing a prefix or suffix as a marker, and keep reading the following frames.
+fn read_pass_marker_line<R: std::io::BufRead>(
+    out: &mut R,
+    max: usize,
+    oversized: &mut bool,
+) -> std::io::Result<Option<Vec<u8>>> {
+    loop {
+        let mut raw = Vec::new();
+        let n = {
+            let mut limited = std::io::Read::take(&mut *out, (max as u64).saturating_add(1));
+            std::io::BufRead::read_until(&mut limited, b'\n', &mut raw)?
+        };
+        if n == 0 {
+            return Ok(None);
+        }
+        let newline = raw.last() == Some(&b'\n');
+        if newline {
+            raw.pop();
+        }
+        if raw.len() <= max {
+            return Ok(Some(raw));
+        }
+        if !*oversized {
+            aterm_log::info!("atpkg stdout: discarded a frame above {max} bytes");
+        }
+        *oversized = true;
+        if !newline {
+            loop {
+                let chunk = match out.fill_buf() {
+                    Ok(chunk) => chunk,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error),
+                };
+                if chunk.is_empty() {
+                    return Ok(None);
+                }
+                let newline = chunk.iter().position(|byte| *byte == b'\n');
+                let consumed = newline.map_or(chunk.len(), |at| at + 1);
+                out.consume(consumed);
+                if newline.is_some() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn read_seed_markers<R: std::io::BufRead>(mut out: R, mut post: impl FnMut(Wake)) -> SeedMarkers {
     let mut seen = SeedMarkers::default();
-    for raw in out.split(b'\n').map_while(Result::ok) {
+    let mut oversized = false;
+    loop {
+        let raw = match read_pass_marker_line(&mut out, PASS_STDOUT_LINE_MAX, &mut oversized) {
+            Ok(Some(raw)) => raw,
+            Ok(None) => break,
+            Err(error) => {
+                seen.stdout_unread = true;
+                aterm_log::info!("atpkg stdout could not be read: {error}");
+                break;
+            }
+        };
         let line = String::from_utf8_lossy(&raw);
         let line = line.trim_end_matches('\r');
         if line
@@ -24535,6 +24663,7 @@ fn read_seed_markers<R: std::io::BufRead>(out: R, mut post: impl FnMut(Wake)) ->
             post(event);
         }
     }
+    seen.stdout_unread |= oversized;
     if seen.saw_machine_change && !seen.saw_machine_state {
         post(Wake::PkgMachineRecordMissing);
     }
@@ -24553,7 +24682,7 @@ const fn seed_retire(seen: SeedMarkers, ok: bool, store_holds_programs: bool) ->
     if !seen.saw_start || seen.saw_terminal {
         return SeedRetire::Nothing;
     }
-    if !ok {
+    if !ok || seen.stdout_unread || seen.stderr_unread {
         return SeedRetire::Failed;
     }
     if store_holds_programs {
@@ -26981,7 +27110,6 @@ pub fn main_entry_with_network(
         cwd,
         sandbox_wrap,
         terminal_config: Some(config.applied_terminal_config_from(&startup_colors)),
-        tab_status: config.tab_status_or_default(),
         integrate,
         lat_epoch,
         loop_idle: Arc::default(),
@@ -28956,7 +29084,6 @@ fn ptyless_session(id: u64, self_id: SessionId, term: Terminal, sink: Arc<SinkWr
         screen_moves: Default::default(),
         job_feed: Default::default(),
         ran: Default::default(),
-        box_banner: Default::default(),
         update_parked: Default::default(),
         watchers: observed.watchers,
         frame: Default::default(),

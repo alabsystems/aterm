@@ -380,7 +380,11 @@ pub(super) const HOME_FOLDERS: [&str; 9] = [
 ];
 
 pub(super) fn partition(sys: &dyn System, user: &User, all: &[Repo]) -> Result<Partition, String> {
-    admit_home(sys, user)?;
+    if all.is_empty() {
+        admit_destination(sys, user)?;
+    } else {
+        admit_home(sys, user)?;
+    }
     let home = Path::new(&user.home);
     let mut standing = Partition::default();
     for repo in all {
@@ -648,7 +652,8 @@ fn refresh_one(
     crate::checkout::align_guarded(sys, user, path, &origin, &admitted).map(Some)
 }
 
-pub(super) fn admit_home(sys: &dyn System, user: &User) -> Result<(), String> {
+/// Admit the account's destination without requiring a tool for an empty selection.
+pub(super) fn admit_destination(sys: &dyn System, user: &User) -> Result<(), String> {
     let home = Path::new(&user.home);
     let stat = sys
         .stat(home)
@@ -656,6 +661,11 @@ pub(super) fn admit_home(sys: &dyn System, user: &User) -> Result<(), String> {
     if !home.is_absolute() || !stat.dir || stat.symlink || stat.uid != user.uid {
         return Err("repository destination must be this user's own home directory".into());
     }
+    Ok(())
+}
+
+pub(super) fn admit_home(sys: &dyn System, user: &User) -> Result<(), String> {
+    admit_destination(sys, user)?;
     if !git_installed(sys) {
         return Err(no_git(sys).into());
     }

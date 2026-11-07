@@ -385,6 +385,7 @@ fn a_finished_install_or_update_is_followed_by_setup_unless_its_words_say_otherw
         &["install", crate::cli::NO_INIT_FLAG, "claude"],
         &["install", "claude", crate::cli::NO_INIT_FLAG],
         &["update", crate::cli::NO_INIT_FLAG],
+        &["update", DEFAULT_SELECTED_FLAG, "git"],
         &[crate::cli::PRIVATE_STATE_ROOT_FLAG, "update"],
     ] {
         assert!(!super::pass_finishes_setup(&words(stays)), "{stays:?}");
@@ -1175,6 +1176,7 @@ fn named_staging_never_starts_a_changed_machine_plan() {
         (&["install", "trust"], true, 0),
         (&["update", "claude"], false, 0),
         (&["update", "ay"], false, 1),
+        (&["update", DEFAULT_SELECTED_FLAG, "git"], false, 0),
         (&["list"], false, 0),
     ] {
         let args = words
@@ -3371,6 +3373,82 @@ fn a_system_install_satisfies_a_default_set_member_and_retires_the_managed_copy(
             .is_empty()
     );
     assert!(reconcile_system_satisfied_with(&layout, &index, &wanted, &mut none, None).is_empty());
+
+    let registry = scratch("selected-system-registry");
+    write_registry(&registry, "stable");
+    let index = registry.join("index.toml");
+    let body = std::fs::read_to_string(&index).unwrap().replace(
+        "[programs.ay]\nrepo = \"ay\"",
+        "[programs.ay]\nrepo = \"ay\"\nsystem = \"gh\"",
+    );
+    std::fs::write(&index, &body).unwrap();
+    std::fs::write(
+        registry.join("index.toml.sig"),
+        sign(&RELEASE_SEED, body.as_bytes()),
+    )
+    .unwrap();
+    let selected = temp_layout("selected-system");
+    let mut fetcher = CountingFetcher::new(registry.clone());
+    fetcher.selected = Some(&[]);
+    let trust = crate::vendor_direct::lane::world::trust();
+    let seams = PassSeams {
+        scope: UpdateScope::Selected("ay"),
+        now: || 0,
+        path: Some(path.clone()),
+        ..world_seams(&trust)
+    };
+    assert_eq!(
+        run_recorded_update_pass(
+            &selected,
+            &crate::config::PackagesConfig::default(),
+            &fetcher,
+            &Default::default(),
+            true,
+            &seams,
+        ),
+        0
+    );
+    assert!(crate::active_builds(&selected).is_empty());
+    let status = crate::status::read(&selected).unwrap();
+    assert_eq!(
+        status.programs["ay"].state,
+        crate::state::system(&sys.join("gh"), None)
+    );
+    assert!(status.last_pass_at.is_empty());
+
+    // The signed Git row uses this prebuilt-only shape: an old executable
+    // on PATH is not system satisfaction without an explicit signed declaration.
+    let body = body.replace("system = \"gh\"", "policy = \"prebuilt-only\"");
+    std::fs::write(&index, &body).unwrap();
+    std::fs::write(
+        registry.join("index.toml.sig"),
+        sign(&RELEASE_SEED, body.as_bytes()),
+    )
+    .unwrap();
+    let managed = temp_layout("selected-despite-native");
+    fetcher.selected = Some(&["ay"]);
+    assert!(sys.join("ay").is_file());
+    assert_eq!(
+        run_recorded_update_pass(
+            &managed,
+            &crate::config::PackagesConfig::default(),
+            &fetcher,
+            &Default::default(),
+            true,
+            &seams,
+        ),
+        0
+    );
+    assert_eq!(crate::active_builds(&managed).get("ay"), Some(&18));
+    assert!(
+        crate::status::read(&managed)
+            .unwrap()
+            .last_pass_at
+            .is_empty()
+    );
+    let _ = std::fs::remove_dir_all(&managed.prefix);
+    let _ = std::fs::remove_dir_all(&selected.prefix);
+    let _ = std::fs::remove_dir_all(&registry);
     let _ = std::fs::remove_dir_all(&sys);
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
@@ -6370,6 +6448,8 @@ fn checkout(label: &str, prog: &str) -> crate::testdir::Dir {
 
 struct CountingFetcher {
     inner: crate::DirFetcher,
+    selected: Option<&'static [&'static str]>,
+    after_download: Option<Box<dyn Fn()>>,
     resolves: std::cell::Cell<u32>,
     fail_first_index: std::cell::Cell<bool>,
     first_index_link_down: bool,
@@ -6379,6 +6459,8 @@ impl CountingFetcher {
     fn new(dir: PathBuf) -> Self {
         Self {
             inner: crate::DirFetcher::new(dir),
+            selected: None,
+            after_download: None,
             resolves: std::cell::Cell::new(0),
             fail_first_index: std::cell::Cell::new(false),
             first_index_link_down: false,
@@ -6405,11 +6487,21 @@ impl crate::flow::Fetcher for CountingFetcher {
         program: &str,
         build: u64,
     ) -> Result<(Vec<u8>, Vec<u8>), String> {
+        if let Some(selected) = self.selected {
+            assert!(
+                selected.contains(&program),
+                "the scoped pass reached an unrelated package"
+            );
+        }
         crate::flow::Fetcher::pkg_manifest(&self.inner, repo, program, build)
     }
 
     fn download(&self, repo: &str, asset: &str, dest: &Path) -> Result<(), String> {
-        crate::flow::Fetcher::download(&self.inner, repo, asset, dest)
+        crate::flow::Fetcher::download(&self.inner, repo, asset, dest)?;
+        if let Some(changed) = &self.after_download {
+            changed();
+        }
+        Ok(())
     }
 
     fn source_id(&self) -> String {
@@ -6439,6 +6531,8 @@ fn empty_store_retry_records_the_signed_index_it_resolved() {
     };
     let trust = crate::vendor_direct::lane::world::trust();
     let seams = PassSeams {
+        scope: UpdateScope::Whole,
+        config: None,
         anchor: |_| test_anchor(),
         now: || 0,
         trust: &trust,
@@ -6479,6 +6573,155 @@ fn empty_store_retry_records_the_signed_index_it_resolved() {
         !stamps.completed_older_index_pass(46),
         "a second pass for the signed build must keep the spacing hold"
     );
+
+    // A repository prerequisite owes one default-selected unit, not the
+    // unrelated packages a normal full pass will finish independently.
+    let selected_layout = temp_layout("selected-default-store");
+    let ny = crate::store::ToolName::new("ny").unwrap();
+    crate::stub::write_pending_stub(&selected_layout, &ny).unwrap();
+    let stub = std::fs::read(selected_layout.shim(&ny)).unwrap();
+    let mut selected_fetcher = CountingFetcher::new(dir.clone());
+    selected_fetcher.selected = Some(&["ay"]);
+    let selected_cfg = crate::config::PackagesConfig {
+        exclude: Some(agents_except(&[])),
+        ..Default::default()
+    };
+    let selected_seams = PassSeams {
+        scope: UpdateScope::Selected("ay"),
+        ..seams
+    };
+    let code = run_recorded_update_pass(
+        &selected_layout,
+        &selected_cfg,
+        &selected_fetcher,
+        &std::collections::BTreeMap::new(),
+        true,
+        &selected_seams,
+    );
+    assert_eq!(code, 0);
+    assert_eq!(crate::active_builds(&selected_layout).get("ay"), Some(&18));
+    assert!(!crate::active_builds(&selected_layout).contains_key("ny"));
+    assert_eq!(std::fs::read(selected_layout.shim(&ny)).unwrap(), stub);
+    assert!(
+        crate::status::read(&selected_layout).is_none_or(|status| status.last_pass_at.is_empty()),
+        "a selected prerequisite cannot settle the independent whole-toolset pass"
+    );
+
+    let upgrade = temp_layout("selected-default-upgrade");
+    make_live(&upgrade, "ay", 17);
+    assert_eq!(
+        run_recorded_update_pass(
+            &upgrade,
+            &selected_cfg,
+            &selected_fetcher,
+            &crate::active_builds(&upgrade),
+            true,
+            &selected_seams,
+        ),
+        0
+    );
+    assert_eq!(crate::active_builds(&upgrade).get("ay"), Some(&18));
+
+    let checkout = dir.join("declared-checkout").to_string_lossy().into_owned();
+    for choice in [
+        "removed",
+        "excluded",
+        checkout.as_str(),
+        "~/declared-checkout",
+    ] {
+        let held = temp_layout("selected-local-choice");
+        let mut cfg = selected_cfg.clone();
+        if choice == "removed" {
+            std::fs::write(held.removed(), "ay\n").unwrap();
+        } else if choice == "excluded" {
+            cfg.exclude.as_mut().unwrap().push("ay".into());
+        } else {
+            cfg.links.insert("ay".into(), choice.into());
+        }
+        let no_reads = CountingFetcher::new(dir.clone());
+        assert_eq!(
+            run_recorded_update_pass(
+                &held,
+                &cfg,
+                &no_reads,
+                &Default::default(),
+                true,
+                &selected_seams,
+            ),
+            0
+        );
+        assert_eq!(
+            no_reads.resolves(),
+            0,
+            "local choices precede any host read"
+        );
+        assert!(crate::active_builds(&held).is_empty());
+        let _ = std::fs::remove_dir_all(&held.prefix);
+    }
+
+    let rebound = temp_layout("selected-source-rebound");
+    let changed_source = rebound.prefix.join("choices.toml");
+    std::fs::write(&changed_source, "[packages]\naccount = \"new-source\"\n").unwrap();
+    let no_reads = CountingFetcher::new(dir.clone());
+    assert_eq!(
+        run_recorded_update_pass(
+            &rebound,
+            &selected_cfg,
+            &no_reads,
+            &Default::default(),
+            true,
+            &PassSeams {
+                config: Some(changed_source),
+                path: selected_seams.path.clone(),
+                ..selected_seams
+            },
+        ),
+        0
+    );
+    assert_eq!(no_reads.resolves(), 0);
+    assert!(crate::active_builds(&rebound).is_empty());
+    let _ = std::fs::remove_dir_all(&rebound.prefix);
+
+    // A real admitted download completes, then a newer local choice withdraws
+    // installation before the shared transaction can activate it.
+    for updated in [
+        "[packages]\nexclude = [\"ay\"]\n".to_owned(),
+        format!("[packages.links]\nay = {checkout:?}\n"),
+    ] {
+        let withdrawn = temp_layout("selected-withdrawn");
+        let config = withdrawn.prefix.join("choices.toml");
+        std::fs::write(&config, "[packages]\n").unwrap();
+        let mut changing = CountingFetcher::new(dir.clone());
+        changing.selected = Some(&["ay"]);
+        let changed = config.clone();
+        changing.after_download = Some(Box::new(move || {
+            std::fs::write(&changed, &updated).unwrap();
+        }));
+        let withdrawn_seams = PassSeams {
+            config: Some(config),
+            path: selected_seams.path.clone(),
+            ..selected_seams
+        };
+        assert_eq!(
+            run_recorded_update_pass(
+                &withdrawn,
+                &selected_cfg,
+                &changing,
+                &Default::default(),
+                true,
+                &withdrawn_seams,
+            ),
+            1
+        );
+        assert!(crate::active_builds(&withdrawn).is_empty());
+        assert!(!withdrawn.build_dir("ay", 18).exists());
+        assert!(
+            crate::status::read(&withdrawn).is_none_or(|status| status.last_pass_at.is_empty())
+        );
+        let _ = std::fs::remove_dir_all(&withdrawn.prefix);
+    }
+    let _ = std::fs::remove_dir_all(&upgrade.prefix);
+    let _ = std::fs::remove_dir_all(&selected_layout.prefix);
     let _ = std::fs::remove_dir_all(&layout.prefix);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -6506,6 +6749,8 @@ fn assert_empty_store_retry_success(first_index_link_down: bool) {
     };
     let trust = crate::vendor_direct::lane::world::trust();
     let seams = PassSeams {
+        scope: UpdateScope::Whole,
+        config: None,
         anchor: |_| test_anchor(),
         now: || 1,
         trust: &trust,
@@ -6579,6 +6824,8 @@ fn a_translated_pass_replaces_an_earlier_passs_unreachable_row() {
     };
     let trust = crate::vendor_direct::lane::world::trust();
     let seams = PassSeams {
+        scope: UpdateScope::Whole,
+        config: None,
         anchor: |_| test_anchor(),
         now: || 1,
         trust: &trust,
@@ -6712,6 +6959,8 @@ fn the_updates_empty_store_verdict_prints_the_seeds_unusable_line() {
                 &no_rustup_seam
             };
         let seams = PassSeams {
+            scope: UpdateScope::Whole,
+            config: None,
             anchor: |_| test_anchor(),
             now: || 1,
             trust: &trust,
@@ -7944,6 +8193,92 @@ fn default_set_bootstrap_never_splits_a_coherence_group() {
         Some(18),
         "the singleton still installs"
     );
+    let selected_layout = temp_layout("selected-group-abort");
+    let mut selected_fetcher = CountingFetcher::new(dir.clone());
+    selected_fetcher.selected = Some(&["ta", "tb"]);
+    let trust = crate::vendor_direct::lane::world::trust();
+    let seams = PassSeams {
+        scope: UpdateScope::Selected("ta"),
+        now: || 0,
+        path: Some(std::ffi::OsString::new()),
+        ..world_seams(&trust)
+    };
+    assert_eq!(
+        run_recorded_update_pass(
+            &selected_layout,
+            &cfg,
+            &selected_fetcher,
+            &std::collections::BTreeMap::new(),
+            true,
+            &seams,
+        ),
+        1,
+        "a selected member cannot install without its signed sibling"
+    );
+    assert!(crate::active_builds(&selected_layout).is_empty());
+    assert!(
+        !selected_layout.build_dir("ta", 4).exists(),
+        "the selected member's staged build was discarded on abort"
+    );
+
+    write_pkg(&dir, "tb", 6);
+    assert_eq!(
+        run_recorded_update_pass(
+            &selected_layout,
+            &cfg,
+            &selected_fetcher,
+            &std::collections::BTreeMap::new(),
+            true,
+            &seams,
+        ),
+        0,
+        "the selected unit retries once its sibling is published"
+    );
+    let active = crate::active_builds(&selected_layout);
+    assert_eq!(active.get("ta"), Some(&4));
+    assert_eq!(active.get("tb"), Some(&6));
+    assert!(
+        !active.contains_key("ay"),
+        "the unrelated singleton stays absent"
+    );
+
+    for held in ["excluded", "removed"] {
+        let held_layout = temp_layout(&format!("selected-group-{held}"));
+        let held_cfg = if held == "excluded" {
+            crate::config::PackagesConfig {
+                exclude: Some(vec!["tb".into()]),
+                ..Default::default()
+            }
+        } else {
+            record_removed(&held_layout, "tb").unwrap();
+            crate::config::PackagesConfig::default()
+        };
+        assert_eq!(
+            run_recorded_update_pass(
+                &held_layout,
+                &held_cfg,
+                &selected_fetcher,
+                &std::collections::BTreeMap::new(),
+                true,
+                &seams,
+            ),
+            0,
+            "a {held} sibling holds the selected unit without a partial install"
+        );
+        assert!(crate::active_builds(&held_layout).is_empty(), "{held}");
+        for (program, build) in [("ta", 4), ("tb", 6)] {
+            assert!(
+                !held_layout.build_dir(program, build).exists(),
+                "{held}: {program}"
+            );
+            assert!(
+                !held_layout.staging_dir(program).exists(),
+                "{held}: {program}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&held_layout.prefix);
+    }
+    let _ = std::fs::remove_dir_all(&selected_layout.prefix);
     let _ = std::fs::remove_dir_all(&layout.prefix);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -9633,6 +9968,8 @@ fn no_processes() -> Option<Vec<std::path::PathBuf>> {
 
 fn world_seams(trust: &crate::vendor_direct::lane::Trust) -> PassSeams<'_> {
     PassSeams {
+        scope: UpdateScope::Whole,
+        config: None,
         anchor: world_anchor,
         now: world_now,
         trust,
@@ -11996,6 +12333,7 @@ fn a_yank_published_after_the_last_pass_binds_the_head_watch_door() {
     ));
     f.publish_claude("2.1.282", &native_exe("claude 2.1.282"));
     let later = PassSeams {
+        scope: UpdateScope::Whole,
         now: two_hours_on,
         ..world_seams(&trust)
     };
@@ -12021,6 +12359,7 @@ fn a_yank_published_after_the_last_pass_binds_the_head_watch_door() {
     );
     let reads = f.index_reads.get();
     let soon = PassSeams {
+        scope: UpdateScope::Whole,
         now: two_and_a_half_hours_on,
         ..world_seams(&trust)
     };
@@ -12298,6 +12637,7 @@ fn the_pass_record_refines_the_derived_model() {
     let cfg = crate::config::PackagesConfig::default();
     let trust = world::trust();
     let seams = PassSeams {
+        scope: UpdateScope::Whole,
         now: ticking_now,
         ..world_seams(&trust)
     };
@@ -12935,6 +13275,7 @@ fn a_vendor_not_reached_for_a_day_is_no_longer_called_latest() {
     let claude = crate::vendor_direct::spec("claude").unwrap();
     let run = |now: fn() -> i64| {
         let seams = PassSeams {
+            scope: UpdateScope::Whole,
             now,
             ..world_seams(&trust)
         };
@@ -13314,6 +13655,7 @@ fn a_vendor_fresh_install_streams_on_the_progress_file() {
     let trust = world::trust();
     let progress = layout.progress_file();
     let seams = PassSeams {
+        scope: UpdateScope::Whole,
         progress: Some(&progress),
         ..world_seams(&trust)
     };
@@ -13358,6 +13700,7 @@ fn an_install_given_a_progress_file_writes_its_pass_there() {
     let layout = world::layout("install-progress");
     let progress = layout.progress_file();
     let seams = PassSeams {
+        scope: UpdateScope::Whole,
         progress: Some(&progress),
         ..world_seams(&trust)
     };
@@ -13399,6 +13742,7 @@ fn a_vendor_doors_sweep_and_hooks_run_after_its_pass_ends() {
     let layout = world::layout("door-settles-after-pass");
     let progress = layout.progress_file();
     let seams = PassSeams {
+        scope: UpdateScope::Whole,
         progress: Some(&progress),
         shell_hooks: note_the_pass,
         ..world_seams(&trust)
@@ -13428,6 +13772,7 @@ fn a_fresh_landing_whose_signature_check_did_not_finish_is_no_failure() {
         |layout: &crate::store::Layout, f: &Fake, trust: &crate::vendor_direct::lane::Trust| {
             let progress = layout.progress_file();
             let seams = PassSeams {
+                scope: UpdateScope::Whole,
                 progress: Some(&progress),
                 ..world_seams(trust)
             };
@@ -14887,6 +15232,7 @@ fn an_alab_rollback_on_the_vendor_door_sweeps_the_revoked_build_and_refreshes_ho
         HOOKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
     let seams = PassSeams {
+        scope: UpdateScope::Whole,
         shell_hooks: count_hooks,
         ..world_seams(&trust)
     };

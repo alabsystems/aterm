@@ -4,7 +4,7 @@
 use super::*;
 
 #[test]
-fn a_completed_cold_preparation_survives_target_rotation_and_durable_reload() {
+fn completed_predecessor_and_positive_noexec_survive_target_rotation_and_reload() {
     use super::super::native_act::{
         self, ClaimOutcome, ColdBilling, ColdIntent, NativePlan, Reply, Request,
     };
@@ -101,6 +101,16 @@ fn a_completed_cold_preparation_survives_target_rotation_and_durable_reload() {
         ),
         Some(super::super::native_restart::Recovery::Completed)
     );
+    let mut cancelled = predecessor.clone();
+    cancelled.id = "34".repeat(16);
+    prior.native_prepare = Request::prepare(cancelled.clone()).encode().unwrap();
+    assert_eq!(
+        super::super::native_restart::terminal_for_test(
+            &mut prior,
+            &Reply::Decision(native_act::Decision::ProvenNotCommittedRollbackSafe)
+        ),
+        Some(super::super::native_restart::Recovery::Cancelled)
+    );
     let candidate = Candidate {
         exe: PathBuf::from("/different/managed/build"),
         version: Version::parse("2.1.319").unwrap(),
@@ -123,6 +133,10 @@ fn a_completed_cold_preparation_survives_target_rotation_and_durable_reload() {
     assert!(retargeted.native_coordination);
     assert!(retargeted.native.is_none() && retargeted.native_prepare.is_empty());
     assert!(retargeted.native_observation.is_none());
+    assert_eq!(
+        retargeted.native_noexec_prepare.as_deref(),
+        Some(&cancelled)
+    );
     save_checked(&opts, "conversation", &retargeted).unwrap();
     let loaded = load(&opts, "conversation").unwrap();
     assert_eq!(
@@ -130,6 +144,18 @@ fn a_completed_cold_preparation_survives_target_rotation_and_durable_reload() {
         Some(&predecessor)
     );
     assert!(loaded.native_coordination);
+    assert_eq!(loaded.native_noexec_prepare.as_deref(), Some(&cancelled));
+    for retry in [false, true] {
+        let mut next = St::default();
+        if retry {
+            loaded.retried_by(&mut next);
+        } else {
+            loaded.kept_by_restart("another-tab", &mut next);
+        }
+        assert_eq!(next.native_noexec_prepare.as_deref(), Some(&cancelled));
+        assert_eq!(next.native_completed_prepare.as_deref(), Some(&predecessor));
+        assert!(next.native_coordination);
+    }
     assert_eq!(loaded.to, "2.1.319");
 }
 

@@ -39,7 +39,6 @@ fn test_session(id: u64) -> Session {
         screen_moves: Default::default(),
         job_feed: Default::default(),
         ran: Default::default(),
-        box_banner: Default::default(),
         update_parked: Default::default(),
         watchers: observed.watchers,
         frame: Default::default(),

@@ -211,6 +211,13 @@ pub fn observe_until(
     observe_until_with(paths, deadline, || {})
 }
 
+/// How long a read right after a publication waits for this Mac's subscriber, which the
+/// publication wakes, to let the vault's state lock go: its apply of one version holds the lock
+/// for a moment. A founding's read-back waits so ([`crate::client::admin_commons_init`]), and so
+/// does `sync.shared-data`'s read, which may follow one ([`observe_until_settled`]).
+#[cfg(unix)]
+pub const SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// [`observe`] for a reader that asks again every few seconds whatever it found (the Commons
 /// runtime's presence poll, the members desk): where every file the observation reads, and the
 /// vault folder, are as they were at the last settled observation, it takes that observation's

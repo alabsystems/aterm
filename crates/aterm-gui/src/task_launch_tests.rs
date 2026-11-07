@@ -1432,6 +1432,31 @@ fn an_installing_mark_stands_on_the_timeline_while_it_lives() {
     assert!(!installing(), "dropped with its install");
 }
 
+#[test]
+fn an_old_install_guard_cannot_clear_its_replacement() {
+    let h = crate::stub_session(1);
+    let old = InstallingMark::of(&h.ctx);
+    let newer = InstallingMark::of(&h.ctx);
+    let epoch = h.ctx.timeline.lock().unwrap().worker_install_mark();
+    {
+        let mut timeline = h.ctx.timeline.lock().unwrap();
+        assert!(timeline.set_worker_install_child(epoch, 222));
+        assert!(!timeline.set_worker_install_child(old.mark, 111));
+        assert_eq!(timeline.worker_install_child(), Some(222));
+    }
+    drop(old);
+    let timeline = h.ctx.timeline.lock().unwrap();
+    assert!(timeline.worker_installing());
+    assert_eq!(timeline.worker_install_mark(), epoch);
+    assert_eq!(timeline.worker_install_child(), Some(222));
+    drop(timeline);
+    drop(newer);
+    let mut timeline = h.ctx.timeline.lock().unwrap();
+    assert!(!timeline.worker_installing());
+    assert!(!timeline.set_worker_install_child(epoch, 333));
+    assert_eq!(timeline.worker_install_child(), None);
+}
+
 /// A LAUNCHER'S INSTALL NAMES ITS CHILD ON THE TIMELINE: the process whose pass the startup
 /// deadline reads as this worker's work, which is the pid a stand-in atpkg sees as its own under
 /// the very spawn and QoS wrapper an install runs, since the file's `pid` is atpkg's own. It goes
@@ -1465,11 +1490,28 @@ fn a_launchers_install_names_its_child_on_the_timeline() {
     {
         let _mark = InstallingMark::of(&h.ctx);
         assert_eq!(child(), None, "CONTROL: nothing spawned yet");
-        install_with(&stub, &layout, "codex", &h.ctx).expect("the stub exits clean");
+        install_with(&stub, &layout, "codex", &h.ctx, _mark.mark).expect("the stub exits clean");
         let pid = std::fs::read_to_string(&said).expect("the stub ran");
         assert_eq!(child(), Some(pid.trim().parse().expect("a pid")));
     }
     assert_eq!(child(), None, "gone with its mark");
+    std::fs::remove_file(&said).unwrap();
+    let store = AtpkgStore::new(&h.ctx);
+    let old = store.installing();
+    let newer = InstallingMark::of(&h.ctx);
+    let mark = store.install_mark.get().unwrap();
+    assert_eq!(mark, old.mark);
+    assert!(install_with(&stub, &layout, "codex", &h.ctx, mark).is_err());
+    assert!(!said.exists(), "a stale admission starts no child");
+    drop(old);
+    assert!(
+        h.ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .worker_installing_at(newer.mark)
+    );
+    drop(newer);
 }
 
 #[test]

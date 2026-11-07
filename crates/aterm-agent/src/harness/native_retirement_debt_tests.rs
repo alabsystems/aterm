@@ -6,9 +6,13 @@ use super::super::upgrade::{Agent, Phase};
 use super::*;
 use aterm_spec::interp::State;
 
-fn pending() -> St {
+pub(super) fn pending() -> St {
     let image = Image {
-        path: b"/model/agent".to_vec(),
+        path: if cfg!(windows) {
+            b"C:\\model\\agent".to_vec()
+        } else {
+            b"/model/agent".to_vec()
+        },
         device: 1,
         inode: 2,
     };
@@ -22,7 +26,7 @@ fn pending() -> St {
     };
     let command = native_act::RestartCommand {
         image: image.clone(),
-        program: "/model/agent".into(),
+        program: String::from_utf8(image.path.clone()).unwrap(),
         argv: vec!["--resume".into(), "original-conversation".into()],
         env: Vec::new(),
         unset: None,
@@ -50,7 +54,11 @@ fn pending() -> St {
             observation: None,
             shell: Process { pid: 43, ..process },
             launcher: image,
-            socket: "/model/control.sock".into(),
+            socket: if cfg!(windows) {
+                "C:\\model\\control.sock".into()
+            } else {
+                "/model/control.sock".into()
+            },
             forward: Box::new(command.clone()),
             rollback: Some(Box::new(command)),
         },

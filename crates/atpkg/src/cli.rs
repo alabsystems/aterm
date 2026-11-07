@@ -78,12 +78,24 @@ const TABLE: &[Verb] = &[
         tier: Tier::Daily,
         usage: "aterm pkg update [program] [--retry]  (a program not installed is installed; \
                 --retry: try a held-back download again now)\n\
+                aterm pkg update --default-selected program — one signed unit already selected \
+                by automatic installation, preserving excludes and removals\n\
                 aterm pkg update codex --vendor | --alab  — OpenAI's codex here, or back to \
                 ALab's",
         arity: Arity::One {
-            flags: &[RETRY_FLAG, SOURCE_VENDOR_FLAG, SOURCE_ALAB_FLAG],
+            flags: &[
+                RETRY_FLAG,
+                SOURCE_VENDOR_FLAG,
+                SOURCE_ALAB_FLAG,
+                DEFAULT_SELECTED_FLAG,
+            ],
         },
-        program_flags: Some(&[RETRY_FLAG, SOURCE_VENDOR_FLAG, SOURCE_ALAB_FLAG]),
+        program_flags: Some(&[
+            RETRY_FLAG,
+            SOURCE_VENDOR_FLAG,
+            SOURCE_ALAB_FLAG,
+            DEFAULT_SELECTED_FLAG,
+        ]),
         mutates_store: true,
         applies_machine: true,
         run: cmd_update_argv,
@@ -753,6 +765,7 @@ pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
         .clone()
         .map(|layout| PassRecord::begin(layout, &args));
     if matches!(verb, Some("seed" | "update" | "install"))
+        && !args.iter().any(|arg| arg == DEFAULT_SELECTED_FLAG)
         && let Some(layout) = pass_layout.clone()
     {
         roll_forward_interrupted_activations(&layout, || cached_index(&layout));
@@ -1295,6 +1308,10 @@ fn head_watch_pass() -> bool {
 /// The flag the unattended lanes (the window's package loop, a terminal session's detached pass) put on every whole `update`.
 pub const DEFER_BUSY_FLIP_FLAG: &str = "--defer-busy-flip";
 
+/// Narrow an unattended update to one signed, default-selected coherence unit.
+/// This is no explicit install consent and never restores a removed package.
+pub const DEFAULT_SELECTED_FLAG: &str = "--default-selected";
+
 /// The word that says no setup follows this `install` or `update` ([`pass_finishes_setup`]),
 /// taken from anywhere among a pass's words ([`LaneFlags`]). A command that runs a pass on a
 /// person's terminal as one step of its own work (`aterm ai doctor`'s and `aterm ai login`'s
@@ -1339,6 +1356,7 @@ pub fn pass_finishes_setup(argv: &[std::ffi::OsString]) -> bool {
     matches!(verb.as_str(), "install" | "update")
         && lane.wait_lock.is_none()
         && !lane.no_init
+        && !rest.iter().any(|word| word == DEFAULT_SELECTED_FLAG)
         && !help_flag_addresses_atpkg(verb, rest)
         && built_in(verb, rest).is_none()
         && !rest.iter().any(|word| is_clt_alias(word))
@@ -5787,23 +5805,27 @@ fn reconcile_system_satisfied_with(
     path_var: Option<&std::ffi::OsStr>,
 ) -> Vec<String> {
     let mut satisfied = Vec::new();
-    for name in wanted
-        .iter()
-        .filter(|n| !crate::vendor_direct::is_vendor(n))
-    {
-        let Some(program) = index.program(name) else {
-            continue;
-        };
-        let Some(bin) = program.system.as_deref() else {
-            continue;
-        };
-        let Some(path) = crate::vendor::system_binary_on_path(&layout.prefix, bin, path_var) else {
+    for name in wanted {
+        let Some(path) = system_satisfying(layout, index, name, path_var) else {
             continue;
         };
         satisfy_by_system(layout, name, &path, installed);
         satisfied.push(name.clone());
     }
     satisfied
+}
+
+fn system_satisfying(
+    layout: &crate::store::Layout,
+    index: &crate::manifest::Index,
+    name: &str,
+    path: Option<&std::ffi::OsStr>,
+) -> Option<std::path::PathBuf> {
+    if crate::vendor_direct::is_vendor(name) {
+        return None;
+    }
+    let binary = index.program(name)?.system.as_deref()?;
+    crate::vendor::system_binary_on_path(&layout.prefix, binary, path)
 }
 
 /// What the last verified index pins for this machine.
@@ -6713,6 +6735,7 @@ fn machine_edit_for_request<T>(
 ) -> Option<T> {
     let verb = args.first()?.as_str();
     let applies = verb_applies_machine_settings(verb)
+        && !args.iter().any(|arg| arg == DEFAULT_SELECTED_FLAG)
         && !install.is_some_and(|request| request.build.is_some())
         && !(verb == "update"
             && args
@@ -8923,10 +8946,13 @@ fn cmd_pin(program: Option<&String>, pinned: bool) -> ExitCode {
 
 fn cmd_update_argv(rest: &[String]) -> ExitCode {
     let mut retry = false;
+    let mut selected = false;
     let mut choice: Option<&str> = None;
     let mut operands: Vec<&String> = Vec::new();
     for arg in rest {
-        if arg == RETRY_FLAG {
+        if arg == DEFAULT_SELECTED_FLAG {
+            selected = true;
+        } else if arg == RETRY_FLAG {
             retry = true;
         } else if arg == SOURCE_VENDOR_FLAG || arg == SOURCE_ALAB_FLAG {
             if choice.is_some_and(|c| c != arg) {
@@ -8947,6 +8973,15 @@ fn cmd_update_argv(rest: &[String]) -> ExitCode {
         return refusal;
     }
     let program = operands.first().copied();
+    if selected {
+        if retry || choice.is_some() || program.is_none() {
+            return usage_error(
+                "update",
+                Some("--default-selected names one program and preserves its automatic policy"),
+            );
+        }
+        return cmd_update_all(UpdateScope::Selected(program.expect("checked above")));
+    }
     if let Some(choice) = choice {
         return cmd_update_source(program.map(String::as_str), choice);
     }
@@ -9041,13 +9076,15 @@ fn retry_line(forgotten: usize) -> String {
 fn cmd_update(program: Option<&String>) -> ExitCode {
     match program {
         Some(p) => cmd_update_one(p),
-        None => cmd_update_all(),
+        None => cmd_update_all(UpdateScope::Whole),
     }
 }
 
-fn cmd_update_all() -> ExitCode {
-    let code = cmd_update_all_code();
-    answer_announcement(code == 0);
+fn cmd_update_all(scope: UpdateScope<'_>) -> ExitCode {
+    let code = cmd_update_all_code(scope);
+    if matches!(scope, UpdateScope::Whole) {
+        answer_announcement(code == 0);
+    }
     ExitCode::from(code)
 }
 
@@ -9221,7 +9258,7 @@ fn update_toolset_is_empty(
     managed.is_empty() && linked.is_empty()
 }
 
-fn cmd_update_all_code() -> u8 {
+fn cmd_update_all_code(scope: UpdateScope<'_>) -> u8 {
     if !manager_enabled() {
         eprintln!("atpkg: disabled (no root key pinned) — nothing to update");
         return 1;
@@ -9229,6 +9266,28 @@ fn cmd_update_all_code() -> u8 {
     let Some(layout) = layout() else {
         return 1;
     };
+    if let UpdateScope::Selected(program) = scope {
+        if !crate::lock::held_by_this_process(&layout) {
+            eprintln!("atpkg: the configured store changed while taking its lock; update waits");
+            return crate::lock::CONTENDED_EXIT;
+        }
+        if let Err(why) = update_selected::allowed(&layout, crate::config::cached(), program) {
+            println!("atpkg: {program} left unchanged: {why}");
+            return 0;
+        }
+        let seams = PassSeams {
+            scope,
+            ..PassSeams::process()
+        };
+        return run_recorded_update_pass(
+            &layout,
+            crate::config::cached(),
+            &*resolve_fetcher(&layout),
+            &crate::active_builds(&layout),
+            true,
+            &seams,
+        );
+    }
     let _promise = PromiseEnds(&layout);
     if let Some((outcome, ago)) = pass_ended_while_we_waited(&layout) {
         let record = crate::status::read(&layout);
@@ -9427,6 +9486,9 @@ fn run_recorded_update_pass(
     complete_the_set: bool,
     seams: &PassSeams<'_>,
 ) -> u8 {
+    if let UpdateScope::Selected(program) = seams.scope {
+        return update_selected::run(layout, cfg, fetcher, installed, program, seams);
+    }
     let stamped_before = successes_stamped();
     PASS_INDEX_RESOLVE_ATTEMPTED.with(|seen| seen.set(false));
     RESOLVED_PASS_INDEX_BUILD.with(|seen| seen.set(0));
@@ -9459,7 +9521,18 @@ fn attempted_pass_index_build(requested: u64, resolved: u64, attempted: bool) ->
     }
 }
 
+#[derive(Clone, Copy)]
+enum UpdateScope<'a> {
+    Whole,
+    Selected(&'a str),
+}
+
+#[path = "cli_update_selected.rs"]
+mod update_selected;
+
 struct PassSeams<'a> {
+    scope: UpdateScope<'a>,
+    config: Option<std::path::PathBuf>,
     anchor: fn(&crate::store::Layout) -> crate::Anchor,
     now: fn() -> i64,
     trust: &'a crate::vendor_direct::lane::Trust,
@@ -9475,9 +9548,11 @@ struct PassSeams<'a> {
     read_ahead_in: &'a (dyn Fn(&str) + Sync),
 }
 
-impl PassSeams<'static> {
+impl PassSeams<'_> {
     fn process() -> Self {
         Self {
+            scope: UpdateScope::Whole,
+            config: crate::config::config_path(),
             anchor: effective_anchor,
             now: now_unix,
             trust: &crate::vendor_direct::lane::Trust::PRODUCTION,

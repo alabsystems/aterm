@@ -1319,7 +1319,6 @@ fn admit_recovered_journaled(
         task: None,
         autopilot_end: None,
         wakes: None,
-        box_receipt: None,
     })
 }
 

@@ -3007,52 +3007,7 @@ impl App {
             .unwrap_or_else(|p| p.into_inner())
             .contains(&session);
         let spent = looking.then_some(crate::status_item::Spent::Looking);
-        // One banner per box (`box_banner`): a program-claim need's banner is decided with the
-        // program's own notifications held off, and spent where one of them, or a banner of the
-        // herald's, told the box; a banner for an ask, approval or question beside a shown box
-        // (codex-alab's own ask about it) tells that box too.
-        let banner = handle.as_ref().map(|h| {
-            let shown_box = h
-                .ctx
-                .timeline
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .program_shown()
-                .filter(|shown| {
-                    shown.state.state
-                        == aterm_core::terminal::program_state::ProgramStateWord::Blocked
-                })
-                .map(|shown| shown.report);
-            (std::sync::Arc::clone(&h.ctx.box_banner), shown_box)
-        });
-        let answered_at_the_box = current.as_ref().is_some_and(|esc| {
-            matches!(
-                esc.word,
-                aterm_types::needs::NeedWord::Ask
-                    | aterm_types::needs::NeedWord::Approval
-                    | aterm_types::needs::NeedWord::Question
-            )
-        });
-        match (current.as_ref().and_then(|esc| esc.report), banner) {
-            (Some(report), Some((banner, _))) => banner.herald(report, |told| {
-                let spent = spent.or(told.then_some(crate::status_item::Spent::Told));
-                (
-                    (),
-                    self.herald_deliver_spent(session, current.as_ref(), spent),
-                )
-            }),
-            (None, Some((banner, Some(report)))) if answered_at_the_box => {
-                banner.herald_beside(report, || {
-                    (
-                        (),
-                        self.herald_deliver_spent(session, current.as_ref(), spent),
-                    )
-                });
-            }
-            _ => {
-                let _ = self.herald_deliver_spent(session, current.as_ref(), spent);
-            }
-        }
+        self.herald_deliver_spent(session, current.as_ref(), spent);
     }
 
     fn adopt_status_carry(
@@ -3067,23 +3022,6 @@ impl App {
         let Some(carry) = self.status_carry.remove(&row.sid) else {
             return;
         };
-        if self.config.tab_status_or_default()
-            && let Some(session) = self.pool.get(session)
-        {
-            let report = crate::term_lock(&session.term).program_state();
-            let shown = session
-                .ctx
-                .timeline
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .program_shown()
-                .is_some_and(|shown| {
-                    Some(shown.state) == report.state && shown.report == report.began
-                });
-            if shown {
-                session.ctx.box_banner.adopt(carry.box_receipt, report);
-            }
-        }
         if let (Some(done), Some(task)) = (carry.done, &row.task)
             && task.state.has_an_end_to_read()
             && task.since_unix_ms == done
@@ -3204,19 +3142,13 @@ impl App {
     pub(crate) fn status_carry_rows(&self) -> Vec<(u64, String)> {
         self.status_carry_snapshots()
             .into_iter()
-            .filter_map(|(id, carry, _)| carry.row().map(|row| (id, row)))
+            .filter_map(|(id, carry)| carry.row().map(|row| (id, row)))
             .collect()
     }
 
-    /// Capture a receipt and its final-Commit custody from the same frozen report read.
+    /// What the status item knows of each session ([`crate::status_item::StatusCarry`]), which a seamless update's park stamps on its manifest as rows (`app_update_handoff::stamp_status_seen`).
     #[cfg(unix)]
-    pub(crate) fn status_carry_snapshots(
-        &self,
-    ) -> Vec<(
-        u64,
-        crate::status_item::StatusCarry,
-        crate::box_banner::Snapshot,
-    )> {
+    pub(crate) fn status_carry_snapshots(&self) -> Vec<(u64, crate::status_item::StatusCarry)> {
         self.pool
             .iter()
             .map(|session| {
@@ -3225,11 +3157,6 @@ impl App {
                     .presence
                     .herald
                     .carry_of(id, session.ctx.human_input.last_plain_enter());
-                let (receipt, banner) = {
-                    let terminal = crate::term_lock(&session.term);
-                    session.ctx.box_banner.carry(terminal.program_state())
-                };
-                carry.box_receipt = receipt;
                 carry.done = self.done_seen.get(&id).and_then(|entered| {
                     session
                         .ctx
@@ -3240,19 +3167,19 @@ impl App {
                         .filter(|t| t.state.has_an_end_to_read() && t.entered == *entered)
                         .map(|t| t.since_unix_ms)
                 });
-                (id, carry, banner)
+                (id, carry)
             })
             .collect()
     }
 
     /// The herald's decision for the local session `session` at `current`, where the owner may
-    /// already have heard of the need (`spent`), and what it posts: whether a notice was queued.
+    /// already have heard of the need (`spent`), and what it posts.
     fn herald_deliver_spent(
         &mut self,
         session: u64,
         current: Option<&crate::status_item::Escalation>,
         spent: Option<crate::status_item::Spent>,
-    ) -> bool {
+    ) {
         let now = std::time::Instant::now();
         let alerts = self.config.desktop_alerts_or_default();
         let outcome = self
@@ -3286,7 +3213,6 @@ impl App {
         if outcome.row_moved {
             self.mark_status_dirty();
         }
-        outcome.notice.is_some() && post == crate::status_item::HeraldPost::Queued
     }
 
     fn post_herald_notice(
@@ -10672,298 +10598,6 @@ mod status_glance_tests {
         assert_eq!(take_posts().len(), 1, "no carry: told again");
         assert_ne!(fresh.presence.herald.need_since(1), Some(1_000));
         assert_eq!(fresh.status_glance().done.len(), 1, "no carry: unread");
-    }
-
-    /// A box told before a seamless update is still that box when codex's overlay
-    /// releases its delayed notification. Checkpoint restoration and status adoption
-    /// must retain both halves of the one-banner rule.
-    #[cfg(unix)]
-    #[test]
-    fn an_adopted_told_box_drops_its_late_program_notification() {
-        use aterm_core::config::TerminalConfig;
-        use aterm_core::terminal::TerminalCheckpoint;
-        use std::sync::{Arc, Mutex};
-
-        const WORKING: &[u8] = b"\x1b]7501;state=working:app=codex\x1b\\";
-        const BLOCKED: &[u8] = b"\x1b]7501;state=blocked:app=codex:kind=permission\x1b\\";
-        const NOTICE: &[u8] = b"\x1b]9;Approval requested: inspect output\x07";
-        const DONE_NOTICE: &[u8] = b"\x1b]9;Agent turn complete\x07";
-
-        fn take_posts() -> Vec<crate::status_item::HeraldNotice> {
-            HERALD_POSTS.with(|posts| std::mem::take(&mut *posts.borrow_mut()))
-        }
-
-        fn project(app: &mut App) {
-            let session = app.pool.get(0).expect("session 0");
-            let ctx = session.ctx.clone();
-            let report = crate::term_lock(&session.term).program_state();
-            {
-                let mut timeline = ctx.timeline.lock().unwrap();
-                timeline.note_foreground_group(4242);
-                timeline.set_program(4242, Some("codex".into()));
-                timeline.publish_agent(
-                    "unknown",
-                    None,
-                    None,
-                    Some(aterm_phase::Program::Codex),
-                    crate::session_timeline::AgentStamp {
-                        generation: crate::control::ScreenGen { epoch: 1, seq: 7 },
-                        fp: 0xc0de,
-                    },
-                );
-                timeline.note_program_state(report.state, report.began);
-            }
-            ctx.box_banner.shown(
-                report
-                    .state
-                    .filter(|state| {
-                        state.state
-                            == aterm_core::terminal::program_state::ProgramStateWord::Blocked
-                    })
-                    .map(|_| report.began),
-            );
-            app.publish_need(0);
-            app.herald_session(0);
-        }
-
-        fn desk(
-            checkpoint: Option<&TerminalCheckpoint>,
-            carry: Option<crate::status_item::StatusCarry>,
-        ) -> (App, Arc<Mutex<Vec<String>>>) {
-            let mut app = App::headless_for_test();
-            app.headless = false;
-            app.config.desktop_alerts = Some(true);
-            app.notify_suppress.lock().unwrap().clear();
-            HERALD_REFUSAL.set(None);
-            let session = app.pool.get(0).expect("session 0");
-            let ctx = session.ctx.clone();
-            let notices = Arc::new(Mutex::new(Vec::new()));
-            {
-                let mut terminal = crate::term_lock(&session.term);
-                if let Some(checkpoint) = checkpoint {
-                    terminal.restore_checkpoint(checkpoint);
-                } else {
-                    terminal.process(&[WORKING, BLOCKED].concat());
-                }
-                let _ = terminal.apply_config(&TerminalConfig {
-                    allow_notifications: true,
-                    ..TerminalConfig::default()
-                });
-                terminal.set_notification_admission(ctx.box_banner.admission());
-                let passed = notices.clone();
-                terminal.set_notification_callback(move |text| {
-                    passed.lock().unwrap().push(text.to_string());
-                });
-            }
-            if let Some(carry) = carry {
-                app.status_carry
-                    .insert(ctx.self_id.as_str().to_string(), carry);
-            }
-            let _ = take_posts();
-            project(&mut app);
-            (app, notices)
-        }
-
-        let (before, original_notices) = desk(None, None);
-        assert_eq!(
-            take_posts().len(),
-            1,
-            "PRECONDITION: the parent told the box"
-        );
-        let row = before
-            .status_carry_rows()
-            .into_iter()
-            .find_map(|(id, row)| (id == 0).then_some(row))
-            .expect("the box's actual carry row");
-        let carry = crate::status_item::StatusCarry::parse(&row);
-        assert!(carry.told, "PRECONDITION: status carry knows it was told");
-        let original = before.pool.get(0).expect("session 0");
-        let checkpoint = crate::term_lock(&original.term)
-            .checkpoint_carry(0)
-            .expect("Ground");
-        crate::term_lock(&original.term).process(NOTICE);
-        assert!(
-            original_notices.lock().unwrap().is_empty(),
-            "CONTROL: the same image drops the late notification"
-        );
-
-        let (fresh, fresh_notices) = desk(Some(&checkpoint), None);
-        assert_eq!(
-            take_posts().len(),
-            1,
-            "CONTROL: no told carry posts a fresh herald notice"
-        );
-        crate::term_lock(&fresh.pool.get(0).unwrap().term).process(NOTICE);
-        assert!(
-            fresh_notices.lock().unwrap().is_empty(),
-            "CONTROL: a freshly heralded box drops its program notification"
-        );
-
-        let (mut resolved, resolved_notices) = desk(Some(&checkpoint), Some(carry.clone()));
-        assert!(
-            take_posts().is_empty(),
-            "CONTROL: adoption posts no new herald notice"
-        );
-        crate::term_lock(&resolved.pool.get(0).unwrap().term).process(WORKING);
-        project(&mut resolved);
-        assert!(
-            resolved
-                .pool
-                .get(0)
-                .unwrap()
-                .ctx
-                .timeline
-                .lock()
-                .unwrap()
-                .need()
-                .need
-                .is_none(),
-            "CONTROL: the box resolved"
-        );
-        crate::term_lock(&resolved.pool.get(0).unwrap().term).process(DONE_NOTICE);
-        assert_eq!(
-            *resolved_notices.lock().unwrap(),
-            ["Agent turn complete"],
-            "CONTROL: a later turn's notification passes"
-        );
-
-        let (adopted, adopted_notices) = desk(Some(&checkpoint), Some(carry));
-        assert!(
-            take_posts().is_empty(),
-            "PRECONDITION: the adopted box was told before this image"
-        );
-        assert!(
-            adopted.presence.herald.carry_of(0, 0).told,
-            "PRECONDITION: the successor considers this same need told"
-        );
-        let terminal = &adopted.pool.get(0).unwrap().term;
-        let report = crate::term_lock(terminal).program_state();
-        assert_eq!(
-            report.state,
-            crate::term_lock(&original.term).program_state().state,
-            "PRECONDITION: the carried box is still blocked"
-        );
-        crate::term_lock(terminal).process(NOTICE);
-        assert_eq!(
-            crate::term_lock(terminal).program_state(),
-            report,
-            "PRECONDITION: the notification began no new box"
-        );
-        assert!(
-            adopted_notices.lock().unwrap().is_empty(),
-            "a box already told before handoff must not emit a second, late program notification"
-        );
-    }
-
-    /// Spending a need while looking or with alerts off is not a delivered box
-    /// banner. A successor must still admit the program's own delayed notice.
-    #[cfg(unix)]
-    #[test]
-    fn only_an_actual_queued_box_receipt_suppresses_before_first_projection() {
-        use std::sync::{Arc, Mutex};
-        const BLOCKED: &[u8] = b"\x1b]7501;state=blocked:app=codex:kind=permission\x1b\\";
-        const NOTICE: &[u8] = b"\x1b]9;Approval requested\x07";
-        for mode in ["queued", "looking", "off", "refused", "untold"] {
-            let mut app = App::headless_for_test();
-            app.headless = mode == "untold";
-            app.config.desktop_alerts = Some(mode != "off");
-            app.notify_suppress.lock().unwrap().clear();
-            if mode == "looking" {
-                app.notify_suppress.lock().unwrap().insert(0);
-            }
-            HERALD_POSTS.with(|posts| posts.borrow_mut().clear());
-            HERALD_REFUSAL.set((mode == "refused").then_some("the notifier's queue is full"));
-            let session = app.pool.get(0).unwrap();
-            let ctx = session.ctx.clone();
-            crate::term_lock(&session.term).process(BLOCKED);
-            let report = crate::term_lock(&session.term).program_state();
-            {
-                let mut timeline = ctx.timeline.lock().unwrap();
-                timeline.note_foreground_group(4242);
-                timeline.set_program(4242, Some("codex".into()));
-                timeline.publish_agent(
-                    "unknown",
-                    None,
-                    None,
-                    Some(aterm_phase::Program::Codex),
-                    crate::session_timeline::AgentStamp {
-                        generation: crate::control::ScreenGen { epoch: 1, seq: 7 },
-                        fp: 0xc0de,
-                    },
-                );
-                timeline.note_program_state(report.state, report.began);
-            }
-            ctx.box_banner.shown(Some(report.began));
-            app.publish_need(0);
-            app.herald_session(0);
-            assert_eq!(
-                HERALD_POSTS.with(|posts| posts.borrow().len()),
-                usize::from(mode == "queued"),
-                "{mode}: actual queue result"
-            );
-            let (_, carry, snapshot) = app
-                .status_carry_snapshots()
-                .into_iter()
-                .find(|(id, _, _)| *id == 0)
-                .unwrap();
-            assert_eq!(
-                carry.told,
-                matches!(mode, "queued" | "looking" | "off"),
-                "{mode}: told includes undelivered needs"
-            );
-            assert_eq!(
-                carry.box_receipt.is_some(),
-                mode == "queued",
-                "{mode}: only a queued banner supplies a receipt"
-            );
-            assert_eq!(
-                snapshot,
-                ctx.box_banner.snapshot(),
-                "receipt and custody were sampled together"
-            );
-            let carry = crate::status_item::StatusCarry::parse(&carry.row().unwrap());
-            let checkpoint = crate::term_lock(&app.pool.get(0).unwrap().term)
-                .checkpoint_carry(0)
-                .unwrap();
-            if mode == "queued" {
-                let mut moved = App::headless_for_test();
-                let session = moved.pool.get(0).unwrap();
-                let ctx = session.ctx.clone();
-                crate::term_lock(&session.term).restore_checkpoint(&checkpoint);
-                let report = crate::term_lock(&session.term).program_state();
-                ctx.box_banner.adopt(carry.box_receipt, report);
-                ctx.box_banner.shown(None);
-                moved
-                    .status_carry
-                    .insert(ctx.self_id.as_str().to_string(), carry.clone());
-                moved.herald_session(0);
-                assert!(
-                    ctx.box_banner.admit(&report),
-                    "a foreground move that shows no box cannot be undone by status adoption"
-                );
-            }
-            let mut adopted = aterm_core::terminal::Terminal::from_checkpoint(&checkpoint);
-            let banner = Arc::new(crate::box_banner::BoxBanner::default());
-            // Spawn takes this same binding before notification wiring and reader attachment.
-            banner.adopt(carry.box_receipt, adopted.program_state());
-            adopted.set_notification_admission(banner.admission());
-            let passed = Arc::new(Mutex::new(Vec::new()));
-            let sink = passed.clone();
-            adopted
-                .set_notification_callback(move |body| sink.lock().unwrap().push(body.to_string()));
-            let _ = adopted.apply_config(&aterm_core::config::TerminalConfig {
-                allow_notifications: true,
-                ..Default::default()
-            });
-            adopted.process(NOTICE);
-            assert_eq!(
-                passed.lock().unwrap().is_empty(),
-                mode == "queued",
-                "{mode}: the delayed notice precedes any successor projection"
-            );
-        }
-        HERALD_REFUSAL.set(None);
-        HERALD_POSTS.with(|posts| posts.borrow_mut().clear());
     }
 
     #[test]

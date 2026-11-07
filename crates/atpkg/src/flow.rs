@@ -1998,6 +1998,7 @@ fn apply_group(
         installed,
         resolved_assets,
         flip,
+        &|| Ok(()),
     );
     Some((acted, outcome, applied))
 }
@@ -2022,6 +2023,38 @@ pub fn bootstrap_group(
     resolved_assets: &mut BTreeMap<String, String>,
     flip: &crate::quiet::FlipGate<'_>,
 ) -> Result<(TxnOutcome, BTreeMap<String, AppliedMember>), FlowError> {
+    bootstrap_group_guarded(
+        fetcher,
+        layout,
+        index,
+        channel,
+        triple,
+        group,
+        installed,
+        resolved_assets,
+        flip,
+        &|| Ok(()),
+    )
+}
+
+/// The same signed group transaction, with the caller's current policy checked
+/// before staging each member and immediately before the atomic activation.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the existing group inputs and its caller-owned effect admission"
+)]
+pub(crate) fn bootstrap_group_guarded(
+    fetcher: &dyn Fetcher,
+    layout: &Layout,
+    index: &TrustedIndex,
+    channel: &str,
+    triple: &str,
+    group: &Group,
+    installed: &BTreeMap<String, u64>,
+    resolved_assets: &mut BTreeMap<String, String>,
+    flip: &crate::quiet::FlipGate<'_>,
+    current: &dyn Fn() -> Result<(), String>,
+) -> Result<(TxnOutcome, BTreeMap<String, AppliedMember>), FlowError> {
     let ch = index
         .channel_for(channel, triple)
         .ok_or_else(|| FlowError::NoChannel(channel.to_string()))?;
@@ -2035,6 +2068,7 @@ pub fn bootstrap_group(
         installed,
         resolved_assets,
         flip,
+        current,
     ))
 }
 
@@ -2090,6 +2124,7 @@ fn apply_group_txn(
     installed: &BTreeMap<String, u64>,
     resolved_assets: &mut BTreeMap<String, String>,
     flip: &crate::quiet::FlipGate<'_>,
+    current: &dyn Fn() -> Result<(), String>,
 ) -> (TxnOutcome, BTreeMap<String, AppliedMember>) {
     let (outcome, applied) = apply_group_txn_inner(
         fetcher,
@@ -2101,6 +2136,7 @@ fn apply_group_txn(
         installed,
         resolved_assets,
         flip,
+        current,
     );
     if group.members.iter().any(|m| m == crate::seam::SEAM_PROGRAM)
         && !matches!(
@@ -2207,7 +2243,19 @@ fn apply_group_txn_inner(
     installed: &BTreeMap<String, u64>,
     resolved_assets: &mut BTreeMap<String, String>,
     flip: &crate::quiet::FlipGate<'_>,
+    current: &dyn Fn() -> Result<(), String>,
 ) -> (TxnOutcome, BTreeMap<String, AppliedMember>) {
+    if let Err(why) = current() {
+        return (
+            TxnOutcome::Aborted {
+                failed: group.members.first().cloned().unwrap_or_default(),
+                during_flip: false,
+                why,
+                rolled_back: Vec::new(),
+            },
+            BTreeMap::new(),
+        );
+    }
     let decided = GroupDecisions::of(layout, ch, group, installed);
 
     if let Some(member) = decided.retired_requires(index) {
@@ -2330,6 +2378,17 @@ fn apply_group_txn_inner(
             }
             crate::quiet::Verdict::Defer { since } => {
                 for m in &install_members {
+                    if let Err(why) = current() {
+                        return (
+                            TxnOutcome::Aborted {
+                                failed: (*m).clone(),
+                                during_flip: false,
+                                why,
+                                rolled_back: Vec::new(),
+                            },
+                            BTreeMap::new(),
+                        );
+                    }
                     let mut why = String::new();
                     let Some(fetched) = fetch_member(
                         fetcher,
@@ -2413,6 +2472,7 @@ fn apply_group_txn_inner(
     let outcome = transact_holding(
         decisions,
         &mut |m| {
+            current()?;
             let mut why = String::new();
             match stage_member(
                 fetcher,
@@ -2462,6 +2522,7 @@ fn apply_group_txn_inner(
             .then(|| (busy.clause(), since))
         },
         &mut |m| {
+            current()?;
             crate::progress::note_phase(m, crate::progress::Phase::Link);
             let check = ahead.borrow_mut().remove(m);
             let all = staged.borrow();

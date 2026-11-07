@@ -107,6 +107,7 @@ pub struct Toolset {
     /// holds the store.
     wait: Option<Duration>,
     atpkg: Atpkg,
+    selected: Option<&'static str>,
     aside: Mutex<Option<StoodAside>>,
     /// Where a stop of the passes is said, before the stop is sent again ends the run: this
     /// run's standard error.
@@ -123,11 +124,22 @@ impl Toolset {
             pkg,
             wait,
             atpkg,
+            selected: None,
             aside: Mutex::new(None),
             say: Arc::new(|text: &str| {
                 use std::io::Write as _;
                 let _ = std::io::stderr().lock().write_all(text.as_bytes());
             }),
+        }
+    }
+
+    /// Run only this signed default-selected unit through the same unattended
+    /// package policy and process custody. It does not seed or complete the toolset.
+    #[must_use]
+    pub fn default_selected(self, program: &'static str) -> Self {
+        Self {
+            selected: Some(program),
+            ..self
         }
     }
 
@@ -145,6 +157,9 @@ impl Toolset {
         let mut args = vec![verb.to_owned()];
         if verb == "update" {
             args.extend(self.atpkg.update_flags.iter().map(|&flag| flag.to_owned()));
+            if let Some(program) = self.selected {
+                args.extend(["--default-selected".to_owned(), program.to_owned()]);
+            }
         }
         if let Some(wait) = self.wait {
             args.push("--wait-lock".to_owned());
@@ -174,13 +189,17 @@ impl Toolset {
         let _stops = sys.defer_stops();
         let stopped = || sys.stopped().is_some() || continuing().is_err();
         let waited = self.wait.unwrap_or_default();
-        let passes = [("seed", SEED_BUDGET), ("update", UPDATE_BUDGET)];
+        let passes = if self.selected.is_some() {
+            &[("update", UPDATE_BUDGET)][..]
+        } else {
+            &[("seed", SEED_BUDGET), ("update", UPDATE_BUDGET)][..]
+        };
         let named = |at: usize| {
             passes
                 .get(at)
                 .map(|&(verb, _)| format!("aterm pkg {}", self.args(verb).join(" ")))
         };
-        for (at, (verb, budget)) in passes.into_iter().enumerate() {
+        for (at, &(verb, budget)) in passes.iter().enumerate() {
             current()?;
             let args = self.args(verb);
             let shown = format!("aterm pkg {}", args.join(" "));

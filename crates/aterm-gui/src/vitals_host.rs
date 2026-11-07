@@ -361,8 +361,8 @@ pub(crate) enum Wall {
         )
     )]
     System,
-    /// `wall_ms` at `at`, moving with the monotonic clock: a test's.
-    #[cfg(test)]
+    /// `wall_ms` at `at`, moving with the monotonic clock: a test's (its one test is Unix's).
+    #[cfg(all(test, unix))]
     Fixed { at: Instant, wall_ms: i64 },
     /// None: a reading is due a period after the last ask. Tests default to it, so their
     /// cadences count from their asks whatever the clock reads.
@@ -378,7 +378,7 @@ impl Wall {
                 let wall_ms = unix_ms_now();
                 (wall_ms > 0).then(|| wall_ms.saturating_sub(signed_ms(Instant::now(), now)))
             }
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             Self::Fixed { at, wall_ms } => Some(wall_ms.saturating_add(signed_ms(now, at))),
             #[cfg(test)]
             Self::Unread => None,

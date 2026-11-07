@@ -68,6 +68,27 @@ fn receipt_reply(receipt: &Receipt) -> String {
     }
 }
 
+fn acknowledged_receipt_reply(env: &Env, receipt: &Receipt) -> String {
+    if matches!(
+        receipt.phase,
+        Phase::Committed | Phase::Consumed | Phase::Retired
+    ) && !renewal::with_receipt_writer(env, |writer| {
+        writer.acknowledge(receipt)?;
+        if receipt.intent.purpose == renewal::Purpose::WeeklyQuota
+            && (receipt.phase == Phase::Consumed
+                || (receipt.phase == Phase::Retired && !receipt.launch_attempted))
+        {
+            writer.retire_pool_record(receipt)?;
+        }
+        Ok(())
+    })
+    .is_ok_and(|result| result.is_some())
+    {
+        return "ERR codex-renewal record unavailable\n".into();
+    }
+    receipt_reply(receipt)
+}
+
 fn human_grace_elapsed(ctx: &crate::SessionCtx, seconds: u32, now: u64) -> bool {
     ctx.human_input
         .ms_since(now)
@@ -593,7 +614,7 @@ fn serve_inner(
                 Ok(receipt)
             });
             match result {
-                Ok(Some(receipt)) => receipt_reply(&receipt),
+                Ok(Some(receipt)) => acknowledged_receipt_reply(&env, &receipt),
                 _ => "OK codex-renewal state=waiting\n".into(),
             }
         }
@@ -711,12 +732,12 @@ fn commit(
         return "ERR codex-renewal receipt changed\n".into();
     }
     match retire_stale_ready_bound(ctx, env, proof, current, &receipt) {
-        Ok(Some(retired)) => return receipt_reply(&retired),
+        Ok(Some(retired)) => return acknowledged_receipt_reply(env, &retired),
         Err(_) => return "ERR codex-renewal record unavailable\n".into(),
         Ok(None) => {}
     }
     if !same_native_host(&receipt) || receipt.phase != Phase::Ready {
-        return receipt_reply(&receipt);
+        return acknowledged_receipt_reply(env, &receipt);
     }
     if now_ms() >= receipt.expires_ms
         || ctx.human_input.seq() != receipt.human_seq
@@ -935,7 +956,7 @@ fn commit(
         remove_seal(&Arc::downgrade(ctx), &receipt.id);
         return "ERR codex-renewal worker unavailable\n".into();
     }
-    receipt_reply(&receipt)
+    acknowledged_receipt_reply(env, &receipt)
 }
 
 fn remove_seal(ctx: &std::sync::Weak<crate::SessionCtx>, id: &str) {
@@ -990,25 +1011,21 @@ fn status(
         return DENIED.into();
     };
     match retire_stale_ready_bound(ctx, env, proof, current, &receipt) {
-        Ok(Some(retired)) => return receipt_reply(&retired),
+        Ok(Some(retired)) => return acknowledged_receipt_reply(env, &retired),
         Err(_) => return "ERR codex-renewal record unavailable\n".into(),
         Ok(None) => {}
     }
     if receipt.phase == Phase::Committing
         && same_native_host(&receipt)
         && let Some(opts) = opts(env, &receipt.sid)
-        && let Some((forward, observed)) = renewal::completed_restart(
-            &opts,
-            receipt
-                .current_attempt
-                .as_ref()
-                .map_or(id, |attempt| attempt.id.as_str()),
-        )
+        && let Some(expected) = renewal::active_prepare(env, &receipt)
+        && let Some((forward, observed)) =
+            renewal::completed_restart(&opts, &receipt.sid, &expected)
         && observed.registration.vendor.pid == proof.pid
         && Process::observe(proof.pid).as_ref() == Some(&observed.registration.vendor)
     {
         let Ok(Some(_guard)) = store.acquire_bounded() else {
-            return receipt_reply(&receipt);
+            return acknowledged_receipt_reply(env, &receipt);
         };
         if renewal::read_receipt(env, id).as_ref() == Some(&receipt) {
             receipt.phase = if forward {
@@ -1058,7 +1075,7 @@ fn status(
                 }
         {
             let Ok(Some(_guard)) = store.acquire_bounded() else {
-                return receipt_reply(&receipt);
+                return acknowledged_receipt_reply(env, &receipt);
             };
             if renewal::read_receipt(env, id).as_ref() == Some(&receipt) {
                 receipt.phase = if candidate.forward {
@@ -1096,7 +1113,7 @@ fn status(
             return "ERR codex-renewal identity changed\n".into();
         }
         let Ok(Some(_guard)) = store.acquire_bounded() else {
-            return receipt_reply(&receipt);
+            return acknowledged_receipt_reply(env, &receipt);
         };
         if renewal::read_receipt(env, id).as_ref() == Some(&receipt) {
             receipt.successor_pid = Some(process.pid);
@@ -1135,7 +1152,7 @@ fn status(
             return "ERR codex-renewal identity changed\n".into();
         }
         let Ok(Some(_guard)) = store.acquire_bounded() else {
-            return receipt_reply(&receipt);
+            return acknowledged_receipt_reply(env, &receipt);
         };
         if renewal::read_receipt(env, id).as_ref() == Some(&receipt) {
             let mut retired = receipt.clone();
@@ -1145,7 +1162,8 @@ fn status(
             }
             receipt = retired;
         }
-        return receipt_reply(&receipt);
+        drop(_guard);
+        return acknowledged_receipt_reply(env, &receipt);
     }
 
     let awaiting_forward = receipt.phase == Phase::Committing
@@ -1153,7 +1171,7 @@ fn status(
             == Some(receipt.new_auth.as_path())
         && receipt.intent.marker(current)["receipt"].as_str() == Some(id);
     if same_session && awaiting_forward {
-        return receipt_reply(&receipt);
+        return acknowledged_receipt_reply(env, &receipt);
     }
     let rolled_back = receipt.phase == Phase::Retired
         && process.as_ref().is_some_and(|process| {
@@ -1163,18 +1181,25 @@ fn status(
         && resume.codex_auth_path.as_deref().map(std::path::Path::new)
             == Some(receipt.old_auth.as_path());
     if same_session && rolled_back {
-        if let Some(options) = opts(env, sid) {
-            let _ = renewal::with_receipt_writer(env, |writer| {
+        if receipt.intent.purpose == renewal::Purpose::WeeklyQuota {
+            let Some(options) = opts(env, sid) else {
+                return "ERR codex-renewal record unavailable\n".into();
+            };
+            if !renewal::with_receipt_writer(env, |writer| {
                 writer.retire_rolled_back_pool_record(&receipt, &options)
-            });
+            })
+            .is_ok_and(|result| result.is_some())
+            {
+                return "ERR codex-renewal record unavailable\n".into();
+            }
         }
-        return receipt_reply(&receipt);
+        return acknowledged_receipt_reply(env, &receipt);
     }
     if !same_session || !(source || successor) {
         return "ERR codex-renewal wrong process\n".into();
     }
     if !matches!(receipt.phase, Phase::Consumed | Phase::Retired) && !same_native_host(&receipt) {
-        return receipt_reply(&receipt);
+        return acknowledged_receipt_reply(env, &receipt);
     }
     // Terminal observation is never new execution authority. A later owner
     // hold must not prevent this same lineage from acknowledging its result.
@@ -1184,14 +1209,14 @@ fn status(
         {
             return "ERR codex-renewal receipt changed\n".into();
         }
-        return receipt_reply(&receipt);
+        return acknowledged_receipt_reply(env, &receipt);
     }
     if receipt.phase == Phase::Committing
         && !receipt.launch_attempted
         && now_ms() >= receipt.expires_ms
     {
         let Ok(Some(_guard)) = store.acquire_bounded() else {
-            return receipt_reply(&receipt);
+            return acknowledged_receipt_reply(env, &receipt);
         };
         if renewal::read_receipt(env, id).as_ref() == Some(&receipt) {
             let mut retired = receipt.clone();
@@ -1252,7 +1277,7 @@ fn status(
         // The potentially large history read and auth-file observation above
         // hold no account writer guard. Only the final receipt CAS is serialized.
         let Ok(Some(_guard)) = store.acquire_bounded() else {
-            return receipt_reply(&receipt);
+            return acknowledged_receipt_reply(env, &receipt);
         };
         if renewal::read_receipt(env, id).as_ref() != Some(&receipt) || !receipt.consume(&turn) {
             return "ERR codex-renewal receipt changed\n".into();
@@ -1261,12 +1286,7 @@ fn status(
             return "ERR codex-renewal record unavailable\n".into();
         }
     }
-    if receipt.intent.purpose == renewal::Purpose::WeeklyQuota
-        && matches!(receipt.phase, Phase::Consumed | Phase::Retired)
-    {
-        let _cleanup = renewal::retire_pool_record(env, &receipt);
-    }
-    receipt_reply(&receipt)
+    acknowledged_receipt_reply(env, &receipt)
 }
 
 /// A trusted unit world supplies the same previously authorized live-source
@@ -1557,6 +1577,118 @@ mod tests {
                 .renewal_services
                 .contains_key(&id)
         );
+    }
+
+    #[test]
+    fn codex_renewal_terminal_receipt_waits_for_directory_barrier() {
+        for (offset, purpose) in [renewal::Purpose::Login, renewal::Purpose::WeeklyQuota]
+            .into_iter()
+            .enumerate()
+        {
+            let handle = crate::session_store::test_handle_on(8895 + offset as u64, -1);
+            let ctx = Arc::clone(&handle.ctx);
+            install(&ctx, 71, &[Scope::Relaunch]);
+            let directory = aterm_tempfile::tempdir().unwrap();
+            let mut seed = seal(&ctx);
+            seed.env.home = Some(directory.path().join("home"));
+            seed.env.state = directory.path().join("state");
+            seed.env.config = Some(directory.path().join("aterm.toml"));
+            seed.receipt.intent.purpose = purpose;
+            if purpose == renewal::Purpose::WeeklyQuota {
+                seed.receipt.destination = Some(renewal::Identity::from_native("target", "user"));
+            }
+            seed.receipt.phase = Phase::Committing;
+            seed.receipt.launch_attempted = true;
+            let env = seed.env.clone();
+            let id = seed.receipt.id.clone();
+            renewal::with_receipt_writer(&env, |_| renewal::write_receipt(&env, &seed.receipt))
+                .unwrap()
+                .unwrap();
+            let mut completed = seed.receipt.clone();
+            completed.phase = Phase::Committed;
+            completed.successor_pid = Some(4243);
+            completed.successor_birth = Some(13);
+            ctx.fenced_writes
+                .native
+                .lock()
+                .unwrap()
+                .renewal_services
+                .insert(id.clone(), Arc::new(Service::new(seed)));
+            // The account guard is already held when the failure is armed:
+            // permit the grandparent flush, then fail after the receipt rename.
+            let failure = renewal::with_receipt_writer(&env, |_| {
+                let failure = aterm_durable::seam::FailingDirs::after(1, aterm_durable::seam::EIO);
+                assert_eq!(
+                    renewal::write_receipt(&env, &completed),
+                    Err("receipt-directory-flush")
+                );
+                Ok(failure)
+            })
+            .unwrap()
+            .unwrap();
+            assert_eq!(renewal::read_receipt(&env, &id), Some(completed));
+            assert!(!service::observe_terminal(&ctx, &id));
+            assert!(
+                ctx.fenced_writes
+                    .native
+                    .lock()
+                    .unwrap()
+                    .renewal_services
+                    .contains_key(&id)
+            );
+            drop(failure);
+            assert!(service::observe_terminal(&ctx, &id));
+            assert!(
+                !ctx.fenced_writes
+                    .native
+                    .lock()
+                    .unwrap()
+                    .renewal_services
+                    .contains_key(&id)
+            );
+        }
+    }
+
+    #[test]
+    fn codex_renewal_consumed_reply_repairs_the_barrier_and_rejects_a_stale_receipt() {
+        let handle = crate::session_store::test_handle_on(8897, -1);
+        let ctx = Arc::clone(&handle.ctx);
+        install(&ctx, 71, &[Scope::Relaunch]);
+        let directory = aterm_tempfile::tempdir().unwrap();
+        let mut seed = seal(&ctx);
+        seed.env.home = Some(directory.path().join("home"));
+        seed.env.state = directory.path().join("state");
+        seed.env.config = Some(directory.path().join("aterm.toml"));
+        let env = seed.env;
+        let mut consumed = seed.receipt;
+        consumed.phase = Phase::Consumed;
+        consumed.accepted_turn = Some(consumed.intent.wall.clone());
+        let failure = renewal::with_receipt_writer(&env, |_| {
+            let failure = aterm_durable::seam::FailingDirs::after(1, aterm_durable::seam::EIO);
+            assert_eq!(
+                renewal::write_receipt(&env, &consumed),
+                Err("receipt-directory-flush")
+            );
+            Ok(failure)
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            acknowledged_receipt_reply(&env, &consumed),
+            "ERR codex-renewal record unavailable\n"
+        );
+        drop(failure);
+        assert!(acknowledged_receipt_reply(&env, &consumed).contains("state=consumed"));
+        let mut newer = consumed.clone();
+        newer.generation += 1;
+        renewal::with_receipt_writer(&env, |_| renewal::write_receipt(&env, &newer))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            acknowledged_receipt_reply(&env, &consumed),
+            "ERR codex-renewal record unavailable\n"
+        );
+        assert_eq!(renewal::read_receipt(&env, &newer.id), Some(newer));
     }
 
     #[test]

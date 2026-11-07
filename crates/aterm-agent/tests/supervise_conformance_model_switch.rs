@@ -340,6 +340,8 @@ fn the_guessed_return_and_the_old_half_hour_disagree_with_the_real_code() {
         from: Some("fable".to_string()),
         to: "opus".to_string(),
         back_at: Some(t + 30 * MIN),
+        proc: None,
+        unproven: false,
     });
     let idle = base_reading();
     st.observe(&idle, t + 31 * MIN);

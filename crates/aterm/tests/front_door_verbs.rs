@@ -346,6 +346,7 @@ fn temporary_bundle_relaunches_before_setup(entry: &[&str]) {
         root: Some(private_root()),
         source_ran: false,
         successor_reaped: false,
+        locations_locked: false,
     };
     let root_path = fixture
         .root
@@ -454,6 +455,12 @@ fn temporary_bundle_relaunches_before_setup(entry: &[&str]) {
                 .unwrap()
                 .ino()
         });
+        if newer {
+            // The existing app is readable while neither installation location can
+            // be written. Reopening it must not prepare another destination first.
+            fixture.locations_locked = true;
+            fixture.location_flags("uchg").unwrap();
+        }
         for name in [
             "first-launch-ran.json",
             "first-launch-receipt.json",
@@ -468,12 +475,15 @@ fn temporary_bundle_relaunches_before_setup(entry: &[&str]) {
             .env("ATERM_DEBUG_FIRST_LAUNCH_ROOT", &root_path)
             .args(&arguments);
         let output = capture_on_a_terminal(command);
+        fixture.allow_location_writes().unwrap();
         let proof = std::fs::read_to_string(root_path.join("first-launch-ran.json"));
         assert!(
             destination.join("Contents/MacOS/aterm").is_file(),
             "actual init dispatch never installed its temporary bundle: {output}"
         );
-        let proof = proof.expect("successor's own proof");
+        let proof = proof.unwrap_or_else(|error| {
+            panic!("successor's own proof: {error}; launcher output: {output}")
+        });
         let parsed: aterm_json::Value =
             aterm_json::from_str(&proof).expect("structured native proof");
         let receipt: aterm_json::Value = aterm_json::from_str(
@@ -557,11 +567,49 @@ struct FirstLaunchFixture {
     root: Option<aterm_tempfile::TempDir>,
     source_ran: bool,
     successor_reaped: bool,
+    locations_locked: bool,
+}
+
+#[cfg(all(target_os = "macos", debug_assertions))]
+impl FirstLaunchFixture {
+    fn location_flags(&self, flag: &str) -> Result<(), String> {
+        let root = self.root.as_ref().unwrap().path();
+        let output = aterm_uds::deadline::output_within(
+            aterm_uds::spawnfd::command("/usr/bin/chflags")
+                .arg(flag)
+                .arg(root.join("Applications"))
+                .arg(root.join("home")),
+            DEADLINE,
+        )
+        .map_err(|error| error.to_string())?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!("owned first-launch location flags: {output:?}"))
+        }
+    }
+
+    fn allow_location_writes(&mut self) -> Result<(), String> {
+        if self.locations_locked {
+            self.location_flags("nouchg")?;
+            self.locations_locked = false;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(all(target_os = "macos", debug_assertions))]
 impl Drop for FirstLaunchFixture {
     fn drop(&mut self) {
+        if let Err(error) = self.allow_location_writes() {
+            if let Some(root) = self.root.take() {
+                eprintln!(
+                    "{error}; immutable fixture retained at {}",
+                    root.keep().display()
+                );
+            }
+            return;
+        }
         let Some(root) = self.root.take() else {
             return;
         };

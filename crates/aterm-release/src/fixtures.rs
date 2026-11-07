@@ -652,6 +652,214 @@ fn files_under(dir: &Path) -> Result<Vec<(String, Vec<u8>)>> {
     Ok(out)
 }
 
+/// Main's interpretation of a proposed fixture landing.
+#[derive(Debug, Clone)]
+pub struct Reading {
+    /// Complete corpus rendered by main, never the release line's reader.
+    pub answers: std::result::Result<String, String>,
+    /// Verdict including failing test names or why the checks could not run.
+    pub checks: String,
+}
+
+/// One private source path for all compare-and-swap attempts in a landing.
+/// Keeping the worktree alive preserves Cargo's build-script inputs on a lost race.
+pub struct MainReader {
+    repo: PathBuf,
+    scratch: aterm_tempfile::TempDir,
+    last_binary: Option<PathBuf>,
+}
+
+impl MainReader {
+    /// Allocate an isolated reader workspace.
+    ///
+    /// # Errors
+    /// Returns scratch directory creation failures.
+    pub fn new(repo: &Path) -> std::io::Result<Self> {
+        Ok(Self {
+            repo: repo.to_path_buf(),
+            scratch: aterm_tempfile::tempdir()?,
+            last_binary: None,
+        })
+    }
+
+    /// Compile main, record only the new release's answers, and exercise its desk readers.
+    /// Failures are reported without retrying or preventing producer fixture landing.
+    #[must_use]
+    pub fn read(
+        &mut self,
+        targo: &Path,
+        preview: &str,
+        pins: &Pins,
+        run: &mut dyn FnMut(&mut Command) -> std::io::Result<Output>,
+    ) -> Reading {
+        let started = std::time::Instant::now();
+        let mut timings = Vec::new();
+        let mut answers = Err("main reader did not record answers".to_string());
+        let result = (|| -> Result<String> {
+            if let Some(binary) = &self.last_binary {
+                check_execution_hold(self.scratch.path(), binary)?;
+            }
+            let tree = self.scratch.path().join("main");
+            let git = crate::ledger::GitCli::new(&self.repo);
+            let tree_arg = tree.to_string_lossy().into_owned();
+            let local = crate::ledger::GitCli::new(&tree);
+            if tree.join(".git").exists() {
+                // This is our own generated corpus edit from the previous attempt.
+                git_ok(&local, &["restore", "--", SHIPPED_STATE_CORPUS])?;
+                git_ok(&local, &["checkout", "--detach", preview])?;
+            } else {
+                git_ok(&git, &["worktree", "add", "--detach", &tree_arg, preview])?;
+            }
+            git_ok(&local, &["submodule", "update", "--init"])?;
+            // Apply the cut's cache policy. Its workspace-root template intentionally
+            // gives this source path its own lane: cross-root freshness on the deployed
+            // compiler cannot safely reuse the cut's live build directory (C4/B18).
+            let (target, layout) = crate::release_steps::verify_layout(&self.repo);
+            let mut compile = crate::gates::aterm_gui_lib_compile(targo, &tree, &target);
+            if let Some(layout) = layout {
+                compile.arg("--config").arg(layout);
+            }
+            let compile_start = std::time::Instant::now();
+            let compiled =
+                run(&mut compile).map_err(|e| Error::new(format!("main reader compile: {e}")))?;
+            let units =
+                aterm_verify::compile_account::read(&String::from_utf8_lossy(&compiled.stdout))
+                    .units;
+            timings.push(format!(
+                "compile {:.3}s ({} fresh, {} compiled, {} unknown)",
+                compile_start.elapsed().as_secs_f64(),
+                units.fresh,
+                units.compiled,
+                units.unknown
+            ));
+            if !compiled.status.success() {
+                return Err(Error::new(format!(
+                    "main reader compile failed: {}",
+                    crate::gates::build_error_lines(&String::from_utf8_lossy(&compiled.stderr))
+                )));
+            }
+            let index = aterm_verify::test_index::Index::from_messages(
+                preview.to_string(),
+                String::new(),
+                &String::from_utf8_lossy(&compiled.stdout),
+            )
+            .map_err(|e| Error::new(format!("main reader executable index: {e}")))?;
+            let binary = index
+                .binaries
+                .iter()
+                .find(|entry| entry.kind == "lib" && entry.name == "aterm_gui")
+                .ok_or_else(|| Error::new("main reader compile reported no GUI lib test binary"))?;
+            let output = self.scratch.path().join(STAGED_ANSWERS);
+            let command = || {
+                let mut cmd = aterm_uds::spawnfd::command(&binary.path);
+                cmd.current_dir(&tree)
+                    .env("CARGO_MANIFEST_DIR", tree.join("crates/aterm-gui"))
+                    .env_remove("ATERM_BLESS_SERDE_CORPUS")
+                    .stdin(aterm_uds::spawnfd::Stdio::null());
+                cmd
+            };
+            let record_start = std::time::Instant::now();
+            let hold = execution_hold(self.scratch.path(), &binary.path);
+            let hold_error = |e| Error::new(format!("main reader execution hold: {e}"));
+            fs::create_dir_all(&hold).map_err(hold_error)?;
+            stamp_hold(&hold).map_err(hold_error)?;
+            self.last_binary = Some(binary.path.clone());
+            let outcome = run(command()
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "serde_corpus_tests::record_shipped_state_for_landing",
+                ])
+                .env(ANSWERS_OUT, &output));
+            if outcome.as_ref().is_ok_and(|out| {
+                let (passed, failed, _) =
+                    crate::gates::libtest_tally(&String::from_utf8_lossy(&out.stdout));
+                passed + failed > 0
+            }) {
+                clear_marker(&hold.join(aterm_uds::deadline::EXEC_STAMP)).map_err(hold_error)?;
+            } else {
+                stamp_hold(&hold).map_err(hold_error)?;
+            }
+            let recorded = outcome.map_err(|e| Error::new(format!("main reader record: {e}")))?;
+            timings.push(format!(
+                "record {:.3}s",
+                record_start.elapsed().as_secs_f64()
+            ));
+            let (passed, failed, _) =
+                crate::gates::libtest_tally(&String::from_utf8_lossy(&recorded.stdout));
+            if !recorded.status.success() || passed != 1 || failed != 0 {
+                return Err(Error::new(format!(
+                    "main reader recording failed: {} {}",
+                    String::from_utf8_lossy(&recorded.stdout),
+                    String::from_utf8_lossy(&recorded.stderr)
+                )));
+            }
+            let rendered = crate::durable::read_text(&output)
+                .map_err(|e| Error::new(format!("main reader answers: {e}")))?;
+            let corpus_path = tree.join(SHIPPED_STATE_CORPUS);
+            let corpus = crate::durable::read_text(&corpus_path)
+                .map_err(|e| Error::new(format!("main corpus: {e}")))?;
+            let (merged, _) = with_release_answers(&corpus, &rendered, &pins.tag())?;
+            fs::write(corpus_path, merged)
+                .map_err(|e| Error::new(format!("main corpus write: {e}")))?;
+            answers = Ok(rendered);
+            // These modules own the enabled readers of tests/fixtures/handoff,
+            // including their indirect helpers and adoption negative controls.
+            let test_start = std::time::Instant::now();
+            let tested = run(command().args(consumer_args()))
+                .map_err(|e| Error::new(format!("main desk consumers: {e}")))?;
+            timings.push(format!("tests {:.3}s", test_start.elapsed().as_secs_f64()));
+            let stdout = String::from_utf8_lossy(&tested.stdout);
+            let (passed, failed, failing) = crate::gates::libtest_tally(&stdout);
+            if !tested.status.success() || failed > 0 || passed == 0 {
+                return Err(Error::new(format!(
+                    "FAIL: {} (passed {passed}, failed {failed}); {}",
+                    failing.join(", "),
+                    String::from_utf8_lossy(&tested.stderr)
+                )));
+            }
+            Ok(format!("PASS ({passed} desk-reader tests)"))
+        })();
+        Reading {
+            answers,
+            checks: format!(
+                "{}; {}; {:.3}s after-cut",
+                result.unwrap_or_else(|e| e.to_string()),
+                timings.join(", "),
+                started.elapsed().as_secs_f64()
+            ),
+        }
+    }
+}
+
+impl Drop for MainReader {
+    fn drop(&mut self) {
+        let tree = self.scratch.path().join("main");
+        if tree.join(".git").exists() {
+            let git = crate::ledger::GitCli::new(&self.repo);
+            if let Err(why) = git_ok(
+                &git,
+                &["worktree", "remove", "--force", &tree.to_string_lossy()],
+            ) {
+                eprintln!("main fixture reader cleanup: {why}");
+            }
+        }
+    }
+}
+
+/// The modules containing enabled shipped-desk readers, with a bounded thread width.
+#[must_use]
+pub fn consumer_args() -> [&'static str; 6] {
+    [
+        "serde_corpus_tests::",
+        "restore::tests::",
+        "seamless::fixture_tests::",
+        "restore_claude_auth_tests::",
+        "--test-threads",
+        "1",
+    ]
+}
+
 /// Disposition of shipped-state answers during a fixture landing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Answers {
@@ -682,6 +890,7 @@ fn fixture_commit(
     tip: &str,
     staged: &Staged,
     pins: &Pins,
+    reading: &Reading,
 ) -> Result<(String, Answers)> {
     let guard = git_ok(
         git,
@@ -703,15 +912,17 @@ fn fixture_commit(
         })
         .collect();
     files.push((HANDOFF_FIXTURE_GUARD.to_string(), guard.into_bytes()));
-    let answers = crate::durable::read_text(&staged.answers)
-        .map_err(|e| Error::new(format!("read {}: {e}", staged.answers.display())))
+    let answers = reading
+        .answers
+        .as_ref()
+        .map_err(Error::new)
         .and_then(|answers| {
             let corpus = git_ok(
                 git,
                 &["cat-file", "blob", &format!("{tip}:{SHIPPED_STATE_CORPUS}")],
             )?
             .stdout_utf8();
-            with_release_answers(&corpus, &answers, &pins.tag())
+            with_release_answers(&corpus, answers, &pins.tag())
         });
     let answers = match answers {
         Ok((corpus, cases)) => {
@@ -739,7 +950,7 @@ fn fixture_commit(
     let recorded = match &answers {
         Answers::Recorded(cases) => format!(
             "Its {cases} cases in the serde corpus's sweep of every shipped\nproducer's bytes \
-             ({SHIPPED_STATE_CORPUS}),\nas its own cut's models read them, ride with them.\n"
+             ({SHIPPED_STATE_CORPUS}),\nas main's reader reads them, ride with them.\n"
         ),
         Answers::Unrecorded(why) => format!(
             "Its cases in the serde corpus's sweep of every shipped producer's\nbytes \
@@ -751,7 +962,8 @@ fn fixture_commit(
          {desks} desks{rendezvous} from build {build} ({short}), written before the claim \
          by the\nin-tree generator ({GENERATOR_SOURCE}) in the\nrelease's cut tree, and \
          the PINNED_DESKS rows that pin them. The next cut's\nhandoff fixture gate reads \
-         them ({HANDOFF_FIXTURE_README}).\n{recorded}",
+         them ({HANDOFF_FIXTURE_README}).\n{recorded}\nMain reader checks: {checks}\n",
+        checks = reading.checks,
         tag = pins.tag(),
         desks = staged.desks.len(),
         rendezvous = if staged.rendezvous {
@@ -779,6 +991,8 @@ pub enum Landed {
         commit: String,
         attempt: u32,
         answers: Answers,
+        /// Main's consumer test verdict; a red never prevents landing producer truth.
+        checks: String,
     },
 }
 
@@ -797,8 +1011,9 @@ impl Landed {
                 commit,
                 attempt,
                 answers,
+                checks,
             } => format!(
-                "{}'s handoff fixtures landed on main as {}{}, {}",
+                "{}'s handoff fixtures landed on main as {}{}, {}; main reader: {}",
                 pins.tag(),
                 commit.get(..12).unwrap_or(commit),
                 if *attempt > 1 {
@@ -806,7 +1021,8 @@ impl Landed {
                 } else {
                     String::new()
                 },
-                answers.words()
+                answers.words(),
+                checks
             ),
         }
     }
@@ -828,6 +1044,7 @@ pub fn land(
     staged: &Staged,
     pins: &Pins,
     max_attempts: u32,
+    read_main: &mut dyn FnMut(&str) -> Reading,
 ) -> Result<Landed> {
     let mut attempt = 0_u32;
     loop {
@@ -844,7 +1061,13 @@ pub fn land(
                 desks: found.desks,
             });
         }
-        let (commit, answers) = fixture_commit(git, &tip, staged, pins)?;
+        let pending = Reading {
+            answers: Err("main reader has not run".into()),
+            checks: "NOT RUN".into(),
+        };
+        let (preview, _) = fixture_commit(git, &tip, staged, pins, &pending)?;
+        let reading = read_main(&preview);
+        let (commit, answers) = fixture_commit(git, &tip, staged, pins, &reading)?;
         let push = git.git(&["push", "origin", &format!("{commit}:refs/heads/main")])?;
         if push.success() {
             git_ok(git, &["fetch", "origin", "main"])?;
@@ -864,6 +1087,7 @@ pub fn land(
                 commit,
                 attempt,
                 answers,
+                checks: reading.checks,
             });
         }
         let why = push.stderr_utf8().trim().to_string();

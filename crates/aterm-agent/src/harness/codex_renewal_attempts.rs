@@ -70,12 +70,50 @@ impl<'a> ReceiptWriter<'a> {
         Self { env, _guard: guard }
     }
 
+    /// Acknowledge the exact visible receipt, including any cancellation
+    /// projected from its adjacent tombstone. This grants no native authority.
+    /// # Errors
+    /// The receipt changed or cannot be read, or its directory cannot be flushed.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "ReceiptAcknowledgement",
+            action = "Changed",
+            reason = "A competing writer changed the receipt before this guard was acquired"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "ReceiptAcknowledgement",
+            action = "Failed",
+            reason = "The filesystem refuses the injected directory durability barrier"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "ReceiptAcknowledgement",
+            action = "Acknowledge",
+            project = "aterm_agent::harness::codex_renewal::attempts::tests::acknowledgement_transition"
+        )
+    )]
+    pub fn acknowledge(&self, expected: &Receipt) -> Result<(), &'static str> {
+        if read_receipt(self.env, &expected.id).as_ref() != Some(expected) {
+            return Err("receipt-acknowledge-changed");
+        }
+        // Both writers sync file data and directory reachability before rename.
+        // Repair the remaining entry barrier for the root and its tombstone.
+        flush_receipt_dir(self.env, expected)
+    }
+
     pub(super) fn release_unexecuted_rotation(
         &self,
         receipt: &Receipt,
         target: &str,
     ) -> Result<(), &'static str> {
         let binding = super::super::codex_rotation::receipt_binding(receipt)?;
+        self.acknowledge(receipt)?;
         let store = self
             .env
             .accounts_store_for(accounts::Cli::Codex)
@@ -120,6 +158,7 @@ impl<'a> ReceiptWriter<'a> {
         {
             return Err("rotation-not-consumed");
         }
+        self.acknowledge(receipt)?;
         let store = self
             .env
             .accounts_store_for(accounts::Cli::Codex)
@@ -216,6 +255,7 @@ impl<'a> ReceiptWriter<'a> {
         if !terminal || super::read_receipt(self.env, &expected.id).as_ref() != Some(expected) {
             return Err("rotation-not-terminal");
         }
+        self.acknowledge(expected)?;
         let binding = super::super::codex_rotation::receipt_binding(expected)?;
         let store = self
             .env
@@ -387,6 +427,7 @@ impl<'a> ReceiptWriter<'a> {
             return Err("cancel-intent-changed");
         }
         if current.phase == Phase::Consumed {
+            self.acknowledge(&current)?;
             return Ok(None);
         }
         let cancellation = if let Some(existing) = read_cancellation(self.env, &current)? {

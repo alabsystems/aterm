@@ -367,14 +367,34 @@ fn a_switch_turning_off_says_so_and_takes_no_click() {
         s.autopilot_pending.is_none() && !s.rewritten,
         "agy's bare off read-back clears in-flight autopilot_pending and rewritten"
     );
+    app.windows
+        .get_mut(&wid)
+        .expect("window")
+        .claude_lights
+        .sessions
+        .clear();
     policy(&mut app, "[harness.agy]\nenabled = false\n");
     frame(&mut app, wid);
     assert_eq!(
         app.windows[&wid].claude_lights.sessions[&session].autopilot,
         Some(AutopilotView::AgentOff(aterm_phase::Program::Agy)),
-        "agy's agent-off read-back updates SessionLights::autopilot to AgentOff(Agy)"
+        "a fresh agy pane starting off records AgentOff(Agy) on its first frame"
     );
+    let bottom_row = footer_row(&app, wid);
+    app.windows.get_mut(&wid).expect("window").chrome_rows =
+        std::iter::once(bottom_row..bottom_row + 1).collect();
     policy(&mut app, "[harness]\n");
+    frame(&mut app, wid);
+    assert_eq!(
+        app.windows[&wid].claude_lights.sessions[&session].autopilot,
+        Some(AutopilotView::Cruise),
+        "turning back on while the bottom rule is covered still updates SessionLights::autopilot"
+    );
+    app.windows
+        .get_mut(&wid)
+        .expect("window")
+        .chrome_rows
+        .clear();
     set_program(&app, session, Some("claude"));
     frame(&mut app, wid);
     assert_eq!(

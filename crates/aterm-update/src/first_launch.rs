@@ -3,7 +3,7 @@
 
 //! First launch installs aterm before it sets up (init-on-by-default design §6.8).
 //!
-//! When macOS opens aterm from a disk image, an App Translocation copy or a plain binary,
+//! When macOS opens the full aterm app from a disk image or an App Translocation copy,
 //! nothing on that copy may set the Mac up or add `aterm` to PATH: the copy goes away. So on
 //! such a first launch aterm installs the running bundle into Applications and relaunches from
 //! the copy, opens an existing installed copy, or refuses — and never runs, nor clears
@@ -12,6 +12,10 @@
 //! way before it is opened, so a planted unsigned bundle with a high `CFBundleVersion` is not
 //! launched on its version alone; a copy that fails is moved aside. The original is quit only
 //! once the copy shows it ran, by a line it wrote.
+//!
+//! Self-installation requires the full signed app supplied by the macOS DMG, ZIP and installer
+//! routes. Bare development images do not self-install. A manually extracted product-release
+//! executable without its signed app bundle refuses setup.
 
 use crate::which_copy::InstallPosture;
 use std::path::{Path, PathBuf};
@@ -99,15 +103,16 @@ pub fn plan(facts: &Facts) -> FirstLaunchPlan {
     if facts.posture == InstallPosture::Installed {
         return FirstLaunchPlan::AlreadyInstalled;
     }
+    if let Some(installed) = &facts.installed
+        && installed.at_least_running
+        && installed.verified.is_ok()
+    {
+        return FirstLaunchPlan::OpenInstalled(installed.app_root.clone());
+    }
     let Some(dest) = facts.install_dest() else {
         return FirstLaunchPlan::NoDestination;
     };
     if let Some(installed) = &facts.installed {
-        // Same-or-newer and verified: open it, copy nothing. A high version with a failed gate
-        // falls through to Install, so it is never opened on its version alone.
-        if installed.at_least_running && installed.verified.is_ok() {
-            return FirstLaunchPlan::OpenInstalled(installed.app_root.clone());
-        }
         // An existing copy sitting where ours would land is moved aside first; one elsewhere is
         // simply left where it is (we install to `dest` and do not open it).
         let move_aside = (installed.app_root == dest).then(|| installed.app_root.clone());
@@ -485,6 +490,13 @@ mod tests {
             FirstLaunchOutcome::Relaunched {
                 from: applications()
             }
+        );
+        fake.facts.can_write_applications = false;
+        fake.facts.home_dest = None;
+        assert_eq!(
+            plan(&fake.facts),
+            FirstLaunchPlan::OpenInstalled(applications()),
+            "reopening the verified app requires no installation destination"
         );
     }
 

@@ -438,6 +438,19 @@ pub enum SharedRead {
     Deferred(String),
     /// The control record is here: what it reads, in one line.
     Visible(String),
+    /// The vault's state stayed busy (a sync held its lock past a short wait), so nothing was
+    /// read: why. It founds nothing, and fails no founding read back over it.
+    Busy(String),
+}
+
+/// What a founding of the vault's Commons did ([`Ports::found_commons`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SharedDone {
+    /// It founded the vault's Commons, or finished one founded already: what it did.
+    Done(String),
+    /// It meets the same answer at the next pass until a person changes something (a refusal or
+    /// a precondition): why, and what changes it.
+    Waiting(String),
 }
 
 /// What this Mac's credential requests read as (`sync.requests`,
@@ -736,11 +749,13 @@ pub trait Ports: Sync {
     /// copy or publication failed: the error says both passes.
     fn pass_requests(&self) -> Result<String, String>;
     /// `sync.shared-data`'s apply: the founding of the vault's Commons by its only admin, under
-    /// the authority the admin already holds; what it did, naming each Mac it approved.
+    /// the authority the admin already holds; what it did, naming each Mac it approved, or why it
+    /// stands for a person.
     ///
     /// # Errors
-    /// The founding did not finish (the vault did not take the publication, say).
-    fn found_commons(&self) -> Result<String, String>;
+    /// The founding did not finish and the next pass may (the vault did not answer, another
+    /// publish landed first, say).
+    fn found_commons(&self) -> Result<SharedDone, String>;
     /// `sync.accounts`'s read.
     ///
     /// # Errors
@@ -1320,6 +1335,14 @@ impl Item for Synced<'_> {
                 },
                 SharedRead::Deferred(why) => Probe::Deferred { why },
                 SharedRead::Visible(now) => Probe::Ok { now },
+                // Read back after an apply, a busy state is no evidence against it: the apply's
+                // own report stands, unconfirmed, and the next pass reads the settled state.
+                SharedRead::Busy(why) => match self.detail() {
+                    Some(said) => Probe::Ok {
+                        now: format!("{said}; unconfirmed: {why}"),
+                    },
+                    None => not_applicable(why),
+                },
             }),
             Kind::Requests => read(self.ports.requests(), |requests| match requests {
                 RequestsRead::Idle(why) => not_applicable(why),
@@ -1535,10 +1558,16 @@ impl Item for Synced<'_> {
                 .ports
                 .pass_requests()
                 .map_err(|why| format!("{why}; the next pass tries again"))?,
-            Kind::SharedData => self
-                .ports
-                .found_commons()
-                .map_err(|why| format!("{why}; the next pass tries again"))?,
+            Kind::SharedData => match self.ports.found_commons() {
+                Ok(SharedDone::Done(said)) => said,
+                // A refusal the next pass meets again waits for the person who changes it, and
+                // promises no retry.
+                Ok(SharedDone::Waiting(why)) => {
+                    self.stand_aside(StoodAside::Waiting(why));
+                    return Ok(());
+                }
+                Err(why) => return Err(format!("{why}; the next pass tries again")),
+            },
             Kind::Accounts => self.ports.resync_accounts()?,
             Kind::Release => self
                 .ports
@@ -1600,7 +1629,22 @@ impl Item for Synced<'_> {
             Kind::StewardServerStandby => Remedy::Command("aterm init --converge".to_owned()),
             Kind::Fleet => Remedy::Command("aterm fleet sync".to_owned()),
             Kind::Node => Remedy::Command("aterm node on".to_owned()),
-            Kind::SharedData => Remedy::None,
+            // A founding row, which only the vault's only admin reads (a change, one deferred, or
+            // one that stood aside, explained as deferred): `commons init` makes the founding by
+            // hand, printing a refusal whole. A read that failed, which any Mac's can (a member's
+            // as well, where that command fails), and a member's (not applicable) name their own
+            // why.
+            Kind::SharedData => match probe {
+                Probe::Change { .. } | Probe::Deferred { .. } => {
+                    Remedy::Command("aterm secrets commons init".to_owned())
+                }
+                Probe::Ok { .. }
+                | Probe::Person { .. }
+                | Probe::Blocked { .. }
+                | Probe::Waits { .. }
+                | Probe::NotApplicable { .. }
+                | Probe::Unusable { .. } => Remedy::None,
+            },
             Kind::Requests => Remedy::Command("aterm secrets need pass".to_owned()),
             Kind::Accounts => Remedy::Init {
                 only: "base.ai.accounts".to_owned(),

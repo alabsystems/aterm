@@ -111,6 +111,153 @@ fn child(parent: &Prepare, id: &str) -> Prepare {
     }
 }
 
+fn acknowledge_case(state: &aterm_spec::interp::State, buggy: u8) -> bool {
+    let (_tmp, env, expected, _) = fixture();
+    with_receipt_writer(&env, |writer| {
+        if state["changed"] == 1 {
+            let mut changed = expected.clone();
+            changed.generation += 1;
+            write_receipt(&env, &changed)?;
+        }
+        let failure = (state["failed"] == 1)
+            .then(|| aterm_durable::seam::FailingDirs::with(aterm_durable::seam::EIO));
+        let accepted = match buggy {
+            1 => state["failed"] == 0,
+            2 => state["changed"] == 0,
+            3 => false,
+            _ => writer.acknowledge(&expected).is_ok(),
+        };
+        drop(failure);
+        Ok(accepted)
+    })
+    .unwrap()
+    .unwrap()
+}
+
+pub(crate) fn acknowledgement_transition(
+    state: &aterm_spec::interp::State,
+    action: &str,
+) -> aterm_spec::interp::State {
+    let mut next = state.clone();
+    match action {
+        "Changed" => {
+            next.insert("changed", 1);
+        }
+        "Failed" => {
+            next.insert("failed", 1);
+        }
+        "Acknowledge" => {
+            next.insert("done", 1);
+            next.insert("accepted", i64::from(acknowledge_case(state, 0)));
+        }
+        _ => unreachable!(),
+    };
+    next
+}
+
+#[test]
+fn receipt_acknowledgement_refines_exact_read_and_real_directory_barrier() {
+    let model = aterm_models_harness::receipt_acknowledgement_model();
+    aterm_spec::interp::prove_and_catch(&model);
+    assert!(aterm_spec::verify::sweep_faults(std::slice::from_ref(&model)).is_empty());
+    for state in aterm_spec::interp::reachable_states(&model) {
+        for action in &model.actions {
+            if model.action_enabled(action.name, &state) {
+                let next = acknowledgement_transition(&state, action.name);
+                assert!(model.successors(action.name, &state).contains(&next));
+            }
+        }
+    }
+    for (buggy, changed, failed, law) in [
+        (1, 1, 0, "Exact"),
+        (2, 0, 1, "Durable"),
+        (3, 0, 0, "Available"),
+    ] {
+        let mut state = model.init_state();
+        state.insert("changed", changed);
+        state.insert("failed", failed);
+        let accepted = acknowledge_case(&state, buggy);
+        let mut next = state.clone();
+        next.insert("done", 1);
+        next.insert("accepted", i64::from(accepted));
+        assert!(!model.check_invariant(law, &next), "{law}");
+        assert!(!model.successors("Acknowledge", &state).contains(&next));
+    }
+}
+
+#[test]
+fn receipt_acknowledgement_repairs_a_projected_cancellation_tombstone() {
+    let (_tmp, env, root, _) = fixture();
+    with_receipt_writer(&env, |writer| {
+        let failure = aterm_durable::seam::FailingDirs::after(1, aterm_durable::seam::EIO);
+        assert!(
+            writer
+                .cancel(&root, CancellationKind::OwnerStop, 5, 5)
+                .is_err()
+        );
+        let projected = read_receipt(&env, &root.id).unwrap();
+        assert!(projected.revoked);
+        assert_eq!(projected.phase, Phase::Retired);
+        assert!(writer.acknowledge(&projected).is_err());
+        assert!(writer.acknowledge(&root).is_err());
+        drop(failure);
+        writer.acknowledge(&projected)?;
+        assert_eq!(read_receipt(&env, &root.id), Some(projected));
+        Ok(())
+    })
+    .unwrap()
+    .unwrap();
+}
+
+#[test]
+fn receipt_barrier_precedes_pool_retirement_even_after_a_visible_consume() {
+    let (_tmp, env, mut root, _) = fixture();
+    root.intent.purpose = Purpose::WeeklyQuota;
+    root.destination = Some(Identity::from_native("target", "user"));
+    root.phase = Phase::Consumed;
+    root.accepted_turn = Some(root.intent.wall.clone());
+    let store = env.accounts_store_for(accounts::Cli::Codex).unwrap();
+    let binding = crate::harness::codex_rotation::receipt_binding(&root).unwrap();
+    let mut logins = accounts::Logins::default();
+    logins
+        .native_rotations
+        .insert(root.id.clone(), binding.clone());
+    // A retained starting pool snapshot, not an authorized new handoff.
+    super::super::super::upgrade_models::write_atomic_mode(
+        &store.logins_file(),
+        &logins.to_json(),
+        Some(0o600),
+    )
+    .unwrap();
+    with_receipt_writer(&env, |writer| {
+        let failure = aterm_durable::seam::FailingDirs::after(1, aterm_durable::seam::EIO);
+        assert_eq!(write_receipt(&env, &root), Err("receipt-directory-flush"));
+        assert!(writer.retire_pool_record(&root).is_err());
+        assert_eq!(
+            store
+                .load_logins(env.now)
+                .unwrap()
+                .0
+                .native_rotations
+                .get(&root.id),
+            Some(&binding)
+        );
+        drop(failure);
+        assert!(writer.retire_pool_record(&root)?);
+        assert!(
+            !store
+                .load_logins(env.now)
+                .unwrap()
+                .0
+                .native_rotations
+                .contains_key(&root.id)
+        );
+        Ok(())
+    })
+    .unwrap()
+    .unwrap();
+}
+
 #[test]
 fn attempt_chain_appends_immutable_recipes_without_growing_the_root_history() {
     let (_tmp, env, root, original) = fixture();

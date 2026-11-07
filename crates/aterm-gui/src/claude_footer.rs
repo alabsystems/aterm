@@ -236,20 +236,12 @@ struct FooterPane {
     /// One of the rule's own glyph cells.
     rule: RenderCell,
     blank: RenderCell,
-    /// The session's own Autopilot word and its view.
-    autopilot: (
-        Option<aterm_agent::supervise::Autopilot>,
-        crate::autopilot::AutopilotView,
-    ),
     /// The palette the glass wears on the pane ([`crate::autopilot::harness_theme`]), `None`
     /// with no harness theme.
     palette: Option<aterm_effects::harness_card::CardPalette>,
     /// The pane's width, across which each cell takes its column's hue
     /// ([`aterm_effects::glass_inks::field`]).
     cols: usize,
-    /// Whether the glass rewrote Claude's mode row on this pane, its pill dropped
-    /// ([`rewrites_mode_row`], [`collect_mode_row`]).
-    row_rewritten: bool,
 }
 
 /// A visible Claude Code pane and the lights' reading of its rows.
@@ -258,6 +250,13 @@ struct SeenPane {
     session: u64,
     lights: LightsRead,
     switch: Option<crate::autopilot::HarnessSwitch>,
+    autopilot: Option<(
+        (
+            Option<aterm_agent::supervise::Autopilot>,
+            crate::autopilot::AutopilotView,
+        ),
+        bool,
+    )>,
 }
 
 /// Cached harness-lights reading (`None` if the reader panicked, `Some(reading)` otherwise).
@@ -1604,12 +1603,22 @@ impl PaneFooter {
         marks: &mut MarkContents,
         rings: &mut RingContents,
     ) -> &ComposedTop {
-        let goal = self.goal.as_ref().map_or(0, |(_, term)| *term);
+        let hide_goal = key
+            .switch
+            .is_some_and(|s| s.harness == Some(aterm_phase::CliHarness::Agy) && s.face.is_off());
+        let goal = if hide_goal {
+            0
+        } else {
+            self.goal.as_ref().map_or(0, |(_, term)| *term)
+        };
         if self.top.key != Some(key) || self.top.goal != goal {
             let version = (key.title_gen != 0)
                 .then_some(self.shown.version.as_deref())
                 .flatten();
-            let text = self.goal.as_ref().map(|(text, _)| &**text);
+            let text = (!hide_goal)
+                .then_some(self.goal.as_ref())
+                .flatten()
+                .map(|(text, _)| &**text);
             compose_top(&key, &mut self.top, version, text, tail);
             self.top.mark = mark_layer(&key, &self.top, self.session, marks);
             self.top.ring = ring_layer(&key, &self.top, self.session, rings);
@@ -4801,13 +4810,16 @@ impl App {
             });
             let gate = timeline.card_gate().map_or(0, |gate| gate.key());
             let drawer = !shows && timeline.card_drawer_current();
-            let goal = goal_term(timeline.goal());
+            let mut goal = goal_term(timeline.goal());
             let cli = TopCli::from_timeline(&timeline).term();
             drop(timeline);
             let agent = crate::harness_host::admitted_as(&entry.ctx, agent, group);
             let harness = if shows {
                 let (word, view, supervised, _) =
                     self.session_autopilot_for(session, agent, &claims);
+                if bare_while_off(agent, crate::autopilot::HarnessSwitch::of(view)) {
+                    goal = 0;
+                }
                 let theme = crate::autopilot::harness_theme(
                     view,
                     supervised,
@@ -4932,9 +4944,6 @@ impl App {
             && ws.claude_lights.mark_hovered(session)
             && lists.pointer.is_none_or(|(row, _)| row == frame_row);
         let footer = texts.footer(leaf_index, session);
-        if hide_lockup {
-            footer.note_goal(None);
-        }
         let typed = !hide_lockup && program == aterm_phase::Program::Claude && footer.key_typed();
         let face = if hide_lockup {
             KeyFace::default()
@@ -5668,6 +5677,7 @@ impl App {
                         session,
                         lights: None,
                         switch: crate::autopilot::HarnessSwitch::of(view),
+                        autopilot: None,
                     });
                     continue;
                 }
@@ -5849,6 +5859,7 @@ impl App {
                     session,
                     lights: readings.lights,
                     switch: crate::autopilot::HarnessSwitch::of(view),
+                    autopilot: Some(((word, view), row_rewritten)),
                 });
                 let Some((frame_row, term_row, run, rule)) = rule else {
                     continue;
@@ -5862,10 +5873,8 @@ impl App {
                     run,
                     rule,
                     blank,
-                    autopilot: (word, view),
                     palette: border,
                     cols: pane_cols,
-                    row_rewritten,
                 });
             }
             let seen = &lists.seen;
@@ -5875,10 +5884,12 @@ impl App {
             );
         }
         for pane in lists.seen.drain(..) {
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            self.observe_claude_lights(wid, pane.session, pane.lights);
+            if let Some((autopilot, row_rewritten)) = pane.autopilot {
+                self.note_claude_autopilot(wid, pane.session, autopilot, row_rewritten);
+            } else if let Some(ws) = self.windows.get_mut(&wid) {
                 ws.claude_lights.note_switch_face(pane.session, pane.switch);
             }
-            self.observe_claude_lights(wid, pane.session, pane.lights);
         }
         for session in lists.bare.drain(..) {
             self.note_claude_footer_row(wid, session, 0);
@@ -5908,7 +5919,6 @@ impl App {
                 continue;
             };
             self.note_claude_footer_row(wid, pane.session, chips_room);
-            self.note_claude_autopilot(wid, pane.session, pane.autopilot, pane.row_rewritten);
             self.note_claude_team(wid, pane.session);
             let glass = GlassInks::of(
                 pane.palette,

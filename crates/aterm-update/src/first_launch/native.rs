@@ -295,46 +295,11 @@ impl NativeHost {
             crate::install::APPLY_LOCK_WAIT,
         )
         .map_err(|error| format!("first-launch update custody: {error}"))?;
-        let mut can_write_applications = match crate::bundle::probe_parent_write(&applications_dest)
-        {
-            ParentWrite::Writable => true,
-            ParentWrite::NotWritable(_) => false,
-            ParentWrite::Passing(reason) => return Err(reason),
-        };
-        if let Ok(metadata) = std::fs::symlink_metadata(&applications_dest)
-            && (metadata.uid() != aterm_uds::peer::our_uid()
-                || (metadata.is_dir()
-                    && !metadata.file_type().is_symlink()
-                    && crate::bundle::is_dev_marked(&applications_dest)))
-        {
-            can_write_applications = false;
-        }
-        let dest = if can_write_applications {
-            Some(&applications_dest)
-        } else {
-            home_dest.as_ref()
-        }
-        .ok_or("no writable Applications folder")?;
-        let parent = dest.parent().ok_or("installation has no parent folder")?;
-        #[cfg(debug_assertions)]
-        if fixture.is_some() {
-            aterm_update_core::ensure_private_dir(parent).map_err(|error| error.to_string())?;
-        } else {
-            std::fs::create_dir_all(parent)
-                .map_err(|error| format!("create Applications folder: {error}"))?;
-        }
-        #[cfg(not(debug_assertions))]
-        std::fs::create_dir_all(parent)
-            .map_err(|error| format!("create Applications folder: {error}"))?;
-        if parent.canonicalize().map_err(|error| error.to_string())? != parent {
-            return Err("Applications folder must have a canonical path without symlinks".into());
-        }
-        let initial_destination = destination_identity(dest)?;
         let running_build = crate::verify::bundle_build_number(&source.app_root)?;
         let mut host = Self {
             facts: Facts {
                 posture: crate::bundle::posture_from(&source.exe),
-                can_write_applications,
+                can_write_applications: false,
                 applications_dest,
                 home_dest,
                 installed: None,
@@ -343,12 +308,13 @@ impl NativeHost {
             args,
             _lock: lock,
             source_build: running_build,
-            initial_destination,
+            initial_destination: None,
             child: RefCell::new(None),
             #[cfg(debug_assertions)]
             fixture,
         };
-        let mut occupied = None;
+        // Opening a verified installed app needs no installation destination. Inspect both
+        // normal locations before any write probe or directory creation for a new copy.
         for candidate in [&host.facts.applications_dest]
             .into_iter()
             .chain(host.facts.home_dest.as_ref())
@@ -360,45 +326,93 @@ impl NativeHost {
             };
             if metadata.is_dir()
                 && !metadata.file_type().is_symlink()
-                && crate::bundle::is_dev_marked(candidate)
+                && !crate::bundle::is_dev_marked(candidate)
+                && candidate
+                    .canonicalize()
+                    .is_ok_and(|canonical| canonical == *candidate)
+                && crate::verify::bundle_build_number(candidate)
+                    .is_ok_and(|build| build >= running_build)
+                && host.verify(candidate).is_ok()
             {
-                if Some(candidate) == host.facts.install_dest().as_ref() {
+                host.facts.installed = Some(InstalledCopy {
+                    app_root: candidate.clone(),
+                    at_least_running: true,
+                    verified: Ok(()),
+                });
+                break;
+            }
+        }
+        if host.facts.installed.is_some() {
+            return Ok(host);
+        }
+        let mut can_write_applications =
+            match crate::bundle::probe_parent_write(&host.facts.applications_dest) {
+                ParentWrite::Writable => true,
+                ParentWrite::NotWritable(_) => false,
+                ParentWrite::Passing(reason) => return Err(reason),
+            };
+        if let Ok(metadata) = std::fs::symlink_metadata(&host.facts.applications_dest)
+            && (metadata.uid() != aterm_uds::peer::our_uid()
+                || (metadata.is_dir()
+                    && !metadata.file_type().is_symlink()
+                    && crate::bundle::is_dev_marked(&host.facts.applications_dest)))
+        {
+            can_write_applications = false;
+        }
+        host.facts.can_write_applications = can_write_applications;
+        let dest = host
+            .facts
+            .install_dest()
+            .ok_or("no writable Applications folder")?;
+        let parent = dest.parent().ok_or("installation has no parent folder")?;
+        #[cfg(debug_assertions)]
+        if host.fixture.is_some() {
+            aterm_update_core::ensure_private_dir(parent).map_err(|error| error.to_string())?;
+        } else {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("create Applications folder: {error}"))?;
+        }
+        #[cfg(not(debug_assertions))]
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("create Applications folder: {error}"))?;
+        if parent.canonicalize().map_err(|error| error.to_string())? != parent {
+            return Err("Applications folder must have a canonical path without symlinks".into());
+        }
+        host.initial_destination = destination_identity(&dest)?;
+        match std::fs::symlink_metadata(&dest) {
+            Ok(metadata) => {
+                if metadata.is_dir()
+                    && !metadata.file_type().is_symlink()
+                    && crate::bundle::is_dev_marked(&dest)
+                {
                     return Err(
                         "installation destination is a development app; leaving it untouched"
                             .into(),
                     );
                 }
-                continue;
-            }
-            let verified = if metadata.is_dir() && !metadata.file_type().is_symlink() {
-                host.verify(candidate)
-            } else {
-                Err("installed name is not a real app directory".into())
-            };
-            let at_least_running = verified.is_ok()
-                && crate::verify::bundle_build_number(candidate)
-                    .is_ok_and(|build| build >= running_build);
-            let copy = InstalledCopy {
-                app_root: candidate.clone(),
-                at_least_running,
-                verified,
-            };
-            if copy.at_least_running {
-                host.facts.installed = Some(copy);
-                break;
-            }
-            if Some(candidate) == host.facts.install_dest().as_ref() {
-                if metadata.uid() != aterm_uds::peer::our_uid() {
+                let verified = if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                    host.verify(&dest)
+                } else {
+                    Err("installed name is not a real app directory".into())
+                };
+                let at_least_running = verified.is_ok()
+                    && crate::verify::bundle_build_number(&dest)
+                        .is_ok_and(|build| build >= running_build);
+                let copy = InstalledCopy {
+                    app_root: dest,
+                    at_least_running,
+                    verified,
+                };
+                if !copy.at_least_running && metadata.uid() != aterm_uds::peer::our_uid() {
                     return Err(
                         "installation destination belongs to another account; leaving it untouched"
                             .into(),
                     );
                 }
-                occupied = Some(copy);
+                host.facts.installed = Some(copy);
             }
-        }
-        if host.facts.installed.is_none() {
-            host.facts.installed = occupied;
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("inspect installation destination: {error}")),
         }
         Ok(host)
     }

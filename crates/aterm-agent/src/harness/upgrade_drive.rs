@@ -4011,6 +4011,8 @@ pub(super) struct St {
     pub(super) native_account_candidate: Option<super::native_account_handoff::Pending>,
     /// Completed data is never an active grant; later crash entry mints a new operation.
     pub(super) native_completed_prepare: Option<Box<super::native_act::Prepare>>,
+    /// The latest positively unexecuted attempt, independent of its live predecessor.
+    pub(super) native_noexec_prepare: Option<Box<super::native_act::Prepare>>,
     pub(super) native_observation: Option<super::native_observe::SavedObservation>,
     pub(super) native_rollback: bool,
     pub(super) native: Option<super::native_act::Binding>,
@@ -4549,6 +4551,9 @@ impl St {
         let native_completed_prepare = prior
             .as_ref()
             .and_then(|st| st.native_completed_prepare.clone());
+        let native_noexec_prepare = prior
+            .as_ref()
+            .and_then(|st| st.native_noexec_prepare.clone());
         let left = prior
             .as_ref()
             .map(|p| p.left_typed.clone())
@@ -4736,6 +4741,9 @@ impl St {
         if st.native_completed_prepare.is_none() {
             st.native_completed_prepare = native_completed_prepare;
         }
+        if st.native_noexec_prepare.is_none() {
+            st.native_noexec_prepare = native_noexec_prepare;
+        }
         if st.left_typed.is_empty() {
             st.left_typed = left;
         }
@@ -4847,6 +4855,7 @@ impl St {
         }
         st.native_coordination |= super::native_restart::coordinated(self);
         st.native_record = self.native_record.clone();
+        self.carry_noexec(st);
         if self.agent == st.agent
             && let Some(failed) = self
                 .carried_failed_start()
@@ -4863,6 +4872,7 @@ impl St {
         }
         st.native_coordination |= super::native_restart::coordinated(self);
         st.native_record = self.native_record.clone();
+        self.carry_noexec(st);
         if let Some(word) = self.owners_hold(tab) {
             st.request = word;
             st.request_tab.clone_from(&self.request_tab);
@@ -4880,6 +4890,22 @@ impl St {
             && upgrade::same_build(self.agent, self.build_behind(), &st.from);
         if behind && same_build && self.pending_since != 0 {
             st.pending_since = self.pending_since;
+        }
+    }
+
+    fn carry_noexec(&self, st: &mut St) {
+        // Rebuilding ordinary retry state is not a new native preparation.
+        // Keep the positive result and its predecessor context until one is.
+        if self.native_noexec_prepare.is_some()
+            && st.native.is_none()
+            && st.native_prepare.is_empty()
+            && st.native_completed_prepare.is_none()
+            && st.native_noexec_prepare.is_none()
+        {
+            st.native_noexec_prepare = self.native_noexec_prepare.clone();
+            st.native_completed_prepare = self.native_completed_prepare.clone();
+            st.native_observation = self.native_observation.clone();
+            st.native_rollback = self.native_rollback;
         }
     }
 
@@ -5197,6 +5223,13 @@ impl St {
             o.insert("native_completed_prepare".into(), Value::from(encoded));
         }
         if let Some(encoded) = self
+            .native_noexec_prepare
+            .as_ref()
+            .and_then(|prepare| super::native_act::Request::Prepare(prepare.clone()).encode())
+        {
+            o.insert("native_noexec_prepare".into(), Value::from(encoded));
+        }
+        if let Some(encoded) = self
             .native_observation
             .as_ref()
             .and_then(super::native_observe::SavedObservation::encode)
@@ -5450,6 +5483,7 @@ impl St {
                 || !s("native_prepare").is_empty()
                 || v.get("native_id").is_some()
                 || v.get("native_completed_prepare").is_some()
+                || v.get("native_noexec_prepare").is_some()
                 || v.get("native_observation").is_some()
                 || v.get("native_account_candidate").is_some()
                 || v.get("native_generation").is_some()
@@ -5469,6 +5503,20 @@ impl St {
                     let super::native_act::Request::Prepare(prepare) =
                         super::native_act::Request::parse(value.as_str()?)?
                     else {
+                        return None;
+                    };
+                    Some(prepare)
+                }
+            },
+            native_noexec_prepare: match v.get("native_noexec_prepare") {
+                None => None,
+                Some(value) => {
+                    let wire = value.as_str()?;
+                    let request = super::native_act::Request::parse(wire)?;
+                    if !request.matches_retained(wire) {
+                        return None;
+                    }
+                    let super::native_act::Request::Prepare(prepare) = request else {
                         return None;
                     };
                     Some(prepare)
@@ -6710,6 +6758,7 @@ mod record {
             "native_id",
             "native_cap",
             "native_completed_prepare",
+            "native_noexec_prepare",
             "native_observation",
             "native_account_candidate",
             "native_generation",

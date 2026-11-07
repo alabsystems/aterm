@@ -242,13 +242,17 @@ mod tests {
     use std::time::Duration;
 
     const TOKEN: &str = "fixture_repository_token_only";
-    const INVENTORY: &str = r#"{"schema":2,"account":"alice","repositories":[]}"#;
+    const INVENTORY: &str = r#"{"schema":2,"account":"alice","repositories":[{"id":1,"name":"fixture","owner":{"login":"alice"},"full_name":"alice/fixture","private":true,"clone_url":"https://github.com/alice/fixture.git","default_branch":"main"}]}"#;
 
     fn joined(home: &Path, source: &Path) -> Paths {
+        joined_inventory(home, source, INVENTORY)
+    }
+
+    fn joined_inventory(home: &Path, source: &Path, inventory: &str) -> Paths {
         std::fs::write(
             source,
             format!(
-                "gh_access_token={TOKEN}\ngithub-repositories.json={INVENTORY}\ntool-other=before\n"
+                "gh_access_token={TOKEN}\ngithub-repositories.json={inventory}\ntool-other=before\n"
             ),
         )
         .unwrap();
@@ -306,11 +310,14 @@ mod tests {
         sys.file(token.to_str().unwrap(), &bytes)
             .stat_of(token.to_str().unwrap(), stat(false, bytes.len() as u64));
         let inventory = home.join(".secrets/github-repositories.json");
-        sys.file(inventory.to_str().unwrap(), INVENTORY.as_bytes())
-            .stat_of(
-                inventory.to_str().unwrap(),
-                stat(false, INVENTORY.len() as u64),
-            );
+        match std::fs::read(&inventory) {
+            Ok(bytes) => {
+                sys.file(inventory.to_str().unwrap(), &bytes)
+                    .stat_of(inventory.to_str().unwrap(), stat(false, bytes.len() as u64));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("reading fixture inventory: {error}"),
+        }
         for (endpoint, body) in [
             ("/user", aterm_json::json!({"login":"alice"})),
             (
@@ -427,11 +434,43 @@ mod tests {
         assert!(
             result.iter().any(|row| matches!(
                 aterm_machines::init_observe::Reading::of(row),
-                Some(aterm_machines::init_observe::Reading::Repositories { count: 0, .. })
+                Some(aterm_machines::init_observe::Reading::Repositories { count: 1, .. })
             )),
             "{result:?}"
         );
         assert!(!sys.calls().iter().any(|call| call.contains(" agh GET ")));
+    }
+
+    #[test]
+    fn an_empty_selected_inventory_needs_no_git_or_repository_work() {
+        use aterm_types::macos_setup::Standing;
+
+        let root = aterm_tempfile::tempdir().unwrap();
+        let source = root.path().join("team.secrets");
+        let home = root.path().join("home");
+        joined_inventory(
+            &home,
+            &source,
+            r#"{"schema":2,"account":"alice","repositories":[]}"#,
+        );
+        let plan = Plan {
+            vault_url: source.to_string_lossy().into_owned(),
+            ..Plan::default()
+        };
+        let (sys, ctx) = fake(&home);
+        sys.stat_fails(
+            aterm_machines::items::github::CLT_GIT,
+            std::io::ErrorKind::NotFound,
+        );
+        let seen = observe(&sys, &ctx, Some(&plan), false).unwrap();
+        assert_eq!(seen.standing, Standing::NotNeeded, "{seen:?}");
+        assert!(
+            !sys.calls().iter().any(|call| call.contains(" agh GET ")
+                || call.contains("credential fill")
+                || call.contains(" clone ")),
+            "{:?}",
+            sys.calls()
+        );
     }
 
     #[test]

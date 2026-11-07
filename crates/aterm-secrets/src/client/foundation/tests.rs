@@ -510,7 +510,10 @@ fn a_closed_vault_is_left_to_commons_init() {
     );
     let before = published(&lab);
     let error = admin_commons_found_by_default(&lab.paths).unwrap_err();
-    assert!(error.to_string().contains("not open"), "{error}");
+    assert!(
+        matches!(&error, NotFounded::Stands(why) if why.contains("not open")),
+        "{error:?}"
+    );
     assert!(published(&lab) == before && no_control(&lab.paths));
     let founded = admin_commons_init(&lab.paths).unwrap();
     assert_eq!(founded.approved, ["m1", "m2"]);
@@ -580,7 +583,10 @@ fn a_vault_with_two_admins_or_an_unbound_authority_is_left_as_it_is() {
     );
     let before = published(&lab);
     let error = admin_commons_found_by_default(&lab.paths).unwrap_err();
-    assert!(error.to_string().contains("2 admins"), "{error}");
+    assert!(
+        matches!(&error, NotFounded::Stands(why) if why.contains("2 admins")),
+        "{error:?}"
+    );
     assert!(published(&lab) == before && no_control(&lab.paths));
 
     let root = aterm_tempfile::tempdir().unwrap();
@@ -597,7 +603,11 @@ fn a_vault_with_two_admins_or_an_unbound_authority_is_left_as_it_is() {
         "{read:?}"
     );
     let before = std::fs::read(&source).unwrap();
-    assert!(admin_commons_found_by_default(&paths).is_err());
+    let error = admin_commons_found_by_default(&paths).unwrap_err();
+    assert!(
+        matches!(&error, NotFounded::Stands(why) if why.contains("not bound")),
+        "{error:?}"
+    );
     assert!(std::fs::read(&source).unwrap() == before && no_control(&paths));
 }
 
@@ -672,10 +682,15 @@ fn unrelated_local_history_is_not_founded_over() {
     aterm_journal::write_private_durable(&commons, "default.pin", b"existing history").unwrap();
     let read = commons_foundable(&lab.paths).unwrap();
     assert!(
-        matches!(&read, Foundable::Elsewhere(why) if why.contains("existing local history")),
+        matches!(&read, Foundable::Elsewhere(why) if why.contains("existing local history")
+            && why.contains("default.pin: move it out of the way")),
         "{read:?}"
     );
-    assert!(admin_commons_found_by_default(&lab.paths).is_err());
+    let error = admin_commons_found_by_default(&lab.paths).unwrap_err();
+    assert!(
+        matches!(&error, NotFounded::Stands(why) if why.contains("move it out of the way")),
+        "{error:?}"
+    );
     assert!(no_control(&lab.paths));
 }
 
@@ -746,13 +761,19 @@ fn a_kept_attempt_is_finished_by_default_only_under_its_own_authority() {
 
     let other = lab_open("default-kept-other");
     aterm_journal::write_private_durable(&other.paths.dir, PREPARED, &kept.bytes()).unwrap();
+    let kept_path = other.paths.dir.join(PREPARED).display().to_string();
     let read = commons_foundable(&other.paths).unwrap();
     assert!(
-        matches!(&read, Foundable::Elsewhere(why) if why.contains("another authority")),
+        matches!(&read, Foundable::Elsewhere(why) if why.contains("another authority")
+            && why.contains(&format!("move {kept_path} out of the way"))),
         "{read:?}"
     );
     let error = admin_commons_found_by_default(&other.paths).unwrap_err();
-    assert!(error.to_string().contains("another authority"), "{error}");
+    assert!(
+        matches!(&error, NotFounded::Stands(why) if why.contains("another authority")
+            && why.contains(&format!("move {kept_path} out of the way"))),
+        "{error:?}"
+    );
     assert!(no_control(&other.paths));
 }
 
@@ -831,9 +852,11 @@ fn an_approver_that_shares_no_root_on_an_open_approval_holds_the_founding() {
             panic!("an approver at {release} holds the founding: {read:?}");
         };
         let error = admin_commons_found_by_default(&lab.paths)
-            .expect_err("an old approver refuses the founding")
-            .to_string();
-        assert!(error.contains(release), "{error}");
+            .expect_err("an old approver refuses the founding");
+        assert!(
+            matches!(&error, NotFounded::Stands(why) if why.contains(release)),
+            "{error:?}"
+        );
         assert_eq!(published(&lab), before, "nothing was published");
         assert!(
             !lab.paths.dir.join(PREPARED).exists(),
@@ -960,10 +983,9 @@ fn a_held_founding_lock_puts_the_founding_by_default_off() {
     let held = FoundationLock::held_waiting(&lab.paths).unwrap();
     let error = admin_commons_found_by_default(&lab.paths).unwrap_err();
     assert!(
-        error
-            .to_string()
-            .contains("another founding of this vault's Commons runs on this Mac now"),
-        "{error}"
+        matches!(&error, NotFounded::Again(why)
+            if why.contains("another founding of this vault's Commons runs on this Mac now")),
+        "{error:?}"
     );
     assert_eq!(published(&lab), before, "nothing was published");
     assert!(
@@ -1054,10 +1076,9 @@ fn a_publication_another_landed_first_finishes_the_root_that_landed() {
         admin_commons_found_by_default,
     )
     .unwrap_err();
-    assert_eq!(error.kind(), crate::ErrorKind::NotStored, "{error}");
     assert!(
-        error.to_string().contains("another publish landed first"),
-        "{error}"
+        matches!(&error, NotFounded::Again(why) if why.contains("another publish landed first")),
+        "{error:?}"
     );
     assert!(no_control(&lab.paths));
     let kept = prepared(&lab.paths)
@@ -1073,12 +1094,16 @@ fn a_publication_another_landed_first_finishes_the_root_that_landed() {
         } else {
             "landed-first-default"
         });
-        let call: fn(&Paths) -> crate::Result<CommonsInit> = if init {
-            admin_commons_init
+        let done = if init {
+            raced(&lab, found_without_decisions, admin_commons_init).unwrap()
         } else {
-            admin_commons_found_by_default
+            raced(
+                &lab,
+                found_without_decisions,
+                admin_commons_found_by_default,
+            )
+            .unwrap()
         };
-        let done = raced(&lab, found_without_decisions, call).unwrap();
         assert!(
             !done.published,
             "init={init}: the root that landed is finished"
@@ -1093,4 +1118,133 @@ fn a_publication_another_landed_first_finishes_the_root_that_landed() {
             prepared(&lab.paths).unwrap().unwrap().trust().genesis
         );
     }
+}
+
+/// A founding by default whose publication met another that landed first reads the root that
+/// landed, reopened, as its first read reads one: a root that is not the one this Mac kept stands,
+/// as the next pass's first read of it does, and promises no retry.
+/// NEGATIVE CONTROL: the reopened root read through `From<Error>` reads the mismatch, an error of
+/// no kind, as one that passes, which the next pass then reads as standing.
+#[test]
+fn a_root_that_landed_first_and_is_not_the_kept_one_stands() {
+    let other = lab("landed-first-other-root");
+    let elsewhere = prepare(&other.paths, &admin_open(&other.paths).unwrap()).unwrap();
+    let lab = lab_open("landed-first-not-kept");
+    let error = raced(
+        &lab,
+        move |paths| {
+            found_without_decisions(paths);
+            aterm_journal::write_private_durable(&paths.dir, PREPARED, &elsewhere.bytes()).unwrap();
+        },
+        admin_commons_found_by_default,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&error, NotFounded::Stands(why)
+            if why.contains("differs from the retained attempt")
+                && why.contains("`aterm secrets commons init`")),
+        "{error:?}"
+    );
+    assert_eq!(
+        admin_commons_found_by_default(&lab.paths),
+        Err(error),
+        "the next pass's first read meets the same answer"
+    );
+    drop(other);
+}
+
+/// What a founding by default that meets the same answer until a person changes something reads
+/// as, against one that may pass by the next pass: an error whose kind says the next try meets
+/// the same answer (the vault server's 403 or 507) stands, naming `aterm secrets commons init`;
+/// a lost race, a deadline, a busy lock or vault and an error whose kind says nothing pass, word
+/// for word. A precondition the founding refuses stands.
+/// NEGATIVE CONTROL: reading every error as passing turns the refusal into a retry.
+#[test]
+fn a_refusal_stands_and_a_lost_race_passes() {
+    let stands = NotFounded::from(Error::of_kind(crate::ErrorKind::Refused, "answered 403"));
+    assert!(
+        matches!(&stands, NotFounded::Stands(why) if why.starts_with("answered 403: ")
+            && why.contains("`aterm secrets commons init`")),
+        "{stands:?}"
+    );
+    for kind in [
+        crate::ErrorKind::NotStored,
+        crate::ErrorKind::TimedOut,
+        crate::ErrorKind::JournalBusy,
+        crate::ErrorKind::VaultBusy,
+        crate::ErrorKind::Other,
+    ] {
+        assert_eq!(
+            NotFounded::from(Error::of_kind(kind, "x")),
+            NotFounded::Again("x".to_owned()),
+            "{kind:?}"
+        );
+    }
+    let two = lab("stands-two-admins");
+    two.machine("m2", |admin, doc, _| {
+        doc.add_admin("m2").unwrap();
+        doc.set_open(true).unwrap();
+        admin_publish(&two.paths, admin, doc).unwrap();
+    });
+    let refused = admin_commons_found_by_default(&two.paths);
+    assert!(
+        matches!(&refused, Err(NotFounded::Stands(why)) if why.contains("2 admins")),
+        "{refused:?}"
+    );
+}
+
+/// Each reason an admin's aterm does not found its vault's Commons by itself names what changes
+/// it where anything does: an opaque control entry names the edit that removes it, and that edit
+/// leaves the vault to be founded; another Mac as the only admin names `commons init` run there;
+/// an unbound authority says no command binds one; a `commons` path that is a file names the move
+/// that lets the founding go on.
+/// NEGATIVE CONTROL: the bare reasons, with no remedy, fail each check.
+#[test]
+fn each_reason_not_to_found_by_default_names_what_changes_it() {
+    let lab = lab_open("default-remedies");
+    let opaque = || Audience::Hosts(vec!["m1".into()]);
+    let admin = admin_open(&lab.paths).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.set_entry(&opaque(), crate::commons::ENTRY, b"opaque")
+        .unwrap();
+    admin_publish(&lab.paths, &admin, &doc).unwrap();
+    let read = commons_foundable(&lab.paths).unwrap();
+    let edit = format!(
+        "an admin's `aterm secrets edit` that removes its `{}` entry leaves the vault to be founded",
+        crate::commons::ENTRY
+    );
+    assert!(
+        matches!(&read, Foundable::Elsewhere(why) if why.contains("opaque") && why.contains(&edit)),
+        "{read:?}"
+    );
+    // The edit it names, made as an admin's edit publishes it: the vault reads due.
+    let admin = admin_open(&lab.paths).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.unset_entry(&opaque(), crate::commons::ENTRY).unwrap();
+    admin_publish(&lab.paths, &admin, &doc).unwrap();
+    let read = commons_foundable(&lab.paths).unwrap();
+    assert!(matches!(read, Foundable::Due(_)), "{read:?}");
+
+    let doc = admin_open(&lab.paths).unwrap().doc.clone();
+    let why = founds_by_default(&doc, true, "age1notthismac").unwrap_err();
+    assert_eq!(
+        why,
+        "this Mac is not its admin: `aterm secrets commons init`, run on m1, founds its Commons"
+    );
+    let why = founds_by_default(&doc, false, "age1notthismac").unwrap_err();
+    assert!(
+        why.contains("not bound") && why.contains("no command binds one to an existing vault"),
+        "{why}"
+    );
+
+    let commons = lab.paths.dir.join("commons");
+    assert!(!commons.exists(), "CONTROL: nothing founded or kept yet");
+    std::fs::write(&commons, b"").unwrap();
+    let read = commons_foundable(&lab.paths).unwrap();
+    assert!(
+        matches!(&read, Foundable::Elsewhere(why)
+            if why.contains(&format!("cannot replace the existing commons path {}", commons.display()))
+                && why.contains("move it out of the way")),
+        "{read:?}"
+    );
 }

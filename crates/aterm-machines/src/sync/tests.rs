@@ -130,7 +130,11 @@ pub(crate) struct Inert {
     shared: Mutex<SharedRead>,
     requests: Mutex<RequestsRead>,
     /// What a founding of the vault's Commons ends in ([`Ports::found_commons`]).
-    founded: Mutex<Result<String, String>>,
+    founded: Mutex<Result<SharedDone, String>>,
+    /// What `sync.shared-data` reads once a founding is done.
+    shared_after: Mutex<SharedRead>,
+    /// Why `sync.shared-data`'s read fails, where it does.
+    shared_fails: Mutex<Option<String>>,
     accounts: Mutex<AccountsRead>,
     release: Mutex<ReleaseRead>,
     github: Mutex<GithubRead>,
@@ -240,7 +244,9 @@ impl Inert {
             requests: Mutex::new(RequestsRead::Idle(
                 "this Mac is not a Commons Writer, and holds no needs".to_owned(),
             )),
-            founded: Mutex::new(Ok("founded, approving m2".to_owned())),
+            founded: Mutex::new(Ok(SharedDone::Done("founded, approving m2".to_owned()))),
+            shared_after: Mutex::new(SharedRead::Visible("control record here".to_owned())),
+            shared_fails: Mutex::new(None),
             accounts: Mutex::new(AccountsRead::Due("the roster's sources changed".to_owned())),
             release: Mutex::new(ReleaseRead::NotApplicable("no release ring".into())),
             fabric: Mutex::new(FabricRead::Due(
@@ -465,6 +471,9 @@ impl Ports for Inert {
         Ok("started systems.alab.aterm-secrets-server advertising m29.local".to_owned())
     }
     fn shared_data(&self) -> Result<SharedRead, String> {
+        if let Some(why) = self.shared_fails.lock().unwrap().clone() {
+            return Err(why);
+        }
         self.read(&self.shared)
     }
     fn requests(&self) -> Result<RequestsRead, String> {
@@ -474,11 +483,11 @@ impl Ports for Inert {
         self.applied("requests");
         Ok("0 posted".to_owned())
     }
-    fn found_commons(&self) -> Result<String, String> {
+    fn found_commons(&self) -> Result<SharedDone, String> {
         self.applied("commons");
         let founded = self.founded.lock().unwrap().clone();
-        if founded.is_ok() {
-            *self.shared.lock().unwrap() = SharedRead::Visible("control record here".to_owned());
+        if matches!(founded, Ok(SharedDone::Done(_))) {
+            *self.shared.lock().unwrap() = self.shared_after.lock().unwrap().clone();
         }
         founded
     }
@@ -1881,7 +1890,7 @@ fn an_admin_founds_commons_in_an_applying_pass_alone() {
         "the row names why: {shared:?}"
     );
     // The next pass tries again, and founds once the vault takes the publication.
-    *ports.founded.lock().unwrap() = Ok("founded, approving m2".to_owned());
+    *ports.founded.lock().unwrap() = Ok(SharedDone::Done("founded, approving m2".to_owned()));
     ports.now.fetch_add(31 * 60 * 1000, Ordering::SeqCst);
     let next = ran(ports.pass(Trigger::Window, Mode::Apply));
     assert_eq!(row(&next.rows, SHARED_DATA).outcome, Outcome::Changed);
@@ -1891,6 +1900,138 @@ fn an_admin_founds_commons_in_an_applying_pass_alone() {
         .filter(|kind| **kind == "commons")
         .count();
     assert_eq!(tries, 2, "the failed founding and the next pass's");
+}
+
+/// A founding that meets the same answer at the next pass until a person changes something (the
+/// vault server refused it) waits for that person, naming why and `aterm secrets commons init`,
+/// and promises no retry; a founding that may pass by itself fails the row and says the next
+/// pass tries again, naming the same command.
+/// NEGATIVE CONTROL: an apply that reads every failure as passing promises the refused founding
+/// a retry; a row that names no remedy leaves the person with none.
+#[test]
+fn a_refused_founding_waits_for_a_person_and_promises_no_retry() {
+    let init = Some(Remedy::Command("aterm secrets commons init".to_owned()));
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let ports = Inert::new(scratch.path());
+    *ports.shared.lock().unwrap() = SharedRead::Foundable("vault alab has none".to_owned());
+    *ports.founded.lock().unwrap() = Ok(SharedDone::Waiting(
+        "publishing answered 403: the vault server refused it".to_owned(),
+    ));
+    let pass = ran(ports.pass(Trigger::Window, Mode::Apply));
+    let shared = row(&pass.rows, SHARED_DATA);
+    assert_eq!(shared.outcome, Outcome::Blocked, "{shared:?}");
+    assert_eq!(
+        shared.stood_aside,
+        Some(StoodAside::Waiting(
+            "publishing answered 403: the vault server refused it".to_owned()
+        )),
+        "{shared:?}"
+    );
+    let why = shared.why.as_deref().unwrap_or_default();
+    assert!(
+        why.contains("answered 403") && !why.contains("the next pass tries again"),
+        "{shared:?}"
+    );
+    assert_eq!(
+        shared
+            .explain
+            .as_ref()
+            .map(|explain| explain.remedy.clone()),
+        init,
+        "{shared:?}"
+    );
+
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let ports = Inert::new(scratch.path());
+    *ports.shared.lock().unwrap() = SharedRead::Foundable("vault alab has none".to_owned());
+    *ports.founded.lock().unwrap() = Err("another publish landed first".to_owned());
+    let pass = ran(ports.pass(Trigger::Window, Mode::Apply));
+    let shared = row(&pass.rows, SHARED_DATA);
+    assert_eq!(shared.outcome, Outcome::Failed, "{shared:?}");
+    assert_eq!(
+        shared.why.as_deref(),
+        Some("another publish landed first; the next pass tries again"),
+        "{shared:?}"
+    );
+    assert_eq!(
+        shared
+            .explain
+            .as_ref()
+            .map(|explain| explain.remedy.clone()),
+        init,
+        "{shared:?}"
+    );
+}
+
+/// A founding read back while the vault's state stays busy is no failure: the row keeps the
+/// apply's report, unconfirmed, and the next pass reads the settled state. A busy first read
+/// founds nothing and fails nothing.
+/// NEGATIVE CONTROL: a busy read-back read as not applicable fails the founding that landed.
+#[test]
+fn a_busy_read_back_leaves_the_founding_unconfirmed_not_failed() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let ports = Inert::new(scratch.path());
+    *ports.shared.lock().unwrap() = SharedRead::Foundable("vault alab has none".to_owned());
+    *ports.shared_after.lock().unwrap() =
+        SharedRead::Busy("the vault's state is changing".to_owned());
+    let pass = ran(ports.pass(Trigger::Window, Mode::Apply));
+    let shared = row(&pass.rows, SHARED_DATA);
+    assert_eq!(shared.outcome, Outcome::Changed, "{shared:?}");
+    assert_eq!(
+        shared.to.as_deref(),
+        Some("founded, approving m2; unconfirmed: the vault's state is changing"),
+        "{shared:?}"
+    );
+
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let ports = Inert::new(scratch.path());
+    *ports.shared.lock().unwrap() = SharedRead::Busy("the vault's state is changing".to_owned());
+    let pass = ran(ports.pass(Trigger::Window, Mode::Apply));
+    let shared = row(&pass.rows, SHARED_DATA);
+    assert_eq!(shared.outcome, Outcome::NotApplicable, "{shared:?}");
+    assert!(!pass.rows.iter().any(|row| row.outcome.is_failure()));
+    assert!(!ports.applies().contains(&"commons"));
+}
+
+/// A `sync.shared-data` read that failed, which a member's can as well as an admin's (its
+/// `[commons]` config unreadable, say), names no command, since `aterm secrets commons init`
+/// fails on a member; a founding that waits, which only the vault's only admin reads, names it.
+/// NEGATIVE CONTROL: a failed read that names `commons init` points a member at a command that
+/// fails for it.
+#[test]
+fn a_failed_commons_read_names_no_founding_command() {
+    let remedy = |shared: &ItemReport| {
+        shared
+            .explain
+            .as_ref()
+            .map(|explain| explain.remedy.clone())
+    };
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let ports = Inert::new(scratch.path());
+    *ports.shared_fails.lock().unwrap() = Some("aterm.toml: [commons] is not a table".to_owned());
+    let pass = ran(ports.pass(Trigger::Window, Mode::Apply));
+    let shared = row(&pass.rows, SHARED_DATA);
+    assert_eq!(shared.outcome, Outcome::Unknown, "{shared:?}");
+    assert_eq!(
+        shared.why.as_deref(),
+        Some("aterm.toml: [commons] is not a table"),
+        "{shared:?}"
+    );
+    assert_eq!(remedy(shared), Some(Remedy::None), "{shared:?}");
+    assert!(!ports.applies().contains(&"commons"));
+
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let ports = Inert::new(scratch.path());
+    *ports.shared.lock().unwrap() =
+        SharedRead::Deferred("the LAN broker is not installed".to_owned());
+    let pass = ran(ports.pass(Trigger::Window, Mode::Apply));
+    let shared = row(&pass.rows, SHARED_DATA);
+    assert_eq!(shared.outcome, Outcome::Deferred, "{shared:?}");
+    assert_eq!(
+        remedy(shared),
+        Some(Remedy::Command("aterm secrets commons init".to_owned())),
+        "{shared:?}"
+    );
 }
 
 /// A founding that waits (on the LAN broker) reads deferred, and a control record this
@@ -2587,8 +2728,8 @@ fn thirty_five_joins_against_sixteen_connections_all_land_within_ten_minutes() {
                 fn pass_requests(&self) -> Result<String, String> {
                     Ok("0 posted".to_owned())
                 }
-                fn found_commons(&self) -> Result<String, String> {
-                    Ok("founded".to_owned())
+                fn found_commons(&self) -> Result<SharedDone, String> {
+                    Ok(SharedDone::Done("founded".to_owned()))
                 }
                 fn accounts(&self) -> Result<AccountsRead, String> {
                     Ok(AccountsRead::Current("in step".to_owned()))
@@ -2930,7 +3071,7 @@ pub(crate) mod owed_clone {
         fn pass_requests(&self) -> Result<String, String> {
             self.inner.pass_requests()
         }
-        fn found_commons(&self) -> Result<String, String> {
+        fn found_commons(&self) -> Result<SharedDone, String> {
             self.inner.found_commons()
         }
         fn accounts(&self) -> Result<AccountsRead, String> {
@@ -3435,22 +3576,6 @@ pub(crate) mod owed_clone {
         }
     }
 
-    /// The token file the vault lands for alice, here now.
-    fn token_landed(sys: &crate::port::Fake) {
-        let token = "/Users//alice/.secrets/gh_access_token";
-        sys.file(token, b"fixture_token_only").stat_of(
-            token,
-            crate::port::Stat {
-                uid: 501,
-                gid: 20,
-                mode: 0o600,
-                dir: false,
-                symlink: false,
-                len: 18,
-            },
-        );
-    }
-
     /// Every clone runs Apple's git, which `base.clt` installs and this pass never does: a clone
     /// owed while the Command Line Tools are missing waits for them as for the token, naming
     /// the step that installs them; the pass after they arrive runs it.
@@ -3460,29 +3585,8 @@ pub(crate) mod owed_clone {
         let state = scratch.path().to_path_buf();
         crate::init::owe_clone(&state, &crate::init::Holds::NONE).unwrap();
         let (sys, alice) = alice_with(false);
-        token_landed(&sys);
-        let inventory = "/Users//alice/.secrets/github-repositories.json";
-        let inventory_bytes = br#"{"schema":2,"account":"alice","repositories":[]}"#;
-        sys.file(inventory, inventory_bytes).stat_of(
-            inventory,
-            crate::port::Stat {
-                uid: 501,
-                gid: 20,
-                mode: 0o600,
-                dir: false,
-                symlink: false,
-                len: inventory_bytes.len() as u64,
-            },
-        );
-        crate::git_credential::script::launcher(&sys, &alice);
-        crate::git_credential::script::lookups_hold(
-            &sys,
-            &alice,
-            crate::git_credential::GITHUB,
-            "alice",
-            "fixture_token_only",
-        );
-        crate::git_credential::script::alike(&sys, &alice);
+        crate::init_github::scripted::converged(&sys, &alice, "ready");
+        crate::port::System::remove(&sys, Path::new(crate::items::github::CLT_GIT)).unwrap();
         let held = || None;
         let owed = || crate::init::owed_clone(&sys, &state, &crate::init::Holds::NONE);
         let clone = || {
