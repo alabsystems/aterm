@@ -30,6 +30,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
+pub mod repository_refresh;
+
 /// The desired state's revision: a pass is due on the same build once it moves, as when an item
 /// joins or leaves the pass (3: `sync.identity`; 4: the ALab steward's fleet item; 5:
 /// `sync.steward.revoke`; 6: `sync.node`; 7: `sync.steward.lease` and
@@ -47,13 +49,7 @@ pub const LOCK: &str = "align.lock";
 /// How long after a pass's attempt the next one is due on the same build and routes.
 pub const RECHECK: Duration = Duration::from_secs(30 * 60);
 
-/// Maximum random jitter before an automatic pass's first `sync.fleet` attempt (§7.1, C18), on a
-/// Mac that holds a fleet key already ([`Ports::holds_fleet_key`]): every member re-joins at once
-/// after the vault rotates the code, and the jitter spreads that herd. A Mac in no fleet yet (one
-/// the vault just let in) joins at once; a burst of those lands on the capacity backoff alone.
-pub const FLEET_JOIN_JITTER_MAX: Duration = Duration::from_secs(120);
-
-/// Total wait budget (initial jitter plus capacity retries) for one `sync.fleet` apply (§12.3, C18).
+/// Total capacity-retry wait budget for one `sync.fleet` apply (§12.3, C18).
 pub const FLEET_JOIN_RETRY_BUDGET: Duration = Duration::from_secs(10 * 60);
 
 /// Per-retry backoff caps when the fleet listener or resolver is at capacity.
@@ -202,6 +198,9 @@ pub struct Record {
     /// that lays none (a held copy's, a build's, or one on a build already laid).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<BaseRecord>,
+    /// Repository-only request/fulfillment facts; never source or credential authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repositories: Option<repository_refresh::RefreshState>,
 }
 
 impl Record {
@@ -575,19 +574,13 @@ pub trait Ports: Sync {
     fn routes(&self) -> Vec<String>;
     /// Now, in ms since the epoch.
     fn now_ms(&self) -> u64;
-    /// Draw a uniform random wait in `0..=max` for `sync.fleet`'s join jitter and capacity
-    /// backoff. Overridden in tests for deterministic virtual-clock simulation.
+    /// Draw a uniform random wait in `0..=max` for `sync.fleet`'s capacity backoff.
+    /// Overridden in tests for deterministic virtual-clock simulation.
     fn random_wait(&self, max: Duration) -> Duration {
         random_duration_up_to(max, self.now_ms())
     }
     /// Pause this pass for `duration` (real sleep in `Live`, recorded or virtual-clock in tests).
     fn sleep(&self, duration: Duration);
-    /// Whether this Mac holds a fleet key already (it joined a fleet, so a `sync.fleet` re-joins
-    /// under a newer code and waits its join jitter first, [`FLEET_JOIN_JITTER_MAX`]). A Mac in
-    /// no fleet yet joins at once.
-    fn holds_fleet_key(&self) -> bool {
-        true
-    }
     /// Whether this process is the installed release aterm.app's (not a build, a renamed or held
     /// copy): only it re-lays the base layer.
     fn installed_release(&self) -> bool;
@@ -795,7 +788,11 @@ pub trait Ports: Sync {
     ///
     /// # Errors
     /// A repository row of the step did not end in place.
-    fn clone_owed(&self, _work: aterm_secrets::converge::RepositoryWork) -> Result<String, String> {
+    fn clone_owed(
+        &self,
+        _work: aterm_secrets::converge::RepositoryWork,
+        _execution: Option<repository_refresh::Execution>,
+    ) -> Result<String, String> {
         Err("this build runs no clone aterm init owes".into())
     }
     /// Forget the clone an `aterm init` owes ([`crate::init::forget_owed_clone`]): its step was
@@ -942,6 +939,7 @@ struct Synced<'a> {
     mode: Mode,
     /// A repair wake does not requery remote heads of already acquired worktrees.
     repository_work: aterm_secrets::converge::RepositoryWork,
+    repository_execution: Option<repository_refresh::Execution>,
     /// Why System State holds the vault out, read as the row starts ([`Ports::vault_held`]): a
     /// Stop pressed while an earlier row ran holds this one.
     held: std::sync::OnceLock<Option<String>>,
@@ -969,6 +967,7 @@ impl<'a> Synced<'a> {
             trigger,
             mode,
             repository_work: aterm_secrets::converge::RepositoryWork::Refresh,
+            repository_execution: None,
             held: std::sync::OnceLock::new(),
             said: Mutex::new(None),
             aside: Mutex::new(None),
@@ -1067,17 +1066,8 @@ fn random_duration_up_to(max: Duration, fallback_seed: u64) -> Duration {
     Duration::from_millis(pick)
 }
 
-fn sync_fleet_with_retry(ports: &dyn Ports, trigger: Trigger) -> Result<FleetDone, String> {
+fn sync_fleet_with_retry(ports: &dyn Ports) -> Result<FleetDone, String> {
     let mut waited = Duration::ZERO;
-    if trigger != Trigger::Init && ports.holds_fleet_key() {
-        let jitter = ports
-            .random_wait(FLEET_JOIN_JITTER_MAX)
-            .min(FLEET_JOIN_JITTER_MAX);
-        if !jitter.is_zero() {
-            ports.sleep(jitter);
-            waited += jitter;
-        }
-    }
     let mut attempt = 0;
     loop {
         match ports.sync_fleet() {
@@ -1480,7 +1470,10 @@ impl Item for Synced<'_> {
                     self.stand_aside(StoodAside::Waiting(why));
                     return Ok(());
                 }
-                None => match self.ports.clone_owed(self.repository_work) {
+                None => match self
+                    .ports
+                    .clone_owed(self.repository_work, self.repository_execution.clone())
+                {
                     Ok(said) => said,
                     // A step only a person can finish waits for them: no pass runs it again
                     // until the token or init.toml changes.
@@ -1524,7 +1517,7 @@ impl Item for Synced<'_> {
                 .ports
                 .apply_steward_standby_server()
                 .map_err(|why| format!("{why}; the next pass tries again"))?,
-            Kind::Fleet => match sync_fleet_with_retry(self.ports, self.trigger) {
+            Kind::Fleet => match sync_fleet_with_retry(self.ports) {
                 Ok(FleetDone::Synced(said)) => said,
                 Ok(FleetDone::Blocked(why)) => {
                     self.stand_aside(StoodAside::Waiting(why));
@@ -1823,6 +1816,7 @@ fn sync_items<'a>(
     trigger: Trigger,
     mode: Mode,
     work: aterm_secrets::converge::RepositoryWork,
+    execution: Option<repository_refresh::Execution>,
 ) -> Items<'a> {
     let mut items: Items<'a> = [
         Kind::Peers,
@@ -1853,6 +1847,7 @@ fn sync_items<'a>(
         items.push(prerequisites);
     }
     let mut repositories = Synced::new(Kind::OwedClone, ports, trigger, mode);
+    repositories.repository_execution = execution;
     repositories.repository_work = work;
     items.push(Box::new(repositories));
     items.push(Box::new(Synced::new(
@@ -1908,10 +1903,10 @@ pub fn converge(
     ports: &dyn Ports,
     trigger: Trigger,
     mode: Mode,
-    work: aterm_secrets::converge::RepositoryWork,
+    work: impl Into<repository_refresh::Job>,
     on_row: &mut dyn FnMut(&ItemReport),
 ) -> Result<Pass, Stop> {
-    let pass = run_pass(ports, trigger, mode, work, on_row);
+    let pass = run_pass(ports, trigger, mode, work.into(), on_row);
     if mode == Mode::Apply
         && let Err(Stop::Refused(why)) = &pass
     {
@@ -1933,7 +1928,7 @@ fn run_pass(
     ports: &dyn Ports,
     trigger: Trigger,
     mode: Mode,
-    work: aterm_secrets::converge::RepositoryWork,
+    job: repository_refresh::Job,
     on_row: &mut dyn FnMut(&ItemReport),
 ) -> Result<Pass, Stop> {
     if !ports.own_account() {
@@ -1945,11 +1940,25 @@ fn run_pass(
     let state = ports.state_dir().ok_or_else(|| {
         Stop::Refused("this account has no state directory to record a pass in".to_owned())
     })?;
-    let _lock = match mode {
-        Mode::Apply => Some(try_lock(&state).map_err(Stop::Refused)?.ok_or(Stop::Held)?),
-        Mode::Plan => None,
+    let (pass, observed) = match mode {
+        Mode::Apply => {
+            let access = repository_refresh::RepositoryPass::open(&state, ports.now_ms())
+                .map_err(Stop::Refused)?;
+            (Some(access.pass.ok_or(Stop::Held)?), access.observed)
+        }
+        Mode::Plan => (None, Default::default()),
     };
-    let record = read_record(&state);
+    let record = if let Some(pass) = &pass {
+        Some(pass.record())
+    } else {
+        read_record(&state)
+    };
+    let request = job.request(observed);
+    let work = request.work();
+    let execution = pass.as_ref().map(|pass| repository_refresh::Execution {
+        request,
+        pass: std::sync::Arc::clone(pass),
+    });
     let (build, routes, now) = (ports.build(), ports.routes(), ports.now_ms());
     let due = due(record.as_ref(), &build, &routes, now);
     let scope = Scope {
@@ -1990,7 +1999,7 @@ fn run_pass(
     {
         ports.log(&format!("converge vault subscriber: {line}"));
     }
-    let items = sync_items(ports, trigger, mode, work);
+    let items = sync_items(ports, trigger, mode, work, execution);
     rows.extend(aterm_converge::run_scoped(&items, mode, scope, journal, on_row).map_err(refused)?);
     if mode == Mode::Plan {
         return Ok(Pass {
@@ -2020,8 +2029,11 @@ fn run_pass(
             })
             .collect(),
         base,
+        repositories: None,
     };
-    let unrecorded = write_record(&state.join(FileJournal::DIR), &record).err();
+    let unrecorded = pass
+        .as_ref()
+        .and_then(|pass| pass.record_pass(record).err());
     ports.log(&ledger(&build, trigger, due, &rows, unrecorded.as_deref()));
     Ok(Pass {
         due,

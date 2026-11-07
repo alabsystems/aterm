@@ -266,6 +266,9 @@ fn rewriting_source_config_is_refused_before_any_import() {
     let root = aterm_tempfile::tempdir().unwrap();
     let target = repo(root.path(), "target", false);
     let bare = repo(root.path(), "remote.git", true);
+    // The same source is admissible before its config redirects Git. Refusal
+    // below must be caused by that rewrite, not another fixture setup failure.
+    drop(local(&target, &bare));
     git(
         &target,
         &[
@@ -277,10 +280,7 @@ fn rewriting_source_config_is_refused_before_any_import() {
     let client = GithubBuilder::new(Router::empty())
         .git_remote_for_tests("fixture/app", &bare)
         .build();
-    let error = Remote::new(client, Slug::parse("fixture/app").unwrap(), &target)
-        .err()
-        .unwrap();
-    assert!(error.contains("insteadof"), "{error}");
+    assert!(Remote::new(client, Slug::parse("fixture/app").unwrap(), &target).is_err());
     assert!(git(&target, &["for-each-ref"]).is_empty());
 }
 

@@ -994,15 +994,8 @@ impl Build {
         .map_err(|e| Fail::die(format!("targo: {e}")))?;
         let pgid = child.id();
         let waiter = std::thread::spawn(move || {
-            let ended = child.wait_with_rusage();
-            if let Some(m) = metered {
-                match &ended {
-                    Ok(u) => m.end(atpkg::build_admit::BuildEnd::Status(u.status), u.maxrss),
-                    Err(_) => m.end(atpkg::build_admit::BuildEnd::Unknown, 0),
-                }
-            }
-            ended
-                .map(|u| (u.status, started.elapsed()))
+            crate::util::wait_claimed(&mut child, metered)
+                .map(|status| (status, started.elapsed()))
                 .map_err(|e| format!("targo: {e}"))
         });
         Ok(Build {

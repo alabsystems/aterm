@@ -390,7 +390,7 @@ impl Client {
             account: Some(row),
             left: None,
             default_home: true,
-            stored_login: true,
+            route: aterm_agent::harness::accounts::AuthRoute::Stored,
         };
         let advice = accounts::advise(
             &roster(),

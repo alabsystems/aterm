@@ -586,7 +586,7 @@ fn an_exit_is_relaunched_only_where_the_relaunch_would_plan_it() {
     let snap = |argv: &[&str]| Snapshot {
         launch_env: None,
         auth_observed: true,
-        stored_login: false,
+        route: crate::harness::accounts::AuthRoute::Outside,
         profile: None,
         tab: "s-1".to_string(),
         pid: 4242,
@@ -681,7 +681,7 @@ fn a_snapshot_follows_its_own_process_and_nothing_else() {
     let snap = Snapshot {
         launch_env: None,
         auth_observed: true,
-        stored_login: false,
+        route: crate::harness::accounts::AuthRoute::Outside,
         profile: None,
         tab: "s-1".to_string(),
         pid: 4242,
@@ -2142,7 +2142,7 @@ fn the_relaunch_line_carries_the_claude_home_its_agent_ran_under() {
     let snap = |home: Option<String>| Snapshot {
         launch_env: None,
         auth_observed: true,
-        stored_login: false,
+        route: crate::harness::accounts::AuthRoute::Outside,
         profile: None,
         tab: "s-1".to_string(),
         pid: 4242,
@@ -2184,7 +2184,7 @@ fn an_exit_is_promised_a_relaunch_only_where_the_line_can_hold_its_login() {
     let snap = |login: Option<String>| Snapshot {
         launch_env: None,
         auth_observed: true,
-        stored_login: false,
+        route: crate::harness::accounts::AuthRoute::Outside,
         profile: None,
         tab: "s-1".to_string(),
         pid: 4242,
@@ -2232,7 +2232,7 @@ fn a_label_is_a_login_only_through_the_roster() {
     let on = |login: Option<&str>| Snapshot {
         launch_env: None,
         auth_observed: true,
-        stored_login: false,
+        route: crate::harness::accounts::AuthRoute::Outside,
         profile: None,
         tab: "s-1".to_string(),
         pid: 4242,
@@ -2863,7 +2863,7 @@ fn a_limit_row_a_move_left_is_no_standing_limit() {
         login: None,
         home: None,
         claude_dir: None,
-        stored_login: false,
+        route: crate::harness::accounts::AuthRoute::Outside,
         profile: None,
     };
     let standing = |cause: Option<&str>, relaunched_at: u64, tail: &str| {
@@ -3074,7 +3074,7 @@ fn a_move_to_the_default_login_is_met_by_an_unset_variable_under_the_default_hom
         login: login.map(str::to_owned),
         home: home.map(str::to_owned),
         claude_dir: None,
-        stored_login: false,
+        route: crate::harness::accounts::AuthRoute::Outside,
         profile: None,
     };
     let stands = |target: &str, live: &Snapshot| {
@@ -3166,7 +3166,7 @@ fn the_command_a_person_is_told_carries_the_home_its_relaunch_carries() {
         login: Some(LOGIN_DIR.to_string()),
         home: home.map(str::to_string),
         claude_dir: claude_dir.map(PathBuf::from),
-        stored_login: false,
+        route: crate::harness::accounts::AuthRoute::Outside,
         profile: None,
     };
     let bare = format!("claude --verbose --resume {LOGIN_ID}");
@@ -3376,7 +3376,7 @@ fn the_measured_machines_relaunch_line_carries_the_tap() {
     ];
     let value = tap::gate(&tap::GateFacts {
         exe: Some(Path::new("/Applications/aterm.app/Contents/MacOS/aterm")),
-        stored_login: true,
+        route: crate::harness::accounts::AuthRoute::Stored,
         login: None,
         lone_login: None,
         home: None,
@@ -3437,11 +3437,12 @@ fn the_measured_machines_relaunch_line_carries_the_tap() {
     }
 }
 
-/// A RELAUNCH THAT DROPS THE TAP SAYS SO IN THE LEDGER ([`note_tap_dropped`]): one row, step
-/// [`TAP_DROPPED`], with the reason; nothing where the line kept it, and nothing on a dry run.
+/// A RELAUNCH THAT DROPS THE TAP OR THE TOKEN WRAPPER SAYS SO IN THE LEDGER ([`note_dropped`]):
+/// one row each, step [`TAP_DROPPED`] or [`TOKEN_DROPPED`], with the reason; nothing where the
+/// line kept both, and nothing on a dry run.
 #[cfg(unix)]
 #[test]
-fn a_dropped_tap_is_recorded_in_the_ledger() {
+fn a_dropped_tap_or_token_is_recorded_in_the_ledger() {
     let tmp = aterm_tempfile::TempDir::new().expect("tmp");
     let opts = super::super::upgrade_drive::Opts {
         home: tmp.path().join("home"),
@@ -3482,20 +3483,32 @@ fn a_dropped_tap_is_recorded_in_the_ledger() {
             .map(str::to_owned)
             .collect::<Vec<_>>()
     };
-    note_tap_dropped(&opts, &r, None);
+    note_dropped(&opts, &r, None, None);
     assert_eq!(rows(), Vec::<String>::new(), "a line that kept the tap");
-    note_tap_dropped(
+    note_dropped(
         &super::super::upgrade_drive::Opts {
             dry_run: true,
             ..opts.clone()
         },
         &r,
         Some("why"),
+        Some("why"),
     );
     assert_eq!(rows(), Vec::<String>::new(), "a dry run");
-    note_tap_dropped(&opts, &r, Some("the usage tap left this relaunch line"));
+    note_dropped(
+        &opts,
+        &r,
+        Some("the usage tap left this relaunch line"),
+        Some("the token wrapper left this relaunch line"),
+    );
     let rows = rows();
-    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    let token: Value = aterm_json::from_str(&rows[1]).expect("a JSON row");
+    assert_eq!(token["step"].as_str(), Some(TOKEN_DROPPED));
+    assert_eq!(
+        token["detail"].as_str(),
+        Some("the token wrapper left this relaunch line")
+    );
     let row: Value = aterm_json::from_str(&rows[0]).expect("a JSON row");
     assert_eq!(row["step"].as_str(), Some(TAP_DROPPED));
     assert_eq!(row["tab"].as_str(), Some("s-1"));
@@ -3629,7 +3642,7 @@ fn the_footers_promise_asks_whether_the_line_has_room_for_the_tap() {
         login: None,
         home: None,
         claude_dir: None,
-        stored_login: true,
+        route: crate::harness::accounts::AuthRoute::Stored,
         profile: None,
     };
     assert!(tap_room(home, &snap("/Users//example/trust"), &value));
@@ -3728,7 +3741,7 @@ fn a_relaunch_after_aterm_ended_is_made_on_the_carried_line_as_the_crash_rule_ma
     let snap = |self_claimed: Option<super::super::self_claimed::Resume>| Snapshot {
         launch_env: None,
         auth_observed: true,
-        stored_login: false,
+        route: crate::harness::accounts::AuthRoute::Outside,
         profile: None,
         tab: "s-1".to_string(),
         pid: dead,
@@ -4339,7 +4352,7 @@ fn a_model_move_reads_the_launchs_model_and_never_another_flags_value() {
         login: None,
         home: None,
         claude_dir: None,
-        stored_login: false,
+        route: crate::harness::accounts::AuthRoute::Outside,
         profile: None,
     };
     for (argv, expected) in [
@@ -5452,7 +5465,7 @@ fn agent_resumed_recognizes_aterm_relaunches_and_refuses_fresh_or_recycled_proce
         login: None,
         home: None,
         claude_dir: None,
-        stored_login: true,
+        route: crate::harness::accounts::AuthRoute::Stored,
         profile: None,
     };
 
@@ -5813,7 +5826,7 @@ fn a_launch_that_resumes_a_conversation_is_a_resumed_agent() {
         login: None,
         home: None,
         claude_dir: None,
-        stored_login: true,
+        route: crate::harness::accounts::AuthRoute::Stored,
         profile: None,
     };
     let muse = || {
@@ -6043,4 +6056,226 @@ fn a_relaunch_with_no_marker_types_the_build_the_twin_execs() {
     let line = types(&twin, &bare, None, None);
     assert!(line.contains(&twin_word), "no build to read: {line}");
     super::super::upgrade_drive::AGENTS_DIR.with(|d| *d.borrow_mut() = None);
+}
+
+/// THE LINE BUDGET (DESIGN-claude-setup-token S8, §5.4): as the line grows the usage tap leaves
+/// first, then the token wrapper, then the plan is refused, and each drop is said; a line that
+/// keeps the wrapper types it before the store build, and one that drops it the build alone. An
+/// account with no stored login on this Mac has no line without the wrapper: no plan. A line
+/// after a token session that serves the token again unsets no token state (the wrapper makes it
+/// afresh), and one that drops the wrapper unsets both names.
+#[test]
+fn the_line_budget_drops_the_tap_then_the_wrapper_then_the_plan() {
+    assert_eq!(
+        budget_stages(true).0,
+        vec![0, 1, 2, 3],
+        "each stage, in order"
+    );
+    assert_eq!(
+        budget_stages(false).0,
+        vec![0, 1, 3],
+        "no stored login: no plan"
+    );
+}
+
+/// A SERVED LINE SPENDS NO BYTES ON TOKEN STATE (§5.4): the tapped, served line keeps its tap
+/// for a longer line than one that also unsets the descriptor and the marker would, by those
+/// words' length. CONTROL: a served line that unsets them too ([`budget_stages_unsetting`])
+/// drops its tap that much sooner.
+///
+/// NEGATIVE CONTROL (2026-11-06, restored with cp from a backup plus touch, confirmed with cmp):
+/// with the served line unsetting the stored line's list again, its line types `-u
+/// 'CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR' -u 'ATERM_CLAUDE_TOKEN'` (`left: true`, `right:
+/// false`), here and in the line budget's test.
+#[test]
+fn a_served_line_unsets_no_token_state_so_its_tap_fits_longer() {
+    let (_, kept) = budget_stages(true);
+    let (_, unsetting) = budget_stages_unsetting(true, Some(&token_route::TOKEN_STATE_ENV));
+    let words: usize = token_route::TOKEN_STATE_ENV
+        .iter()
+        .map(|name| name.len())
+        .sum();
+    assert!(
+        kept >= unsetting + words,
+        "the tap fits {kept} bytes of directory, against {unsetting} with the unset"
+    );
+}
+
+/// The stages [`line_tap_selected`] passes as its line grows (0, the tap and the wrapper; 1, the
+/// wrapper alone; 2, neither; 3, no plan) after a token session, and the longest directory the
+/// first stage held.
+fn budget_stages(stored: bool) -> (Vec<u8>, usize) {
+    budget_stages_unsetting(stored, None)
+}
+
+/// [`budget_stages`], a served line unsetting `served_unset`.
+fn budget_stages_unsetting(stored: bool, served_unset: Option<&[&str]>) -> (Vec<u8>, usize) {
+    let aterm = Path::new("/Applications/aterm.app/Contents/MacOS/aterm");
+    let build = Path::new("/s/store/claude/7/bin/claude");
+    let tap = super::super::tap::settings_value(aterm).expect("a tap value");
+    let serve = TokenServe {
+        aterm: aterm.to_path_buf(),
+        named: "work".to_owned(),
+        build: build.to_path_buf(),
+        entry: accounts::TokenEntry::parse("aterm-claude-token-ac-fedcba9876543210")
+            .expect("an entry"),
+        stored,
+    };
+    let argv = words(&["claude", "--verbose"]);
+    let selected = |cd: &str| {
+        line_tap_selected(
+            Dialect::Zsh,
+            None,
+            Some(cd),
+            build,
+            &argv,
+            Some(LOGIN_ID),
+            None,
+            None,
+            &[],
+            Some(&token_route::TOKEN_STATE_ENV),
+            served_unset,
+            Some(&tap),
+            Some(&serve),
+        )
+    };
+    let mut seen = Vec::new();
+    let mut tapped_at = 0;
+    for extra in (0..upgrade::MAX_LINE).step_by(7) {
+        let cd = format!("/d{}", "d".repeat(extra));
+        let stage = match selected(&cd) {
+            Ok(kept) => {
+                let tapped = kept.line.contains("--settings");
+                let wrapped = kept.line.contains("'token-run' 'work' '--' '/s/store");
+                assert_eq!(wrapped, kept.served.is_some(), "{}", kept.line);
+                if served_unset.is_none() {
+                    assert_eq!(
+                        kept.line.contains(token_route::DESCRIPTOR_ENV),
+                        !wrapped,
+                        "a served line unsets no token state; a stored one unsets it: {}",
+                        kept.line
+                    );
+                }
+                if tapped && wrapped {
+                    tapped_at = extra;
+                }
+                assert_eq!(wrapped, kept.exe == aterm);
+                assert_eq!(kept.tap_dropped.is_some(), !tapped, "{}", kept.line);
+                assert_eq!(kept.token_dropped.is_some(), !wrapped, "{}", kept.line);
+                if let Some(why) = &kept.tap_dropped {
+                    assert!(
+                        why.starts_with("the usage tap left this relaunch line: with it, "),
+                        "{why}"
+                    );
+                }
+                if let Some(why) = &kept.token_dropped {
+                    assert!(
+                        why.starts_with("the token wrapper left this relaunch line: with it, "),
+                        "{why}"
+                    );
+                    assert!(
+                        kept.line
+                            .contains("'/s/store/claude/7/bin/claude' '--verbose'")
+                    );
+                }
+                match (tapped, wrapped) {
+                    (true, true) => 0,
+                    (false, true) => 1,
+                    (false, false) => 2,
+                    (true, false) => panic!("the wrapper left before the tap: {}", kept.line),
+                }
+            }
+            Err(NoPlan::Refused { what, detail, .. }) => {
+                assert_eq!(what, "line");
+                assert_eq!(
+                    detail.contains("no stored login on this Mac"),
+                    !stored,
+                    "{detail}"
+                );
+                3
+            }
+            Err(_) => panic!("another refusal"),
+        };
+        if seen.last() != Some(&stage) {
+            seen.push(stage);
+        }
+    }
+    (seen, tapped_at)
+}
+
+/// A TOKEN COMMAND CAPTURES THE BUILD ITS WRAPPER EXECS (DESIGN-claude-setup-token §5.4): its
+/// program is aterm's wrapper, and the native host holds the child to the store build the
+/// wrapper's `--` names (`RestartCommand::settled`), captured with it and kept through the
+/// command's canonical encoding. CONTROLS: a stored-login command settles on its own program; a
+/// token command whose argv names no build captures nothing; an encoding with half a settled
+/// image is refused.
+#[cfg(unix)]
+#[test]
+fn a_token_command_captures_the_build_its_wrapper_execs() {
+    use super::super::accounts_pool::ExecutionIntent;
+    use super::super::native_act::{Image, RestartCommand};
+    use std::os::unix::fs::PermissionsExt;
+    let root = aterm_tempfile::Builder::new()
+        .prefix("aterm-token-capture-")
+        .suffix(".noindex")
+        .tempdir()
+        .unwrap();
+    let aterm = root.path().join("aterm");
+    let build = root.path().join("store/claude/7/bin/claude");
+    std::fs::create_dir_all(build.parent().unwrap()).unwrap();
+    for file in [&aterm, &build] {
+        std::fs::write(file, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let entry = accounts::TokenEntry::parse("aterm-claude-token-ac-0123456789abcdef").unwrap();
+    let serve = TokenServe {
+        aterm: aterm.clone(),
+        named: "work".into(),
+        build: build.clone(),
+        entry,
+        stored: true,
+    };
+    let flags = words(&["--resume", "s"]);
+    let token = ExecutionIntent::Token {
+        namespace: "ab".repeat(32),
+        login: None,
+        owner: Some("work".into()),
+        entry,
+    };
+    let command = |argv: Vec<String>, intent: ExecutionIntent| PlannedCommand {
+        dialect: Dialect::Zsh,
+        heal: None,
+        cwd: None,
+        target: aterm.clone(),
+        argv,
+        env: Vec::new(),
+        unset: None,
+        account_intent: Some(intent),
+    };
+    let captured = command(serve.args(&flags), token.clone())
+        .capture()
+        .expect("a token command captures");
+    assert_eq!(captured.image, Image::at(&aterm).unwrap());
+    assert_eq!(captured.settled(), &Image::at(&build).unwrap());
+    let encoded = captured.encode().expect("it encodes");
+    assert_eq!(RestartCommand::parse(&encoded).as_ref(), Some(&captured));
+    let half = encoded
+        .split_ascii_whitespace()
+        .filter(|word| !word.starts_with("settle-ino="))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_eq!(RestartCommand::parse(&half), None, "{half}");
+
+    let stored = ExecutionIntent::Stored {
+        namespace: "ab".repeat(32),
+        login: None,
+        owner: Some("work".into()),
+        generation: "cd".repeat(32),
+    };
+    let plain = command(flags.clone(), stored)
+        .capture()
+        .expect("it captures");
+    assert_eq!(plain.settles, None);
+    assert_eq!(plain.settled(), &plain.image);
+    assert!(command(flags, token).capture().is_none());
 }

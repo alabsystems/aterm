@@ -54,6 +54,17 @@ pub enum Step {
     /// `<program> login`: the vendor's own sign-in in this machine's default home, a person's act
     /// that aterm does not run for them.
     VendorLogin(Cli),
+    /// `aterm harness accounts token <label|email> [--replace]`: a Claude Code setup-token made
+    /// for one account and stored in the vault (`docs/DESIGN-claude-setup-token-2026-11-05.md`
+    /// §4.6). `label` is the row's label, or the account's email where no row names it;
+    /// `replace` is set where the token the step offers for is still in use (`soon`, `exposed`),
+    /// so the step never meets the verb's refusal of a bare run.
+    Token {
+        /// The row's label, or the account's email.
+        label: String,
+        /// `--replace`.
+        replace: bool,
+    },
 }
 
 impl Step {
@@ -126,6 +137,13 @@ impl fmt::Display for Step {
             Self::AiLogin(id) => write!(f, "aterm ai login {id}"),
             Self::Doctor => f.write_str("aterm ai doctor"),
             Self::VendorLogin(cli) => write!(f, "{} login", cli.id()),
+            Self::Token { label, replace } => {
+                write!(f, "{accounts} token {label}")?;
+                if *replace {
+                    f.write_str(" --replace")?;
+                }
+                Ok(())
+            }
         }
     }
 }

@@ -26,7 +26,7 @@ use super::claims::{Book, View};
 use super::headless_oauth::{MailboxConfig, MailboxCredential};
 
 /// Materialized filename under `~/.secrets/` carrying age-sealed per-email passwords for warm Macs.
-pub const AI_SIGNIN_FILE: &str = "ai-signin.toml";
+pub const AI_SIGNIN_FILE: &str = aterm_secrets::entry_class::AI_SIGNIN;
 
 /// Audit log filename under `<state_dir>/` recording answered `mail-code <email>` relay requests.
 pub const MAIL_CODE_AUDIT_FILE: &str = "mail-code-relay.log";
@@ -1391,7 +1391,8 @@ fn read_standby_steward_labels(home: &Path, roster: Option<&SwarmRoster>) -> Vec
         push_label(&mut out, &holder);
     }
     for candidate in [
-        home.join(".secrets/swarm-policy.toml"),
+        home.join(".secrets")
+            .join(aterm_secrets::entry_class::SWARM_POLICY_FILE),
         home.join(".config/aterm/swarm-policy.toml"),
     ] {
         let Some(raw) = read_regular_nofollow_bounded(&candidate, 1024 * 1024) else {

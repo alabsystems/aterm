@@ -1016,7 +1016,7 @@ fn group_is_exited(
 /// End the child's unreaped process group. XNU refuses a signal with `EPERM` when only zombies
 /// remain, so prove that case from complete kernel group listings around per-process exit reads
 /// instead of treating a normal successful child exit as a process-control failure.
-fn finish_exited_group(leader: i32) -> std::io::Result<()> {
+pub(super) fn finish_exited_group(leader: i32) -> std::io::Result<()> {
     match aterm_uds::process::kill_group_until_empty(leader) {
         Ok(()) => Ok(()),
         Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {

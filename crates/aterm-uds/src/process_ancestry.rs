@@ -100,6 +100,51 @@ impl Ancestry {
         &self.nodes
     }
 
+    /// Test seam: `pid`'s path as far as this account reads it natively, without
+    /// [`Self::capture`]'s completeness. It holds `pid`'s own record, then each parent's, up to
+    /// pid 1 or to the first parent whose same-account record is unavailable. Under SSH a
+    /// root-owned `sshd` is an ancestor of every process the session starts, so there no
+    /// complete path exists to capture. This is for a test of what reads an ancestry's nodes,
+    /// never of a refusal [`Self::capture`] owes.
+    /// # Errors
+    /// `pid`'s own record is unavailable, or its birth is not `birth`.
+    #[cfg(any(test, debug_assertions))]
+    pub fn readable_prefix(pid: u32, birth: Birth) -> io::Result<Self> {
+        Self::readable_prefix_with(pid, birth, read_lineage)
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    fn readable_prefix_with(
+        pid: u32,
+        birth: Birth,
+        mut read: impl FnMut(i32) -> Option<Lineage>,
+    ) -> io::Result<Self> {
+        let mut nodes: Vec<Lineage> = Vec::new();
+        let mut next = pid;
+        while nodes.len() < MAX_ANCESTORS
+            && next > 1
+            && !nodes.iter().any(|node| node.identity.pid as u32 == next)
+        {
+            let Some(node) = i32::try_from(next).ok().and_then(&mut read) else {
+                break;
+            };
+            if node.identity.pid as u32 != next {
+                break;
+            }
+            next = node.parent;
+            nodes.push(node);
+        }
+        match nodes.first() {
+            Some(own) if own.identity.birth == birth => Ok(Self { nodes }),
+            Some(_) => Err(io::Error::other(format!(
+                "native ancestry identity changed for pid {pid}"
+            ))),
+            None => Err(io::Error::other(format!(
+                "native same-account ancestry record unavailable for pid {pid}"
+            ))),
+        }
+    }
+
     /// Reread every original birth, exec generation, group and parent.
     /// # Errors
     /// A read changes or becomes unavailable (identifying its PID), or the
@@ -281,6 +326,40 @@ mod tests {
                 .kind(),
             io::ErrorKind::TimedOut
         );
+    }
+
+    /// The seam's readable prefix: `pid`'s own native record first, each next node its parent,
+    /// ending at pid 1 or at the first parent the account cannot read (a foreign-account
+    /// `sshd`), and refused when `pid` itself is unreadable or reborn. NEGATIVE CONTROL: a walk
+    /// that refused an unreadable parent, as [`Ancestry::capture`] does, fails the second case.
+    #[test]
+    fn a_readable_prefix_ends_at_the_first_parent_this_account_cannot_read() {
+        let pid = std::process::id();
+        let identity = super::super::read_identity(pid as i32).unwrap();
+        let own = Ancestry::readable_prefix(pid, identity.birth).unwrap();
+        assert_eq!(own.nodes().first().unwrap().identity, identity);
+        for pair in own.nodes().windows(2) {
+            assert_eq!(pair[0].parent, pair[1].identity.pid as u32);
+        }
+        assert!(Ancestry::readable_prefix(pid, Birth(identity.birth.0 + 1)).is_err());
+        let lineage = |pid, birth, parent| Lineage {
+            identity: node(pid, birth, parent).identity,
+            uniqueid: birth,
+            parent,
+            pgid: 10,
+            launcher_version: None,
+            tty: None,
+        };
+        let nodes = [lineage(30, 3, 20), lineage(20, 2, 10), lineage(10, 1, 1)];
+        let read = |pid| nodes.iter().find(|n| n.identity.pid == pid).copied();
+        let whole = Ancestry::readable_prefix_with(30, Birth(3), read).unwrap();
+        assert_eq!(whole.nodes(), &nodes);
+        let foreign_parent = |pid| (pid != 10).then(|| read(pid)).flatten();
+        let prefix = Ancestry::readable_prefix_with(30, Birth(3), foreign_parent).unwrap();
+        assert_eq!(prefix.nodes(), &nodes[..2]);
+        assert!(Ancestry::capture_with(30, Birth(3), deadline(), foreign_parent).is_err());
+        let unreadable_self = |pid| (pid != 30).then(|| read(pid)).flatten();
+        assert!(Ancestry::readable_prefix_with(30, Birth(3), unreadable_self).is_err());
     }
 
     #[test]

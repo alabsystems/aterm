@@ -586,6 +586,29 @@ impl TapeValue for crate::supervise::policy::login::LoginPin {
     }
 }
 
+/// The route move the host offers ([`super::super::IdleHost::route_move`]) on a tape: its word.
+/// A DOOR NEWER THAN THE TAPE: a recording build with no `host.route_move` offered none, so its
+/// replay reads none ([`TapeValue::absent`]), where the tape's header says that build lacked the
+/// door, and only there.
+impl TapeValue for Option<crate::supervise::policy::turn_end::RouteTo> {
+    fn to_tape(&self) -> Vec<u8> {
+        json(&self.map(crate::supervise::policy::turn_end::RouteTo::word))
+    }
+
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        of_json::<Option<String>>(bytes)?
+            .map(|word| {
+                crate::supervise::policy::turn_end::RouteTo::of_word(&word)
+                    .ok_or(bad("a route this build does not know"))
+            })
+            .transpose()
+    }
+
+    fn absent() -> Option<Self> {
+        Some(None)
+    }
+}
+
 /// The account the session's profile is signed in to
 /// ([`super::super::IdleHost::login_account`]) on a tape: its key's text.
 impl TapeValue for Option<AccountKey> {

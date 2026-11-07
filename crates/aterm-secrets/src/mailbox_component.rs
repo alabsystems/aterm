@@ -5,7 +5,7 @@
 //! The names disclose neither the login nor a credential value.
 
 /// The only registered configuration a component holder may inspect.
-pub const SOURCE_ENTRY: &str = "ai-mailbox.toml";
+pub const SOURCE_ENTRY: &str = crate::entry_class::AI_MAILBOX;
 const DOMAIN: &[u8] = b"aterm/mailbox-component/1\0";
 const ENTRY_PREFIX: &str = "mailbox-field-";
 

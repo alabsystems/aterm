@@ -548,17 +548,7 @@ fn test_build() -> Build {
 
 #[cfg(unix)]
 fn cohort_seat<'m>(dir: &Path, machine: &'m Fixed) -> Seat<'m> {
-    use std::os::unix::fs::DirBuilderExt as _;
-    let home = dir.join("private-home");
-    std::fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&home)
-        .unwrap();
-    let namespace =
-        aterm_capacity::cohort_namespace::Namespace::create_private(dir, &home).unwrap();
-    let mut selected = seat(dir, machine, std::process::id());
-    selected.ledger = Some(Ledger::at(namespace.fence()));
-    selected
+    cohort_world(dir, machine).0
 }
 
 #[cfg(unix)]
@@ -883,6 +873,121 @@ fn a_claims_row_names_its_checkout_and_its_own_ledger_holds_it_whatever_its_kind
     }
 }
 
+/// A seat on a private cohort namespace's ledger in `dir`, as this process, with that namespace.
+#[cfg(unix)]
+fn cohort_world<'m>(
+    dir: &Path,
+    machine: &'m Fixed,
+) -> (Seat<'m>, aterm_capacity::cohort_namespace::Namespace) {
+    use std::os::unix::fs::DirBuilderExt as _;
+    let home = dir.join("private-home");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&home)
+        .unwrap();
+    let namespace =
+        aterm_capacity::cohort_namespace::Namespace::create_private(dir, &home).unwrap();
+    let mut selected = seat(dir, machine, std::process::id());
+    selected.ledger = Some(Ledger::at(namespace.fence()));
+    (selected, namespace)
+}
+
+/// THIS USER'S LEDGER IS THE FOLDER ITS LEDGER OPENS (TM-1 review: `ended`): a build's row is held
+/// to the folder of the ledger [`Ledger::user`] opens, its `dir`, which for an account adopted
+/// into a memory namespace is the namespace's backend, not the folder the ledger is opened from.
+/// Here the stand-in for this user's ledger is opened from a private namespace's fence and lies
+/// in its backend beside it, as an adopted account's does; a host job's claim held there ends
+/// through [`Held::end`], whose row is written. NEGATIVE CONTROL: a claim held in another scratch
+/// ledger writes none. (By hand: `ended` held to the account's capacity folder,
+/// `aterm_capacity::ledger::user_dir()`, as TM-0's admission rows were held: no row.)
+#[cfg(unix)]
+#[test]
+fn a_builds_row_is_held_to_the_folder_this_users_ledger_opens() {
+    let m = machine();
+    let world = aterm_tempfile::tempdir().expect("scratch");
+    let (selected, namespace) = cohort_world(world.path(), &m);
+    let user = selected.ledger.clone().expect("a ledger");
+    assert_eq!(user.dir(), namespace.backend());
+    assert!(!namespace.backend().starts_with(namespace.fence()));
+    let build = classify(&words(&["--unverified", "build"]), Tool::Targo).expect("claims");
+    let Admission::Claimed(held) = admit_cohort_job(&build, world.path(), &selected, &mut |_| {})
+    else {
+        panic!("a host job's claim");
+    };
+    let (_, rows) = telemetry::capture(user.clone(), || {
+        held.end(BuildEnd::Success(true), 1, &mut |_| {})
+    });
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        (&rows[0].kind, rows[0].outcome),
+        (&aterm_telemetry::Kind::Build, aterm_telemetry::Outcome::Ok)
+    );
+    let other = aterm_tempfile::tempdir().expect("scratch");
+    let s = seat(other.path(), &m, std::process::id().wrapping_add(59));
+    let Admission::Claimed(elsewhere) = admit(&test_build(), other.path(), &s, &mut |_| {}) else {
+        panic!("a holder's claim");
+    };
+    let (_, rows) = telemetry::capture(user, || {
+        elsewhere.end(BuildEnd::Success(true), 1, &mut |_| {})
+    });
+    assert!(rows.is_empty(), "another ledger's claim: {rows:?}");
+}
+
+/// A HOST JOB'S ADMISSION WRITES ONE ROW WHERE ITS LOOK DECIDES (TM-1 review): it admits through
+/// one look of a [`aterm_capacity::Waiter`] of its own, not `admit_with`, so its `kind=admission`
+/// row is written where that look decides: one, admitted, for a job that fits; one, not admitted,
+/// for a job that does not fit beside it. NEGATIVE CONTROL (by hand: this path writing no row, as
+/// before): no row for either.
+#[cfg(unix)]
+#[test]
+fn a_host_jobs_one_look_writes_one_row() {
+    let m = machine();
+    let world = aterm_tempfile::tempdir().expect("scratch");
+    let (seat, _namespace) = cohort_world(world.path(), &m);
+    let user = seat.ledger.clone().expect("a ledger");
+    let build = classify(&words(&["--unverified", "build"]), Tool::Targo).expect("claims");
+    let (first, rows) = telemetry::capture(user.clone(), || {
+        admit_cohort_job(&build, world.path(), &seat, &mut |_| {})
+    });
+    let Admission::Claimed(first) = first else {
+        panic!("the first job fits: {first:?}");
+    };
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        (&rows[0].kind, rows[0].outcome, rows[0].meter),
+        (
+            &aterm_telemetry::Kind::Admission,
+            aterm_telemetry::Outcome::Ok,
+            aterm_telemetry::Meter::Exact
+        )
+    );
+    assert_eq!(
+        rows[0].wait_ms,
+        aterm_capacity::telemetry::wait(
+            first.claim().asked_ms(),
+            first.claim().record().held.map(|h| h.admitted_ms)
+        ),
+        "the wait its build's row will say"
+    );
+    let (second, rows) = telemetry::capture(user, || {
+        admit_cohort_job(&build, world.path(), &seat, &mut |_| {})
+    });
+    assert!(
+        matches!(second, Admission::Stopped(_)),
+        "the second does not fit beside it: {second:?}"
+    );
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        (&rows[0].kind, rows[0].outcome, rows[0].stop),
+        (
+            &aterm_telemetry::Kind::Admission,
+            aterm_telemetry::Outcome::Fail,
+            aterm_telemetry::Stop::Exit
+        )
+    );
+    drop(first);
+}
+
 /// A failed build keeps its peak when it would claim more than its claim did, since its peak is
 /// the least its work takes: under a 3 GiB claim, a 5 GiB failure raises the next to 6 GiB, and
 /// under the cold 12 GiB a 14 GiB one raises it to 16.8. NEGATIVE CONTROL: a failure below what
@@ -1009,8 +1114,9 @@ fn a_fresh_builds_light_peak_never_lowers_its_claim() {
     );
 }
 
-/// A supervised build's status is its own and its peak (here the floor it is handed, which rose
-/// to 3 GiB while it ran) is kept only when it succeeded; its claim is gone once it ends.
+/// A supervised build's status is its own and a peak is kept only when it succeeded; its claim
+/// is gone once it ends. (Its floor, the root's own peak, is
+/// [`a_builds_own_peak_is_its_floor_whatever_an_earlier_child_peaked`]'s.)
 /// NEGATIVE CONTROL: a build that exits 1 keeps nothing.
 #[cfg(unix)]
 #[test]
@@ -1026,12 +1132,7 @@ fn a_supervised_build_keeps_its_peak_only_when_it_succeeds() {
         };
         let mut cmd = aterm_uds::spawnfd::transparent("/bin/sh").into_command();
         cmd.args(["-c", script]);
-        let reads = std::cell::Cell::new(0u32);
-        let rising = || {
-            reads.set(reads.get() + 1);
-            if reads.get() == 1 { 0 } else { 3 * GIB }
-        };
-        supervise(Some(*held), &mut cmd, &rising, &mut |_| {}).expect("ran")
+        supervise(Some(*held), &mut cmd, &mut |_| {}).expect("ran")
     };
     let records = || Records::load(&dir.path().join("targo-memory.json"));
     let failed = run("exit 1");
@@ -1041,7 +1142,7 @@ fn a_supervised_build_keeps_its_peak_only_when_it_succeeds() {
     assert!(ok.success());
     let rows = records();
     assert_eq!(rows.rows().len(), 1);
-    assert_eq!(rows.rows()[0].peaks[0].bytes, 3 * GIB);
+    assert!(rows.rows()[0].peaks[0].bytes > 0, "a peak kept");
     assert!(
         Ledger::at(dir.path().join("ledger"))
             .list()
@@ -1053,52 +1154,61 @@ fn a_supervised_build_keeps_its_peak_only_when_it_succeeds() {
     assert_eq!(killed.signal(), Some(libc::SIGTERM));
 }
 
-/// A front that reaped an earlier child (another tool's run, as `atpkg-publish adopt` reaps
-/// `verify test` before its build) holds that child's peak in its children's accounting: no
-/// floor of this build. NEGATIVE CONTROL: the same floor, risen to 9 GiB while the build ran, is
-/// kept.
+/// THE ROOT'S OWN PEAK IS A SUPERVISED BUILD'S FLOOR (TM-1 review): the reap that consumes its
+/// exit reads its accounting (`wait4`), which holds the root's resident peak and those of the
+/// descendants it reaped, and no other child's of the front. Here the front first reaps an
+/// earlier child that touched 512 MiB (another tool's run, as `atpkg-publish adopt` reaps
+/// `verify test` before its build); then the build, a shell, runs and reaps a child that leaves
+/// the build's group (`setsid`) before it touches 256 MiB, so the tree's meter, which reads that
+/// group, never sees it. The kept peak is the build's own 256 MiB and more, never the earlier
+/// child's 512 MiB, so a wrong unit (KiB read as bytes, bytes as KiB) fails too.
+/// NEGATIVE CONTROL (by hand: the floor read from the front's `RUSAGE_CHILDREN` and counted only
+/// where it rose while the build ran, as before): the earlier child's peak is already the
+/// front's most, no rise is seen, and the build keeps the meter's few MiB alone.
 #[cfg(unix)]
 #[test]
-fn an_earlier_childs_peak_is_no_floor_of_the_build() {
+fn a_builds_own_peak_is_its_floor_whatever_an_earlier_child_peaked() {
+    const MIB: u64 = 1 << 20;
     let dir = aterm_tempfile::tempdir().expect("scratch");
     let m = machine();
-    let s = seat(dir.path(), &m, std::process::id().wrapping_add(17));
-    let b = test_build();
-    let records = || Records::load(&dir.path().join("targo-memory.json"));
-    let peaks = || {
-        records()
-            .rows()
-            .iter()
-            .flat_map(|r| r.peaks.iter().map(|p| p.bytes))
-            .collect::<Vec<_>>()
-    };
-    let run = |floor: &dyn Fn() -> u64| {
-        let Admission::Claimed(held) = admit(&b, dir.path(), &s, &mut |_| {}) else {
-            panic!("expected a claim");
-        };
-        let mut cmd = aterm_uds::spawnfd::transparent("/bin/sh").into_command();
-        cmd.args(["-c", "exit 0"]);
-        assert!(
-            supervise(Some(*held), &mut cmd, floor, &mut |_| {})
-                .expect("ran")
-                .success()
-        );
-    };
-    run(&|| 9 * GIB);
+    let s = seat(dir.path(), &m, std::process::id().wrapping_add(19));
     assert!(
-        peaks().iter().all(|&p| p < 9 * GIB),
-        "an earlier child's 9 GiB is not this build's: {:?}",
-        peaks()
+        touching_child("touch:512")
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .status()
+            .expect("the earlier child")
+            .success()
     );
-    let reads = std::cell::Cell::new(0u32);
-    run(&|| {
-        reads.set(reads.get() + 1);
-        if reads.get() == 1 { 0 } else { 9 * GIB }
-    });
+    let Admission::Claimed(held) = admit(&test_build(), dir.path(), &s, &mut |_| {}) else {
+        panic!("expected a claim");
+    };
+    let exe = std::env::current_exe().expect("test binary");
+    let mut cmd = aterm_uds::spawnfd::transparent("/bin/sh").into_command();
+    cmd.args([
+        "-c",
+        "\"$0\" \"$@\" >/dev/null 2>&1; exit $?",
+        exe.to_str().expect("a UTF-8 path"),
+    ])
+    .args(standin_words())
+    .env(TOUCH_STANDIN, "away:256");
     assert!(
-        peaks().contains(&(9 * GIB)),
-        "the floor risen while it ran is kept: {:?}",
-        peaks()
+        supervise(Some(*held), &mut cmd, &mut |_| {})
+            .expect("ran")
+            .success()
+    );
+    let peaks = Records::load(&dir.path().join("targo-memory.json"))
+        .rows()
+        .iter()
+        .flat_map(|r| r.peaks.iter().map(|p| p.bytes))
+        .collect::<Vec<_>>();
+    let [kept] = peaks[..] else {
+        panic!("one peak kept: {peaks:?}");
+    };
+    assert!(kept >= 256 * MIB, "the build's own: {} MiB", kept / MIB);
+    assert!(
+        kept < 512 * MIB,
+        "never the earlier child's: {} MiB",
+        kept / MIB
     );
 }
 
@@ -1151,7 +1261,7 @@ fn a_supervised_builds_child_does_not_hold_the_claim() {
         }
         let mut cmd = aterm_uds::spawnfd::transparent("/bin/sh").into_command();
         cmd.args(["-c", &aterm_uds::host::held_probe(fd)]);
-        let status = supervise(Some(*held), &mut cmd, &|| 0, &mut |_| {}).expect("ran");
+        let status = supervise(Some(*held), &mut cmd, &mut |_| {}).expect("ran");
         status.code()
     };
     assert_eq!(probe(false), Some(0), "the child holds no claim");
@@ -1188,7 +1298,7 @@ fn standin_front_supervises_a_cat() {
     let build = std::env::var(FORWARD_BUILD).unwrap_or_else(|_| A_CAT.to_owned());
     let mut cmd = aterm_uds::spawnfd::transparent("/bin/sh").into_command();
     cmd.args(["-c", &build]);
-    let status = supervise(Some(*held), &mut cmd, &|| 0, &mut |_| {}).expect("ran");
+    let status = supervise(Some(*held), &mut cmd, &mut |_| {}).expect("ran");
     let _ = end_like(status);
     std::process::exit(status.code().unwrap_or(1));
 }
@@ -1532,7 +1642,7 @@ fn a_supervised_build_is_handed_its_claims_cover_marker() {
         &format!("printf %s \"$ATERM_CAPACITY_COVER\" > '{}'", out.display()),
     ])
     .env(aterm_capacity::COVER_ENV, aterm_capacity::NO_COVER);
-    let status = supervise(Some(*held), &mut cmd, &|| 0, &mut |_| {}).expect("ran");
+    let status = supervise(Some(*held), &mut cmd, &mut |_| {}).expect("ran");
     assert!(status.success());
     assert_eq!(std::fs::read_to_string(&out).expect("it said"), marker);
 }
@@ -1540,65 +1650,83 @@ fn a_supervised_build_is_handed_its_claims_cover_marker() {
 #[cfg(unix)]
 const TOUCH_STANDIN: &str = "ATPKG_BUILD_ADMIT_TOUCH_STANDIN";
 
-/// The stand-ins of [`a_fronts_floor_is_its_reaped_childs_resident_peak`]: with `TOUCH_STANDIN`
-/// set to `touch`, touch 256 MiB and end; set to `front`, run one of those as this process's one
-/// child, reap it, and say [`children_maxrss`]. Run alone, it does nothing.
+/// A ROOT REAPED ALREADY REAPS TO ITS STATUS (review of the root's own peak): a cohort's capture
+/// reaps a root that ended before it ([`aterm_capacity::cohort::Cohort::of_spawned`]), and the
+/// supervisor's reap then gives the status that reap took, not an error. Here a plain reap took
+/// a root's exit 3, and a root reaped with its accounting first keeps it. NEGATIVE CONTROL (by
+/// hand: no guard): the accounted reap of the first refuses, "already reaped without resource
+/// accounting".
 #[cfg(unix)]
 #[test]
-fn standin_touches_or_reads_its_child() {
-    match std::env::var(TOUCH_STANDIN).as_deref() {
-        Ok("touch") => {
-            let held = vec![1u8; 256 << 20];
-            assert_eq!(held.iter().map(|&b| u64::from(b)).sum::<u64>(), 256 << 20);
-        }
-        Ok("front") => {
-            let status = touching_child("touch")
-                .stdout(aterm_uds::spawnfd::Stdio::null())
-                .status()
-                .expect("the child");
-            assert!(status.success());
-            println!("CHILDREN_MAXRSS {}", children_maxrss());
-        }
-        _ => {}
+fn a_root_reaped_already_reaps_to_its_status() {
+    let spawn = || {
+        aterm_uds::spawnfd::command("/bin/sh")
+            .args(["-c", "exit 3"])
+            .spawn()
+            .expect("sh")
+    };
+    let mut plain = spawn();
+    assert_eq!(plain.wait().expect("reaped").code(), Some(3));
+    assert_eq!(
+        reap_accounted(&mut plain).expect("its status").code(),
+        Some(3)
+    );
+    assert_eq!(plain.usage(), None, "a plain reap collects none: no floor");
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_vendor = "apple", target_os = "linux")
+    ))]
+    {
+        let mut accounted = spawn();
+        let usage = accounted
+            .wait_with_rusage()
+            .expect("reaped with its accounting");
+        assert_eq!(
+            reap_accounted(&mut accounted).expect("its status").code(),
+            Some(3)
+        );
+        assert_eq!(accounted.usage(), Some(usage), "its accounting, kept");
     }
 }
 
-/// This test binary as [`standin_touches_or_reads_its_child`] in `role`.
+/// The stand-in of [`a_builds_own_peak_is_its_floor_whatever_an_earlier_child_peaked`]: with
+/// `TOUCH_STANDIN` set to `touch:<MiB>`, touch that many MiB and end; set to `away:<MiB>`, first
+/// leave its parent's group and session (`setsid`), so that a meter of that group never reads it.
+/// Run alone, it does nothing.
+#[cfg(unix)]
+#[test]
+fn standin_touches() {
+    let Ok(role) = std::env::var(TOUCH_STANDIN) else {
+        return;
+    };
+    let (how, mib) = role.split_once(':').expect("<how>:<MiB>");
+    if how == "away" {
+        // SAFETY: `setsid` takes no arguments; this stand-in leads no group, so it may.
+        assert_ne!(unsafe { libc::setsid() }, -1, "it left its group");
+    }
+    let held = vec![1u8; mib.parse::<usize>().expect("MiB") << 20];
+    std::hint::black_box(&held);
+}
+
+/// The words that run this test binary as [`standin_touches`].
+#[cfg(unix)]
+fn standin_words() -> [&'static str; 4] {
+    [
+        "--exact",
+        "build_admit::tests::standin_touches",
+        "--test-threads=1",
+        "--nocapture",
+    ]
+}
+
+/// This test binary as [`standin_touches`] in `role`.
 #[cfg(unix)]
 fn touching_child(role: &str) -> aterm_uds::spawnfd::Command {
     let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"));
-    cmd.args([
-        "--exact",
-        "build_admit::tests::standin_touches_or_reads_its_child",
-        "--test-threads=1",
-        "--nocapture",
-    ])
-    .env(TOUCH_STANDIN, role)
-    .stderr(aterm_uds::spawnfd::Stdio::null());
+    cmd.args(standin_words())
+        .env(TOUCH_STANDIN, role)
+        .stderr(aterm_uds::spawnfd::Stdio::null());
     cmd
-}
-
-/// A front's floor is its reaped child's resident peak, bytes: a child that touched 256 MiB
-/// reads at least that and less than 2 GiB, so a wrong unit (KiB read as bytes, bytes as KiB) or
-/// a misread layout fails. NEGATIVE CONTROL (by hand: the KiB scaling applied on macOS): 256 GiB
-/// and more.
-#[cfg(unix)]
-#[test]
-fn a_fronts_floor_is_its_reaped_childs_resident_peak() {
-    let out = touching_child("front")
-        .output()
-        .expect("the stand-in front");
-    let said = String::from_utf8_lossy(&out.stdout);
-    let rss: u64 = said
-        .lines()
-        .find_map(|l| {
-            l[l.find("CHILDREN_MAXRSS ")? + "CHILDREN_MAXRSS ".len()..]
-                .parse()
-                .ok()
-        })
-        .expect("it said");
-    assert!(rss >= 256 << 20, "{} MiB", rss >> 20);
-    assert!(rss < 2 << 30, "{} MiB", rss >> 20);
 }
 
 const MODE_STANDIN: &str = "ATPKG_BUILD_ADMIT_MODE_STANDIN";
@@ -1676,7 +1804,7 @@ fn standin_front_ends_as_its_build() {
     };
     let mut cmd = aterm_uds::spawnfd::transparent("/bin/sh").into_command();
     cmd.args(["-c", &format!("kill -{sig} $$")]);
-    let status = supervise(Some(*held), &mut cmd, &|| 0, &mut |_| {}).expect("ran");
+    let status = supervise(Some(*held), &mut cmd, &mut |_| {}).expect("ran");
     raise_like(&status);
     std::process::exit(
         status
@@ -2210,6 +2338,102 @@ fn an_unproven_nested_lock_takes_its_turn_at_the_ledgers_lock() {
     });
     let (claimed, admitted) = nested.join().expect("the nested admission");
     assert!(claimed, "{admitted} after {met:?}");
+}
+
+/// A NESTED BUILD'S LOOK IN ITS TURN WRITES ONE ROW WHERE IT DECIDES (TM-1 review): under an
+/// unproven lock it admits through a [`aterm_capacity::Waiter`] of its own, not `admit_with`, so
+/// its `kind=admission` row is written once its look decides, however many looks met the
+/// ledger's lock: here three looks met it before one admitted, and one row says it, admitted.
+/// A look short of memory writes one row, not admitted. NEGATIVE CONTROLS (by hand: this path
+/// writing no row, as before: none; a row each look: four for the first).
+#[test]
+fn a_nested_builds_look_in_its_turn_writes_one_row_where_it_decides() {
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let ledger = Ledger::at(dir.path().join("ledger"));
+    let turn = ledger
+        .hold_turn()
+        .expect("the ledger's lock")
+        .expect("free");
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let path = dir.path().to_owned();
+    let user = ledger.clone();
+    let nested = std::thread::spawn(move || {
+        let m = machine();
+        let mut s = seat(&path, &m, std::process::id().wrapping_add(43));
+        s.pace = Pace {
+            poll: std::time::Duration::from_millis(5),
+            line_every: std::time::Duration::ZERO,
+        };
+        telemetry::capture(user, || {
+            matches!(
+                admit_bounded(
+                    &test_build(),
+                    &path,
+                    &s,
+                    &|| Some(PathBuf::from("/foreign/.cargo-lock")),
+                    &mut |line| {
+                        let _ = tx.send(line.to_owned());
+                    },
+                ),
+                Admission::Claimed(_)
+            )
+        })
+    });
+    let lock = aterm_capacity::Short::Turn {
+        holder: Some(std::process::id()),
+    }
+    .to_string();
+    let mut met = 0;
+    while met < 3 {
+        let line = rx
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("a line naming the lock's holder");
+        met += usize::from(line.contains(&lock));
+    }
+    drop(turn);
+    aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "its admission", || {
+        nested.is_finished().then_some(())
+    });
+    let (claimed, rows) = nested.join().expect("the nested admission");
+    assert!(claimed);
+    assert_eq!(rows.len(), 1, "one row however many looks: {rows:?}");
+    assert_eq!(
+        (&rows[0].kind, rows[0].outcome),
+        (
+            &aterm_telemetry::Kind::Admission,
+            aterm_telemetry::Outcome::Ok
+        )
+    );
+    let m = machine();
+    let s = seat(dir.path(), &m, std::process::id().wrapping_add(43));
+    let alone = aterm_capacity::admit_with(
+        &ledger,
+        &m,
+        Need::new("unrelated alone").mem(64 * GIB).alone(),
+        Admit::Now,
+        Pace::default(),
+        &mut |_| {},
+    )
+    .expect("unrelated ALONE claim");
+    let (refused, rows) = telemetry::capture(ledger.clone(), || {
+        admit_bounded(
+            &test_build(),
+            dir.path(),
+            &s,
+            &|| Some(PathBuf::from("/foreign/.cargo-lock")),
+            &mut |_| {},
+        )
+    });
+    assert!(matches!(refused, Admission::Refused(_)), "{refused:?}");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        (&rows[0].kind, rows[0].outcome),
+        (
+            &aterm_telemetry::Kind::Admission,
+            aterm_telemetry::Outcome::Fail
+        )
+    );
+    drop(alone);
 }
 
 /// A WAITING FRONT'S LEDGER SAYS WHAT IT WAITS FOR ([`front_claim`]), read off a real ledger: its

@@ -93,7 +93,7 @@ fn me(label: &str) -> Me<'_> {
         account: Some(label),
         left: None,
         default_home: true,
-        stored_login: true,
+        route: crate::harness::accounts::AuthRoute::Stored,
     }
 }
 
@@ -1714,7 +1714,7 @@ fn rule_1_stays_for_a_session_the_roster_does_not_govern() {
         ..me("main")
     };
     let api_key = Me {
-        stored_login: false,
+        route: crate::harness::accounts::AuthRoute::Outside,
         ..me("main")
     };
     for (roster, who, mode, why) in [
@@ -5948,7 +5948,7 @@ fn stored() -> ProcessLogin {
     ProcessLogin {
         login: None,
         default_home: true,
-        stored_login: true,
+        route: crate::harness::accounts::AuthRoute::Stored,
     }
 }
 
@@ -6022,7 +6022,7 @@ fn a_process_login_is_read_from_its_own_environment_and_nothing_else() {
             assert_eq!(
                 env_of(&[(name, value)]),
                 ProcessLogin {
-                    stored_login: false,
+                    route: crate::harness::accounts::AuthRoute::Outside,
                     ..stored()
                 },
                 "{name}={value:?}"
@@ -6041,12 +6041,16 @@ fn a_process_login_is_read_from_its_own_environment_and_nothing_else() {
         ProcessLogin {
             login: Some("/logins/pool-a".to_string()),
             default_home: false,
-            stored_login: false,
+            route: crate::harness::accounts::AuthRoute::Outside,
         }
     );
 
     assert!(!env_of(&[(HOME_ENV, ""), (HOME_ENV, "/elsewhere")]).default_home);
-    assert!(!env_of(&[("ANTHROPIC_API_KEY", "k"), ("ANTHROPIC_API_KEY", "")]).stored_login);
+    assert!(
+        !env_of(&[("ANTHROPIC_API_KEY", "k"), ("ANTHROPIC_API_KEY", "")])
+            .route
+            .is_stored()
+    );
     for (a, b) in [
         ("/logins/work-2", "/logins/pool-a"),
         ("/logins/work-2", ""),
@@ -6059,7 +6063,7 @@ fn a_process_login_is_read_from_its_own_environment_and_nothing_else() {
             ProcessLogin {
                 login: Some(a.to_string()).filter(|a| !a.is_empty()),
                 default_home: true,
-                stored_login: false,
+                route: crate::harness::accounts::AuthRoute::Outside,
             },
             "{a:?} then {b:?}"
         );
@@ -6106,7 +6110,7 @@ fn a_process_login_names_its_row_byte_for_byte() {
             account: Some("pool-a"),
             left: None,
             default_home: false,
-            stored_login: false,
+            route: crate::harness::accounts::AuthRoute::Outside,
         }
     );
 }
@@ -7046,7 +7050,7 @@ fn the_vendors_profile_source_is_not_a_stored_login() {
         "ANTHROPIC_IDENTITY_TOKEN_FILE",
         "ANTHROPIC_CONFIG_DIR",
     ] {
-        assert!(!env_of(&[(name, "x")]).stored_login, "{name}");
+        assert!(!env_of(&[(name, "x")]).route.is_stored(), "{name}");
         assert_eq!(env_of(&[(name, "")]), stored(), "{name}=");
     }
 
@@ -7089,14 +7093,14 @@ fn the_vendors_profile_source_is_not_a_stored_login() {
     assert!(profile_configured(&configs.join("notes.txt")));
 
     assert_eq!(stored().with_profile_store(false), stored());
-    assert!(!stored().with_profile_store(true).stored_login);
+    assert!(!stored().with_profile_store(true).route.is_stored());
     let keyed = env_of(&[("ANTHROPIC_API_KEY", "k")]);
-    assert!(!keyed.with_profile_store(false).stored_login);
+    assert!(!keyed.with_profile_store(false).route.is_stored());
     let elsewhere = env_of(&[(HOME_ENV, "/elsewhere"), (LOGIN_ENV, "/logins/work-2")]);
     assert_eq!(
         elsewhere.clone().with_profile_store(true),
         ProcessLogin {
-            stored_login: false,
+            route: crate::harness::accounts::AuthRoute::Outside,
             ..elsewhere
         },
         "nothing else is touched"
@@ -7134,39 +7138,47 @@ fn a_settings_file_can_take_a_stored_login_away_and_never_gives_one() {
         .chain(crate::harness::netwatch::ROUTE_KEYS)
         .chain(&["CLAUDE_CODE_PROXY_URL"]);
     for name in listed {
-        assert!(!with(&[block(name, "x")]).stored_login, "{name}");
+        assert!(!with(&[block(name, "x")]).route.is_stored(), "{name}");
         assert!(
-            !with(&[Source::Missing, quiet[1].clone(), block(name, "0")]).stored_login,
+            !with(&[Source::Missing, quiet[1].clone(), block(name, "0")])
+                .route
+                .is_stored(),
             "{name}: any source of several"
         );
         assert_eq!(with(&[block(name, "")]), stored(), "{name}=");
     }
     let number = Source::Text(r#"{"env":{"CLAUDE_CODE_USE_GATEWAY":1}}"#.to_string());
-    assert!(!with(&[number]).stored_login);
+    assert!(!with(&[number]).route.is_stored());
 
-    assert!(!with(&[block(LOGIN_ENV, "/logins/work-2")]).stored_login);
-    assert!(!with(&[block(LOGIN_ENV, "")]).stored_login);
-    assert!(!with(&[block(HOME_ENV, "/elsewhere")]).stored_login);
+    assert!(
+        !with(&[block(LOGIN_ENV, "/logins/work-2")])
+            .route
+            .is_stored()
+    );
+    assert!(!with(&[block(LOGIN_ENV, "")]).route.is_stored());
+    assert!(!with(&[block(HOME_ENV, "/elsewhere")]).route.is_stored());
     assert_eq!(with(&[block(HOME_ENV, "")]), stored());
 
     let helper = Source::Text(r#"{"apiKeyHelper":"/usr/local/bin/key"}"#.to_string());
-    assert!(!with(std::slice::from_ref(&helper)).stored_login);
-    assert!(!with(&[Source::Unreadable]).stored_login);
+    assert!(!with(std::slice::from_ref(&helper)).route.is_stored());
+    assert!(!with(&[Source::Unreadable]).route.is_stored());
     for unparsed in ["{env", "[1]", "{\"env\":[1]}"] {
         assert!(
-            !with(&[Source::Text(unparsed.to_string())]).stored_login,
+            !with(&[Source::Text(unparsed.to_string())])
+                .route
+                .is_stored(),
             "{unparsed}"
         );
     }
 
     let keyed = env_of(&[("ANTHROPIC_API_KEY", "k")]);
-    assert!(!keyed.with_settings(&[]).stored_login);
+    assert!(!keyed.with_settings(&[]).route.is_stored());
     let elsewhere = env_of(&[(HOME_ENV, "/elsewhere"), (LOGIN_ENV, "/logins/work-2")]);
     let named = [("the user's settings".to_string(), helper)];
     assert_eq!(
         elsewhere.clone().with_settings(&named),
         ProcessLogin {
-            stored_login: false,
+            route: crate::harness::accounts::AuthRoute::Outside,
             ..elsewhere
         }
     );
@@ -7186,14 +7198,18 @@ fn the_lab_stubs_url_is_no_stored_login_where_its_seam_is_not_read() {
     );
     assert!(!lab_route("ANTHROPIC_BASE_URL", stub));
     assert!(lab_default_route(Some(stub), "ANTHROPIC_BASE_URL", stub));
-    assert!(!env_of(&[("ANTHROPIC_BASE_URL", stub), (LOGIN_ENV, "/logins/a")]).stored_login);
+    assert!(
+        !env_of(&[("ANTHROPIC_BASE_URL", stub), (LOGIN_ENV, "/logins/a")])
+            .route
+            .is_stored()
+    );
     let settings = [(
         "the user's settings".to_string(),
         Source::Text(format!(
             "{{\"apiKeyHelper\":null,\"env\":{{\"ANTHROPIC_BASE_URL\":\"{stub}\",\"HTTPS_PROXY\":null}}}}"
         )),
     )];
-    assert!(!stored().with_settings(&settings).stored_login);
+    assert!(!stored().with_settings(&settings).route.is_stored());
 }
 
 #[test]
@@ -9371,7 +9387,7 @@ fn a_grok_process_is_judged_by_the_auth_file_its_seam_names() {
         "/logins/work\u{2028}1/auth.json",
     ] {
         let who = ProcessLogin::of_env_for(Cli::Codex, [("CODEX_AUTH_PATH", malformed)]);
-        assert!(!who.stored_login, "{malformed:?}: {who:?}");
+        assert!(!who.route.is_stored(), "{malformed:?}: {who:?}");
         assert_eq!(
             who.login.as_deref(),
             Some(malformed),
@@ -9399,7 +9415,7 @@ fn a_relative_login_file_never_names_the_default_account() {
         for value in ["auth.json", "./auth.json", "nested/auth.json"] {
             let who = ProcessLogin::of_env_for(cli, [(var, value)]);
             assert_eq!(judged_label(&roster, &who), None, "{cli:?}: {value}");
-            assert!(!who.stored_login, "{cli:?}: {value}");
+            assert!(!who.route.is_stored(), "{cli:?}: {value}");
             assert_eq!(who.login.as_deref(), Some(value), "retain the unbound path");
         }
     }
@@ -9438,7 +9454,7 @@ fn a_kimi_process_is_judged_off_its_row_by_an_environment_model_or_header_alone(
         ("KIMI_CODE_CUSTOM_HEADERS", "Authorization: Bearer k"),
     ] {
         let who = on(ahead);
-        assert!(!who.stored_login, "{ahead:?}");
+        assert!(!who.route.is_stored(), "{ahead:?}");
         assert_eq!(judged_label(&roster, &who), None, "{ahead:?}");
     }
     for beside in [
@@ -10091,4 +10107,164 @@ fn a_login_belongs_to_the_row_that_holds_it_before_any_that_left_it() {
     assert_eq!(labels(left.rows_of_login(Some("/l/a"))), ["a"], "CONTROL");
     assert_eq!(labels(left.rows_of_login(None)), ["a", "b"], "CONTROL");
     assert!(left.rows_of_login(Some("/l/none")).is_empty(), "CONTROL");
+}
+
+/// The lab key of each login email [`token_roster`] names.
+fn token_keyer(_realm: &str, email: &str) -> Option<String> {
+    match email {
+        "main@example.com" => Some("ac-00000000000000a1".to_owned()),
+        "work@example.com" => Some("ac-00000000000000b2".to_owned()),
+        _ => None,
+    }
+}
+
+/// [`three`], with `main` and `work-2` naming their login emails and `pool-a` none.
+fn token_roster() -> Roster {
+    let mut r = three();
+    r.rows[0].email = Some("main@example.com".to_owned());
+    r.rows[1].email = Some("work@example.com".to_owned());
+    r
+}
+
+fn token_entry(name: &str) -> TokenEntry {
+    TokenEntry::parse(name).expect("a token entry")
+}
+
+#[test]
+fn a_token_entry_spells_only_an_account_entry_of_the_token_class() {
+    let entry = token_entry("aterm-claude-token-ac-00000000000000a1");
+    assert_eq!(entry.name(), "aterm-claude-token-ac-00000000000000a1");
+    assert_eq!(entry.key().as_str(), "ac-00000000000000a1");
+    assert_eq!(format!("{entry}"), entry.name());
+    assert_eq!(format!("{entry:?}"), entry.name());
+    for refused in [
+        "aterm-claude-token-ac-00000000000000a1-meta",
+        "aterm-claude-token-sa-00000000000000a1",
+        "aterm-claude-token-ac-00000000000000A1",
+        "ac-00000000000000a1",
+        "aterm-claude-token-",
+    ] {
+        assert_eq!(TokenEntry::parse(refused), None, "{refused}");
+    }
+}
+
+#[test]
+fn each_reader_role_decides_a_token_route() {
+    let (entry, other) = (
+        token_entry("aterm-claude-token-ac-00000000000000a1"),
+        token_entry("aterm-claude-token-ac-00000000000000b2"),
+    );
+    let token = AuthRoute::VaultToken { entry };
+    // Attribution counts the account's own credential, either route.
+    assert!(AuthRoute::Stored.on_account() && token.on_account());
+    assert!(!AuthRoute::Outside.on_account());
+    // A login service, and another CLI's reader, leave the token route out.
+    assert!(AuthRoute::Stored.is_stored());
+    assert!(!token.is_stored() && !AuthRoute::Outside.is_stored());
+    // A gate keeps a token route only for the account whose entry its marker names.
+    assert_eq!(token.for_account(Some(entry)), token);
+    assert_eq!(token.for_account(Some(other)), AuthRoute::Outside);
+    assert_eq!(token.for_account(None), AuthRoute::Outside);
+    assert_eq!(AuthRoute::Stored.for_account(None), AuthRoute::Stored);
+    assert_eq!(
+        AuthRoute::Outside.for_account(Some(entry)),
+        AuthRoute::Outside
+    );
+    assert_eq!(
+        [AuthRoute::Stored, token, AuthRoute::Outside].map(AuthRoute::word),
+        ["stored", "token", "outside"]
+    );
+    assert_eq!(AuthRoute::default(), AuthRoute::Outside);
+}
+
+#[test]
+fn a_token_route_credits_only_the_row_whose_entry_its_marker_names() {
+    let r = token_roster();
+    crate::harness::journal::with_keyer(token_keyer, || {
+        let entry_of = |label| TokenEntry::of_row(r.row(label).unwrap()).unwrap();
+        let (main, work) = (entry_of("main"), entry_of("work-2"));
+        assert_ne!(main, work);
+        let on = |login: Option<&str>, entry| ProcessLogin {
+            login: login.map(str::to_owned),
+            default_home: true,
+            route: AuthRoute::VaultToken { entry },
+        };
+        let work_dir = Some(at!("/logins/work-2"));
+        assert_eq!(
+            on(work_dir, work).me(&r).route,
+            AuthRoute::VaultToken { entry: work }
+        );
+        assert_eq!(judged_label(&r, &on(work_dir, work)), Some("work-2"));
+        assert_eq!(judged_label(&r, &on(None, main)), Some("main"));
+        // A marker naming another account's entry reads as outside it, credited to no row.
+        assert_eq!(on(work_dir, main).me(&r).route, AuthRoute::Outside);
+        assert_eq!(judged_label(&r, &on(work_dir, main)), None);
+        assert_eq!(judged_label(&r, &on(None, work)), None);
+        // A row the lab cannot key (no email) has no entry a marker can name.
+        assert_eq!(
+            on(Some(at!("/logins/pool-a")), work).me(&r).route,
+            AuthRoute::Outside
+        );
+    });
+}
+
+#[test]
+fn advise_moves_a_token_route_as_a_stored_login_and_stays_only_outside() {
+    let r = three();
+    let mut s = on_main();
+    limited(&mut s, "main", NOW + HOUR);
+    let enrolled = all(&r);
+    let entry = token_entry("aterm-claude-token-ac-00000000000000a1");
+    let token = Me {
+        route: AuthRoute::VaultToken { entry },
+        ..me("main")
+    };
+    assert_eq!(
+        advise(&r, &s, &enrolled, &token, &wall(), Mode::Early, NOW),
+        advise(&r, &s, &enrolled, &me("main"), &wall(), Mode::Early, NOW),
+    );
+    assert!(matches!(
+        advise(&r, &s, &enrolled, &token, &wall(), Mode::Early, NOW),
+        Advice::Move { .. }
+    ));
+    let outside = Me {
+        route: AuthRoute::Outside,
+        ..me("main")
+    };
+    assert_eq!(
+        advise(&r, &s, &enrolled, &outside, &wall(), Mode::Early, NOW),
+        Advice::Stay(StayWhy::NotAStoredLogin)
+    );
+}
+
+#[test]
+fn settings_and_the_profile_store_only_move_a_route_toward_outside() {
+    use crate::harness::netwatch::Source;
+    let entry = token_entry("aterm-claude-token-ac-00000000000000a1");
+    let helper = Source::Text(r#"{"apiKeyHelper":"/bin/key"}"#.to_owned());
+    for route in [
+        AuthRoute::Stored,
+        AuthRoute::VaultToken { entry },
+        AuthRoute::Outside,
+    ] {
+        let who = ProcessLogin {
+            login: None,
+            default_home: true,
+            route,
+        };
+        let with = |source: Source| {
+            who.clone()
+                .with_settings(&[("user".to_owned(), source)])
+                .route
+        };
+        assert_eq!(who.clone().with_settings(&[]).route, route);
+        assert_eq!(with(Source::Missing), route);
+        assert_eq!(with(Source::Unreadable), AuthRoute::Outside);
+        assert_eq!(with(helper.clone()), AuthRoute::Outside);
+        assert_eq!(who.clone().with_profile_store(false).route, route);
+        assert_eq!(
+            who.clone().with_profile_store(true).route,
+            AuthRoute::Outside
+        );
+    }
 }

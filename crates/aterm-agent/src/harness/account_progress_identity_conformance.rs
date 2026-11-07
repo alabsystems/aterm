@@ -96,7 +96,7 @@ fn project(case: i64, fault: Fault) -> [(&'static str, i64); 9] {
         account: Some("current"),
         left: None,
         default_home: true,
-        stored_login: true,
+        route: crate::harness::accounts::AuthRoute::Stored,
     };
     let point = match case {
         10 => None,

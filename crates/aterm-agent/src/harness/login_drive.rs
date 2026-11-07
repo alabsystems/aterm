@@ -22,7 +22,9 @@ use crate::ai::connector::{Cli, Completion, Drive, Flow, Grammar, Region, Route,
 pub use super::auth_deadline::Deadline;
 
 /// The hang detector of one sign-in: the vendors' device codes live 15 minutes (Codex's) to
-/// 30 (Kimi's), and a sign-in the page never approved is ended at this.
+/// 30 (Kimi's), and a sign-in the page never approved is ended at this. A setup-token capture
+/// (`super::setup_token`) is bounded by it too, measured as every use here is, on both clocks
+/// ([`WakeDeadline`]), so a Mac that slept does not stretch it.
 pub const HANG: Duration = Duration::from_secs(15 * 60);
 
 /// The most of one line that is read; the rest of it is dropped unread.
@@ -103,6 +105,17 @@ pub const PASSED: &[&str] = &[
     "NO_PROXY",
     "no_proxy",
 ];
+
+/// [`PASSED`] less every variable that routes a request somewhere ([`super::netwatch::ROUTE_KEYS`]:
+/// the proxies in both cases), so a child handed only these takes the default route: who it is,
+/// where its temporary files go, its locale, its certificates and `NO_PROXY`, which routes
+/// nothing. The setup-token capture's child is handed these (`super::setup_token`).
+pub fn passed_unrouted() -> impl Iterator<Item = &'static str> {
+    PASSED
+        .iter()
+        .copied()
+        .filter(|name| !super::netwatch::ROUTE_KEYS.contains(name))
+}
 
 /// `raw` without its ANSI escapes (CSI, OSC and two-byte sequences) or other control
 /// characters, and, where a carriage return redrew the line, only what follows the last one.

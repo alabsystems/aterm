@@ -619,6 +619,14 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// The route move this host offers the session's Claude Code at the point just asked
+    /// ([`Self::account`]): onto its account's vault token now in use on this Mac, or back onto
+    /// its row's stored login from a token that cannot serve
+    /// ([`crate::supervise::policy::turn_end::TurnEndReading::route`]). `None` by default.
+    fn route_move(&self) -> Option<crate::supervise::policy::turn_end::RouteTo> {
+        None
+    }
+
     fn account_served(&self) {}
 
     fn account_answered(&self, bad: AccountBad) {

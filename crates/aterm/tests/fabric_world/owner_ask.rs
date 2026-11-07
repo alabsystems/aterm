@@ -2050,29 +2050,52 @@ fn launches(inst: &Inst) -> Vec<(u32, String)> {
         .collect()
 }
 
-/// Check the actual argument boundaries: an admitted stable executable may add
-/// one managed status-line JSON argument without replacing the saved model or
-/// conversation. A build-cache executable is deliberately not admitted for the tap.
+/// Whether `inst`'s aterm can name itself in the usage tap's status-line command
+/// (`aterm_agent::harness::tap::stable_exe`, judged on the image this world launches with the
+/// temporary directory the instance runs with): a lasting path, neither under a temporary
+/// directory nor under a `CACHEDIR.TAG` folder, that the command can spell. A build Cargo left in
+/// its target directory (which Cargo tags `CACHEDIR.TAG`) is not lasting, so the relaunch rightly
+/// carries no tap; an image at a lasting path (`ATERM_TEST_EXECUTABLE`) does.
+fn tap_named(inst: &Inst) -> bool {
+    let exe = Path::new(harness::aterm());
+    let roots = aterm_toolchain::lasting::temp_roots_from(inst.root.join("tmp"));
+    !aterm_toolchain::lasting::transient(exe, &roots)
+        && aterm_agent::harness::tap::exe_admissible(exe)
+}
+
+/// Check the actual argument boundaries: the relaunch resumes the saved model and conversation
+/// with no other argument but, exactly where the instance's aterm can name itself in the tap
+/// ([`tap_named`]), one intact managed status-line `--settings` JSON document.
 fn assert_stored_resume_arguments(inst: &Inst, pid: u32) {
     let encoded = std::fs::read_to_string(inst.root.join(format!("launch-{pid}.argv")))
         .expect("the launch wrote its argv before announcing itself");
     assert!(encoded.ends_with('\0'), "complete argument record");
     let mut args: Vec<&str> = encoded.split_terminator('\0').collect();
-    if let Some(settings_at) = args.iter().position(|arg| *arg == "--settings") {
-        assert_eq!(args.iter().filter(|arg| **arg == "--settings").count(), 1);
-        let settings: aterm_json::Value = aterm_json::from_str(args[settings_at + 1])
-            .expect("the settings argument is an intact JSON document");
-        let settings = settings.as_object().expect("settings object");
-        assert_eq!(settings.len(), 1, "only managed status settings were added");
-        let status = settings.get("statusLine").expect("managed status line");
-        assert_eq!(status["type"].as_str(), Some("command"));
-        assert!(
-            status["command"]
-                .as_str()
-                .is_some_and(|command| !command.is_empty())
+    let settings_at = args.iter().position(|arg| *arg == "--settings");
+    let named = tap_named(inst);
+    eprintln!("the aterm under test names the tap: {named}; the relaunch's argv: {args:?}");
+    if !named {
+        assert_eq!(
+            settings_at, None,
+            "an aterm at a transient path names no tap: {args:?}"
         );
-        args.drain(settings_at..=settings_at + 1);
+        assert_eq!(args, ["--model", "opus", "--resume", CONVERSATION]);
+        return;
     }
+    let settings_at = settings_at.expect("stored relaunch keeps the managed status line");
+    assert_eq!(args.iter().filter(|arg| **arg == "--settings").count(), 1);
+    let settings: aterm_json::Value = aterm_json::from_str(args[settings_at + 1])
+        .expect("the settings argument is an intact JSON document");
+    let settings = settings.as_object().expect("settings object");
+    assert_eq!(settings.len(), 1, "only managed status settings were added");
+    let status = settings.get("statusLine").expect("managed status line");
+    assert_eq!(status["type"].as_str(), Some("command"));
+    assert!(
+        status["command"]
+            .as_str()
+            .is_some_and(|command| !command.is_empty())
+    );
+    args.drain(settings_at..=settings_at + 1);
     assert_eq!(args, ["--model", "opus", "--resume", CONVERSATION]);
 }
 
@@ -2291,13 +2314,13 @@ fn hosted_stand_in_as(
     shell: &str,
     rc: Option<&str>,
     elsewhere: bool,
-    stored_login: bool,
+    on_own_login: bool,
     interpreter: Interpreter,
 ) -> (Owner, Inst, String) {
     let owner = Owner::boot();
     // Its tabs' shell runs aterm's shell integration, so a command's end says its exit code, and
     // the relaunch's line opens a command of its own.
-    let shell = if stored_login {
+    let shell = if on_own_login {
         PathBuf::from(shell)
     } else {
         relaunch_fixture_shell(&owner.tmp, shell)
@@ -2347,7 +2370,7 @@ fn hosted_stand_in_as(
     };
     // These provider-free fixtures model an explicit unmanaged credential route.
     // Export only inside this private shell, so resumed stand-ins keep that route.
-    let line = if stored_login {
+    let line = if on_own_login {
         line
     } else {
         format!("export ANTHROPIC_API_KEY=aterm-fabric-standin; {line}")
@@ -2369,9 +2392,9 @@ fn hosted_stand_in_as(
     let pid = launches(&a).first().expect("the native launch").0;
     let args = atpkg::caller_shell::process_args(pid).expect("the stand-in's exec context");
     let observed = aterm_agent::harness::accounts::ProcessLogin::of_exec_env(&args.env)
-        .map(|who| who.stored_login);
+        .map(|who| who.route == aterm_agent::harness::accounts::AuthRoute::Stored);
     assert!(
-        observed == Some(stored_login)
+        observed == Some(on_own_login)
             || (interpreter == Interpreter::Platform && observed.is_none()),
         "fixture authentication attribution: {observed:?}"
     );

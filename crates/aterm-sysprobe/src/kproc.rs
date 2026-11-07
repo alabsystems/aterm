@@ -39,6 +39,15 @@ pub fn record(pid: u32) -> Option<Record> {
     record_read(pid).ok().flatten()
 }
 
+/// When `pid`'s live process started, in Unix seconds. An exited, unreaped process
+/// owns no ongoing work; its retained kernel record supplies no live start.
+#[must_use]
+pub fn live_start_s(pid: u32) -> Option<u64> {
+    record(pid)
+        .filter(|record| !record.zombie)
+        .map(|record| record.start_s)
+}
+
 /// `pid`'s record, distinguishing a definite absence from a failed read.
 /// # Errors
 /// An invalid pid, an unavailable platform reader, a kernel read error other than `ESRCH`,

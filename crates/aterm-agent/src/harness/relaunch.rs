@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use aterm_json::Value;
 
 use super::accounts;
+use super::token_route;
 use super::upgrade::{self, Dialect, SessionFile, Version};
 #[cfg(test)]
 use super::upgrade_drive::state_dir;
@@ -41,8 +42,12 @@ pub(super) struct Plan {
     pub(super) dialect: Dialect,
     pub(super) line: String,
     /// Why [`Self::line`] does not carry the usage tap its gate offered it ([`line_tap_kept`]):
-    /// recorded when the line is typed ([`note_tap_dropped`]).
+    /// recorded when the line is typed ([`note_dropped`]).
     pub(super) tap_dropped: Option<String>,
+    /// Why [`Self::line`] does not carry the token wrapper its judgment offered it
+    /// ([`token_route::judge`]; the tap went first): recorded when the line is typed
+    /// ([`note_dropped`]).
+    pub(super) token_dropped: Option<String>,
     /// The directory [`Self::line`] runs the agent in when it carries no `cd` of its own: the
     /// agent's, where the shell stood when the line was planned (`None`: the line carries its own
     /// `cd`, or no directory was read). The record keeps it ([`St::line_dir`]), and the line typed
@@ -66,7 +71,33 @@ pub(super) struct PlannedCommand {
 }
 
 impl PlannedCommand {
+    /// The program a native restart of this command expects it to execute
+    /// (`native_restart::begin`'s target): aterm's token wrapper where the command serves the
+    /// account's vault token ([`super::accounts_pool::ExecutionIntent::Token`]), else `program`,
+    /// the build the caller planned it for.
+    pub(super) fn expects<'a>(command: Option<&'a Self>, program: &'a Path) -> &'a Path {
+        match command {
+            Some(command)
+                if matches!(
+                    command.account_intent,
+                    Some(super::accounts_pool::ExecutionIntent::Token { .. })
+                ) =>
+            {
+                &command.target
+            }
+            _ => program,
+        }
+    }
+
     pub(super) fn capture(&self) -> Option<super::native_act::RestartCommand> {
+        // A token command's program is aterm's wrapper, which execs the build its line names in
+        // the same pid: the host holds the child to that build, captured here with the wrapper.
+        let settles = match self.account_intent {
+            Some(super::accounts_pool::ExecutionIntent::Token { .. }) => Some(
+                super::native_act::Image::at(TokenServe::served_build(&self.argv)?)?,
+            ),
+            Some(_) | None => None,
+        };
         Some(super::native_act::RestartCommand {
             image: super::native_act::Image::at(&self.target)?,
             program: self.target.to_str()?.to_string(),
@@ -79,6 +110,7 @@ impl PlannedCommand {
                 Some(path) => Some(path.to_str()?.to_string()),
             },
             dialect: self.dialect,
+            settles,
             account_intent: self.account_intent.clone().map(Box::new),
         })
     }
@@ -86,11 +118,58 @@ impl PlannedCommand {
 
 struct SelectedCommand {
     line: String,
-    /// What `line` executes: the launch's `exe`, or the build past its twin ([`managed_twin_build`]).
+    /// What `line` executes: the launch's `exe`, the build past its twin ([`managed_twin_build`]),
+    /// or aterm's token wrapper where the line serves the vault token ([`TokenServe`]).
     exe: PathBuf,
     argv: Vec<String>,
     env: Vec<(String, String)>,
     tap_dropped: Option<String>,
+    token_dropped: Option<String>,
+    /// The token entry the line serves through the wrapper, where it carries it.
+    served: Option<accounts::TokenEntry>,
+}
+
+/// What a relaunch line types for a token decision ([`token_route::Decision::Token`]):
+/// `<aterm> harness accounts token-run <named> -- <build> <flags…>` (§5.4).
+#[derive(Clone, Debug)]
+pub(super) struct TokenServe {
+    /// The aterm the line runs.
+    pub(super) aterm: PathBuf,
+    /// The row's label, or a row-less account's email.
+    pub(super) named: String,
+    /// The store build, as the twin names it ([`super::upgrade_drive::twin_build`]).
+    pub(super) build: PathBuf,
+    /// The account's token entry.
+    pub(super) entry: accounts::TokenEntry,
+    /// The account has a stored login on this Mac (its login record is here): a line that drops
+    /// the wrapper for want of room falls back to it, and one with none is no plan.
+    pub(super) stored: bool,
+}
+
+impl TokenServe {
+    /// The wrapper's arguments around `flags`.
+    fn args(&self, flags: &[String]) -> Vec<String> {
+        token_route::VERB
+            .iter()
+            .map(|word| (*word).to_owned())
+            .chain([
+                self.named.clone(),
+                "--".to_owned(),
+                self.build.to_string_lossy().into_owned(),
+            ])
+            .chain(flags.iter().cloned())
+            .collect()
+    }
+
+    /// The build a wrapper line's arguments ([`Self::args`]) serve: the word after the `--` that
+    /// follows the verb and the account. `None` for any other argv.
+    fn served_build(argv: &[String]) -> Option<&Path> {
+        let verb = token_route::VERB.len();
+        let named = argv.get(..verb)?.iter().eq(token_route::VERB.iter());
+        (named && argv.get(verb + 1).map(String::as_str) == Some("--"))
+            .then(|| argv.get(verb + 2).map(Path::new))
+            .flatten()
+    }
 }
 
 /// Why a session has no relaunch plan.
@@ -139,8 +218,8 @@ pub(super) struct Launch<'a> {
     pub(super) homedir: Option<&'a str>,
     /// The login the line must carry ([`login_env`]).
     pub(super) login: Option<&'a str>,
-    /// Whether the process it replaces authenticated by its stored login ([`Snapshot::stored_login`]).
-    pub(super) stored_login: bool,
+    /// How the process it replaces authenticated ([`Snapshot::route`]).
+    pub(super) route: accounts::AuthRoute,
     /// The authentication route was positively observed, rather than omitted by a legacy record.
     pub(super) auth_observed: bool,
     /// What the replaced agent's own exec environment recorded of its shell's, where it was
@@ -149,7 +228,25 @@ pub(super) struct Launch<'a> {
     /// Whether the line moves the model: without usage credits, a move needs a named model and a
     /// captured Standard billing context equal to the target's.
     pub(super) billing: ModelBilling<'a>,
+    /// What the line does with its account's vault token ([`Serve`]).
+    pub(super) serve: Serve,
 }
+
+/// What a relaunch line does with its account's vault token
+/// (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.4, §5.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Serve {
+    /// The one judgment decides ([`token_route::judge`]): the wrapper where it says token.
+    Judge,
+    /// Never: the line is on the row's stored login (a move back off a token that cannot serve,
+    /// an upgrade's rollback, which a native restart holds to the replaced process's own image).
+    Never,
+    /// The line serves the token, else there is no plan (a move onto it, [`Restart::Route`]).
+    Must,
+}
+
+/// What a plan answers where a move onto the token finds no line that serves it ([`Serve::Must`]).
+pub(super) const ROUTE_UNSERVED: &str = "route-unserved";
 
 /// Whether a planned line requests a new model, rather than retaining the session's existing choice.
 #[derive(Clone, Copy)]
@@ -335,6 +432,25 @@ fn plan_with_cold(
             .map(|(name, value)| (*name, value.as_str()))
             .collect()
     });
+    // The one judgment (§5.3): a token decision types the wrapper before the store build. A cold
+    // plan's route is resolved by its own helper, after this.
+    let token = match launch.serve {
+        Serve::Judge | Serve::Must if cold.is_none() => token_serve(opts, launch, &want),
+        Serve::Judge | Serve::Must | Serve::Never => None,
+    };
+    // No inherited token state where the replaced process ran on its vault token: a line on the
+    // stored login carries neither the descriptor nor the marker (§5.4). A line that serves the
+    // token unsets neither (`served_unset`), since the wrapper makes both afresh, and any line
+    // after another route keeps the length it had, so its usage tap still fits Darwin's cap.
+    let served_unset: Option<Vec<&str>> = exact.as_ref().map(|env| env.unset.clone());
+    let unset: Option<Vec<&str>> = match launch.route {
+        accounts::AuthRoute::VaultToken { .. } => {
+            let mut names = served_unset.clone().unwrap_or_default();
+            names.extend(token_route::TOKEN_STATE_ENV);
+            Some(names)
+        }
+        accounts::AuthRoute::Stored | accounts::AuthRoute::Outside => served_unset.clone(),
+    };
     // A cold restart execs what its command names and holds the child to that image, and a script
     // twin's exec maps its build: named the twin, the agent runs and its outcome never matches.
     let cold_build = cold.as_ref().and_then(|_| managed_twin_build(launch.exe));
@@ -352,9 +468,26 @@ fn plan_with_cold(
         } else {
             &required
         },
-        exact.as_ref().map(|env| env.unset.as_slice()),
+        unset.as_deref(),
+        served_unset.as_deref(),
         tap.as_deref(),
+        token.as_ref(),
     )?;
+    // What the selected line unsets, which the command's capture renders again.
+    let unset = if selected.served.is_some() {
+        served_unset
+    } else {
+        unset
+    };
+    if launch.serve == Serve::Must && selected.served.is_none() {
+        return Err(NoPlan::Refused {
+            why: ROUTE_UNSERVED.to_string(),
+            what: ROUTE_UNSERVED.to_string(),
+            detail: "the account's vault token does not serve this launch here, or its line has \
+                     no room for aterm's wrapper"
+                .to_string(),
+        });
+    }
     // Profile reconstruction can supply a login absent from the original argv.
     // Bind the environment actually retained by this command, after selection.
     let selected_value = |name: &str| {
@@ -364,14 +497,24 @@ fn plan_with_cold(
             .find(|(key, _)| key == name)
             .map(|(_, value)| value.as_str())
     };
+    // A line that serves the token carries a token intent; one that does not is on the stored
+    // login, whatever the replaced process ran on (§5.2).
+    let route = match selected.served {
+        Some(entry) => accounts::AuthRoute::VaultToken { entry },
+        None => match launch.route {
+            accounts::AuthRoute::VaultToken { .. } => accounts::AuthRoute::Stored,
+            route @ (accounts::AuthRoute::Stored | accounts::AuthRoute::Outside) => route,
+        },
+    };
     let selected_launch = Launch {
         home: selected_value(accounts::HOME_ENV).or(launch.home),
         homedir: selected_value(accounts::HOMEDIR_ENV).or(launch.homedir),
         login: selected_value(accounts::LOGIN_ENV).or(launch.login),
+        route,
         ..*launch
     };
-    let unset = exact.map(|env| {
-        env.unset
+    let unset = unset.map(|names| {
+        names
             .iter()
             .map(|name| (*name).to_string())
             .collect::<Vec<_>>()
@@ -392,6 +535,7 @@ fn plan_with_cold(
         dialect,
         line: selected.line,
         tap_dropped: selected.tap_dropped,
+        token_dropped: selected.token_dropped,
         line_dir: (cd.is_none() && !want.is_empty()).then_some(want),
         command: Some(PlannedCommand {
             dialect,
@@ -404,6 +548,171 @@ fn plan_with_cold(
             account_intent,
         }),
     })
+}
+
+/// The store build a token line types for `exe`, the launch's program: the managed twin's
+/// build ([`super::upgrade_drive::twin_build`], so the line never types the twin), else `exe`
+/// itself; only a Claude Code build in atpkg's own store ([`token_route::store_build_in`] of
+/// [`token_builds`]), the one gate the wrapper judges the same build by at exec. `None` where it
+/// cannot be read or lies in no such store: the plan is then the stored login's, typed as today
+/// (through the twin, whose `--auto` judges at exec), and a move onto the token has no plan.
+fn token_build(exe: &Path) -> Option<PathBuf> {
+    let build = match super::upgrade_drive::managed_agent_twin(token_route::PROGRAM) {
+        Some(twin) if twin == exe => super::upgrade_drive::twin_build(exe, token_route::PROGRAM)?,
+        _ => exe.to_path_buf(),
+    };
+    token_route::store_build_in(&token_builds()?, &build).map(|_| build)
+}
+
+/// atpkg's own store of Claude Code builds ([`token_route::configured_builds`]); a test's, where
+/// it set one ([`TOKEN_BUILDS`]).
+fn token_builds() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(builds) = TOKEN_BUILDS.with(|seam| seam.borrow().clone()) {
+        return Some(builds);
+    }
+    token_route::configured_builds()
+}
+
+/// The plan's half of the one judgment ([`token_route::judge`]): what a relaunch of `launch` in
+/// `cwd` types the wrapper for, where its account's token is in use here. The account is the one
+/// the replaced process's login resolves; the claims ring is admission's, under
+/// `accounts.lock`, before the line is typed.
+fn token_serve(opts: &Opts, launch: &Launch<'_>, cwd: &str) -> Option<TokenServe> {
+    let build = token_build(launch.exe);
+    let facts = token_route::Facts {
+        macos: cfg!(target_os = "macos"),
+        no_harness: false,
+        argv: launch.argv,
+        store_build: build.is_some(),
+    };
+    let asked = PlanAsk { opts, launch, cwd };
+    match token_route::judge(&facts, &asked) {
+        token_route::Decision::Token { account, entry } => Some(TokenServe {
+            aterm: token_aterm()?,
+            named: account.named().to_owned(),
+            build: build?,
+            entry,
+            stored: super::profile::login_record(
+                &opts.home,
+                launch.login.filter(|login| !login.is_empty()),
+            )
+            .is_some(),
+        }),
+        token_route::Decision::Stored(_) | token_route::Decision::AsTyped(_) => None,
+    }
+}
+
+/// The aterm a token line runs: this process's lasting one ([`super::tap::stable_exe`]).
+fn token_aterm() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some((aterm, _)) = TOKEN_SEAM.with(|seam| seam.borrow().clone()) {
+        return Some(aterm);
+    }
+    super::tap::stable_exe()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's aterm for token lines and the token's standing it reads, in place of this
+    /// process's and the vault's.
+    pub(super) static TOKEN_SEAM: std::cell::RefCell<Option<(PathBuf, token_route::TokenFact)>> =
+        const { std::cell::RefCell::new(None) };
+    /// A test's store of Claude Code builds, in place of atpkg's configured one.
+    pub(super) static TOKEN_BUILDS: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// [`token_route::Ask`] for a relaunch plan.
+struct PlanAsk<'a> {
+    opts: &'a Opts,
+    launch: &'a Launch<'a>,
+    cwd: &'a str,
+}
+
+impl token_route::Ask for PlanAsk<'_> {
+    fn account(&self) -> Result<(token_route::Account, Option<accounts::TokenEntry>), String> {
+        let launch = self.launch;
+        let settings = super::upgrade_drive::tap_settings(self.opts, launch.argv, self.cwd);
+        let profile = super::upgrade_drive::tap_profile_store(self.opts);
+        let own_home = launch.home.is_none_or(str::is_empty)
+            && launch
+                .homedir
+                .is_none_or(|home| same_dir(Some(home), &self.opts.home.to_string_lossy()));
+        let who = accounts::ProcessLogin {
+            login: launch
+                .login
+                .filter(|login| !login.is_empty())
+                .map(str::to_owned),
+            default_home: own_home,
+            route: launch.route,
+        }
+        .with_settings(&settings)
+        .with_profile_store(profile);
+        let roster = self
+            .opts
+            .account_roster
+            .as_deref()
+            .filter(|path| path.exists())
+            .and_then(|path| accounts::Roster::load_for(accounts::Cli::Claude, path).ok());
+        token_route::account_of(
+            &who,
+            roster.as_ref(),
+            token_route::Named::Auto,
+            &|login| {
+                super::profile::login_record(&self.opts.home, login).map(|record| record.email)
+            },
+            &|| None,
+        )
+    }
+
+    fn claims(&self, _account: &token_route::Account) -> Option<token_route::Fallback> {
+        None
+    }
+
+    fn token(
+        &self,
+        entry: accounts::TokenEntry,
+        account: &token_route::Account,
+    ) -> token_route::TokenFact {
+        #[cfg(test)]
+        if let Some((_, fact)) = TOKEN_SEAM.with(|seam| seam.borrow().clone()) {
+            return fact;
+        }
+        token_fact(self.opts, entry, account)
+    }
+}
+
+/// The token's standing for a plan, as admission reads it: this Mac's vault under the user's
+/// home and its table.
+#[cfg(unix)]
+fn token_fact(
+    opts: &Opts,
+    entry: accounts::TokenEntry,
+    account: &token_route::Account,
+) -> token_route::TokenFact {
+    let Ok(seat) = account_seat(opts) else {
+        return token_route::TokenFact::Busy;
+    };
+    let store = seat.store(accounts::Cli::Claude);
+    token_route::standing_fact(
+        &aterm_secrets::client::Paths::for_home(&opts.home),
+        &store,
+        entry,
+        account,
+        u64::try_from(seat.now).unwrap_or(0),
+        super::accounts_token_run::LABELLED_WAIT,
+    )
+    .0
+}
+
+#[cfg(not(unix))]
+fn token_fact(
+    _opts: &Opts,
+    _entry: accounts::TokenEntry,
+    _account: &token_route::Account,
+) -> token_route::TokenFact {
+    token_route::TokenFact::Absent
 }
 
 fn account_seat(opts: &Opts) -> Result<super::accounts_pool::Seat<'_>, &'static str> {
@@ -434,13 +743,20 @@ fn command_account(
     if !launch.auth_observed {
         return Err("command authentication attribution is unknown".into());
     }
+    // A launch path carries the route: a token session's relaunch keeps a `Token` intent, and
+    // admission checks its row's custody, claims and token (§5.2).
+    let route = match launch.route {
+        accounts::AuthRoute::Outside => {
+            return Ok(super::accounts_pool::ExecutionIntent::external());
+        }
+        route @ (accounts::AuthRoute::Stored | accounts::AuthRoute::VaultToken { .. }) => route,
+    };
     if launch.home.is_some_and(|home| !home.is_empty())
         || launch
             .homedir
             .is_some_and(|home| !same_dir(Some(home), &opts.home.to_string_lossy()))
-        || launch.auth_observed && !launch.stored_login
     {
-        if launch.stored_login {
+        {
             let mut directories = Vec::new();
             if let Some(home) = launch.home.filter(|home| !home.is_empty()) {
                 directories.push(PathBuf::from(home));
@@ -473,7 +789,7 @@ fn command_account(
                 .filter(|login| !login.is_empty())
                 .map(str::to_owned),
             default_home: true,
-            stored_login: true,
+            route,
         },
     )
 }
@@ -545,11 +861,13 @@ fn external_from_env(
     };
     let home = value(accounts::HOMEDIR_ENV).ok_or("shell home is unavailable")?;
     let same_home = same_dir(Some(home), &opts.home.to_string_lossy());
-    if !intent.matches_process(&who, same_home) {
+    // An external intent names no account, so it names no token entry.
+    if !intent.matches_process(&who, same_home, None) {
         return Err("external authentication route is no longer present".into());
     }
-    if !who.stored_login {
-        return Ok(None);
+    match who.route {
+        accounts::AuthRoute::Outside => return Ok(None),
+        accounts::AuthRoute::Stored | accounts::AuthRoute::VaultToken { .. } => {}
     }
     let mut directories = Vec::new();
     if let Some(custom) = value(accounts::HOME_ENV).filter(|path| !path.is_empty()) {
@@ -595,8 +913,12 @@ fn tap_of(
     cwd: &str,
 ) -> Option<String> {
     let lone = armed.lone_for(launch.login);
-    let own = launch.stored_login
-        && launch.homedir.is_none()
+    // The tap reports a token session's reading as a stored login's; its consumer credits the
+    // row whose entry the marker names (§5.7).
+    let own = match launch.route {
+        accounts::AuthRoute::Stored | accounts::AuthRoute::VaultToken { .. } => true,
+        accounts::AuthRoute::Outside => false,
+    } && launch.homedir.is_none()
         && super::tap::own_login(launch.login, launch.home, lone);
     if !own || super::tap::settings_value(&armed.exe).is_none() {
         return None;
@@ -605,7 +927,7 @@ fn tap_of(
     let user = super::upgrade_drive::tap_user_settings(&opts.home);
     super::tap::gate(&super::tap::GateFacts {
         exe: Some(&armed.exe),
-        stored_login: launch.stored_login,
+        route: launch.route,
         login: launch.login,
         lone_login: lone,
         home: launch.home,
@@ -690,7 +1012,7 @@ fn line_tapped_clear(
 /// (`None`: it carries it, or none was offered): the tty's line cap had no room for it even
 /// without the launch's own environment ([`CLAUDE_LAUNCH_ENV`]), so the line falls back to no tap
 /// rather than to no relaunch. The plan reports it ([`Plan::tap_dropped`]), so the drop is
-/// recorded ([`note_tap_dropped`]), never silent.
+/// recorded ([`note_dropped`]), never silent.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn line_tap_kept(
     dialect: Dialect,
@@ -706,7 +1028,7 @@ pub(super) fn line_tap_kept(
     tap: Option<&str>,
 ) -> Result<(String, Option<String>), NoPlan> {
     line_tap_selected(
-        dialect, heal, cd, exe, argv, session, model, mode, required, unset, tap,
+        dialect, heal, cd, exe, argv, session, model, mode, required, unset, unset, tap, None,
     )
     .map(|selected| (selected.line, selected.tap_dropped))
 }
@@ -744,7 +1066,9 @@ fn line_tap_selected(
     mode: Option<&str>,
     required: &[(&str, &str)],
     unset: Option<&[&str]>,
+    served_unset: Option<&[&str]>,
     tap: Option<&str>,
+    token: Option<&TokenServe>,
 ) -> Result<SelectedCommand, NoPlan> {
     let mut flags =
         upgrade::rewrite_argv(argv, session.unwrap_or("-")).map_err(|e| NoPlan::Refused {
@@ -760,34 +1084,73 @@ fn line_tap_selected(
     let exe = build.as_deref().unwrap_or(exe);
     let both: Vec<(&str, &str)> = required.iter().copied().chain(CLAUDE_LAUNCH_ENV).collect();
     let tapped = tap.map(|value| with_tap(flags.clone(), value));
-    let line = |env: &[(&str, &str)], flags: &[String]| {
-        upgrade::relaunch_line_selected(dialect, heal, cd, env, unset, exe, flags).map(|selected| {
-            SelectedCommand {
+    let line = |env: &[(&str, &str)], flags: &[String], served: Option<&TokenServe>| {
+        // A line that serves the token unsets `served_unset`, what the wrapper does not make
+        // afresh; any other line `unset`.
+        let (exe, shim_of, args, unset) = match served {
+            None => (exe, exe, flags.to_vec(), unset),
+            Some(serve) => (
+                serve.aterm.as_path(),
+                serve.build.as_path(),
+                serve.args(flags),
+                served_unset,
+            ),
+        };
+        upgrade::relaunch_line_selected_for(dialect, heal, cd, env, unset, shim_of, exe, &args).map(
+            |selected| SelectedCommand {
                 line: selected.line,
                 exe: exe.to_path_buf(),
-                argv: flags.to_vec(),
+                argv: args,
                 env: selected.env,
                 tap_dropped: None,
-            }
-        })
+                token_dropped: None,
+                served: served.map(|serve| serve.entry),
+            },
+        )
     };
-    let dropped = match tapped.as_deref() {
+    let fit = |flags: &[String], served: Option<&TokenServe>| {
+        line(&both, flags, served).or_else(|_| line(required, flags, served))
+    };
+    let left = |what: &str, why: String, kept: &SelectedCommand| {
+        format!(
+            "{what} left this relaunch line: with it, {why}; without it, {} bytes",
+            kept.line.len()
+        )
+    };
+    // The line budget (§5.4): the tap goes first, then the wrapper, and the line is the stored
+    // login's.
+    let tap_dropped = match tapped.as_deref() {
         None => None,
-        Some(t) => match line(&both, t).or_else(|_| line(required, t)) {
+        Some(t) => match fit(t, token) {
             Ok(tapped) => return Ok(tapped),
             Err(why) => Some(why),
         },
     };
-    line(&both, &flags)
-        .or_else(|_| line(required, &flags))
+    let token_dropped = match token {
+        None => None,
+        Some(serve) => match fit(&flags, Some(serve)) {
+            Ok(mut served) => {
+                served.tap_dropped = tap_dropped.map(|why| left("the usage tap", why, &served));
+                return Ok(served);
+            }
+            Err(why) if serve.stored => Some(why),
+            Err(why) => {
+                return Err(NoPlan::Refused {
+                    why: format!("line:{why}"),
+                    what: "line".to_string(),
+                    detail: format!(
+                        "the token wrapper left this relaunch line ({why}), and {} has no \
+                         stored login on this Mac to start on without it",
+                        serve.named
+                    ),
+                });
+            }
+        },
+    };
+    fit(&flags, None)
         .map(|mut plain| {
-            let dropped = dropped.map(|why| {
-                format!(
-                    "the usage tap left this relaunch line: with it, {why}; without it, {} bytes",
-                    plain.line.len()
-                )
-            });
-            plain.tap_dropped = dropped;
+            plain.tap_dropped = tap_dropped.map(|why| left("the usage tap", why, &plain));
+            plain.token_dropped = token_dropped.map(|why| left("the token wrapper", why, &plain));
             plain
         })
         .map_err(|e| NoPlan::Refused {
@@ -801,11 +1164,19 @@ fn line_tap_selected(
 /// room on the tty's line ([`line_tap_kept`]).
 pub(super) const TAP_DROPPED: &str = "tap-dropped";
 
+/// The ledger's step for a relaunch typed without the token wrapper its judgment offered it, for
+/// want of room on the tty's line once the tap went ([`line_tap_selected`]).
+pub(super) const TOKEN_DROPPED: &str = "token-dropped";
+
 /// Record, beside the relaunch `r` whose line is about to be typed, that its line dropped the
-/// usage tap, where it did (`dropped`: [`Plan::tap_dropped`]).
-pub(super) fn note_tap_dropped(opts: &Opts, r: &Report, dropped: Option<&str>) {
-    if let Some(why) = dropped {
+/// usage tap, or the token wrapper, where it did ([`Plan::tap_dropped`],
+/// [`Plan::token_dropped`]).
+pub(super) fn note_dropped(opts: &Opts, r: &Report, tap: Option<&str>, token: Option<&str>) {
+    if let Some(why) = tap {
         ledger(opts, &said(r.clone(), TAP_DROPPED), why);
+    }
+    if let Some(why) = token {
+        ledger(opts, &said(r.clone(), TOKEN_DROPPED), why);
     }
 }
 
@@ -3729,6 +4100,10 @@ pub(super) const CAUSE_MODEL_BACK: &str = "model-back:";
 /// The [`St::cause`] of a restart under another of the owner's accounts, `account:` then the label ([`Restart::Account`]) and nothing else of the account.
 pub(super) const CAUSE_ACCOUNT: &str = "account:";
 
+/// The [`St::cause`] of a restart onto another credential of the session's own account,
+/// `route:` then `token` or `stored` ([`Restart::Route`]).
+pub(super) const CAUSE_ROUTE: &str = "route:";
+
 /// What an account move answers where a restart of another kind was in flight for the conversation ([`restart_as`], [`carried_word`]).
 pub const IN_FLIGHT_OTHER: &str = "wait:restart-in-flight";
 
@@ -3892,6 +4267,7 @@ pub(super) fn its_own(why: &Restart, ask: &RestartAsk, st: &St) -> bool {
         Restart::ModelBack { .. } => cause.starts_with(CAUSE_MODEL_BACK),
         Restart::InputLost { .. } => cause == CAUSE_INPUT_LOST,
         Restart::Account { .. } => false,
+        Restart::Route { to } => cause.strip_prefix(CAUSE_ROUTE) == Some(to.word()),
     };
     of_cause && st.ask == ask.word()
 }
@@ -3950,6 +4326,14 @@ pub(super) fn model_restart(
             cause: format!("{CAUSE_ACCOUNT}{to}"),
             launch_model: launched,
             fallback_from: None,
+        },
+        // The same account on another credential: the model it runs rides, as a memory
+        // restart's does, and a fallback it rides stays one.
+        Restart::Route { to } => ModelRestart {
+            fallback_from: fallback_carried(origin, riding.as_deref(), hand.as_deref()),
+            model: riding.or(hand),
+            cause: format!("{CAUSE_ROUTE}{}", to.word()),
+            launch_model: launched,
         },
     }
 }
@@ -4771,7 +5155,10 @@ fn restart_locked(
         &snap.argv,
         matches!(
             why,
-            Restart::Memory | Restart::InputLost { .. } | Restart::Account { .. }
+            Restart::Memory
+                | Restart::InputLost { .. }
+                | Restart::Account { .. }
+                | Restart::Route { .. }
         ),
         snap.profile.as_ref(),
     );
@@ -4792,6 +5179,7 @@ fn restart_locked(
         return said(r, "refused:model-on-credits");
     }
     let mode = resume_mode(&records, &session, tab_mode(opts, &tab));
+    let moves_account = target.is_some();
     let login = target.or_else(|| snap.login.clone());
     let launch = Launch {
         session: &session,
@@ -4805,7 +5193,7 @@ fn restart_locked(
         home: snap.home.as_deref(),
         homedir: None,
         login: login.as_deref(),
-        stored_login: snap.stored_login,
+        route: moved_route(moves_account, snap.route),
         auth_observed: snap.auth_observed,
         launch_env: snap.launch_env.as_ref(),
         billing: if riding_move || matches!(why, Restart::Model { .. } | Restart::ModelBack { .. })
@@ -4814,6 +5202,7 @@ fn restart_locked(
         } else {
             ModelBilling::Keep
         },
+        serve: serve_for(why),
     };
     let mut st = St {
         from: sf.version.clone(),
@@ -4844,6 +5233,7 @@ fn restart_locked(
         shell,
         line,
         tap_dropped,
+        token_dropped,
         line_dir,
         command,
         ..
@@ -4918,7 +5308,7 @@ fn restart_locked(
             &mut st,
             &session,
             super::contract::Scope::Relaunch,
-            std::path::Path::new(&snap.program),
+            PlannedCommand::expects(command.as_ref(), std::path::Path::new(&snap.program)),
             command.as_ref(),
             None,
         );
@@ -5031,10 +5421,43 @@ fn restart_locked(
         &said(r.clone(), format!("restart:{}", why.word())),
         "SIGTERM",
     );
-    note_tap_dropped(opts, &r, tap_dropped.as_deref());
+    note_dropped(opts, &r, tap_dropped.as_deref(), token_dropped.as_deref());
     let r = relaunch(opts, r, &mut st, &mut c, &session, k);
     save(opts, &session, &st);
     r
+}
+
+/// The route an account move's line is judged from (§5.2: "a move's target row starts on its own
+/// route"): a session on its own account's credential, its stored login or its vault token, moves
+/// onto the target row's stored login, which the one judgment then puts on that row's token where
+/// it is in use here ([`token_route::judge`]); a session off it stays off it. Any other restart
+/// keeps the route the replaced process ran on.
+pub(super) const fn moved_route(
+    moves_account: bool,
+    route: accounts::AuthRoute,
+) -> accounts::AuthRoute {
+    match route {
+        accounts::AuthRoute::VaultToken { .. } if moves_account => accounts::AuthRoute::Stored,
+        route => route,
+    }
+}
+
+/// What a restart's line does with the account's vault token ([`Serve`]): a route move's is its
+/// target's, every other restart's the one judgment's.
+pub(super) const fn serve_for(why: &Restart) -> Serve {
+    match why {
+        Restart::Route {
+            to: crate::supervise::policy::turn_end::RouteTo::Token,
+        } => Serve::Must,
+        Restart::Route {
+            to: crate::supervise::policy::turn_end::RouteTo::Stored,
+        } => Serve::Never,
+        Restart::Memory
+        | Restart::InputLost { .. }
+        | Restart::Model { .. }
+        | Restart::ModelBack { .. }
+        | Restart::Account { .. } => Serve::Judge,
+    }
 }
 
 /// Whether the tab's screen lets [`restart_as`] signal its agent: none of the agent's own work
@@ -5073,7 +5496,8 @@ const fn over_own_work(why: &Restart) -> bool {
         Restart::InputLost { .. }
         | Restart::Model { .. }
         | Restart::ModelBack { .. }
-        | Restart::Account { .. } => false,
+        | Restart::Account { .. }
+        | Restart::Route { .. } => false,
     }
 }
 
@@ -5108,8 +5532,9 @@ pub struct Snapshot {
     pub home: Option<String>,
     /// Where its records are.
     pub claude_dir: Option<PathBuf>,
-    /// Whether it authenticates by its stored login, by its own exec environment ([`accounts::ProcessLogin::of_exec_env`]'s `stored_login`).
-    pub stored_login: bool,
+    /// How it authenticates, by its own exec environment ([`accounts::ProcessLogin::of_exec_env`]'s
+    /// route; an unread one is outside).
+    pub route: accounts::AuthRoute,
     /// Whether Claude's authentication attribution was captured, rather than omitted by a legacy restore.
     /// Other providers carry their authentication provenance in their own run fields.
     pub auth_observed: bool,
@@ -5155,7 +5580,7 @@ impl Snapshot {
             login,
             home,
             claude_dir,
-            stored_login,
+            route,
             auth_observed,
             profile,
             cwd: _,
@@ -5163,22 +5588,12 @@ impl Snapshot {
             version: _,
             shell: _,
             dialect: _,
-            // Read from the same exec environment as `login`, `home` and `stored_login`, which
+            // Read from the same exec environment as `login`, `home` and `route`, which
             // are compared: a record carried from an older layout without it is the same context.
             launch_env: _,
         } = self;
         (
-            tab,
-            pid,
-            start,
-            program,
-            argv,
-            run,
-            login,
-            home,
-            claude_dir,
-            stored_login,
-            profile,
+            tab, pid, start, program, argv, run, login, home, claude_dir, route, profile,
         ) == (
             &other.tab,
             &other.pid,
@@ -5189,7 +5604,7 @@ impl Snapshot {
             &other.login,
             &other.home,
             &other.claude_dir,
-            &other.stored_login,
+            &other.route,
             &other.profile,
         ) && (!matches!(run, AgentRun::Claude) || auth_observed == &other.auth_observed)
     }
@@ -5275,7 +5690,7 @@ mod snapshot_start_tests {
 /// The agent a [`Snapshot`] is of, with the run only that agent's relaunch reads.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentRun {
-    /// Claude Code: its run is the snapshot's own fields (`login`, `home`, `claude_dir`, `stored_login`).
+    /// Claude Code: its run is the snapshot's own fields (`login`, `home`, `claude_dir`, `route`).
     Claude,
     /// A Codex TUI ([`CodexRun`]).
     Codex(CodexRun),
@@ -5711,7 +6126,7 @@ pub fn snapshot_of_copy(
         login: None,
         home: None,
         claude_dir: None,
-        stored_login: false,
+        route: crate::harness::accounts::AuthRoute::Outside,
         auth_observed: false,
         profile: None,
         launch_env: None,
@@ -5823,8 +6238,8 @@ fn snapshot_with_claimed(
         login: args.env_var(accounts::LOGIN_ENV).map(str::to_owned),
         home: args.env_var(accounts::HOME_ENV).map(str::to_owned),
         claude_dir: records.dir().map(Path::to_path_buf),
-        stored_login: accounts::ProcessLogin::of_exec_env(&args.env)
-            .is_some_and(|who| who.stored_login),
+        route: accounts::ProcessLogin::of_exec_env(&args.env)
+            .map_or(accounts::AuthRoute::Outside, |who| who.route),
         auth_observed: !args.env.is_empty(),
         profile: records.billing_context(&opts.home, &args),
         launch_env: accounts::LaunchEnv::of_exec_env(&args.env),
@@ -6089,7 +6504,7 @@ pub fn after_exit(
 /// Admission for a newly planned execution, after ended exits and existing durable plans are resolved.
 pub enum ColdAdmission {
     Immediate(Option<Box<Snapshot>>),
-    Deferred(super::native_act::ColdIntent),
+    Deferred(Box<super::native_act::ColdIntent>),
 }
 
 impl ColdAdmission {
@@ -6530,7 +6945,7 @@ fn after_exit_as(
     let (admitted, mut cold) = match admit {
         Some(admit) => match admit(snap) {
             Ok(ColdAdmission::Immediate(chosen)) => (chosen, None),
-            Ok(ColdAdmission::Deferred(intent)) => (None, Some(intent)),
+            Ok(ColdAdmission::Deferred(intent)) => (None, Some(*intent)),
             Err(why) => {
                 aterm_log::info!("harness @{}: live account admission waits: {why}", snap.tab);
                 return said(r, "wait:account");
@@ -6599,7 +7014,7 @@ fn after_exit_as(
         home: snap.home.as_deref(),
         homedir: None,
         login: snap.login.as_deref(),
-        stored_login: snap.stored_login,
+        route: snap.route,
         auth_observed: snap.auth_observed,
         launch_env: snap.launch_env.as_ref(),
         billing: if riding.is_some() {
@@ -6607,6 +7022,7 @@ fn after_exit_as(
         } else {
             ModelBilling::Keep
         },
+        serve: Serve::Judge,
     };
     let mut st = St {
         from: version.unwrap_or_default(),
@@ -6719,6 +7135,7 @@ fn launch_after_exit(
         shell,
         line,
         tap_dropped,
+        token_dropped,
         line_dir,
         command,
         cold,
@@ -6770,7 +7187,7 @@ fn launch_after_exit(
     save(opts, &session, &st);
     consume_stamp(opts, snap, cause);
     ledger(opts, &said(r.clone(), "exited"), &st.line);
-    note_tap_dropped(opts, &r, tap_dropped.as_deref());
+    note_dropped(opts, &r, tap_dropped.as_deref(), token_dropped.as_deref());
     let r = relaunch(opts, r, &mut st, &mut c, &session, &Live);
     save(opts, &session, &st);
     r

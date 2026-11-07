@@ -121,6 +121,12 @@ pub type PageId = usize;
 pub struct PageSlice<T> {
     ptr: NonNull<T>,
     len: u16,
+    /// The elements that may have been written since [`Self::take_touched`] last took them,
+    /// `touched_lo..touched_hi` (none when `touched_lo >= touched_hi`): every mutable access
+    /// notes what it reaches, a [`DerefMut`] view the whole slice, so an element outside it
+    /// holds what it held then. A new slice is touched whole.
+    touched_lo: u16,
+    touched_hi: u16,
     #[cfg(any(test, debug_assertions))]
     page_id: PageId,
     #[cfg(test)]
@@ -161,14 +167,117 @@ impl<T> PageSlice<T> {
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), len) }
     }
 
-    /// View the slice as a mutable reference.
+    /// View the slice as a mutable reference, noting it touched whole.
     #[must_use]
     #[inline]
     pub const fn as_mut_slice(&mut self) -> &mut [T] {
+        self.touched_lo = 0;
+        self.touched_hi = self.len;
+        self.untracked_mut()
+    }
+
+    /// The whole slice, mutably, with nothing noted: only for a caller that notes what it
+    /// writes.
+    #[inline]
+    const fn untracked_mut(&mut self) -> &mut [T] {
         let len = self.len as usize;
         // SAFETY: ptr/len are validated at allocation time and uniquely owned.
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), len) }
     }
+
+    /// Notes the elements `lo..hi`, which the caller keeps within the slice, as touched, with no
+    /// branch: an empty range may widen what is noted, which only makes a reader look at more.
+    /// Each access notes what it reached once its bounds are known good.
+    #[inline]
+    fn touch(&mut self, lo: usize, hi: usize) {
+        #[cfg(test)]
+        if FORGET_TOUCHES.get() {
+            return;
+        }
+        debug_assert!(
+            lo <= hi && hi <= usize::from(self.len),
+            "a noted range is in the slice"
+        );
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "lo <= hi <= len, which is a u16"
+        )]
+        let (lo, hi) = (lo as u16, hi as u16);
+        self.touched_lo = self.touched_lo.min(lo);
+        self.touched_hi = self.touched_hi.max(hi);
+    }
+
+    /// The elements in `range`, mutably, noting them touched once (a run writer's one note for
+    /// its run). Panics as indexing does when `range` is out of bounds.
+    #[inline]
+    pub(crate) fn slice_mut(&mut self, range: std::ops::Range<usize>) -> &mut [T] {
+        let (lo, hi) = (range.start, range.end);
+        let _ = &self.as_slice()[range];
+        self.touch(lo, hi);
+        // SAFETY: indexing the same range above did not panic, so it is in bounds.
+        unsafe { self.untracked_mut().get_unchecked_mut(lo..hi) }
+    }
+
+    /// The element at `index`, mutably, noting it touched.
+    #[inline]
+    pub(crate) fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        if index >= usize::from(self.len) {
+            return None;
+        }
+        self.touch(index, index + 1);
+        // SAFETY: `index` is below the length.
+        Some(unsafe { self.untracked_mut().get_unchecked_mut(index) })
+    }
+
+    /// The element at `index`, mutably and unchecked, noting it touched.
+    /// # Safety
+    /// `index` must be below the slice's length.
+    #[inline]
+    pub(crate) unsafe fn get_unchecked_mut(&mut self, index: usize) -> &mut T {
+        self.touch(index, index + 1);
+        // SAFETY: the caller keeps `index` below the length.
+        unsafe { self.untracked_mut().get_unchecked_mut(index) }
+    }
+
+    /// Sets the element at `index` to `value`, noting it touched. Panics as indexing does when
+    /// `index` is out of bounds.
+    #[inline]
+    pub(crate) fn set(&mut self, index: usize, value: T) {
+        self.untracked_mut()[index] = value;
+        self.touch(index, index + 1);
+    }
+
+    /// Copies `src` to `dest` within the slice (`<[T]>::copy_within`), noting what it writes.
+    #[inline]
+    pub(crate) fn copy_within(&mut self, src: std::ops::Range<usize>, dest: usize)
+    where
+        T: Copy,
+    {
+        let n = src.len();
+        self.untracked_mut().copy_within(src, dest);
+        self.touch(dest, dest + n);
+    }
+
+    /// The elements touched since the last take, as a range, and forgets them.
+    #[inline]
+    pub(crate) fn take_touched(&mut self) -> std::ops::Range<usize> {
+        let touched = usize::from(self.touched_lo)..usize::from(self.touched_hi);
+        self.touched_lo = u16::MAX;
+        self.touched_hi = 0;
+        if touched.is_empty() { 0..0 } else { touched }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORGET_TOUCHES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// While `on`, the precise writes on this thread note nothing: the planted miss the touched-span
+/// test must catch.
+#[cfg(test)]
+pub(crate) fn forget_touches(on: bool) {
+    FORGET_TOUCHES.set(on);
 }
 
 impl<T> Deref for PageSlice<T> {

@@ -2701,7 +2701,7 @@ pub(crate) mod tests {
         let snap = aterm_agent::harness::relaunch::Snapshot {
             launch_env: None,
             auth_observed: true,
-            stored_login: false,
+            route: aterm_agent::harness::accounts::AuthRoute::Outside,
             profile: None,
             tab: sid.to_string(),
             pid: 7,

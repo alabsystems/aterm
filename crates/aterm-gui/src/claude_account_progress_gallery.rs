@@ -952,7 +952,7 @@ fn lab_own_claim_gallery() {
         account: Some("fixture-current"),
         left: None,
         default_home: true,
-        stored_login: true,
+        route: aterm_agent::harness::accounts::AuthRoute::Stored,
     };
     let mut manifest = String::from(
         "# Synthetic retained claim decisions in the actual App Lab page; no provider or credential reads.\nscene\tcolumns\trows\tfile\n",

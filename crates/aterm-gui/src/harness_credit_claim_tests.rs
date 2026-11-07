@@ -658,7 +658,7 @@ fn a_restore_leaves_a_program_in_an_ended_workers_tab() {
         let agent = aterm_agent::harness::relaunch::Snapshot {
             launch_env: None,
             auth_observed: true,
-            stored_login: false,
+            route: aterm_agent::harness::accounts::AuthRoute::Outside,
             profile: None,
             tab: sid.clone(),
             pid: 4242,

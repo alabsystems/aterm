@@ -15,6 +15,10 @@ mod observation;
 #[path = "native_account_claim_tests.rs"]
 mod transaction;
 
+#[cfg(unix)]
+#[path = "native_account_fence_tests.rs"]
+mod fence_transaction;
+
 struct World {
     handle: crate::session_store::SessionHandle,
     facts: Facts,

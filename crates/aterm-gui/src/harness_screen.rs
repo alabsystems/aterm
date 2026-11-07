@@ -424,6 +424,9 @@ pub(crate) struct HarnessSession {
     /// What aterm checked at its landing, beside a landed face (§14.9, slice 9c), read under the
     /// timeline's lock the need's read takes.
     pub(crate) receipt: Option<std::sync::Arc<aterm_agent::harness::acts::LandReceipt>>,
+    /// Its account's vault token phrase while the quiet offer stands (`login ends in 5 days;
+    /// token: none`, `docs/DESIGN-claude-setup-token-2026-11-05.md` §5.9).
+    pub(crate) token: Option<String>,
 }
 
 /// One `[harness]` key of the effective table.
@@ -997,6 +1000,7 @@ impl HarnessState {
                     waiting: session.waiting,
                     switch_asked: session.switch_asked,
                     receipt: session.receipt.clone(),
+                    token: session.token.clone(),
                 }
             })
             .collect()
@@ -1749,6 +1753,9 @@ pub(crate) struct HarnessSessionRow {
     /// What aterm checked at its landing ([`HarnessSession::receipt`]): the state line's landed
     /// arm says it.
     pub(crate) receipt: Option<std::sync::Arc<aterm_agent::harness::acts::LandReceipt>>,
+    /// Its account's vault token phrase while the quiet offer stands
+    /// ([`HarnessSession::token`]): the state line's last part.
+    pub(crate) token: Option<String>,
 }
 
 impl HarnessSessionRow {
@@ -1760,7 +1767,7 @@ impl HarnessSessionRow {
             .map_or(self.detail.as_str(), |(lead, _)| lead)
     }
 
-    /// The row's STATE LINE (§9.3.4, §10.2.3 item 2), led by the loop's outage wait where one stands (`waiting: API overload · next try 18:41 · `, §14.17.5.2), then under Land by the one ask the person's switch over a held tab owed while its answer is unread ([`aterm_agent::harness::acts::SWITCH_ASKED`], v6 §14.17 item 3), then by the stop of whoever drives it (aterm's, or a codex-alab's under its own proven claim: [`crate::App::shown_stop`], §14.3.2) while the chip carries a mode (`stopped typing: the same reply twice, no work · types again at your turn or once the agent works · `, naming `your switch to Land` under Cruise, where it asks, §14.3; a self-claim's in its holder's name, `codex-alab stopped typing: …`, with its own loop's restart, [`crate::harness_glass::ShownStop::words`]), then by a harness's need where one stands (`needs you: … (+1 more); carrying on · `, §12.2.1), then formatted from its glass under its view as the chip's face reads it ([`ChipFace::of`]): `lands at 18:00` (`lands Sat 16:00` on another day), under Land's `⤓` the hold of whoever drives it ([`crate::App::shown_hold`], §14.3.3: `not landed yet: … · landing since 14:02 · 3 nudges`; a self-claim's in its holder's name, `codex-alab: not landed yet: …`, unless its stop named it first, [`crate::harness_glass::ShownHold::words`]), under Land `landed 17:42` with what aterm checked there and what the agent said ([`Self::landed_line`], §14.9 slice 9c) and `quiet: a person's own exchange`; else the loop's pause after short turns (`pausing until 18:41 (3 short turns in a row)`, §10.5.1), which a stop drops; else the trail's newest act (`last: ✓ approved 14:05`; a self-claim's named for its holder, `last: codex-alab: ✓ approved 14:05`).
+    /// The row's STATE LINE (§9.3.4, §10.2.3 item 2), led by the loop's outage wait where one stands (`waiting: API overload · next try 18:41 · `, §14.17.5.2), then under Land by the one ask the person's switch over a held tab owed while its answer is unread ([`aterm_agent::harness::acts::SWITCH_ASKED`], v6 §14.17 item 3), then by the stop of whoever drives it (aterm's, or a codex-alab's under its own proven claim: [`crate::App::shown_stop`], §14.3.2) while the chip carries a mode (`stopped typing: the same reply twice, no work · types again at your turn or once the agent works · `, naming `your switch to Land` under Cruise, where it asks, §14.3; a self-claim's in its holder's name, `codex-alab stopped typing: …`, with its own loop's restart, [`crate::harness_glass::ShownStop::words`]), then by a harness's need where one stands (`needs you: … (+1 more); carrying on · `, §12.2.1), then formatted from its glass under its view as the chip's face reads it ([`ChipFace::of`]): `lands at 18:00` (`lands Sat 16:00` on another day), under Land's `⤓` the hold of whoever drives it ([`crate::App::shown_hold`], §14.3.3: `not landed yet: … · landing since 14:02 · 3 nudges`; a self-claim's in its holder's name, `codex-alab: not landed yet: …`, unless its stop named it first, [`crate::harness_glass::ShownHold::words`]), under Land `landed 17:42` with what aterm checked there and what the agent said ([`Self::landed_line`], §14.9 slice 9c) and `quiet: a person's own exchange`; else the loop's pause after short turns (`pausing until 18:41 (3 short turns in a row)`, §10.5.1), which a stop drops; else the trail's newest act (`last: ✓ approved 14:05`; a self-claim's named for its holder, `last: codex-alab: ✓ approved 14:05`); and last, while the quiet offer stands, its account's vault token phrase (`login ends in 5 days; token: none`, [`Self::token`]).
     #[must_use]
     pub(crate) fn state_line(&self) -> Option<String> {
         let glass = &self.glass;
@@ -1831,10 +1838,17 @@ impl HarnessSessionRow {
         let waiting = self.waiting.map(|wait| wait.state_words(today));
         let asked = (self.switch_asked && face == ChipFace::Land)
             .then(|| aterm_agent::harness::acts::SWITCH_ASKED.to_owned());
-        [waiting, asked, stop, need.map(need_head), rest]
-            .into_iter()
-            .flatten()
-            .reduce(|line, more| format!("{line}{sep}{more}"))
+        [
+            waiting,
+            asked,
+            stop,
+            need.map(need_head),
+            rest,
+            self.token.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        .reduce(|line, more| format!("{line}{sep}{more}"))
     }
 }
 
@@ -2742,7 +2756,7 @@ impl App {
                 crate::autopilot::SetByWords::of(set_by, true, |sid| self.autopilot_setter_tab(sid))
             });
             let resolved = self.harness_session_name(handle.local_id, person, &handle.title);
-            let (need, receipt) = {
+            let (need, receipt, token) = {
                 let timeline = handle
                     .ctx
                     .timeline
@@ -2754,6 +2768,9 @@ impl App {
                         .task_face()
                         .filter(|(face, _)| *face == aterm_agent::harness::acts::TaskFace::Landed)
                         .and_then(|_| timeline.land_receipt().cloned()),
+                    crate::token_shown::shown().and_then(|tokens| {
+                        tokens.of_footer(timeline.claude_footer())?.phrase.clone()
+                    }),
                 )
             };
             let hold = self.shown_hold(handle.local_id);
@@ -2779,6 +2796,7 @@ impl App {
                 waiting,
                 switch_asked,
                 receipt,
+                token,
             });
         }
         sessions.sort_by_key(|s| s.local_id);
@@ -2927,6 +2945,11 @@ impl App {
             crate::native_app::HarnessRequest::AiSignIn { id } => {
                 if let Some(window) = self.frontmost_window {
                     self.ai_sign_in(window, id);
+                }
+            }
+            crate::native_app::HarnessRequest::LabToken { index } => {
+                if let Some(window) = self.frontmost_window {
+                    self.lab_token_step(window, index);
                 }
             }
             crate::native_app::HarnessRequest::Show { session } => {

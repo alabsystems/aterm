@@ -266,7 +266,7 @@ fn material(paths: &Paths, config: &Config) -> crate::Result<Option<Material>> {
         .chain(state.own.iter().flat_map(|names| names.iter()))
         .collect();
     for name in names {
-        if !name.starts_with(APPLE_PREFIX) || !name.ends_with(".cer") {
+        if !name.starts_with(crate::entry_class::APPLE_PREFIX) || !name.ends_with(".cer") {
             continue;
         }
         let key_name = format!("{}.key", name.strip_suffix(".cer").unwrap_or(name));

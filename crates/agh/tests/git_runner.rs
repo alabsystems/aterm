@@ -1051,7 +1051,7 @@ fn read_only_fetches_preserve_pushurl_refusals_and_writes_still_reject_them() {
         .expect_err("write screening remains strict even for a dry run")
         .into_data();
     assert_eq!(error.kind, Kind::Refused);
-    assert!(matches!(error.sub, Sub::GitConfig { key } if key == "remote.origin.pushurl"));
+    assert!(matches!(error.sub, Sub::GitConfig { key } if key == "remote.*"));
     assert_eq!(host_git(&remote, &["rev-parse", "main"]), head);
     assert_eq!(host_git(&elsewhere, &["for-each-ref"]), other);
 }
@@ -1099,11 +1099,6 @@ fn a_fetch_refuses_a_rewriting_config() {
         ("credential.helper", "false", "credential.helper"),
         ("include.path", "/nowhere", "include.path"),
         ("protocol.ext.allow", "always", "protocol.ext.allow"),
-        (
-            "extensions.worktreeConfig",
-            "true",
-            "extensions.worktreeconfig",
-        ),
         ("core.gitProxy", "false", "core.gitproxy"),
         ("fetch.bundleURI", "file:///nowhere", "fetch.bundleuri"),
         ("bundle.version", "1", "bundle.version"),
@@ -1146,7 +1141,7 @@ fn a_fetch_refuses_a_rewriting_config() {
         assert_eq!(
             err.sub,
             Sub::GitConfig {
-                key: listed.clone()
+                key: format!("{}.*", listed.split_once('.').unwrap().0)
             },
             "{key}"
         );
@@ -1170,7 +1165,7 @@ fn a_fetch_refuses_a_rewriting_config() {
     assert_eq!(
         err.sub,
         Sub::GitConfig {
-            key: "hook.x.event".to_string()
+            key: "hook.*".to_string()
         }
     );
     assert_eq!(refs(), before, "the hooked fetch moved the clone's refs");
@@ -1256,6 +1251,238 @@ fn a_fetch_refuses_a_rewriting_config() {
                 .is_some_and(|value| value == "false")
     });
     assert!(off, "{:?}", fetched.env);
+}
+
+fn configured_worktrees(world: &World) -> (Github, PathBuf, PathBuf, PathBuf) {
+    let bare = bare_repo(world.path(), "app");
+    let gh = world
+        .client(git_env())
+        .git_remote_for_tests("fixture-dev/app", &bare)
+        .build();
+    let slug = common::slug("fixture-dev/app");
+    let main = world.path().join("clone");
+    gh.run_git(&GitRun::new_clone(&slug, &main))
+        .unwrap_or_else(|e| panic!("the clone: {}", e.why));
+    let linked = world.path().join("linked");
+    host_git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            linked.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    host_git(
+        &main,
+        &["config", "--local", "extensions.worktreeConfig", "true"],
+    );
+    host_git(
+        &main,
+        &["config", "--worktree", "user.name", "main fixture"],
+    );
+    host_git(
+        &linked,
+        &["config", "--worktree", "user.name", "linked fixture"],
+    );
+    (gh, bare, main, linked)
+}
+
+#[test]
+fn a_fetch_accepts_benign_main_and_linked_worktree_config() {
+    let world = World::canonical("git-fetch-worktree-config");
+    let (gh, bare, main, linked) = configured_worktrees(&world);
+    let slug = common::slug("fixture-dev/app");
+    // Ordinary named-remote URLs do not route this operation: agh hands git
+    // the admitted URL explicitly. They remain harmless in either scope.
+    for dir in [&main, &linked] {
+        host_git(
+            dir,
+            &[
+                "config",
+                "--worktree",
+                "remote.origin.url",
+                "file:///not-the-admitted-remote",
+            ],
+        );
+        host_git(
+            dir,
+            &["config", "--worktree", "core.sparseCheckout", "false"],
+        );
+    }
+    let configs = [
+        main.join(".git/config"),
+        main.join(".git/config.worktree"),
+        PathBuf::from(host_git(&linked, &["rev-parse", "--absolute-git-dir"]))
+            .join("config.worktree"),
+    ];
+    let before: Vec<_> = configs
+        .iter()
+        .map(|path| std::fs::read(path).unwrap())
+        .collect();
+    let tree = host_git(&bare, &["rev-parse", "main^{tree}"]);
+    let first = host_git(&bare, &["rev-parse", "main"]);
+    let second = host_git(&bare, &["commit-tree", &tree, "-p", &first, "-m", "two"]);
+    host_git(&bare, &["update-ref", "refs/heads/main", &second]);
+    for dir in [&main, &linked] {
+        gh.run_git(&GitRun::check_local(&slug, dir))
+            .unwrap_or_else(|e| panic!("local {}: {}", dir.display(), e.why));
+        gh.run_git(&GitRun::fetch(&slug, dir))
+            .unwrap_or_else(|e| panic!("fetch {}: {}", dir.display(), e.why));
+        assert_eq!(
+            host_git(dir, &["rev-parse", "refs/remotes/origin/main"]),
+            second
+        );
+    }
+    for (path, before) in configs.iter().zip(before) {
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            before,
+            "{} changed",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn a_fetch_refuses_rewrites_in_each_worktree_config_without_following_includes() {
+    let world = World::canonical("git-fetch-worktree-screen");
+    let (gh, _bare, main, linked) = configured_worktrees(&world);
+    let slug = common::slug("fixture-dev/app");
+    // If the screen followed includes rather than listing their keys, this
+    // malformed file would fail parsing instead of naming include.path.
+    let include = world.path().join("not-a-config");
+    std::fs::write(&include, "[unterminated\n").unwrap();
+    let include_name = include.to_str().unwrap();
+    let rows = [
+        (
+            "url.https://elsewhere.invalid/.insteadOf",
+            "https://github.com/",
+            "url.https://elsewhere.invalid/.insteadof",
+        ),
+        ("credential.helper", "false", "credential.helper"),
+        ("include.path", include_name, "include.path"),
+        (
+            "includeIf.gitdir:/nowhere/.path",
+            include_name,
+            "includeif.gitdir:/nowhere/.path",
+        ),
+        (
+            "remote.origin.proxy",
+            "http://127.0.0.1:1",
+            "remote.origin.proxy",
+        ),
+        (
+            "remote.https://github.com/elsewhere/app.git.url",
+            "file:///elsewhere",
+            "remote.https://github.com/elsewhere/app.git.url",
+        ),
+        ("core.hooksPath", "/nowhere", "core.hookspath"),
+        ("hook.x.command", "false", "hook.x.command"),
+        (
+            "extensions.partialClone",
+            "origin",
+            "extensions.partialclone",
+        ),
+    ];
+    for dir in [&main, &linked] {
+        let before = host_git(dir, &["for-each-ref"]);
+        let config = PathBuf::from(host_git(dir, &["rev-parse", "--absolute-git-dir"]))
+            .join("config.worktree");
+        let original = std::fs::read(&config).unwrap();
+        for (key, value, expected) in rows {
+            host_git(dir, &["config", "--worktree", "--no-includes", key, value]);
+            for operation in [GitRun::check_local(&slug, dir), GitRun::fetch(&slug, dir)] {
+                let error = gh
+                    .run_git(&operation)
+                    .expect_err("worktree rewrite")
+                    .into_data();
+                assert_eq!(error.kind, Kind::Refused, "{key}: {}", error.why);
+                assert_eq!(
+                    error.sub,
+                    Sub::GitConfig {
+                        key: format!("{}.*", expected.split_once('.').unwrap().0)
+                    },
+                    "{key}"
+                );
+            }
+            // Repository setup would follow a malicious include even when
+            // a cleanup `git config --no-includes --unset` follows it.
+            std::fs::write(&config, &original).unwrap();
+            assert_eq!(host_git(dir, &["for-each-ref"]), before, "{key} moved refs");
+        }
+    }
+}
+
+#[test]
+fn worktree_config_screen_does_not_follow_common_includes_or_inactive_worktree_files() {
+    let world = World::canonical("git-common-config-screen");
+    let (gh, _bare, main, _linked) = configured_worktrees(&world);
+    let slug = common::slug("fixture-dev/app");
+    let before = host_git(&main, &["for-each-ref"]);
+    let config = main.join(".git/config");
+    let original = std::fs::read(&config).unwrap();
+    let include = world.path().join("bad-common-include");
+    std::fs::write(&include, "[unterminated\n").unwrap();
+    let mut included = original.clone();
+    included.extend_from_slice(format!("\n[include]\npath = {}\n", include.display()).as_bytes());
+    std::fs::write(&config, included).unwrap();
+    let error = gh
+        .run_git(&GitRun::check_local(&slug, &main))
+        .unwrap_err()
+        .into_data();
+    assert_eq!(error.kind, Kind::Refused);
+    assert_eq!(
+        error.sub,
+        Sub::GitConfig {
+            key: "include.*".into()
+        }
+    );
+    std::fs::write(&config, original).unwrap();
+    host_git(
+        &main,
+        &["config", "--local", "extensions.worktreeConfig", "false"],
+    );
+    std::fs::write(main.join(".git/config.worktree"), "[unterminated\n").unwrap();
+    gh.run_git(&GitRun::check_local(&slug, &main)).unwrap();
+    gh.run_git(&GitRun::fetch(&slug, &main)).unwrap();
+    assert_eq!(host_git(&main, &["for-each-ref"]), before);
+}
+
+#[test]
+fn worktree_config_parser_recording_never_exposes_url_subsections_or_values() {
+    use agh::fx::tape::{TapeHeader, TapeMode};
+
+    let world = World::canonical("git-config-recording");
+    let (_gh, _bare, main, _linked) = configured_worktrees(&world);
+    let slug = common::slug("fixture-dev/app");
+    let config = main.join(".git/config");
+    let original = std::fs::read(&config).unwrap();
+    let sentinel = "CONFIG_PRIVACY_SENTINEL_729cc1";
+    for (index, extra) in [
+        format!("\n[url \"https://user:{sentinel}@elsewhere.invalid/\"]\ninsteadOf = https://github.com/\n"),
+        format!("\n[extensions]\nworktreeConfig = {sentinel}\n"),
+        format!("\n[user]\nname = \"{sentinel}\n"),
+    ].into_iter().enumerate() {
+        let mut bytes = original.clone();
+        bytes.extend_from_slice(extra.as_bytes());
+        std::fs::write(&config, bytes).unwrap();
+        let tape = world.path().join(format!("config-{index}.tape"));
+        let mut header = TapeHeader::for_run(&["repo".into(), "check-local".into()], &common::endpoints(&world.fake));
+        header.mode = TapeMode::Credentialed;
+        let fx = Arc::new(Fx::record_for_tests(&tape, &header).unwrap());
+        let gh = world.client(git_env()).fx(fx.clone()).build();
+        let error = gh.run_git(&GitRun::check_local(&slug, &main)).unwrap_err();
+        assert_eq!(error.kind, Kind::Refused, "{}", error.why);
+        assert!(!error.why.contains(sentinel));
+        assert!(!format!("{error:?}").contains(sentinel));
+        fx.finish(error.kind.exit()).unwrap();
+        let recorded = std::fs::read_to_string(&tape).unwrap();
+        assert!(!recorded.contains(sentinel), "config input escaped to tape");
+        assert!(recorded.contains("config-screen-v2"), "no parser exchange was recorded");
+    }
+    std::fs::write(config, original).unwrap();
 }
 
 #[test]

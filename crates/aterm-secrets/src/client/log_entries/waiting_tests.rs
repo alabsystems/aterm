@@ -11,7 +11,7 @@ use std::rc::Rc;
 
 /// m7 removes m42 and keeps its batch to itself; m22 takes only the `Remove`, so a rotation is
 /// due on m22 and its `[everyone]` writes wait. Returns m7's batch.
-fn held_remove(lab: &convergence::Six) -> Vec<Record> {
+pub(super) fn held_remove(lab: &convergence::Six) -> Vec<Record> {
     let (m22, m7) = (&lab.all[0], &lab.all[1]);
     let base = convergence::ids(m7);
     test_remove_unposted(m7, &join_code(&lab.recipients[4])).expect("m7 removes m42");
@@ -50,7 +50,7 @@ fn shows(admin: &Admin, name: &str) -> Option<Vec<u8>> {
 }
 
 /// `name` in `[everyone]`, or in any host list, as the Mac at `paths` opens its log.
-fn reads(paths: &Paths, everyone: bool, name: &str) -> Option<Vec<u8>> {
+pub(super) fn reads(paths: &Paths, everyone: bool, name: &str) -> Option<Vec<u8>> {
     let identity = read_identity(paths).unwrap().unwrap();
     reads_in(&log_of(paths), &identity, everyone, name)
 }
@@ -67,7 +67,7 @@ fn reads_in(log: &Log, identity: &Identity, everyone: bool, name: &str) -> Optio
 }
 
 /// Two vault passes on m22, a step apart from now, and what m22 signed in them.
-fn two_passes(m22: &Paths) -> Vec<Record> {
+pub(super) fn two_passes(m22: &Paths) -> Vec<Record> {
     let before = convergence::ids(m22);
     let t0 = aterm_time::unix_millis().unwrap_or(0);
     vault_pass_at(m22, t0).unwrap();

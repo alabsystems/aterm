@@ -2539,7 +2539,14 @@ pub struct Session<'a, C: Ctl> {
     /// (`IdleHost::witness`, v6 §14.17.5.4), `Some` while that point's wait stands
     /// ([`Self::witness_edge`]); `None` where none was asked.
     witness_seen: Option<Option<Instant>>,
-    account_seen: Option<(u64, AccountPoint, Option<AccountAdvice>)>,
+    /// The point's account advice and route move ([`IdleHost::account`],
+    /// [`IdleHost::route_move`]), as last read and at which screen.
+    account_seen: Option<(
+        u64,
+        AccountPoint,
+        Option<AccountAdvice>,
+        Option<super::policy::turn_end::RouteTo>,
+    )>,
     roster_seen: Option<(u64, Option<super::policy::turn_end::RosterWord>)>,
     nothing_decided: bool,
     decided_withheld: bool,
@@ -7191,7 +7198,7 @@ impl<C: Ctl> Session<'_, C> {
             || (self.turn_end_due.is_some()
                 && matches!(
                     &self.account_seen,
-                    Some((_, AccountPoint::TurnEnd, Some(advice)))
+                    Some((_, AccountPoint::TurnEnd, Some(advice), _))
                         if matches!(
                             advice.past_probe(),
                             Some(AccountAdvice::Move { yields: Some(_), .. })

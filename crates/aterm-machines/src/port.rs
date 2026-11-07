@@ -1117,7 +1117,7 @@ pub trait System: Sync {
     }
 
     /// When `pid` started, in Unix seconds, as the kernel recorded it for any uid's process (what
-    /// `ps -o lstart=` prints), or `None` when there is no such process.
+    /// `ps -o lstart=` prints), or `None` when there is no live process.
     fn process_started(&self, pid: u32) -> Option<u64> {
         let _ = pid;
         None
@@ -1289,6 +1289,12 @@ pub trait System: Sync {
     /// Open the converge journal for the account this system acts as.
     fn journal(&self) -> Result<Box<dyn aterm_converge::Journal + Send + '_>, String> {
         Err("this system keeps no converge journal".into())
+    }
+
+    /// Own this account's existing alignment lease and repository scheduling record.
+    /// This never authorizes a credential or Git effect; unsupported systems refuse.
+    fn repository_pass(&self) -> Result<crate::sync::repository_refresh::Access, String> {
+        Err("this system keeps no repository convergence record".into())
     }
 
     /// Whether this process came in over a remote login: OpenSSH's `SSH_CONNECTION` or
@@ -2380,7 +2386,7 @@ impl System for Live {
     }
 
     fn process_started(&self, pid: u32) -> Option<u64> {
-        aterm_sysprobe::kproc::record(pid).map(|r| r.start_s)
+        aterm_sysprobe::kproc::live_start_s(pid)
     }
 
     fn stage_detached(
@@ -2598,6 +2604,16 @@ impl System for Live {
             .ok_or_else(|| "this account has no state directory to journal changes in".into())
     }
 
+    fn repository_pass(&self) -> Result<crate::sync::repository_refresh::Access, String> {
+        let state = aterm_types::dirs::account_state_dir()
+            .ok_or("this account has no state directory to record repository work in")?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|time| u64::try_from(time.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        crate::sync::repository_refresh::RepositoryPass::open(&state, now)
+    }
+
     fn remote_login(&self) -> bool {
         console_session::remote_login()
     }
@@ -2779,6 +2795,7 @@ mod fake {
     /// Scripted [`System`] implementation for unit tests.
     #[derive(Default)]
     pub struct Fake {
+        repository_record: Arc<crate::sync::repository_refresh::Memory>,
         /// The tools a test models instead of scripting ([`Fake::simulate`]).
         model: Mutex<Option<Model>>,
         scroll_natural: Mutex<Option<bool>>,
@@ -4625,6 +4642,13 @@ mod fake {
 
         fn journal(&self) -> Result<Box<dyn aterm_converge::Journal + Send + '_>, String> {
             Ok(Box::new(Journaled(self)))
+        }
+
+        fn repository_pass(&self) -> Result<crate::sync::repository_refresh::Access, String> {
+            Ok(crate::sync::repository_refresh::RepositoryPass::memory(
+                &self.repository_record,
+                self.now.saturating_mul(1000),
+            ))
         }
 
         fn create_new(&self, path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {

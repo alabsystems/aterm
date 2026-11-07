@@ -672,6 +672,7 @@ fn reading(said: &str, worked: Option<Duration>, person: Option<Duration>) -> Tu
         reset_clock: None,
         program: aterm_phase::Program::Claude,
         account: None,
+        route: None,
         autopilot: Autopilot::Land,
         login_label: None,
         autopilot_by_person: false,

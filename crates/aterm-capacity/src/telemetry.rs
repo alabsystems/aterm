@@ -1,13 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE ADMISSION ROW (Continuum TM-0, `aterm_telemetry`): each admission decided in this user's
+//! THE ADMISSION ROW (Continuum TM-0, `aterm_telemetry`): an admission decided in this user's
 //! own ledger appends one `kind=admission` row to this Mac's telemetry log, in the claimant's
-//! process, the moment it is decided. An admitted claim's wait is its own clock
-//! ([`crate::Claim::waited`], `meter=exact`); a refused or ended one's is the call's stopwatch
-//! (`meter=stamped`). A scratch ledger (every test's) writes none, so only this Mac's real
+//! process, the moment it is decided. [`crate::admit_with`] and its kin write theirs. A caller
+//! that decides an admission by driving a [`crate::Waiter`] itself owes its row too: it takes an
+//! [`Asked`] as it asks and gives it the decision ([`Asked::decided`], [`Asked::decided_in`]),
+//! which consumes it, so one row an admission, never one a look. atpkg's host job's one look and
+//! a nested build's look in its turn do. The Trust lane's launch gate (`aterm-release`) and the
+//! resource host's retained runs (`aterm-resource-host`) drive a `Waiter` in this user's ledger
+//! and write none yet. A scratch ledger (every test's) writes none, so only this Mac's real
 //! claims become rows. This user's ledger is [`Ledger::user`]'s folder: the capacity folder, or
 //! the backend of the memory namespace that account's ledger was adopted into.
+//!
+//! ONE CLOCK: every wait here is the wall clock's (unix ms). An admitted claim's is its grant's
+//! `admitted_ms` less its ask ([`Claim::asked_ms`], its record's `start_ms`), the stamps its
+//! build or test row reads from the same record ([`wait`]), so the two rows say one wait
+//! (`meter=exact`, the claim's own stamps). A refused or ended one's runs from the ask's stamp to
+//! the decision's (`meter=stamped`). No monotonic `Instant` can: a build's row is written in the
+//! process that saw it end, often the holder that adopted the claim from its file and reads only
+//! its record, and macOS's `Instant` stops while the Mac sleeps, so a claim that waited across a
+//! sleep said a shorter wait in its admission row than in its build row. Stamps that run
+//! backwards (the clock set back by more than the wait) are `?clock` ([`interval`]), never a
+//! known 0; a smaller step back reads as a shorter known wait.
 //!
 //! The row holds digests of what was asked and where, and its label is the first word of the
 //! need's description, which the claimant program wrote (`targo`, `lab`); never the rest of its
@@ -21,28 +36,73 @@
 //! row this process writes says it. Telemetry never fails an admission.
 
 use std::path::Path;
-use std::time::{Duration, Instant};
 
 use aterm_telemetry::{Digest, Fig, Kind, Meter, Outcome, Row, Stop};
 
 use crate::{Claim, Error, Ledger};
 
-/// What an admission asked, kept before its need moves into the wait.
-pub(crate) struct Asked {
+/// AN ADMISSION'S ROW, OWED FROM ITS ASK TO ITS DECISION: what it asked, kept before its need
+/// moves into the wait, and the wall clock's stamp of the ask. Taken once an admission, before
+/// its first entry, and consumed by its decision ([`Self::decided`]), however many looks that
+/// decision took.
+#[must_use = "an admission owes its row: give it its decision"]
+pub struct Asked {
     what: String,
     checkout: Option<String>,
-    at: Instant,
+    at_ms: u64,
 }
 
 impl Asked {
-    /// `need`'s words and checkout, and the stopwatch started now.
-    pub(crate) fn of(need: &crate::Need) -> Self {
+    /// `need`'s words and checkout, asked now.
+    pub fn of(need: &crate::Need) -> Self {
         Self {
             what: need.what.clone(),
             checkout: need.checkout.clone(),
-            at: Instant::now(),
+            at_ms: aterm_telemetry::now_ms(),
         }
     }
+
+    /// Write the row of `result`, this admission's decision in `ledger`, where `ledger` is this
+    /// user's own ([`Ledger::user`]); none in this crate's unit tests.
+    pub fn decided(self, ledger: &Ledger, result: &Result<Claim, Error>) {
+        decided(ledger, &self, result);
+    }
+
+    /// [`Self::decided`] with this user's ledger folder `user` (its [`Ledger::dir`]) and the
+    /// host's name and facts digest, the row handed to `write`: nothing unless `ledger` is
+    /// `user`'s. The seam through which a caller's test reads the rows its admissions owe.
+    pub fn decided_in(
+        self,
+        ledger: &Ledger,
+        user: &Path,
+        host: &str,
+        digest: Digest,
+        result: &Result<Claim, Error>,
+        write: impl FnOnce(&Row) -> bool,
+    ) {
+        decided_in(ledger, user, host, digest, &self, result, write);
+    }
+}
+
+/// AN ADMITTED CLAIM'S WAIT, as its admission row and its build or test row both say it
+/// (`wait_ms`): its grant's `admitted_ms` less its ask's `asked_ms` ([`Claim::asked_ms`]), by
+/// the wall clock ([`interval`]). `admitted_ms` is `None` where its record holds no grant, or a
+/// clock read before 1970 left it 0: `?aterm-capacity`.
+#[must_use]
+pub fn wait(asked_ms: u64, admitted_ms: Option<u64>) -> Fig<u64> {
+    admitted_ms.filter(|&ms| ms != 0).map_or_else(
+        || Fig::Unknown("aterm-capacity".to_owned()),
+        |admitted| interval(admitted, asked_ms),
+    )
+}
+
+/// The interval from `earlier` to `later`, two wall-clock stamps (unix ms): `?clock` where they
+/// run backwards (the clock set back between them by more than the interval), never a known 0.
+#[must_use]
+pub fn interval(later: u64, earlier: u64) -> Fig<u64> {
+    later
+        .checked_sub(earlier)
+        .map_or_else(|| Fig::Unknown("clock".to_owned()), Fig::Known)
 }
 
 /// Write `result`'s row where `ledger` is this user's own ledger ([`Ledger::user`]).
@@ -92,20 +152,24 @@ pub(crate) fn decided_in(
     if !aterm_telemetry::direct::same_folder(ledger.dir(), user) {
         return;
     }
+    let now = aterm_telemetry::now_ms();
     let decision = match result {
-        Ok(claim) => Decision::Admitted(claim.waited()),
-        Err(e) => Decision::Not(e, asked.at.elapsed()),
+        Ok(claim) => Decision::Admitted(wait(
+            claim.asked_ms(),
+            claim.record().held.map(|h| h.admitted_ms),
+        )),
+        Err(e) => Decision::Not(e, interval(now, asked.at_ms)),
     };
-    let row = row(asked, &decision, aterm_telemetry::now_ms(), host, digest);
+    let row = row(asked, &decision, now, host, digest);
     let _ = write(&row);
 }
 
-/// How an admission ended.
+/// How an admission ended, and its wait by the wall clock.
 pub(crate) enum Decision<'a> {
-    /// Admitted after the claim's own wait.
-    Admitted(Duration),
-    /// Not admitted, after the call's stopwatch.
-    Not(&'a Error, Duration),
+    /// Admitted, after the wait its record's stamps say ([`wait`]).
+    Admitted(Fig<u64>),
+    /// Not admitted, after the wait from its ask to the decision ([`interval`]).
+    Not(&'a Error, Fig<u64>),
 }
 
 /// The `kind=admission` row for `decision`, decided at `at_ms` on `host_name` with facts `facts`.
@@ -117,7 +181,7 @@ pub(crate) fn row(
     facts: Digest,
 ) -> Row {
     let (outcome, stop, sig, waited, meter) = match decision {
-        Decision::Admitted(w) => (Outcome::Ok, Stop::Exit, None, *w, Meter::Exact),
+        Decision::Admitted(w) => (Outcome::Ok, Stop::Exit, None, w.clone(), Meter::Exact),
         Decision::Not(e, w) => {
             let (outcome, stop, sig) = match e {
                 Error::Never(_) | Error::Unmet { .. } | Error::Timing(_) => {
@@ -130,10 +194,9 @@ pub(crate) fn row(
                 Error::Stuck { .. } => (Outcome::Fail, Stop::Stalled, None),
                 Error::Ledger(_) => (Outcome::Fail, Stop::Unknown, None),
             };
-            (outcome, stop, sig, *w, Meter::Stamped)
+            (outcome, stop, sig, w.clone(), Meter::Stamped)
         }
     };
-    let wait = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX);
     let program = asked.what.split_whitespace().next().unwrap_or("");
     Row {
         at_ms,
@@ -149,10 +212,10 @@ pub(crate) fn row(
         on: None,
         host: aterm_telemetry::row::host_word(host_name),
         facts,
-        wall_ms: Fig::Known(wait),
+        wall_ms: waited.clone(),
         cpu_ms: Fig::Na,
         peak_bytes: Fig::Na,
-        wait_ms: Fig::Known(wait),
+        wait_ms: waited,
         cache: Fig::Na,
         outcome,
         stop,
@@ -170,7 +233,7 @@ mod tests {
         Asked {
             what: "targo test aterm-gui".to_owned(),
             checkout: Some("/Users//me/secret-project".to_owned()),
-            at: Instant::now(),
+            at_ms: 1_000,
         }
     }
 
@@ -182,7 +245,7 @@ mod tests {
     fn an_admitted_claim_writes_its_own_wait_and_no_words() {
         let row = row(
             &asked(),
-            &Decision::Admitted(Duration::from_millis(4_250)),
+            &Decision::Admitted(Fig::Known(4_250)),
             1_000,
             "m14",
             facts(),
@@ -221,7 +284,7 @@ mod tests {
         let at = |e: &Error| {
             let r = row(
                 &asked(),
-                &Decision::Not(e, Duration::from_millis(9)),
+                &Decision::Not(e, Fig::Known(9)),
                 1,
                 "m14",
                 facts(),
@@ -268,6 +331,97 @@ mod tests {
 
     fn refused() -> Result<Claim, Error> {
         Err(Error::Never("too big".to_owned()))
+    }
+
+    /// A CLAIM THAT WAITED ACROSS A SLEEP (TM-1 review): macOS's monotonic clock stops while the
+    /// Mac sleeps and the wall clock does not, so the claim's own [`Claim::waited`] says an hour
+    /// less than its record's stamps. Its admission row says the record's wait, by the wall
+    /// clock, which is what its build or test row reads from the same record ([`wait`]): one
+    /// wait from one clock. NEGATIVE CONTROL (by hand: the admitted row's wait taken from
+    /// `waited`, as before): the row says seconds where the build row says an hour.
+    #[test]
+    fn a_claim_that_waited_across_a_sleep_says_one_wait_in_both_rows() {
+        const HOUR: u64 = 3_600_000;
+        let tmp = aterm_tempfile::tempdir().expect("tempdir");
+        let ledger = Ledger::at(tmp.path().join("ledger"));
+        let m = crate::Fixed::new(crate::Reading::of_gib(48, 40, 14));
+        let need = || crate::Need::new("targo test -p a").mem(crate::floor::GIB);
+        let asked = Asked::of(&need());
+        let mut claim = crate::admit_with(
+            &ledger,
+            &m,
+            need(),
+            crate::Admit::Wait,
+            crate::Pace::default(),
+            &mut |_| {},
+        )
+        .expect("held");
+        claim.slept_while_waiting(HOUR);
+        assert!(
+            claim.waited() < std::time::Duration::from_secs(60),
+            "this process's clock saw no sleep"
+        );
+        let record = claim.record().clone();
+        let build_rows = wait(record.start_ms, record.held.map(|h| h.admitted_ms));
+        assert!(
+            build_rows.known().is_some_and(|w| w >= HOUR),
+            "{build_rows:?}"
+        );
+        let mut rows = Vec::new();
+        let facts = host();
+        decided_in(
+            &ledger,
+            ledger.dir(),
+            &facts.host,
+            facts.digest(),
+            &asked,
+            &Ok(claim),
+            |row| {
+                rows.push(row.clone());
+                true
+            },
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].wait_ms, build_rows, "one wait in both rows");
+        assert_eq!(rows[0].wall_ms, rows[0].wait_ms);
+        assert_eq!(rows[0].meter, Meter::Exact);
+    }
+
+    /// A refused admission's wait runs from its ask's stamp to its decision's, by the same wall
+    /// clock: a clock set back between them is `?clock`, never a known 0, and so is an admitted
+    /// claim's whose grant reads before its ask. NEGATIVE CONTROL: stamps in order give theirs.
+    #[test]
+    fn a_wait_whose_stamps_run_backwards_is_no_known_wait() {
+        assert_eq!(interval(5, 9), Fig::Unknown("clock".to_owned()));
+        assert_eq!(interval(9, 5), Fig::Known(4));
+        assert_eq!(wait(9, Some(5)), Fig::Unknown("clock".to_owned()));
+        assert_eq!(wait(5, Some(9)), Fig::Known(4));
+        assert_eq!(wait(5, Some(0)), Fig::Unknown("aterm-capacity".to_owned()));
+        assert_eq!(wait(5, None), Fig::Unknown("aterm-capacity".to_owned()));
+        let later = Asked {
+            at_ms: u64::MAX,
+            ..asked()
+        };
+        let mut rows = Vec::new();
+        let tmp = aterm_tempfile::tempdir().expect("tempdir");
+        let ledger = Ledger::at(tmp.path().to_path_buf());
+        let facts = host();
+        decided_in(
+            &ledger,
+            ledger.dir(),
+            &facts.host,
+            facts.digest(),
+            &later,
+            &refused(),
+            |row| {
+                rows.push(row.clone());
+                true
+            },
+        );
+        assert_eq!(
+            (rows[0].wait_ms.clone(), rows[0].meter),
+            (Fig::Unknown("clock".to_owned()), Meter::Stamped)
+        );
     }
 
     #[test]

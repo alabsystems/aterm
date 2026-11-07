@@ -13,13 +13,7 @@ const DOMAIN: &[u8] = b"aterm/native-account-input/1\0";
 const MAX: usize = 128 * 1024;
 
 fn native_entry(name: &str) -> crate::Result<()> {
-    if name == "ai-native-pool.toml"
-        || (name.starts_with("native-api-key-")
-            && name.len() == "native-api-key-".len() + 48
-            && name["native-api-key-".len()..]
-                .bytes()
-                .all(|b| b.is_ascii_hexdigit()))
-    {
+    if name == crate::entry_class::AI_NATIVE_POOL || crate::entry_class::native_api_key(name) {
         Ok(())
     } else {
         Err(Error::new("native account entry has another purpose"))

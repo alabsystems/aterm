@@ -483,6 +483,22 @@ pub(crate) fn project(slot: Option<&FleetSlot>, obs: &NetworkObservation, now_ms
         if let Some(tally) = mac.activity {
             *tallies.busy.get_or_insert(0) += usize::from(tally.busy);
             tallies.waiting += usize::from(tally.waiting);
+            // A session the tally does not count waiting (a shell; or an agent an older node
+            // still counts by its word alone) whose need a person decides waits too, as its
+            // seat's diamond says; counted only where the read listed every agent, so no agent is
+            // counted twice.
+            if mac.sessions_more == 0 {
+                tallies.waiting += mac
+                    .needs
+                    .iter()
+                    .filter(|need| need.word.severity() == aterm_types::needs::Severity::Decide)
+                    .filter(|need| {
+                        !mac.agent_sessions
+                            .iter()
+                            .any(|s| s.sid == need.sid && s.agent == AgentWord::Waiting)
+                    })
+                    .count();
+            }
             tallies.walled += usize::from(tally.walled);
             tallies.walled_macs += usize::from(tally.walled > 0);
         }
@@ -655,7 +671,7 @@ fn fleet_words(
                     }
                 }
                 if long && t.other_builds > 0 {
-                    terms.push(format!("{} other builds", t.other_builds));
+                    terms.push(count(t.other_builds, "other build", "other builds"));
                 }
                 terms
             };
@@ -1388,8 +1404,10 @@ pub(crate) fn now_line(field: &Field) -> String {
     if let Some(busy) = t.busy {
         let least = if field.lower_bound { "at least " } else { "" };
         line.push_str(&format!(
-            " · {least}{busy} agents busy, {} waiting, {} walled on {} Macs",
-            t.waiting, t.walled, t.walled_macs
+            " · {least}{busy} agents busy, {} waiting on a person, {} walled on {}",
+            t.waiting,
+            t.walled,
+            count(t.walled_macs, "Mac", "Macs")
         ));
     }
     if t.stuck > 0 {
@@ -1601,7 +1619,7 @@ fn spread_line(field: &Field, snapshot: &FleetSnapshot) -> String {
             Some(_) => quiet += 1,
         }
     }
-    let mut terms = vec![format!("{busy} Macs busy")];
+    let mut terms = vec![format!("{} busy", count(busy, "Mac", "Macs"))];
     if held > 0 {
         terms.push(format!("{held} waiting, at a limit or stuck"));
     }
@@ -1609,6 +1627,11 @@ fn spread_line(field: &Field, snapshot: &FleetSnapshot) -> String {
     terms.push(format!("{none} no agents"));
     terms.push(format!("{not_read} not read"));
     terms.join(" · ")
+}
+
+/// `n` and its noun, singular for one: `1 other build`, `5 other builds`.
+fn count(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
 }
 
 fn t_read(field: &Field) -> bool {

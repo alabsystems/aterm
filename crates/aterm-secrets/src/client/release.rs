@@ -45,9 +45,6 @@ const NOTARY_RECHECK: Duration = Duration::from_secs(30 * 60);
 const RELEASE_PROFILE: &str = ".aterm/release-ring/release-credentials.toml";
 const LEGACY_RELEASE_PROFILE: &str = ".aterm/release-credentials.toml";
 
-/// The direct certificate/key leaves the shared signing reader may authenticate.
-pub(super) const APPLE_PREFIX: &str = "~/.aterm/apple/devid-";
-
 /// The canonical roster is considered alongside the profile's named roster. The legacy
 /// location is read only when neither provides a pair.
 const VAULT_ROSTER: &str = ".aterm/release-ring/roster/aterm-machines.toml";

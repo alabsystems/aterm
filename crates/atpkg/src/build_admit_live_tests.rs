@@ -214,7 +214,6 @@ pub(super) fn actor(world: &Path, mode: &str) {
         supervise_launch(
             Some(*held),
             &mut command,
-            &|| 1,
             &mut |_| {},
             front::Front::arm_cohort,
             |owned, _| {
@@ -259,7 +258,6 @@ pub(super) fn actor(world: &Path, mode: &str) {
             *held,
             &mut command,
             std::fs::File::open("/dev/tty").unwrap(),
-            &|| 1,
             &mut |_| {},
             live,
             &mut events,

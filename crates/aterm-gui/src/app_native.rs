@@ -4526,6 +4526,9 @@ impl App {
             AppEffect::Harness(crate::native_app::HarnessRequest::AiSignIn { id }) => {
                 self.ai_sign_in(wid, id);
             }
+            AppEffect::Harness(crate::native_app::HarnessRequest::LabToken { index }) => {
+                self.lab_token_step(wid, index);
+            }
             AppEffect::Harness(request) => self.execute_native_harness(request),
             AppEffect::HarnessTimer(request) => self.execute_harness_timer(request),
             AppEffect::InvalidateOwnPresentation => {

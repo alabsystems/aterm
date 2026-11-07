@@ -89,18 +89,18 @@ impl Row {
         let mut written_end = end;
 
         if start > 0 && self.cells[start - 1].flags().contains(CellFlags::WIDE) {
-            self.cells[start - 1] = orphan;
+            self.cells.set(start - 1, orphan);
             written_start = start - 1;
         }
 
         let mut cleared_right_orphan = false;
         if end > start && end < cols && self.cells[end - 1].flags().contains(CellFlags::WIDE) {
-            self.cells[end] = orphan;
+            self.cells.set(end, orphan);
             cleared_right_orphan = true;
             written_end = end + 1;
         }
 
-        self.cells[start..end].fill(fill);
+        self.cells.slice_mut(start..end).fill(fill);
         self.flags |= RowFlags::DIRTY;
         let right_orphan_is_content = cleared_right_orphan && !orphan.is_empty();
         if !fill.is_empty() {
@@ -164,8 +164,14 @@ impl Row {
         }
         let lead_colors = self.cells[lead].colors();
         let spacer_colors = self.cells[lead + 1].colors();
-        self.cells[lead] = Cell::from_raw_parts(' ' as u16, lead_colors, lead_flags);
-        self.cells[lead + 1] = Cell::from_raw_parts(' ' as u16, spacer_colors, spacer_flags);
+        self.cells.set(
+            lead,
+            Cell::from_raw_parts(' ' as u16, lead_colors, lead_flags),
+        );
+        self.cells.set(
+            lead + 1,
+            Cell::from_raw_parts(' ' as u16, spacer_colors, spacer_flags),
+        );
         self.flags |= RowFlags::DIRTY;
     }
 
@@ -186,10 +192,10 @@ impl Row {
                 .flags()
                 .contains(CellFlags::WIDE_CONTINUATION);
             if prev_wide && !cur_cont {
-                self.cells[left - 1] = Cell::EMPTY;
+                self.cells.set(left - 1, Cell::EMPTY);
             }
             if clear_orphan_spacers && cur_cont && !prev_wide && self.cells[left].char() == ' ' {
-                self.cells[left] = Cell::EMPTY;
+                self.cells.set(left, Cell::EMPTY);
             }
         }
         if right < self.cells.len() && right + 1 < cols && right + 1 < self.cells.len() {
@@ -198,11 +204,11 @@ impl Row {
                 .flags()
                 .contains(CellFlags::WIDE_CONTINUATION);
             if cur_wide && !next_cont {
-                self.cells[right] = Cell::EMPTY;
+                self.cells.set(right, Cell::EMPTY);
             }
             if clear_orphan_spacers && next_cont && !cur_wide && self.cells[right + 1].char() == ' '
             {
-                self.cells[right + 1] = Cell::EMPTY;
+                self.cells.set(right + 1, Cell::EMPTY);
             }
         }
     }
@@ -283,8 +289,8 @@ impl Row {
                     .contains(CellFlags::WIDE)
                 && !self.is_cell_protected((start_usize - 1) as u16)
             {
-                self.cells[start_usize - 1] = fill;
-                self.cells[start_usize] = fill;
+                self.cells.set(start_usize - 1, fill);
+                self.cells.set(start_usize, fill);
                 any_erased = true;
                 written.start = super::u16_from_usize(start_usize - 1);
             }
@@ -297,12 +303,12 @@ impl Row {
                     if self.cells[col].flags().contains(CellFlags::WIDE)
                         && col + 1 < self.cells.len()
                     {
-                        self.cells[col + 1] = fill;
+                        self.cells.set(col + 1, fill);
                         if col + 1 == end_usize {
                             written.end = super::u16_from_usize(end_usize + 1);
                         }
                     }
-                    self.cells[col] = fill;
+                    self.cells.set(col, fill);
                     any_erased = true;
                 }
             }
@@ -351,9 +357,13 @@ impl Row {
                     .contains(CellFlags::WIDE)
                 && !self.is_cell_protected((start_usize - 1) as u16)
             {
-                self.cells[start_usize - 1].set_char(' ');
+                if let Some(cell) = self.cells.get_mut(start_usize - 1) {
+                    cell.set_char(' ');
+                }
                 wiped.push((start_usize - 1) as u16);
-                self.cells[start_usize].set_char(' ');
+                if let Some(cell) = self.cells.get_mut(start_usize) {
+                    cell.set_char(' ');
+                }
                 any_erased = true;
             }
 
@@ -364,10 +374,14 @@ impl Row {
                     if self.cells[col].flags().contains(CellFlags::WIDE)
                         && col + 1 < self.cells.len()
                     {
-                        self.cells[col + 1].set_char(' ');
+                        if let Some(cell) = self.cells.get_mut(col + 1) {
+                            cell.set_char(' ');
+                        }
                         wiped.push((col + 1) as u16);
                     }
-                    self.cells[col].set_char(' ');
+                    if let Some(cell) = self.cells.get_mut(col) {
+                        cell.set_char(' ');
+                    }
                     wiped.push(col as u16);
                     any_erased = true;
                 }
@@ -398,9 +412,9 @@ impl Row {
             if !self.is_cell_protected(col as u16) {
                 // A cleared WIDE head takes its continuation with it.
                 if self.cells[col].flags().contains(CellFlags::WIDE) && col + 1 < cols {
-                    self.cells[col + 1] = fill;
+                    self.cells.set(col + 1, fill);
                 }
-                self.cells[col] = fill;
+                self.cells.set(col, fill);
                 any_erased = true;
             }
         }

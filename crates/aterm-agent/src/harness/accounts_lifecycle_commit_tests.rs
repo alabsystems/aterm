@@ -99,7 +99,7 @@ impl Fixture {
             who: ProcessLogin {
                 login: row.dir.clone(),
                 default_home: true,
-                stored_login: true,
+                route: crate::harness::accounts::AuthRoute::Stored,
             },
             row,
             credential,

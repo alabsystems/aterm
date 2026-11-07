@@ -42,7 +42,7 @@ use aterm_agent::harness::witness::{self, RouteKey, Target};
 use aterm_agent::supervise::memory::AgentMemory;
 use aterm_agent::supervise::policy::turn_end::{
     AccountAdvice, AccountAt, AccountBad, AccountPoint, AskAgain, HeldBy, Reach, Ready,
-    RestartAnswer, RestartAsk, RestartClaim, RosterWord, SignInNext,
+    RestartAnswer, RestartAsk, RestartClaim, RosterWord, RouteTo, SignInNext,
 };
 use aterm_agent::supervise::policy::{
     ResetAsk, ResetEnd, ResetGo, ResetNo, ResetOffer, ResetOutcome, ResetWord,
@@ -2940,7 +2940,8 @@ type ClaimLeftFn = dyn Fn() -> Option<String> + Send + Sync;
 type AccountEnvFn = dyn Fn(&Snapshot) -> Option<Vec<String>> + Send + Sync;
 /// A current screen's usage wall, bound to the captured Claude process.
 type AccountScreenWallFn = dyn Fn(&str, &Snapshot) -> Option<ScreenAccountWall> + Send + Sync;
-/// Whether an agent's settings files and the vendor's profile store leave it its stored login.
+/// Whether an agent's settings files and the vendor's profile store leave it its account's own
+/// credential, its stored login or its vault token ([`crate::harness_netprobe::auth_route_of_agent`]).
 type AccountSettingsFn = dyn Fn(u32, &[String], &str) -> bool + Send + Sync;
 /// [`Acts::login_pin`].
 type LoginPinFn =
@@ -6040,7 +6041,8 @@ impl IdleHost for WorkerIdle {
         }
         let snap = with_kept_of(&self.kept, |k| k.snapshot.clone())?;
         let env = (self.hooks.acts.account_env)(&snap)?;
-        if !accounts::ProcessLogin::of_exec_env(&env)?.stored_login
+        // A profile read: a token session's profile may be stale, so its route is left out.
+        if !accounts::ProcessLogin::of_exec_env(&env)?.route.is_stored()
             || !self.settled(snap.pid, &snap.start, &snap.argv, &snap.cwd)
         {
             return None;
@@ -6408,6 +6410,25 @@ impl IdleHost for WorkerIdle {
             project = "harness_host::tests::account_advice::execution_transition"
         )
     )]
+    fn route_move(&self) -> Option<RouteTo> {
+        if self.beside() || !accounts_for(self.agent) || !self.switches.accounts_live() {
+            return None;
+        }
+        let seat = (self.hooks.acts.account_seat)()?;
+        let roster = roster_read(&seat).ok()?;
+        let look = self.account_look(&roster)?;
+        let to = route_offered(&seat, &roster, &look.who)?;
+        aterm_log::info!(
+            "harness @{}: route move offered: onto its {}",
+            self.sid,
+            match to {
+                RouteTo::Token => "account's vault token",
+                RouteTo::Stored => "row's stored login",
+            }
+        );
+        Some(to)
+    }
+
     fn account_execution_hold(&self) -> Option<Instant> {
         use aterm_agent::harness::account_progress::{
             EXECUTION_CONTEXT_UNREAD_FINDING, EXECUTION_PREPARED_FINDING,
@@ -6507,7 +6528,10 @@ impl IdleHost for WorkerIdle {
             return;
         };
         let me = look.who.me(&roster);
-        let Some(label) = me.account.filter(|_| me.default_home && me.stored_login) else {
+        let Some(label) = me
+            .account
+            .filter(|_| me.default_home && me.route.on_account())
+        else {
             return;
         };
         if with_kept_of(&self.kept, |k| k.account.flying.is_some()) {
@@ -6605,7 +6629,8 @@ impl IdleHost for WorkerIdle {
         }
         let snap = with_kept_of(&self.kept, |k| k.snapshot.clone())?;
         let env = (self.hooks.acts.account_env)(&snap)?;
-        if !accounts::ProcessLogin::of_exec_env(&env)?.stored_login
+        // The sign-in picker is a login service: a token session never reaches it.
+        if !accounts::ProcessLogin::of_exec_env(&env)?.route.is_stored()
             || !self.settled(snap.pid, &snap.start, &snap.argv, &snap.cwd)
         {
             return None;
@@ -6620,11 +6645,20 @@ impl IdleHost for WorkerIdle {
     /// What the session's Claude Code settings make of `/login` ([`IdleHost::login_pin`]): read
     /// from its agent's process as the host last followed it; no process followed is
     /// [`LoginPin::Unread`](aterm_agent::supervise::policy::login::LoginPin::Unread), so aterm types
-    /// no `/login` it cannot tell opens no browser.
+    /// no `/login` it cannot tell opens no browser. A session the wrapper served its vault token
+    /// is [`LoginPin::Token`](aterm_agent::supervise::policy::login::LoginPin::Token): the token
+    /// outranks its stored login, so aterm never types `/login` there
+    /// (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.8).
     fn login_pin(&self) -> aterm_agent::supervise::policy::login::LoginPin {
         let Some(snap) = with_kept_of(&self.kept, |k| k.snapshot.clone()) else {
             return aterm_agent::supervise::policy::login::LoginPin::Unread;
         };
+        match snap.route {
+            accounts::AuthRoute::VaultToken { .. } => {
+                return aterm_agent::supervise::policy::login::LoginPin::Token;
+            }
+            accounts::AuthRoute::Stored | accounts::AuthRoute::Outside => {}
+        }
         (self.hooks.acts.login_pin)(snap.pid, &snap.argv, &snap.cwd)
     }
 
@@ -6770,9 +6804,13 @@ impl IdleHost for WorkerIdle {
     }
 
     /// The claim of the account's one `/usage` probe ([`IdleHost::account_probe`]): [`Self::probe_claim`].
+    /// A session on its vault token never takes one: the probe reads a stored login's usage.
     fn take_provider_read_account(&self) -> Option<provider_read::Account> {
         with_kept_of(&self.kept, |k| {
             let probing = k.account.probing.as_ref()?;
+            if !probing.who.route.is_stored() {
+                return None;
+            }
             if std::mem::replace(&mut k.account.read_authority_taken, true) {
                 return None;
             }
@@ -7071,8 +7109,12 @@ impl WorkerIdle {
         let (reading, _) = read.filter(|_| before.is_some())?;
         let reading_login = login_named(reading.login.as_deref());
         let home = home_named(snap.home.as_deref());
-        let own = snap.stored_login
-            && home.is_none()
+        // A token session's reading is the account's: the fold credits the row whose entry its
+        // marker names (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.7).
+        let own = match snap.route {
+            accounts::AuthRoute::Stored | accounts::AuthRoute::VaultToken { .. } => true,
+            accounts::AuthRoute::Outside => false,
+        } && home.is_none()
             && reading_login == login_named(snap.login.as_deref())
             && home_named(reading.home.as_deref()) == home;
         if !own {
@@ -7103,7 +7145,12 @@ impl WorkerIdle {
         let windows = (reading.five_hour, reading.seven_day);
         // Another login can report the same figures; read its identity before deduplication.
         let row = captured.row(&label).expect("tap row was attributed");
+        // A session on its vault token: the row's own token, whose standing is read value-free
+        // before the fold (served facts, verification by windows; design §5.6, §5.7).
+        let token = token_standing(&seat, row, &look.who);
         let key = match row.expected_identity_email() {
+            // A profile read: a token session's profile may be stale, so it keys nothing.
+            _ if !look.who.route.is_stored() => None,
             Some(email) => profile::account_for_login(
                 &look.profile_env,
                 &seat.home,
@@ -7149,7 +7196,13 @@ impl WorkerIdle {
         let mut held_back = false;
         let mut low_or_limited = false;
         let mut series = None;
+        let mut verify = None;
         let noted = self.usage_observed(&seat, &captured, &look.who, |state, now| {
+            // Under `accounts.lock`, before this reading is folded into the row: so the basis a
+            // token's verification compares with is the stored login's, never the token's own.
+            if let Some(standing) = token.as_ref() {
+                verify = token_served(&seat, standing, &label, state, &read, now);
+            }
             let (events, held) = accounts::note_reading_held(state, &label, &read, now);
             held_back = held;
             low_or_limited = !events.is_empty()
@@ -7171,6 +7224,9 @@ impl WorkerIdle {
         });
         match noted {
             Ok(events) => {
+                if let Some(verify) = verify {
+                    token_verify(&seat, verify);
+                }
                 if low_or_limited {
                     (self.hooks.acts.accounts_upkeep).make(UpkeepStep::Renew);
                 }
@@ -7789,7 +7845,8 @@ impl WorkerIdle {
         let Some(env) = (self.hooks.acts.account_env)(&snap) else {
             return;
         };
-        if !accounts::ProcessLogin::of_exec_env(&env).is_some_and(|who| who.stored_login)
+        // The credit offer reads the session's profile, which a token session's may not be.
+        if !accounts::ProcessLogin::of_exec_env(&env).is_some_and(|who| who.route.is_stored())
             || !self.settled(snap.pid, &snap.start, &snap.argv, &snap.cwd)
         {
             return;
@@ -8232,7 +8289,7 @@ impl WorkerIdle {
         let stored = (self.hooks.acts.account_settings)(pid, argv, cwd);
         if !stored {
             aterm_log::info!(
-                "harness @{}: pid {pid} is no stored login by its settings: no account is its",
+                "harness @{}: pid {pid} is off its account's own credential by its settings: no account is its",
                 self.sid
             );
         }
@@ -8283,7 +8340,8 @@ impl WorkerIdle {
         require_known: bool,
     ) -> bool {
         let me = look.who.me(roster);
-        if !me.default_home || !me.stored_login || me.account != Some(label) {
+        // Identity evidence is the stored login's profile: a login service.
+        if !me.default_home || !me.route.is_stored() || me.account != Some(label) {
             return false;
         }
         let Some(row) = roster.row(label) else {
@@ -8319,7 +8377,8 @@ impl WorkerIdle {
         label: &str,
     ) {
         let me = look.who.me(roster);
-        if !me.default_home || !me.stored_login || me.account != Some(label) {
+        // A sign-in is a stored login's service.
+        if !me.default_home || !me.route.is_stored() || me.account != Some(label) {
             return;
         }
         let done = login_transact_of(
@@ -8439,7 +8498,12 @@ impl WorkerIdle {
         let listed = accounts::judged_label(roster, &who).is_some();
         let who = if listed {
             accounts::ProcessLogin {
-                stored_login: self.settled(snap.pid, &snap.start, &snap.argv, &snap.cwd),
+                route: who.route.unless(!self.settled(
+                    snap.pid,
+                    &snap.start,
+                    &snap.argv,
+                    &snap.cwd,
+                )),
                 ..who
             }
         } else {
@@ -8570,6 +8634,25 @@ impl WorkerIdle {
         let Some(look) = self.account_look(&roster) else {
             return self.account_unjudged("its process's login could not be read", None);
         };
+        // A lost login on a session the token wrapper served is the token's refusal (§5.6 of
+        // `docs/DESIGN-claude-setup-token-2026-11-05.md`): recorded as this Mac's, and nothing of
+        // the row's stored login is judged or written; the route move takes the session back.
+        if matches!(
+            point,
+            AccountPoint::Wall {
+                kind: aterm_phase::WallKind::Auth
+            } | AccountPoint::LoginEnded
+        ) && let Some(first) = token_refused_at(&seat, &roster, &look.who)
+        {
+            if first {
+                aterm_log::info!(
+                    "harness @{}: account advice: Claude Code refused its vault token; marked \
+                     rejected on this Mac",
+                    self.sid
+                );
+            }
+            return None;
+        }
         let Some(seen) = self.lost_seen(&look, point, seat.now) else {
             return self.account_unjudged("its process changed while its login was read", None);
         };
@@ -8883,6 +8966,11 @@ impl WorkerIdle {
             return Err(NoProbe::Mode);
         }
         let (seat, roster, look) = self.account_ctx().ok_or(NoProbe::Unread)?;
+        // The probe reads a stored login's `/usage`: a session on its vault token is no stored
+        // login's (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.7).
+        if !look.who.route.is_stored() {
+            return Err(NoProbe::NotJudged);
+        }
         let label = look.judged(&roster).ok_or(NoProbe::NotJudged)?.to_owned();
         let row = roster.row(&label).ok_or(NoProbe::NotJudged)?.clone();
         let path = seat.roster.clone().ok_or(NoProbe::State)?;
@@ -14301,7 +14389,7 @@ fn restored_step(shared: &Shared, hooks: &Hooks, taken: &RestoredTaken, relaunch
                 relaunch::ColdAdmission::Immediate(chosen) => {
                     (chosen.as_deref().unwrap_or(&agent.snap), None)
                 }
-                relaunch::ColdAdmission::Deferred(intent) => (&agent.snap, Some(intent)),
+                relaunch::ColdAdmission::Deferred(intent) => (&agent.snap, Some(&**intent)),
             };
             // The line a cold restore relaunches a self-claimed codex-alab on is typed as the
             // crash rule's is ([`crate::self_claim::typed`]): the claim the relaunched process
@@ -14311,7 +14399,7 @@ fn restored_step(shared: &Shared, hooks: &Hooks, taken: &RestoredTaken, relaunch
                 crate::self_claim::typed(&agent.sid, resume);
             }
             let deferred_admit = |_: &Snapshot| match deferred {
-                Some(intent) => Ok(relaunch::ColdAdmission::Deferred(intent.clone())),
+                Some(intent) => Ok(relaunch::ColdAdmission::Deferred(Box::new(intent.clone()))),
                 None => Ok(relaunch::ColdAdmission::Immediate(None)),
             };
             match agent.asked {
@@ -16576,6 +16664,7 @@ fn look_at_startups(
             (_, StartupSeen::Unread) => soonest(now + STARTUP_UNREAD_LOOK),
             (_, StartupSeen::CannotClaim) => {
                 books.off.insert(w.sid.clone(), now);
+                books.installs.remove(&w.sid);
                 soonest(now + STARTUP_UNREAD_LOOK);
             }
             (StartupState::Working | StartupState::Reopened, StartupSeen::Holds(hold)) => {
@@ -16656,6 +16745,8 @@ fn judge_install_startup(
         .filter(|until| now < *until);
     if books.waits.relaunching.contains(&w.sid) || panel.is_some() {
         books.off.insert(w.sid.clone(), now);
+        // A harness-owned wait is no install quiet. Resume with a whole quiet clock.
+        books.installs.remove(&w.sid);
         return Some(panel.map_or(now + HELD_RELOOK, |until| until.min(now + HELD_RELOOK)));
     }
     let clock = books
@@ -19356,7 +19447,7 @@ fn live_acts(
                 return "refused:no-home".to_string();
             };
             let deferred = |_: &Snapshot| match launch.deferred {
-                Some(intent) => Ok(relaunch::ColdAdmission::Deferred(intent.clone())),
+                Some(intent) => Ok(relaunch::ColdAdmission::Deferred(Box::new(intent.clone()))),
                 None => Ok(relaunch::ColdAdmission::Immediate(None)),
             };
             let admit = launch
@@ -19511,7 +19602,12 @@ fn live_acts(
         account_screen_wall: Arc::new(move |sid, snap| {
             screen_account_wall(&screen_wall_store, sid, snap)
         }),
-        account_settings: Arc::new(crate::harness_netprobe::stored_login_of_agent),
+        account_settings: Arc::new(|pid, argv, cwd| {
+            match crate::harness_netprobe::auth_route_of_agent(pid, argv, cwd) {
+                accounts::AuthRoute::Stored | accounts::AuthRoute::VaultToken { .. } => true,
+                accounts::AuthRoute::Outside => false,
+            }
+        }),
         login_pin: Arc::new(crate::harness_netprobe::login_pin_of_agent),
         tap_born: Arc::new(|pid| {
             aterm_uds::process::read_process_birth(i32::try_from(pid).ok()?)
@@ -19779,7 +19875,7 @@ fn account_wall_of(
         return ("no-env", None);
     };
     let who = accounts::ProcessLogin {
-        stored_login: who.stored_login && read.settled,
+        route: who.route.unless(!read.settled),
         ..who
     };
     let screen_wall = read.screen_wall.map(ScreenAccountWall::standing);
@@ -20606,7 +20702,9 @@ fn account_usage_of(
         return "no-env";
     };
     let who = accounts::ProcessLogin {
-        stored_login: accounts::judged_label(roster, &who).is_some() && (read.settled)(),
+        route: who
+            .route
+            .unless(accounts::judged_label(roster, &who).is_none() || !(read.settled)()),
         ..who
     };
     let at = if accounts::judged_label(roster, &who).is_some() {
@@ -20810,10 +20908,10 @@ fn observed_account(
         label: None,
         profile_env: profile_environment(&env),
     };
-    let Some(label) = who
-        .me(roster)
+    let me = who.me(roster);
+    let Some(label) = me
         .account
-        .filter(|_| who.default_home && who.stored_login)
+        .filter(|_| me.default_home && me.route.on_account())
     else {
         return Ok(observed);
     };
@@ -21376,10 +21474,193 @@ fn account_made_at(root: &Path, sid: &str, to: &str, at: AccountAt) -> bool {
     refused.is_empty()
 }
 
+/// A token session's standing as the tap reads it ([`token_standing`]).
+#[cfg(unix)]
+type TokenStanding = aterm_secrets::claude_token::Standing;
+#[cfg(not(unix))]
+type TokenStanding = std::convert::Infallible;
+
+/// What a token session's reading leaves to write once its fold is ([`token_verify`]): the
+/// token's key and the evidence of its windows.
+#[cfg(unix)]
+type TokenVerify = (
+    aterm_secrets::claude_token::Key,
+    aterm_secrets::claude_token::Verified,
+);
+#[cfg(not(unix))]
+type TokenVerify = std::convert::Infallible;
+
+/// The standing of `row`'s vault token, where the session whose process login is `who` runs on
+/// it (`AuthRoute::VaultToken` naming the row's own entry): read value-free from this Mac's vault,
+/// never waiting past `claude_token::standing`'s brief wait.
+#[cfg(unix)]
+fn token_standing(
+    seat: &AccountSeat,
+    row: &accounts::Row,
+    who: &accounts::ProcessLogin,
+) -> Option<TokenStanding> {
+    use aterm_secrets::claude_token::{self, Key, Lookup};
+    let entry = accounts::TokenEntry::of_row(row)?;
+    match who.route.for_account(Some(entry)) {
+        accounts::AuthRoute::VaultToken { .. } => {}
+        accounts::AuthRoute::Stored | accounts::AuthRoute::Outside => return None,
+    }
+    let key = Key::parse(entry.key().as_str())?;
+    match claude_token::standing(&aterm_secrets::client::Paths::for_home(&seat.home), &key) {
+        Ok(Lookup::Found(standing)) => Some(standing),
+        Ok(Lookup::Absent | Lookup::Unknown) | Err(_) => None,
+    }
+}
+
+#[cfg(not(unix))]
+fn token_standing(
+    _seat: &AccountSeat,
+    _row: &accounts::Row,
+    _who: &accounts::ProcessLogin,
+) -> Option<TokenStanding> {
+    None
+}
+
+/// A token session's served reading `read` of the row `label`, recorded in this Mac's token table
+/// before the fold ([`aterm_agent::harness::accounts_tokens::note_served`]): its served facts,
+/// and on the minting Mac the basis (the row's stored-login windows `state` holds now) and the
+/// comparison, with the other accounts' current windows here. Where the windows are equal, what
+/// [`token_verify`] writes once the fold is.
+#[cfg(unix)]
+fn token_served(
+    seat: &AccountSeat,
+    standing: &TokenStanding,
+    label: &str,
+    state: &accounts::State,
+    read: &accounts::TapRead,
+    now: i64,
+) -> Option<TokenVerify> {
+    use aterm_agent::harness::accounts_tokens::{self, Due, Served, Windows};
+    let windows = |account: &accounts::Account| {
+        account
+            .sample
+            .as_ref()
+            .map(|sample| Windows::current(sample, now))
+    };
+    let served = Served {
+        label: label.to_owned(),
+        basis: state
+            .accounts
+            .get(label)
+            .and_then(windows)
+            .unwrap_or_default(),
+        reading: Windows::of_reading(read),
+        others: state
+            .accounts
+            .iter()
+            .filter(|(other, _)| other.as_str() != label)
+            .filter_map(|(_, account)| windows(account))
+            .filter(|windows| windows.week_reset.is_some())
+            .collect(),
+    };
+    let at = u64::try_from(now).unwrap_or(0);
+    match accounts_tokens::note_served(&seat.claude_store(), standing, &served, at) {
+        Ok(Due::Verify(evidence)) => Some((standing.key.clone(), evidence)),
+        Ok(Due::Nothing) | Err(_) => None,
+    }
+}
+
+#[cfg(not(unix))]
+fn token_served(
+    _seat: &AccountSeat,
+    standing: &TokenStanding,
+    _label: &str,
+    _state: &accounts::State,
+    _read: &accounts::TapRead,
+    _now: i64,
+) -> Option<TokenVerify> {
+    match *standing {}
+}
+
+/// Writes `verified` for the token [`token_served`] found equal windows for
+/// ([`aterm_agent::harness::accounts_tokens::verify_served`]), after the fold and outside every
+/// store's lock: a vault write. One the vault holds is tried again at the next reading.
+#[cfg(unix)]
+fn token_verify(seat: &AccountSeat, (key, evidence): TokenVerify) {
+    let _ = aterm_agent::harness::accounts_tokens::verify_served(
+        &seat.claude_store(),
+        &aterm_agent::harness::accounts_tokens::Vault(aterm_secrets::client::Paths::for_home(
+            &seat.home,
+        )),
+        &key,
+        evidence,
+        u64::try_from(seat.now).unwrap_or(0),
+    );
+}
+
+#[cfg(not(unix))]
+fn token_verify(_seat: &AccountSeat, verify: TokenVerify) {
+    match verify {}
+}
+
+/// The route move [`IdleHost::route_move`] offers the session whose process login is `who`
+/// ([`aterm_agent::harness::token_route::offered_move`]).
+#[cfg(unix)]
+fn route_offered(
+    seat: &AccountSeat,
+    roster: &accounts::Roster,
+    who: &accounts::ProcessLogin,
+) -> Option<RouteTo> {
+    aterm_agent::harness::token_route::offered_move(
+        &seat.home,
+        &aterm_secrets::client::Paths::for_home(&seat.home),
+        &seat.claude_store(),
+        Some(roster),
+        who,
+        u64::try_from(seat.now).unwrap_or(0),
+    )
+}
+
+#[cfg(not(unix))]
+fn route_offered(
+    _seat: &AccountSeat,
+    _roster: &accounts::Roster,
+    _who: &accounts::ProcessLogin,
+) -> Option<RouteTo> {
+    None
+}
+
+/// Whether a lost login on the session whose process login is `who` is its vault token's
+/// refusal, recorded ([`aterm_agent::harness::token_route::token_refused`]): `Some(first)` for a
+/// session the wrapper served, `None` for one on its stored login.
+#[cfg(unix)]
+fn token_refused_at(
+    seat: &AccountSeat,
+    roster: &accounts::Roster,
+    who: &accounts::ProcessLogin,
+) -> Option<bool> {
+    aterm_agent::harness::token_route::token_refused(
+        &seat.home,
+        &aterm_secrets::client::Paths::for_home(&seat.home),
+        &seat.claude_store(),
+        Some(roster),
+        who,
+        u64::try_from(seat.now).unwrap_or(0),
+    )
+}
+
+#[cfg(not(unix))]
+fn token_refused_at(
+    _seat: &AccountSeat,
+    _roster: &accounts::Roster,
+    _who: &accounts::ProcessLogin,
+) -> Option<bool> {
+    None
+}
+
 fn cold_admission_needed(seat: &AccountSeat, snap: &Snapshot) -> bool {
     accounts_for(snap.agent().program())
         && !snap.home.as_deref().is_some_and(|home| !home.is_empty())
-        && !(snap.auth_observed && !snap.stored_login)
+        && !(snap.auth_observed
+            && match snap.route {
+                accounts::AuthRoute::Stored | accounts::AuthRoute::VaultToken { .. } => false,
+                accounts::AuthRoute::Outside => true,
+            })
         && (snap.auth_observed
             || snap.login.is_some()
             || snap
@@ -21392,7 +21673,12 @@ fn cold_admission_needed(seat: &AccountSeat, snap: &Snapshot) -> bool {
 /// cold constructor is `qualified`: deferred to that constructor only for an agent that ended
 /// under this host (the one case its death witness can prove), and otherwise admitted now on
 /// the tab shell's environment, or the agent's recorded launch environment, as an
-/// unqualified host admits every one ([`account_cold_at`]).
+/// unqualified host admits every one ([`account_cold_at`]). An agent the token wrapper served
+/// (`AuthRoute::VaultToken`) is admitted now too: the native
+/// constructor's seed is fixed before the environment is observed and executes the build, so
+/// only a planned line carries the wrapper ahead of it
+/// (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.4), and a row with no stored login here
+/// would otherwise come back signed out.
 fn account_cold_decided(
     seat: &AccountSeat,
     snap: &Snapshot,
@@ -21401,6 +21687,16 @@ fn account_cold_decided(
     qualified: bool,
     shell_env: impl FnOnce() -> Option<Vec<String>>,
 ) -> Result<relaunch::ColdAdmission, String> {
+    let token = matches!(snap.route, accounts::AuthRoute::VaultToken { .. });
+    if qualified && end == ColdEnd::ThisHost && token {
+        aterm_log::info!(
+            "harness @{}: its agent ran on its account's vault token; it resumes on the planned \
+             line, which carries the token wrapper, admitted on its recorded environment",
+            snap.tab
+        );
+        return account_cold_at(seat, snap, mode, shell_env)
+            .map(relaunch::ColdAdmission::immediate);
+    }
     if !qualified || end == ColdEnd::EarlierHost {
         if qualified {
             aterm_log::info!(
@@ -21413,18 +21709,18 @@ fn account_cold_decided(
         return account_cold_at(seat, snap, mode, shell_env)
             .map(relaunch::ColdAdmission::immediate);
     }
-    Ok(relaunch::ColdAdmission::Deferred(
+    Ok(relaunch::ColdAdmission::Deferred(Box::new(
         aterm_agent::harness::native_act::ColdIntent {
             login: snap.login.clone(),
             home: snap.home.clone(),
             auth_observed: snap.auth_observed,
-            stored_login: snap.stored_login,
+            route: snap.route,
             conversation: snap.session.clone(),
             profile: snap.profile.clone(),
             mode,
             billing: aterm_agent::harness::native_act::ColdBilling::Keep,
         },
-    ))
+    )))
 }
 
 /// Admit the effective stored login before restoring a Claude conversation.
@@ -21487,7 +21783,7 @@ fn account_cold_at(
         login: snap.login.clone(),
         home: snap.home.clone(),
         auth_observed: snap.auth_observed,
-        stored_login: snap.stored_login,
+        route: snap.route,
         conversation: snap.session.clone(),
         profile: snap.profile.clone(),
         mode,
@@ -21505,7 +21801,9 @@ fn account_cold_at(
     };
     let mut admitted = snap.clone();
     admitted.login = login;
-    admitted.stored_login = true;
+    // Cold admission picked a row's stored login; the plan that serves a token decides that
+    // route itself (§5.3).
+    admitted.route = accounts::AuthRoute::Stored;
     admitted.auth_observed = true;
     note_cold_stretch(seat, &admitted, snap)?;
     // Preserve the original profile so a model move cannot erase its billing context.
@@ -21575,7 +21873,11 @@ fn cold_stored_context(
         .home
         .as_deref()
         .is_some_and(|home| !aterm_types::dirs::same_directory(Path::new(home), &seat.home));
-    if !who.default_home || !who.stored_login || different_home {
+    let own = match who.route {
+        accounts::AuthRoute::Stored | accounts::AuthRoute::VaultToken { .. } => true,
+        accounts::AuthRoute::Outside => false,
+    };
+    if !who.default_home || !own || different_home {
         return if intent.auth_observed || intent.login.is_some() {
             Err("cold Claude shell or settings override the captured stored login".into())
         } else {
@@ -21586,7 +21888,7 @@ fn cold_stored_context(
 }
 
 /// One interpreted helper environment. Metadata availability is separate from the
-/// conservative `stored_login` bit: an unread source is never a new External grant.
+/// conservative route: an unread source is never a new External grant.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ColdEffectiveContext {
     pub(crate) who: accounts::ProcessLogin,
@@ -21625,10 +21927,27 @@ fn cold_guard_at(
         .as_deref()
         .ok_or("cold Claude execution intent is absent")?;
     let same_home = aterm_types::dirs::same_directory(&context.home, &seat.home);
-    if !intent.matches_process(&context.who, same_home) {
+    // Only a token route asks which entry the intent's account owns.
+    let owner_entry = match context.who.route {
+        accounts::AuthRoute::VaultToken { .. } => cold_pool_config(seat).ok().and_then(|config| {
+            let roster = accounts_pool::Seat {
+                config_dir: config,
+                state: &seat.state,
+                home: &seat.home,
+                now: seat.now,
+            }
+            .roster(accounts::Cli::Claude)
+            .ok()?;
+            intent.owner_entry(&roster)
+        }),
+        accounts::AuthRoute::Stored | accounts::AuthRoute::Outside => None,
+    };
+    if !intent.matches_process(&context.who, same_home, owner_entry) {
         return Err("cold Claude execution route changed".into());
     }
-    if matches!(intent, ExecutionIntent::External { .. }) && !context.who.stored_login {
+    if matches!(intent, ExecutionIntent::External { .. })
+        && context.who.route == accounts::AuthRoute::Outside
+    {
         return Ok(None);
     }
     let pool = accounts_pool::Seat {
@@ -21669,13 +21988,17 @@ fn cold_pooled_context(
     intent: &aterm_agent::harness::native_act::ColdIntent,
     context: &ColdEffectiveContext,
 ) -> Result<bool, String> {
+    let own = |route: accounts::AuthRoute| match route {
+        accounts::AuthRoute::Stored | accounts::AuthRoute::VaultToken { .. } => true,
+        accounts::AuthRoute::Outside => false,
+    };
     let pooled = context.who.default_home
-        && context.who.stored_login
+        && own(context.who.route)
         && aterm_types::dirs::same_directory(&context.home, &seat.home);
     let captured_external = intent.home.as_ref().is_some_and(|home| !home.is_empty())
-        || (intent.auth_observed && !intent.stored_login);
+        || (intent.auth_observed && !own(intent.route));
     if (pooled && captured_external)
-        || (!pooled && intent.auth_observed && intent.stored_login && !captured_external)
+        || (!pooled && intent.auth_observed && own(intent.route) && !captured_external)
     {
         return Err("cold Claude execution route differs from captured intent".into());
     }
@@ -21813,7 +22136,12 @@ fn cold_effective_context_using(
         Err(_) => return Err("cold Claude profile store is unavailable".into()),
     };
     who = who.with_settings(&settings);
-    if profile_store && who.stored_login {
+    if profile_store
+        && match who.route {
+            accounts::AuthRoute::Stored | accounts::AuthRoute::VaultToken { .. } => true,
+            accounts::AuthRoute::Outside => false,
+        }
+    {
         return Err("cold Claude discovered profile selection is not attributed".into());
     }
     who = who.with_profile_store(profile_store);
@@ -21912,9 +22240,11 @@ impl ColdCommandProof {
                 &self.intent,
                 &self.seed,
                 &self.resolved,
+                // The billing profile is the stored login's; a token session's may be stale.
                 self.effective
                     .who
-                    .stored_login
+                    .route
+                    .is_stored()
                     .then_some(&self.effective.profile),
             )
     }
@@ -22085,7 +22415,11 @@ fn cold_resolve_at(
             intent,
             seed,
             &resolved,
-            effective.who.stored_login.then_some(&effective.profile),
+            effective
+                .who
+                .route
+                .is_stored()
+                .then_some(&effective.profile),
         )
     {
         return Err("cold Claude execution context changed".into());
@@ -22810,7 +23144,10 @@ fn renewable_listed(roster: &accounts::Roster) -> bool {
 /// The renewable row whose own login the process holds.
 fn renewable_own(roster: &accounts::Roster, look: &AccountLook) -> Option<String> {
     let me = look.who.me(roster);
-    let label = me.account.filter(|_| me.default_home && me.stored_login)?;
+    // Renewal is a stored login's service: a token row is left out.
+    let label = me
+        .account
+        .filter(|_| me.default_home && me.route.is_stored())?;
     roster
         .row(label)
         .filter(|row| row.email.is_some())
@@ -27494,7 +27831,7 @@ impl HostHandle {
                 .then(|| Snapshot {
                     launch_env: None,
                     auth_observed: true,
-                    stored_login: false,
+                    route: aterm_agent::harness::accounts::AuthRoute::Outside,
                     profile: None,
                     tab: sid.to_string(),
                     pid: SUCCESSOR_TEST_LANDED,

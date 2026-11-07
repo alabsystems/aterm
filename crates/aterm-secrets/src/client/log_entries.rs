@@ -1345,6 +1345,10 @@ fn overlay_log_commons_with_opened(
 /// Overlay the winning entries from `log` across every [`Audience`] fully unwrapped by `identity`
 /// onto `doc`, leaving audiences `identity` cannot unwrap untouched; a Mac `readmit` names
 /// ([`Base::readmit`]) stays in `doc` although the log left it out. Returns whether `doc` changed.
+/// A Claude Code token entry ([`crate::entry_class::claude_token`]) is never overlaid, and one
+/// `doc` holds (a text an older build wrote) is taken out of it where the audience is overlaid:
+/// the admin's document, and every text drafted from it, holds none (DESIGN-claude-setup-token
+/// §4.4).
 pub(super) fn overlay_log_onto_document(
     log: &Log,
     identity: &Identity,
@@ -1412,19 +1416,20 @@ pub(super) fn overlay_log_onto_document(
             if cur.name == crate::commons::ENTRY && doc_has_commons {
                 continue;
             }
-            let keep = match &cur.audience {
-                Audience::Everyone => opened
-                    .by_audience
-                    .get(&cur.audience)
-                    .is_some_and(|m| m.contains_key(&cur.name)),
-                Audience::Hosts(_) => {
-                    target_host_audience.get(&cur.name) == Some(&cur.audience)
-                        && opened
-                            .by_audience
-                            .get(&cur.audience)
-                            .is_some_and(|m| m.contains_key(&cur.name))
-                }
-            };
+            let keep = !crate::entry_class::claude_token(&cur.name)
+                && match &cur.audience {
+                    Audience::Everyone => opened
+                        .by_audience
+                        .get(&cur.audience)
+                        .is_some_and(|m| m.contains_key(&cur.name)),
+                    Audience::Hosts(_) => {
+                        target_host_audience.get(&cur.name) == Some(&cur.audience)
+                            && opened
+                                .by_audience
+                                .get(&cur.audience)
+                                .is_some_and(|m| m.contains_key(&cur.name))
+                    }
+                };
             if !keep
                 && doc
                     .unset_entry(&cur.audience, &cur.name)
@@ -1452,7 +1457,9 @@ pub(super) fn overlay_log_onto_document(
                 if entry.anchor.is_some() != want_anchored {
                     continue;
                 }
-                if entry.name == crate::commons::ENTRY && doc_has_commons {
+                if (entry.name == crate::commons::ENTRY && doc_has_commons)
+                    || crate::entry_class::claude_token(&entry.name)
+                {
                     continue;
                 }
                 if matches!(aud, Audience::Hosts(_))
@@ -2860,8 +2867,21 @@ pub(super) fn wraps_removed(
     })
 }
 
+#[path = "log_entries/member.rs"]
+mod member;
 #[path = "log_entries/waiting.rs"]
 mod waiting;
+pub use member::{
+    Anchor, FIRST_ANCHOR, MemberEntry, MemberUnset, MemberWritten, OnBusy, RESEAL_REFUSAL, WaitFor,
+    WriteRoute, member_set, member_unset, per_host_shadows, write_route,
+};
+#[cfg(test)]
+pub(super) use member::{BEFORE_OUTCOME, UNSET_UNDER_OLD_EPOCH};
+#[cfg(any(test, debug_assertions))]
+pub use member::{TestPassClaim, test_hold_pass_claim};
+pub(crate) use member::{member_unset_names, member_waits_here, member_write};
+#[cfg(test)]
+pub(super) use waiting::pass_claim;
 #[cfg(test)]
 pub(super) use waiting::{
     BASES_LOG_ONLY, BASES_WITHOUT_HELD, DRAFT_UNCLAIMED, DRAFTS_AT_ONCE, HELD_UNDEFERRED,
@@ -2908,13 +2928,55 @@ fn plan_recipients_of(
 
 /// `doc`'s entries, by audience and name; without the Commons control entry where the log carries
 /// it under its own audience (`commons_in_log`).
+/// Why a publish of `doc` over `base` is refused: it holds a Claude Code token entry
+/// ([`crate::entry_class::claude_token`]) that `base`, the text the edit started from, does not
+/// hold as it is. Only the token call writes the class, into the log (DESIGN-claude-setup-token
+/// §4.4). A text imported with no base (a mirror of a version an older build published) is never
+/// refused for one: its token entries stay out of the diff all the same.
+fn typed_claude_token(doc: &Document, base: Option<&Document>) -> Option<String> {
+    let base = base?;
+    doc.entries()
+        .into_iter()
+        .filter(|entry| crate::entry_class::claude_token(&entry.name))
+        .find(|entry| base.entry(&entry.audience, &entry.name) != Some(entry))
+        .map(|entry| crate::entry_class::claude_token_refusal(&entry.name))
+}
+
+/// Keep the log's Claude Code token entries as they stand in `entries_by_aud`, the entries a
+/// publish leaves in each audience: no text holds one ([`entries_by_audience`] leaves a text's
+/// out), so a token's absence from a text is never a `Delete`, and an epoch a publish mints
+/// reseals the token with the rest. An audience this Mac reads only from the edit's base text
+/// (`sealed_away`) is left as it is: its diff is against that text, which holds none.
+fn claude_tokens_stand(
+    entries_by_aud: &mut BTreeMap<Audience, BTreeMap<String, Entry>>,
+    by_audience: &BTreeMap<Audience, BTreeMap<String, Entry>>,
+    sealed_away: impl Fn(&Audience) -> bool,
+) {
+    for (aud, read) in by_audience {
+        if sealed_away(aud) {
+            continue;
+        }
+        for (name, entry) in read {
+            if crate::entry_class::claude_token(name) {
+                entries_by_aud
+                    .entry(aud.clone())
+                    .or_default()
+                    .insert(name.clone(), entry.clone());
+            }
+        }
+    }
+}
+
 fn entries_by_audience(
     doc: &Document,
     commons_in_log: bool,
 ) -> BTreeMap<Audience, BTreeMap<String, Entry>> {
     let mut out: BTreeMap<Audience, BTreeMap<String, Entry>> = BTreeMap::new();
     for entry in doc.entries() {
-        if commons_in_log && entry.name == crate::commons::ENTRY {
+        // A text's Claude Code token entry is never the diff's ([`claude_tokens_stand`]).
+        if (commons_in_log && entry.name == crate::commons::ENTRY)
+            || crate::entry_class::claude_token(&entry.name)
+        {
             continue;
         }
         out.entry(entry.audience.clone())
@@ -3477,6 +3539,9 @@ fn draft_document_diff_with(
             .find(|e| e.name == crate::commons::ENTRY)
             .map(|e| e.value)
     });
+    if let Some(why) = typed_claude_token(doc, base.doc) {
+        return Err(Error::new(why));
+    }
     let mut entries_by_aud = entries_by_audience(doc, has_commons_aud);
 
     let plans = doc.lockers();
@@ -3623,6 +3688,9 @@ fn draft_document_diff_with(
             entries_by_aud.insert(Audience::Everyone, edit.entries.clone());
         }
     }
+    claude_tokens_stand(&mut entries_by_aud, &opened.by_audience, |aud| {
+        sealed_away(aud)
+    });
     // An edit that takes a name out of `[everyone]` (a `Delete`, a narrowing to a host list, the
     // section dropped whole) writes it now, never waits: as any such edit, it mints a fresh epoch
     // and reseals what stays, so the old value's epoch is neither newest nor winning, and that
@@ -6396,7 +6464,10 @@ pub(super) fn rekey_bound(
                         audience,
                         entry.name.len(),
                         entry.anchor.as_deref().map(str::len),
-                        entry.value.as_slice().len(),
+                        crate::membership_log::entries::stored_value_len(
+                            &entry.name,
+                            entry.value.as_slice(),
+                        ),
                     )
                 })
             };
@@ -8047,7 +8118,7 @@ fn gap_denied(
 
 #[cfg(test)]
 #[path = "log_entries/author_batch_tests.rs"]
-mod author_batch_tests;
+pub(super) mod author_batch_tests;
 
 #[cfg(test)]
 mod tests {

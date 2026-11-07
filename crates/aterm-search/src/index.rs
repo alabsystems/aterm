@@ -145,7 +145,7 @@ fn intersect_posting_lists(sorted_lists: &[&SparseBitmap]) -> SparseBitmap {
 
 /// Reusable per-query case-insensitive line matcher.
 pub(crate) struct CaseInsensitiveMatcher {
-    lower_query: String,
+    lower_query: crate::bytesearch::OwnedSearcher,
     lower_buf: String,
     /// Query classification stays fixed while the matcher visits its candidate rows.
     ascii_query: bool,
@@ -191,14 +191,14 @@ impl CaseInsensitiveMatcher {
         let lower_query = lower_fold(query);
         let ascii_query = lower_query.is_ascii();
         Self {
-            lower_query,
+            lower_query: lower_query.into(),
             lower_buf: String::new(),
             ascii_query,
         }
     }
 
     #[inline]
-    pub(crate) const fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.lower_query.is_empty()
     }
 
@@ -237,7 +237,7 @@ impl CaseInsensitiveMatcher {
             if !self.ascii_query {
                 return empty;
             }
-            let searcher = crate::bytesearch::Searcher::new_ascii(self.lower_query.as_bytes());
+            let searcher = self.lower_query.searcher_ascii();
             let window = anchor
                 .and_then(|(col, inclusive)| {
                     col_map.identity_match_window::<REV>(
@@ -268,7 +268,7 @@ impl CaseInsensitiveMatcher {
         self.lower_buf
             .extend(text.chars().flat_map(lower_fold_char));
         let byte_map = LowerByteMap::new(text);
-        let searcher = crate::bytesearch::Searcher::new(self.lower_query.as_bytes());
+        let searcher = self.lower_query.searcher();
         visit_occurrences(
             line_num,
             self.lower_query.len(),
@@ -1986,6 +1986,38 @@ impl Default for SearchIndex {
 #[cfg(test)]
 #[path = "index_bloom_tests.rs"]
 mod index_bloom_tests;
+
+#[cfg(test)]
+mod case_insensitive_preparation_tests {
+    use super::*;
+
+    #[test]
+    fn row_modes_and_directions_prepare_once_per_query() {
+        let mut matcher = CaseInsensitiveMatcher::new("AABA");
+        let before = crate::bytesearch::factorizations();
+        for row in 0..128 {
+            for text in ["x aABA y aaba z", "é aABA y aaba z"] {
+                let map = ColumnMap::new(text, AmbiguousWidth::Single);
+                let mut forward = Vec::new();
+                let visit = matcher.visit_matches::<false>(row, text, &map, |found| {
+                    forward.push((found.start_col, found.end_col));
+                    true
+                });
+                assert!(visit.completed && visit.had_occurrence);
+                assert_eq!(forward, [(2, 6), (9, 13)]);
+                let mut backward = Vec::new();
+                let visit = matcher.visit_matches::<true>(row, text, &map, |found| {
+                    backward.push((found.start_col, found.end_col));
+                    true
+                });
+                assert!(visit.completed && visit.had_occurrence);
+                assert_eq!(backward, [(9, 13), (2, 6)]);
+            }
+        }
+        let prepared = crate::bytesearch::factorizations() - before;
+        assert!(prepared <= 4, "prepared {prepared} times for one query");
+    }
+}
 
 /// The regex scan budget at the entry points that run a search-box pattern over
 /// terminal content (`REGEX_STEP_LIMIT` derives it).

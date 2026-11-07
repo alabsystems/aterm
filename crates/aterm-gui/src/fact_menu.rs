@@ -81,6 +81,10 @@ pub(crate) enum FactAct {
     NetworkState,
     /// Forget the cached Muse usage reading so the next read mints a fresh one.
     RefreshUsage,
+    /// The quiet offer's one step for this tab's account: a tab beside this one that runs
+    /// `aterm harness accounts token <label> [--replace]`
+    /// (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.9).
+    Token,
 }
 
 impl FactAct {
@@ -101,6 +105,7 @@ impl FactAct {
             Self::AccountSettings => "account-settings".to_string(),
             Self::NetworkState => "network-state".to_string(),
             Self::RefreshUsage => "refresh-usage".to_string(),
+            Self::Token => "token".to_string(),
         }
     }
 }
@@ -389,6 +394,18 @@ pub(crate) struct FactMenuFacts {
     pub(crate) account_row: Option<String>,
     /// The pane's rows the card may take, where its height is known.
     pub(crate) height: Option<usize>,
+    /// This tab's account's vault token, on a Claude Code card
+    /// ([`crate::token_shown::shown`]).
+    pub(crate) token: Option<crate::token_shown::TokenFact>,
+}
+
+/// The card's token rows (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.9): its state,
+/// value-free, and the quiet offer's one step where it stands.
+fn token_rows(out: &mut Vec<MenuRow>, fact: Fact, token: &crate::token_shown::TokenFact) {
+    out.push(MenuRow::note(format!("vault token: {}", token.words)));
+    if let Some(offer) = &token.offer {
+        out.push(item(fact, "+", &offer.line, FactAct::Token, true));
+    }
 }
 
 const HIDEABLE: [FactKind; 5] = [
@@ -801,6 +818,9 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
                     "{}  {sub}",
                     aterm_agent::harness::footer::ACCOUNT_MARK
                 )));
+            }
+            if let Some(token) = &facts.token {
+                token_rows(&mut out, fact, token);
             }
             // Under the outlook the week's bar row carries the meter (§8.1).
             if let Some(meter) = facts
@@ -1482,6 +1502,7 @@ impl App {
         let mut key = false;
         let mut forecast_refusal = None;
         let mut program: Option<aterm_phase::Program> = None;
+        let mut email: Option<String> = None;
         if let Some(entry) = self.pool.get(session) {
             let timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             program = timeline
@@ -1512,6 +1533,7 @@ impl App {
                     .and_then(|s| s.label.clone())
                     .or_else(|| facts.account.clone());
                 if let Some(sub) = &facts.subscription {
+                    email.clone_from(&sub.email);
                     let email_str = sub.email.as_deref().filter(|s| !s.is_empty());
                     let plan_str = sub.plan.as_deref().filter(|s| !s.is_empty());
                     let summary = match (email_str, plan_str) {
@@ -1563,6 +1585,14 @@ impl App {
                     } else {
                         outlook
                     }
+                });
+            out.token = (cli == Some(aterm_agent::harness::accounts::Cli::Claude))
+                .then(crate::token_shown::shown)
+                .flatten()
+                .and_then(|tokens| {
+                    tokens
+                        .of(out.account_row.as_deref(), email.as_deref())
+                        .cloned()
                 });
             (out.refresh_usage, out.own_login) = match program {
                 Some(aterm_phase::Program::Muse) => (
@@ -2047,6 +2077,16 @@ impl App {
             }
             FactAct::NetworkState => {
                 self.open_network_lens();
+            }
+            FactAct::Token => {
+                // The offer as the card showed it, read again at the press: one that no longer
+                // stands opens nothing.
+                if let Some(token) = self.fact_menu_facts(session, Fact::Account).token
+                    && let Some(offer) = &token.offer
+                {
+                    self.open_token_step(wid, offer);
+                    self.note_fact_notice(wid, session, FactNotice::NewTab);
+                }
             }
             FactAct::RefreshUsage => {
                 let email = self.pool.get(session).and_then(|entry| {

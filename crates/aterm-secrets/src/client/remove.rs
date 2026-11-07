@@ -368,6 +368,40 @@ fn seat_nodes_of(
     nodes.into_iter().collect()
 }
 
+/// The label of the Mac whose seat `actor` is, as `log` shows it, a Mac now out included; `a Mac`
+/// where the log names none (`claude_token`'s signer).
+pub(crate) fn seat_label(log: &Log, actor: &MemberId) -> String {
+    label_of(log, &log.membership(), actor)
+}
+
+/// The label of the Mac whose age recipient is `recipient`, as `log` shows it: a member, a Mac
+/// now out or a founder the genesis lists; `a Mac` where the log names none (`claude_token`'s
+/// exposure).
+pub(crate) fn recipient_label(log: &Log, recipient: &Recipient) -> String {
+    let membership = log.membership();
+    if let Some((actor, _)) = membership
+        .members()
+        .iter()
+        .find(|(_, member)| member.binding.recipient() == *recipient)
+    {
+        return label_of(log, &membership, actor);
+    }
+    membership
+        .removed()
+        .keys()
+        .find_map(|actor| {
+            seat_of(log, actor).and_then(|(seat, label, _)| (seat == *recipient).then_some(label))
+        })
+        .or_else(|| match log.genesis().body() {
+            Body::Genesis { founders, .. } => founders
+                .iter()
+                .find(|founder| founder.recipient == *recipient)
+                .map(|founder| founder.label.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "a Mac".to_owned())
+}
+
 /// A Mac's label as this log shows it: its member label, else its seat's.
 fn label_of(log: &Log, membership: &crate::membership_log::Membership, actor: &MemberId) -> String {
     membership
@@ -2288,8 +2322,13 @@ pub struct NodePassHost<'a> {
     pub held: &'a dyn Fn() -> bool,
     /// Whether this Mac's LAN broker answers now, so the pass may post on the LAN.
     pub may_post: &'a dyn Fn() -> bool,
-    /// Start the converge pass's runner (`crate::converge::start`), without waiting for it.
-    pub start_converge: &'a dyn Fn() -> Option<aterm_uds::spawnfd::Child>,
+    /// Routes whose changes request a new shared refresh boundary.
+    pub routes: &'a dyn Fn() -> crate::converge::Routes,
+    /// Make this runtime's local observer after its sharing and subscriber-Off gates admit work.
+    pub make_inputs: &'a dyn Fn() -> super::ConvergenceInputs,
+    /// Start the converge pass's retained request (`crate::converge::start_requested`).
+    pub start_converge:
+        &'a dyn Fn(crate::converge::RepositoryRequest) -> Option<aterm_uds::spawnfd::Child>,
     /// The clock the pass and its timer read.
     pub now_ms: &'a dyn Fn() -> u64,
     /// Where each change in how passes end is noted.
@@ -2313,8 +2352,10 @@ pub fn run_node_pass(host: &NodePassHost<'_>) {
     let mut last_said = None;
     let mut unfinished = 0_u32;
     let mut converge = NodeConverge::default();
+    let mut inputs = None;
     while !host.stop.load(std::sync::atomic::Ordering::Acquire) {
         if !(host.held)() && !crate::service::subscriber_turned_off(&host.paths.home) {
+            let inputs = inputs.get_or_insert_with(host.make_inputs);
             let stamp = records_stamp(host.paths);
             let now_ms = (host.now_ms)();
             if due.due(stamp, now_ms) {
@@ -2329,11 +2370,15 @@ pub fn run_node_pass(host: &NodePassHost<'_>) {
                 // that moved during a pass would otherwise skip the time that pass never saw.
                 due.ran(stamp, now_ms, node_pass_wait(&host.pace, unfinished));
                 if let Some((receipt, error)) = ended {
-                    converge.owed |= receipt.applied.is_some();
+                    if receipt.applied.is_some() {
+                        converge
+                            .due
+                            .request(crate::converge::RepositoryRequest::Repair);
+                    }
                     keep_node_pass_end(host, &receipt, error.as_ref(), &mut last_said);
                 }
             }
-            converge.tend(host);
+            converge.tend(host, inputs);
         }
         std::thread::sleep(host.pace.look);
     }
@@ -2350,43 +2395,44 @@ fn node_pass_wait(pace: &NodePassPace, unfinished: u32) -> Duration {
         .min(pace.every)
 }
 
-/// The converge pass's runner a node pass starts: a version it applied is one the subscriber's
-/// pass beside it then finds unchanged, so its own trigger never fires for that version
-/// ([`crate::converge::Due`]). One runner at a time, and only once this Mac may use the local
-/// network, which a runner does; a start that cannot come yet is owed. Failed runners use the
-/// subscriber's bounded retry policy on a monotonic clock, independent of the vault's wall clock.
+/// One owned runner uses the subscriber's same request and retry policy. Node-local
+/// materialization and source observations progress while HTTP stands unchanged; a start
+/// waits until the LAN is admitted. Pacing uses elapsed time, independently of the vault clock.
 #[derive(Default)]
 struct NodeConverge {
-    owed: bool,
+    due: crate::converge::Due,
     runner: Option<aterm_uds::spawnfd::Child>,
-    retry: crate::converge::RunnerRetry,
     clock: Option<Instant>,
 }
 
 impl NodeConverge {
-    fn tend(&mut self, host: &NodePassHost<'_>) {
+    fn tend(&mut self, host: &NodePassHost<'_>, inputs: &mut super::ConvergenceInputs) {
         let clock = self.clock.get_or_insert_with(Instant::now);
         let now_ms = u64::try_from(clock.elapsed().as_millis()).unwrap_or(u64::MAX);
-        self.tend_at(now_ms, host.may_post, host.start_converge);
+        let (refresh, request) = inputs.snapshot();
+        self.due.observe(refresh);
+        if let Some(request) = request {
+            self.due.request(request);
+        }
+        self.tend_at(now_ms, (host.routes)(), host.may_post, host.start_converge);
     }
 
     fn tend_at(
         &mut self,
         now_ms: u64,
+        routes: crate::converge::Routes,
         may_post: &dyn Fn() -> bool,
-        start: &dyn Fn() -> Option<aterm_uds::spawnfd::Child>,
+        start: &dyn Fn(crate::converge::RepositoryRequest) -> Option<aterm_uds::spawnfd::Child>,
     ) {
         use crate::converge::Last;
         // Each look reaps a runner that ended.
         let last = Last::of(&mut self.runner);
-        self.retry.reaped(last, now_ms);
-        self.owed |= last == Last::Held;
-        if (self.owed || self.retry.due(now_ms)) && last != Last::Running && may_post() {
-            self.retry.started();
-            self.runner = start();
-            self.owed = false;
+        if !may_post() {
+            self.due.hold(now_ms, routes, last);
+        } else if self.due.poll(now_ms, routes, last) {
+            self.runner = start(self.due.repository_request());
             if self.runner.is_none() {
-                self.retry.reaped(Last::Failed, now_ms);
+                self.due.reaped(Last::Failed, now_ms);
             }
         }
     }
@@ -3222,6 +3268,16 @@ pub fn test_remove_unposted(paths: &Paths, who: &str) -> crate::Result<usize> {
 /// pass or another local writer still held the state at the hang detector.
 #[cfg(any(test, debug_assertions))]
 pub fn test_put_everyone(paths: &Paths, name: &str, value: &[u8]) -> crate::Result<RecordId> {
+    test_put_everyone_draft(paths, &[(name, value)])
+}
+
+/// [`test_put_everyone`] of each `(name, value)` of `puts`, in one draft: one actor, one
+/// `authored_ms` and one epoch (a Claude Code token's pair, `claude_token`'s tests).
+///
+/// # Errors
+/// As [`test_put_everyone`].
+#[cfg(any(test, debug_assertions))]
+pub fn test_put_everyone_draft(paths: &Paths, puts: &[(&str, &[u8])]) -> crate::Result<RecordId> {
     if trusted_store(paths)?.is_none() {
         return Err(Error::new("this Mac's vault has no membership log"));
     }
@@ -3265,24 +3321,25 @@ pub fn test_put_everyone(paths: &Paths, name: &str, value: &[u8]) -> crate::Resu
             .unwrapped_keys
             .get(epoch)
             .ok_or_else(|| Error::new("this Mac does not hold the newest [everyone] epoch"))?;
-        let entry = Entry {
-            name: name.to_owned(),
-            value: SecretBytes::from(value),
-            audience: Audience::Everyone,
-            if_absent: false,
-            anchor: None,
-        };
-        let put = device.with_seed(|seed| {
-            log.draft_put(
-                &actor,
-                aterm_time::unix_millis().unwrap_or(0),
-                *epoch,
-                key,
-                &entry,
-            )?
-            .sign(seed, incarnation)
-        })?;
-        Ok((vec![put], *epoch))
+        let authored_ms = aterm_time::unix_millis().unwrap_or(0);
+        let mut log = log.clone();
+        let mut signed = Vec::with_capacity(puts.len());
+        for (name, value) in puts {
+            let entry = Entry {
+                name: (*name).to_owned(),
+                value: SecretBytes::from(*value),
+                audience: Audience::Everyone,
+                if_absent: false,
+                anchor: None,
+            };
+            let put = device.with_seed(|seed| {
+                log.draft_put(&actor, authored_ms, *epoch, key, &entry)?
+                    .sign(seed, incarnation)
+            })?;
+            let _ = log.insert(put.clone())?;
+            signed.push(put);
+        }
+        Ok((signed, *epoch))
     })?;
     let Some((minted, _, epoch)) = authored else {
         return Err(Error::new(

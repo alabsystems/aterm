@@ -71,7 +71,7 @@ fn run_operation(world: &World, cli: Cli, operation: i64, mut arm: impl FnMut())
             let who = accounts::ProcessLogin {
                 login: None,
                 default_home: true,
-                stored_login: true,
+                route: crate::harness::accounts::AuthRoute::Stored,
             };
             let row = before.roster.row("main").unwrap();
             arm();
@@ -159,7 +159,7 @@ fn observe(operation: i64, fault: i64) -> [bool; 6] {
         let who = accounts::ProcessLogin {
             login: None,
             default_home: true,
-            stored_login: true,
+            route: crate::harness::accounts::AuthRoute::Stored,
         };
         super::record_session(
             &world.seat(),

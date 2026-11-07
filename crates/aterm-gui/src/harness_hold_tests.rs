@@ -398,6 +398,7 @@ fn row(
             said: None,
         }),
         receipt: None,
+        token: None,
     }
 }
 

@@ -144,7 +144,7 @@ impl Mac {
             account: Some(account),
             left: None,
             default_home: true,
-            stored_login: true,
+            route: crate::harness::accounts::AuthRoute::Stored,
         };
         match accounts::advise(
             &roster(),
@@ -425,7 +425,7 @@ fn a_junior_with_no_row_to_move_to_yields_its_turn_end_in_every_rotating_mode() 
         account: Some("pool-a"),
         left: None,
         default_home: true,
-        stored_login: true,
+        route: crate::harness::accounts::AuthRoute::Stored,
     };
     let advice = |state: &State, mode: Mode| {
         accounts::advise(
@@ -451,6 +451,34 @@ fn a_junior_with_no_row_to_move_to_yields_its_turn_end_in_every_rotating_mode() 
         advice(&m2.state, Mode::Off),
         Advice::Stay(accounts::StayWhy::Off)
     );
+    // A junior session on pool-a's vault token yields at its turn end just as a stored login's
+    // does (DESIGN-claude-setup-token S8): the token is the account's own route.
+    let on_token = Me {
+        route: crate::harness::accounts::AuthRoute::VaultToken {
+            entry: crate::harness::accounts::TokenEntry::parse(
+                "aterm-claude-token-ac-0123456789abcdef",
+            )
+            .expect("an entry"),
+        },
+        ..me
+    };
+    for mode in [Mode::Early, Mode::Wall] {
+        assert_eq!(
+            accounts::advise(
+                &roster(),
+                &m2.state,
+                &enrolled(),
+                &on_token,
+                &Point::TurnEnd,
+                mode,
+                heal,
+            ),
+            Advice::Wait {
+                until: heal + RECHECK_S
+            },
+            "a token session, {mode:?}"
+        );
+    }
 
     // pool-b low, not walled: a turn end would not take it ahead of a wall, but a junior takes it,
     // and a turn end whose move is deferred holds as the wait above does.
@@ -547,7 +575,7 @@ fn a_junior_yields_while_another_row_waits_on_its_canary() {
         account: Some("pool-a"),
         left: None,
         default_home: true,
-        stored_login: true,
+        route: crate::harness::accounts::AuthRoute::Stored,
     };
     let advice = |state: &State, point: &Point, mode: Mode, now: i64| {
         accounts::advise(&roster(), state, &enrolled(), &me, point, mode, now)
@@ -711,7 +739,7 @@ fn a_junior_on_its_own_unanswered_active_moves_off_it() {
         account: Some("pool-a"),
         left: None,
         default_home: true,
-        stored_login: true,
+        route: crate::harness::accounts::AuthRoute::Stored,
     };
     let advice = |state: &State, mode: Mode, now: i64| {
         accounts::advise(
@@ -860,7 +888,7 @@ fn a_pinned_active_another_mac_holds_keeps_its_pin() {
         account: Some("pool-a"),
         left: None,
         default_home: true,
-        stored_login: true,
+        route: crate::harness::accounts::AuthRoute::Stored,
     };
     for mode in [Mode::Early, Mode::Wall] {
         let advice = accounts::advise(
@@ -998,7 +1026,7 @@ fn a_juniors_move_the_relaunch_defers_is_advised_again_as_its_yield() {
         account: Some("pool-a"),
         left: None,
         default_home: true,
-        stored_login: true,
+        route: crate::harness::accounts::AuthRoute::Stored,
     };
     let advise = |state: &State| {
         accounts::advise(
@@ -1711,7 +1739,7 @@ impl Mac {
             account: Some(account),
             left: None,
             default_home: true,
-            stored_login: true,
+            route: crate::harness::accounts::AuthRoute::Stored,
         };
         matches!(
             accounts::advise(

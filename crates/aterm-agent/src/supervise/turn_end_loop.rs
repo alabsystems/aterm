@@ -12,9 +12,9 @@ use super::super::policy::turn_end::{
     ANSWERS_OFF, AccountAnswer, AccountAt, CREDITS_HOLD_MODEL_TOLD, CREDITS_HOLD_TOLD, Composer,
     ComposerRead, Conversation, CreditsCarry, GoAheadVerdict, LOGIN_SHARED_LOOK, ProbeGate,
     RULE_ACCOUNT, RULE_INPUT_LOST, RULE_LAND, RULE_LEFT, RULE_LOGIN, RULE_USAGE_PROBE, RecordTurn,
-    Restart, RestartAnswer, RestartAsk, RestartClaim, TRY_ANSWER_SLACK, WAKE_KEPT, account_hold,
-    act_turn_work, budget_frees, conversation_mark, decide_turn_end, decide_turn_end_traced,
-    done_row_work, is_wait_resume, outage_of, reads_conversation,
+    Restart, RestartAnswer, RestartAsk, RestartClaim, RouteTo, TRY_ANSWER_SLACK, WAKE_KEPT,
+    account_hold, act_turn_work, budget_frees, conversation_mark, decide_turn_end,
+    decide_turn_end_traced, done_row_work, is_wait_resume, outage_of, reads_conversation,
 };
 use super::super::tap_clock::{TapClock, TapSays, Timed, UsageWindow, timed};
 use super::wall_confirm::{Check, LeftRead};
@@ -2250,11 +2250,12 @@ impl<C: Ctl> Session<'_, C> {
         if let Some(answer) = self.turn_end.account_answer(reading) {
             self.tell_account_answer(host, answer, seq);
         }
-        if let Some((at, asked, advice)) = &self.account_seen
+        if let Some((at, asked, advice, route)) = &self.account_seen
             && *at == seq
             && self.turn_end.account_point(reading, &opts.policy) == Some(*asked)
         {
             reading.account.clone_from(advice);
+            reading.route = *route;
         }
         if let Some((at, word)) = &self.roster_seen
             && *at == seq
@@ -2289,8 +2290,19 @@ impl<C: Ctl> Session<'_, C> {
             return;
         };
         let advice = host.account(point);
-        self.account_seen = Some((seq, point, advice.clone()));
+        // Asked after the advice: at a lost login the host marks a refused token first (§5.6).
+        let route = match reading.program {
+            Program::Claude => host.route_move(),
+            Program::Codex
+            | Program::Grok
+            | Program::Kimi
+            | Program::Agy
+            | Program::Muse
+            | Program::Generic => None,
+        };
+        self.account_seen = Some((seq, point, advice.clone(), route));
         reading.account = advice;
+        reading.route = route;
     }
 
     /// A TURN READ RUNNING ([`TurnEndState::took`]).
@@ -4905,6 +4917,12 @@ impl<C: Ctl> Session<'_, C> {
                     Restart::Account { to, .. } => {
                         format!("{}{to}", approvals::ACCOUNT_MOVE_COMMAND)
                     }
+                    Restart::Route { to: RouteTo::Token } => {
+                        "relaunch on the account's vault token".to_string()
+                    }
+                    Restart::Route {
+                        to: RouteTo::Stored,
+                    } => "relaunch on the row's stored login".to_string(),
                 };
                 if matches!(why, Restart::Account { .. }) {
                     self.forget_wall(seq);
@@ -5136,7 +5154,7 @@ impl<C: Ctl> Session<'_, C> {
         let advice = host.account(point);
         let advised = advice.as_ref().and_then(AccountAdvice::past_probe);
         let held = account_hold(advised, self.fx.mono(), &otherwise);
-        self.account_seen = Some((seq, point, advice));
+        self.account_seen = Some((seq, point, advice, None));
         held.unwrap_or(otherwise)
     }
 
@@ -6693,7 +6711,7 @@ impl<C: Ctl> Session<'_, C> {
     const fn probe_advised(&self, screen: &Screen) -> bool {
         matches!(
             &self.account_seen,
-            Some((at, AccountPoint::TurnEnd, Some(AccountAdvice::Probe { .. })))
+            Some((at, AccountPoint::TurnEnd, Some(AccountAdvice::Probe { .. }), _))
                 if *at == screen.seq
         )
     }

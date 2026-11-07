@@ -269,7 +269,8 @@ pub fn person_holder(layout: &Layout) -> Option<u32> {
             }
             None
         }
-        Err(_) => Some(pid),
+        Err(StoreLockError::Contended(_)) => Some(pid),
+        Err(StoreLockError::Io(_, _)) => None,
     }
 }
 
@@ -798,6 +799,19 @@ mod tests {
         assert_eq!(person_holder(&layout), None);
         std::fs::write(holder_path(&layout), "garbage").unwrap();
         assert_eq!(person_holder(&layout), None);
+        std::fs::write(holder_path(&layout), format!("pid={parent}\nperson=1\n")).unwrap();
+        std::fs::remove_file(layout.store_lock()).unwrap();
+        std::fs::create_dir(layout.store_lock()).unwrap();
+        assert!(matches!(
+            try_lock_store(&layout),
+            Err(StoreLockError::Io(_, _))
+        ));
+        assert_eq!(
+            person_holder(&layout),
+            None,
+            "an I/O error proves no holder"
+        );
+        assert!(holder_path(&layout).is_file());
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 

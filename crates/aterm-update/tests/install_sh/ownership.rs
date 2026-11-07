@@ -283,14 +283,15 @@ fn staller() -> String {
 }
 
 /// Time passes at once while a bound waits on a parked staller: the run it started, or
-/// the shell that started it (root asks as nobody through one).
+/// the shell that started it (root asks as nobody through one). Each look names the run it
+/// waited on, so a call that bounds the staller more than once books one line per run.
 const PARKED_CLOCK: &str = r#"sleep() {
 	local run parent watched
 	watched="$(set +u; printf %s "$!")"
 	if read -r run _ parent 2>/dev/null <"$STALL_PARKED" &&
 		[[ "$run" == "$watched" || "$parent" == "$watched" ]]; then
 		SECONDS=$((SECONDS + 3600))
-		echo look >>"$STALL_PARKED.looks"
+		echo "look $watched" >>"$STALL_PARKED.looks"
 		return 0
 	fi
 	command sleep "$@"
@@ -746,12 +747,14 @@ fn a_binary_that_never_finishes_is_cut_off_and_answers_nothing() {
             &recs[at].out, want,
             "{call}: a run cut off answered nothing"
         );
-        assert_eq!(
-            read(&scratch.join(&format!("stall/{name}.parked.looks")))
-                .lines()
-                .count(),
-            1,
-            "{call}: the bound reads the clock, so its first look past it is its last"
+        // A call may bound the staller more than once (the source lane asks the binary it
+        // placed to record itself, then its version): each run is looked at exactly once.
+        let looks = read(&scratch.join(&format!("stall/{name}.parked.looks")));
+        let runs: std::collections::BTreeSet<&str> = looks.lines().collect();
+        assert!(
+            !runs.is_empty() && runs.len() == looks.lines().count(),
+            "{call}: the bound reads the clock, so each run's first look past it is its last: \
+             {looks:?}"
         );
         let Some([_, child, _]) = parked_pids(&parked(name)) else {
             panic!("{call}: the staller's line: {:?}", read(&parked(name)))

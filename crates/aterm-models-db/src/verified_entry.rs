@@ -4,7 +4,11 @@
 use aterm_spec::derive::Model;
 
 /// A local signed-entry read and re-observation of an opaque snapshot. These
-/// bounded scenarios grant no provider access and assert no global freshness.
+/// bounded scenarios grant no provider access and assert no global freshness, with one
+/// exception: the typed read of a Claude Code token entry (`ClaudeToken`), the owner's sanctioned
+/// headless login (DESIGN-claude-setup-token §4.2), accepts the class's value in place, while a
+/// materialized reading of a class name (`ClaudeTokenMaterialized`) is refused like any other
+/// reserved name.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn verified_entry_model() -> Model {
@@ -30,8 +34,10 @@ pub fn verified_entry_model() -> Model {
             action Fork when (scenario == 0) {scenario = 16; accepted = if Buggy == 16 {1} else {0};}
             action Missing when (scenario == 0) {scenario = 17; accepted = if Buggy == 17 {1} else {0};}
             action Reserved when (scenario == 0) {scenario = 18; accepted = if Buggy == 18 {1} else {0};}
-            invariant OnlyBoundBytes: scenario == 0 || scenario == 1 || scenario == 10 || accepted == 0;
-            invariant Available: ((1 > scenario || scenario > 1) && (10 > scenario || scenario > 10)) || accepted == 1;
+            action ClaudeToken when (scenario == 0) {scenario = 19; accepted = if Buggy == 20 {0} else {1};}
+            action ClaudeTokenMaterialized when (scenario == 0) {scenario = 20; accepted = if Buggy == 21 {1} else {0};}
+            invariant OnlyBoundBytes: scenario == 0 || scenario == 1 || scenario == 10 || scenario == 19 || accepted == 0;
+            invariant Available: ((1 > scenario || scenario > 1) && (10 > scenario || scenario > 10) && (19 > scenario || scenario > 19)) || accepted == 1;
             invariant ReadOnly: effects == 0;
         }
     }

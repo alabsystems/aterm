@@ -28,6 +28,20 @@ pub enum ExecutionIntent {
         /// Credential generation and sign-in provenance, including for unowned logins.
         generation: String,
     },
+    /// A vault-token route (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.2) to one
+    /// account's token entry, in one exact local account namespace. Admission checks the row's
+    /// custody and claims, the token's standing here and its record's email, never a stored
+    /// login: a token row may have none on this Mac.
+    Token {
+        /// Fingerprint of provider and local account roots, never a peer-supplied path.
+        namespace: String,
+        /// The selector the retained command carries; absent means the default login.
+        login: Option<String>,
+        /// The managed row, or `None` for an account no row names (its login record's).
+        owner: Option<String>,
+        /// The token entry the wrapper serves.
+        entry: accounts::TokenEntry,
+    },
 }
 
 /// Holds the account writer through the caller's execution-grant decision.
@@ -102,32 +116,68 @@ impl ExecutionIntent {
         );
         Some(env)
     }
-    /// Match independently observed execution-environment attribution. A route
-    /// formerly external cannot fall back to a pooled login, and a stored route
-    /// must still select exactly the retained login under the same user home.
+    /// The token entry of the account this intent names, where the caller can resolve it:
+    /// a token intent's own, a stored one's owner row's in `roster` ([`accounts::TokenEntry::of_row`]),
+    /// none for an external route or an unowned login.
     #[must_use]
-    pub fn matches_process(&self, who: &accounts::ProcessLogin, same_user_home: bool) -> bool {
+    pub fn owner_entry(&self, roster: &Roster) -> Option<accounts::TokenEntry> {
         match self {
-            Self::External { .. } => !same_user_home || !who.default_home || !who.stored_login,
-            Self::Stored { login, .. } => {
-                same_user_home
-                    && who.default_home
-                    && who.stored_login
-                    && match (
-                        who.login.as_deref().filter(|s| !s.is_empty()),
-                        login.as_deref(),
-                    ) {
-                        (None, None) => true,
-                        (Some(actual), Some(expected)) => {
-                            accounts::canonical_directory(Path::new(actual))
-                                .ok()
-                                .zip(accounts::canonical_directory(Path::new(expected)).ok())
-                                .is_some_and(|(actual, expected)| actual == expected)
-                        }
-                        _ => false,
-                    }
-            }
+            Self::External { .. } => None,
+            Self::Stored { owner, .. } => owner
+                .as_deref()
+                .and_then(|label| roster.row(label))
+                .and_then(accounts::TokenEntry::of_row),
+            Self::Token { entry, .. } => Some(*entry),
         }
+    }
+
+    /// Match independently observed execution-environment attribution. A route
+    /// formerly external cannot fall back to a pooled login, and a stored or token route
+    /// must still select exactly the retained login under the same user home, on either of the
+    /// row's routes: its stored login, or its vault token where the marker names `owner_entry`,
+    /// the intent's account's entry ([`Self::owner_entry`]; a token intent names its own). So a
+    /// wrapper's fallback to the stored login, or the twin's own judgment at exec, never reads
+    /// as a launch on another account.
+    #[must_use]
+    pub fn matches_process(
+        &self,
+        who: &accounts::ProcessLogin,
+        same_user_home: bool,
+        owner_entry: Option<accounts::TokenEntry>,
+    ) -> bool {
+        let (login, entry) = match self {
+            Self::External { .. } => {
+                return !same_user_home
+                    || !who.default_home
+                    || match who.route {
+                        accounts::AuthRoute::Stored | accounts::AuthRoute::VaultToken { .. } => {
+                            false
+                        }
+                        accounts::AuthRoute::Outside => true,
+                    };
+            }
+            Self::Stored { login, .. } => (login, owner_entry),
+            Self::Token { login, entry, .. } => (login, Some(*entry)),
+        };
+        let on_row = match who.route {
+            accounts::AuthRoute::Stored => true,
+            accounts::AuthRoute::VaultToken { entry: named } => Some(named) == entry,
+            accounts::AuthRoute::Outside => false,
+        };
+        same_user_home
+            && who.default_home
+            && on_row
+            && match (
+                who.login.as_deref().filter(|s| !s.is_empty()),
+                login.as_deref(),
+            ) {
+                (None, None) => true,
+                (Some(actual), Some(expected)) => accounts::canonical_directory(Path::new(actual))
+                    .ok()
+                    .zip(accounts::canonical_directory(Path::new(expected)).ok())
+                    .is_some_and(|(actual, expected)| actual == expected),
+                _ => false,
+            }
     }
 
     /// Canonical storage containing no credential values or file contents.
@@ -150,6 +200,15 @@ impl ExecutionIntent {
             } => aterm_json::json!({
                 "v": 1, "route": "stored", "namespace": namespace,
                 "login": login, "owner": owner, "generation": generation,
+            }),
+            Self::Token {
+                namespace,
+                login,
+                owner,
+                entry,
+            } => aterm_json::json!({
+                "v": 1, "route": "token", "namespace": namespace,
+                "login": login, "owner": owner, "entry": entry.name(),
             }),
         }
     }
@@ -205,7 +264,7 @@ impl ExecutionIntent {
                 };
                 Self::External { context, launch }
             }
-            "stored" => {
+            route @ ("stored" | "token") => {
                 let login = match value.get("login")? {
                     aterm_json::Value::Null => None,
                     value => {
@@ -232,11 +291,20 @@ impl ExecutionIntent {
                         Some(label.to_owned())
                     }
                 };
-                Self::Stored {
-                    namespace: digest(value.get("namespace")?)?,
-                    login,
-                    owner,
-                    generation: digest(value.get("generation")?)?,
+                if route == "token" {
+                    Self::Token {
+                        namespace: digest(value.get("namespace")?)?,
+                        login,
+                        owner,
+                        entry: accounts::TokenEntry::parse(value.get("entry")?.as_str()?)?,
+                    }
+                } else {
+                    Self::Stored {
+                        namespace: digest(value.get("namespace")?)?,
+                        login,
+                        owner,
+                        generation: digest(value.get("generation")?)?,
+                    }
                 }
             }
             _ => return None,
@@ -397,6 +465,13 @@ pub(super) fn capture_held(
     who: &accounts::ProcessLogin,
     snapshot: &PoolSnapshot,
 ) -> Result<ExecutionIntent, String> {
+    let token = match who.route {
+        accounts::AuthRoute::Stored => None,
+        accounts::AuthRoute::VaultToken { entry } => Some(entry),
+        accounts::AuthRoute::Outside => {
+            return Err("execution route is not the account's own credential".into());
+        }
+    };
     let login = who
         .login
         .as_deref()
@@ -454,10 +529,22 @@ pub(super) fn capture_held(
             {
                 return Err("execution login has no current account binding".into());
             }
-            (
-                None,
-                unowned_generation(seat, cli, snapshot, login.as_deref())?,
-            )
+            match token {
+                None => (
+                    None,
+                    Some(unowned_generation(seat, cli, snapshot, login.as_deref())?),
+                ),
+                // An account no row names: the marker must name the entry of the account the
+                // session's own login record names (§5.2).
+                Some(entry) => {
+                    let named = super::super::profile::login_record(seat.home, login.as_deref())
+                        .and_then(|record| accounts::TokenEntry::of_email(&record.email));
+                    if named != Some(entry) {
+                        return Err("execution token names another account's entry".into());
+                    }
+                    (None, None)
+                }
+            }
         }
         Some(label) => {
             let row = snapshot
@@ -471,17 +558,36 @@ pub(super) fn capture_held(
                 .state
                 .lease_verdict(label, seat.now)
                 .map_err(|why| format!("execution account: {}", why.as_str()))?;
-            match accounts::condition(row, &snapshot.state, enrolled.contains(label), seat.now) {
-                accounts::Condition::NotEnrolled | accounts::Condition::SignedOut => {
-                    return Err("execution account is not signed in".into());
-                }
-                accounts::Condition::Limited { .. } if mode != Mode::Off && pin.is_none() => {
-                    return Err("execution account is at its limit".into());
-                }
-                _ => {}
+            let condition =
+                accounts::condition(row, &snapshot.state, enrolled.contains(label), seat.now);
+            if matches!(condition, accounts::Condition::Limited { .. })
+                && mode != Mode::Off
+                && pin.is_none()
+            {
+                return Err("execution account is at its limit".into());
             }
-            check_login_identity(cli, row, seat.home).map_err(|why| why.to_string())?;
-            (Some(label.to_owned()), binding(seat, cli, snapshot, row)?)
+            match token {
+                None => {
+                    if matches!(
+                        condition,
+                        accounts::Condition::NotEnrolled | accounts::Condition::SignedOut
+                    ) {
+                        return Err("execution account is not signed in".into());
+                    }
+                    check_login_identity(cli, row, seat.home).map_err(|why| why.to_string())?;
+                    (
+                        Some(label.to_owned()),
+                        Some(binding(seat, cli, snapshot, row)?),
+                    )
+                }
+                // No signed-out check: a token row may have no stored login on this Mac.
+                Some(entry) => {
+                    if accounts::TokenEntry::of_row(row) != Some(entry) {
+                        return Err("execution token names another account's entry".into());
+                    }
+                    (Some(label.to_owned()), None)
+                }
+            }
         }
     };
     let (final_config, final_issues) = crate::supervise::config::SupervisorConfig::from_path(Some(
@@ -493,11 +599,21 @@ pub(super) fn capture_held(
     {
         return Err("execution account controls changed during admission".into());
     }
-    Ok(ExecutionIntent::Stored {
-        namespace: namespace(seat, cli)?,
-        login,
-        owner,
-        generation,
+    let namespace = namespace(seat, cli)?;
+    Ok(match (token, generation) {
+        (Some(entry), _) => ExecutionIntent::Token {
+            namespace,
+            login,
+            owner,
+            entry,
+        },
+        (None, Some(generation)) => ExecutionIntent::Stored {
+            namespace,
+            login,
+            owner,
+            generation,
+        },
+        (None, None) => return Err("execution stored login has no generation".into()),
     })
 }
 
@@ -519,13 +635,16 @@ pub fn capture_execution(
     cli: Cli,
     who: &accounts::ProcessLogin,
 ) -> Result<ExecutionIntent, String> {
-    if !who.stored_login {
-        return Ok(ExecutionIntent::external());
-    }
+    let stored = match who.route {
+        accounts::AuthRoute::Stored => true,
+        accounts::AuthRoute::VaultToken { .. } => false,
+        accounts::AuthRoute::Outside => return Ok(ExecutionIntent::external()),
+    };
     if !who.default_home {
         return Err("custom stored-login home requires directory attribution".into());
     }
-    if seat.keyring_held(cli) {
+    // The sign-in lock is a stored login's service; a token route never takes it (§5.8).
+    if stored && seat.keyring_held(cli) {
         return Err("execution stored-login route is unavailable".into());
     }
     let store = seat.store(cli);
@@ -637,10 +756,14 @@ pub fn admit_execution(
     cli: Cli,
     intent: &ExecutionIntent,
 ) -> Result<ExecutionGuard, String> {
-    let ExecutionIntent::Stored { login, .. } = intent else {
-        return Ok(ExecutionGuard { _held: None });
+    let (login, route) = match intent {
+        ExecutionIntent::External { .. } => return Ok(ExecutionGuard { _held: None }),
+        ExecutionIntent::Stored { login, .. } => (login, accounts::AuthRoute::Stored),
+        ExecutionIntent::Token { login, entry, .. } => {
+            (login, accounts::AuthRoute::VaultToken { entry: *entry })
+        }
     };
-    if seat.keyring_held(cli) {
+    if route == accounts::AuthRoute::Stored && seat.keyring_held(cli) {
         return Err("execution stored-login route is unavailable".into());
     }
     let store = seat.store(cli);
@@ -655,12 +778,75 @@ pub fn admit_execution(
         &accounts::ProcessLogin {
             login: login.clone(),
             default_home: true,
-            stored_login: true,
+            route,
         },
         &snapshot,
     )?;
     if current != *intent {
         return Err("execution account namespace or credential generation changed".into());
     }
+    if let ExecutionIntent::Token { owner, entry, .. } = intent {
+        let email = match owner
+            .as_deref()
+            .and_then(|label| snapshot.roster.row(label))
+        {
+            Some(row) => row.expected_identity_email().map(str::to_owned),
+            None => super::super::profile::login_record(seat.home, login.as_deref())
+                .map(|record| record.email),
+        }
+        .ok_or("execution token's account names no email")?;
+        token_in_use_here(seat, &store, *entry, &email)?;
+    }
     Ok(ExecutionGuard { _held: Some(held) })
+}
+
+/// Whether the token `entry` is in use on this Mac (its standing in this Mac's vault, under
+/// `seat.home`, and the table's own facts: `active`, `soon`, `exposed`, or `unverified` on the
+/// Mac that minted it) and its record names `email` (§5.2). The words name the state, never a
+/// value.
+#[cfg(unix)]
+fn token_in_use_here(
+    seat: &Seat<'_>,
+    store: &Store,
+    entry: accounts::TokenEntry,
+    email: &str,
+) -> Result<(), String> {
+    use aterm_secrets::claude_token::{self, Lookup};
+    let key = claude_token::Key::parse(entry.key().as_str())
+        .ok_or("execution token entry is not a token's")?;
+    let found = claude_token::standing(&aterm_secrets::client::Paths::for_home(seat.home), &key)
+        .map_err(|why| format!("execution token: {why}"))?;
+    let table = super::super::accounts_tokens::read_table(store)
+        .map_err(|why| format!("execution token table: {why}"))?;
+    let now = u64::try_from(seat.now).unwrap_or(0);
+    let state =
+        super::super::accounts_tokens::TokenState::of(&found, table.rows.get(key.as_str()), now);
+    if !state.in_use() {
+        return Err(format!(
+            "execution token is not in use here: {}",
+            state.words()
+        ));
+    }
+    let named = match &found {
+        Lookup::Found(standing) => standing
+            .meta
+            .as_ref()
+            .is_some_and(|meta| accounts::email_matches(&meta.email, email)),
+        Lookup::Absent | Lookup::Unknown => false,
+    };
+    if !named {
+        return Err("execution token's record names another account".into());
+    }
+    Ok(())
+}
+
+/// The token route is macOS's for now (`spawnfd`'s exec keeps a named descriptor only there).
+#[cfg(not(unix))]
+fn token_in_use_here(
+    _seat: &Seat<'_>,
+    _store: &Store,
+    _entry: accounts::TokenEntry,
+    _email: &str,
+) -> Result<(), String> {
+    Err("execution token route is unavailable on this platform".into())
 }

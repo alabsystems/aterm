@@ -399,3 +399,75 @@ fn a_lapsed_login_is_not_a_working_one() {
         );
     }
 }
+
+/// RENEWAL IS OFF FOR A ROW ON ITS VAULT TOKEN (`docs/DESIGN-claude-setup-token-2026-11-05.md`
+/// §5.8): a row whose records open both doors (a due or ended login a session here runs on) is
+/// renewed by no door once it runs on its vault token here ([`OtherMacs::on_token`]): the renewal
+/// door, the session door the upkeep holds, the upkeep's ranked candidates (every tier) and a
+/// person's `--due` sweep pass it by, and the report names why. CONTROL: the same records with no
+/// token row open the doors, and the row stays a candidate.
+#[test]
+fn no_door_renews_a_row_on_its_vault_token() {
+    use super::super::sign_in_ladder::{upkeep_signs_in, upkeep_waits_because};
+    let pool = pool(
+        Cli::Claude,
+        &[shape("dead", CLAUDE_DEAD), shape("live", CLAUDE_LIVE)],
+    );
+    let token = OtherMacs {
+        on_token: [("dead".to_owned(), u64::try_from(NOW + 300 * DAY).unwrap())].into(),
+        ..OtherMacs::NONE
+    };
+    for records in [Records::Due, Records::Ended] {
+        let (roster, mut state, logins, _) = pool.judged(records);
+        let _ = note_session(&mut state, "s-live", "dead", None, NOW);
+        let dead = roster.row("dead").expect("the row");
+        let candidates = |others: &OtherMacs| -> Vec<String> {
+            super::super::accounts_sync::needed_renew_candidates(
+                &roster,
+                &state,
+                (&logins, others),
+                NOW,
+            )
+            .into_iter()
+            .map(|row| row.label)
+            .collect()
+        };
+        assert!(
+            renew_due(&roster, &logins, &state, &OtherMacs::NONE, NOW).contains(&"dead".to_owned()),
+            "{records:?}: CONTROL, the records open the renewal door"
+        );
+        assert!(
+            upkeep_signs_in(dead, (&logins, &state, &OtherMacs::NONE), NOW),
+            "{records:?}: CONTROL"
+        );
+        assert!(
+            candidates(&OtherMacs::NONE).contains(&"dead".to_owned()),
+            "{records:?}: CONTROL, it is a candidate"
+        );
+
+        assert!(
+            !renewal_due(dead, &logins, &state, &token, NOW),
+            "{records:?}"
+        );
+        assert!(
+            !renew_due(&roster, &logins, &state, &token, NOW).contains(&"dead".to_owned()),
+            "{records:?}"
+        );
+        assert!(
+            !upkeep_signs_in(dead, (&logins, &state, &token), NOW),
+            "{records:?}"
+        );
+        assert!(
+            !candidates(&token).contains(&"dead".to_owned()),
+            "{records:?}: auto-renewal never picks it"
+        );
+        assert_eq!(
+            upkeep_waits_because(dead, &state, &token, NOW),
+            "it runs on its vault token here, and renewal is off for it"
+        );
+        assert!(
+            renew_due(&roster, &logins, &state, &token, NOW).contains(&"live".to_owned()),
+            "{records:?}: another row renews as before"
+        );
+    }
+}

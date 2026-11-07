@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 
 use aterm_types::macos_setup::opt_out::OptOut;
 use aterm_types::macos_setup::{
-    Access, AccessOutcome, MacosDialog, Selection, Setting, Standing, Subject, SyncKind,
+    Access, AccessOutcome, MacosDialog, Selection, Setting, Standing, Subject,
 };
 
 use crate::status_item::SystemStateLine;
@@ -297,8 +297,9 @@ impl AccessSteps {
 
 /// `status`'s `setup=` (pure): where this Mac's setup stands, from the last status the worker
 /// published (its progress record and its prompt-free readings), so a `status` costs no probe.
-/// `pending:<row,...>` names each managed row that needs a person, waits, failed, is unread or
-/// still differs without a recorded personal change (`fda`, `devtools`, `vault`, … [`setup_word`]), then `;needs:<row,...>`
+/// `pending:<row,...>` names each managed row that needs a person, waits, failed or
+/// still differs without a recorded personal change; `unknown:<row,...>` names rows with no
+/// usable reading, separately after `;unknown:` while known work is pending. Then `;needs:<row,...>`
 /// for those of them that wait on a person's press (their reading is Needs you), so a reader
 /// tells a press from a wait without the page; `done` once System State's current headline
 /// says this Mac is set up ([`crate::system_state::Headline::set_up`]), including before its run finished,
@@ -314,31 +315,43 @@ pub(crate) fn setup_field(status: &SetupStatus) -> String {
         .as_ref()
         .map_or_else(Selection::none, |plan| plan.selection);
     let rows = crate::system_state::rows(status, selection);
+    setup_field_with_rows(status, selection, &rows)
+}
+
+fn setup_field_with_rows(
+    status: &SetupStatus,
+    selection: Selection,
+    rows: &[crate::system_state::RowView],
+) -> String {
     let mut pending: Vec<&str> = Vec::new();
     let mut needs: Vec<&str> = Vec::new();
+    let mut unknown: Vec<&str> = Vec::new();
     let offered_access: Vec<_> = crate::system_state::offered_access(status)
         .into_iter()
         .filter(|access| crate::system_state::manages(selection, Subject::Access(*access)))
         .collect();
     for access in &offered_access {
-        let word = setup_word(Subject::Access(*access));
+        let word = Subject::Access(*access).status_word();
         if !pending.contains(&word) {
             pending.push(word);
             needs.push(word);
         }
     }
     for row in rows.iter().filter(|row| row.managed) {
-        let left = match row.standing {
-            None
-            | Some(Standing::Unknown | Standing::NeedsYou | Standing::Waiting | Standing::Failed) => {
-                true
+        let word = row.subject.status_word();
+        if matches!(row.standing, None | Some(Standing::Unknown)) {
+            if !pending.contains(&word) && !unknown.contains(&word) {
+                unknown.push(word);
             }
+            continue;
+        }
+        let left = match row.standing {
+            Some(Standing::NeedsYou | Standing::Waiting | Standing::Failed) => true,
             // The probe's personal-change record is evidence of a choice; a finished stage
             // alone says nothing about why a current reading differs.
             Some(Standing::Differs) => !row.changed_by_you,
             _ => false,
         };
-        let word = setup_word(row.subject);
         if left {
             if !pending.contains(&word) {
                 pending.push(word);
@@ -352,7 +365,7 @@ pub(crate) fn setup_field(status: &SetupStatus) -> String {
     // its headline off set up.
     let set_up = || {
         status.plan.as_ref().is_some_and(|plan| {
-            let headline = crate::system_state::headline(status, &rows, Some(plan));
+            let headline = crate::system_state::headline(status, rows, Some(plan));
             headline.set_up
                 // A completed explicit opt-out has no managed work to prove. Keep the
                 // readable idle terminal case without reviving finished-only success.
@@ -371,18 +384,31 @@ pub(crate) fn setup_field(status: &SetupStatus) -> String {
         } else {
             let words: Vec<&str> = offered_access
                 .iter()
-                .map(|access| setup_word(Subject::Access(*access)))
+                .map(|access| Subject::Access(*access).status_word())
                 .collect();
             format!(";offered:{}", words.join(","))
         }
     };
-    if !pending.is_empty() {
+    let active = status.busy || status.changing || status.queued || !status.running.is_empty();
+    if !pending.is_empty() || (active && !unknown.is_empty()) {
+        let pending = if pending.is_empty() {
+            "pending".to_owned()
+        } else {
+            format!("pending:{}", pending.join(","))
+        };
         let needs = if needs.is_empty() {
             String::new()
         } else {
             format!(";needs:{}", needs.join(","))
         };
-        format!("pending:{}{needs}", pending.join(","))
+        let unknown = if unknown.is_empty() {
+            String::new()
+        } else {
+            format!(";unknown:{}", unknown.join(","))
+        };
+        format!("{pending}{needs}{unknown}")
+    } else if !unknown.is_empty() {
+        format!("unknown:{}", unknown.join(","))
     } else if set_up() {
         // The stages the run's last pass parked to ask again by itself, in the rows' words: a
         // vault nobody answered (`unreached`) or none here (`waiting`), a step put off.
@@ -394,7 +420,7 @@ pub(crate) fn setup_field(status: &SetupStatus) -> String {
             .filter_map(|row| aterm_types::macos_setup::StageRow::named(&row.name))
         {
             for setting in stage.settings.iter().filter(|s| selection.contains(**s)) {
-                let word = setup_word(Subject::Setting(*setting));
+                let word = Subject::Setting(*setting).status_word();
                 if !asking.contains(&word) {
                     asking.push(word);
                 }
@@ -416,6 +442,11 @@ pub(crate) fn setup_field(status: &SetupStatus) -> String {
 /// The background check's coherent cached evidence. A finished plan or a held group alone
 /// verifies no private value; only current native readings cover a requested preference.
 pub(crate) fn background_setup_fields(status: &SetupStatus) -> String {
+    let selection = status
+        .plan
+        .as_ref()
+        .map_or_else(Selection::none, |plan| plan.selection);
+    let rows = crate::system_state::rows(status, selection);
     let mut verified = Selection::none();
     if let Some(plan) = status.plan.as_ref()
         && !status.changing
@@ -441,35 +472,28 @@ pub(crate) fn background_setup_fields(status: &SetupStatus) -> String {
             }
         }
     }
-    format!("setup={} verified={}", setup_field(status), verified.bits())
-}
-
-/// A System State row's word in `setup=` ([`setup_field`]).
-const fn setup_word(subject: Subject) -> &'static str {
-    match subject {
-        Subject::Access(Access::FullDiskAccess) => "fda",
-        Subject::Access(Access::DeveloperTools) => "devtools",
-        Subject::Access(Access::Debugger) => "debugger",
-        Subject::Access(Access::Accessibility) => "ax",
-        Subject::Setting(Setting::CapsLock) => "capslock",
-        Subject::Setting(Setting::NaturalScrolling) => "scrolling",
-        Subject::Setting(Setting::TrackpadScrolling) => "trackpad",
-        Subject::Setting(Setting::Desktop) => "desktop",
-        Subject::Setting(Setting::Widgets) => "widgets",
-        Subject::Setting(Setting::Dock) => "dock",
-        Subject::Setting(Setting::Messages) => "messages",
-        Subject::Setting(Setting::FaceTime) => "facetime",
-        Subject::Setting(Setting::Spotlight) => "spotlight",
-        Subject::Setting(Setting::Permissions) => "permissions",
-        Subject::Setting(Setting::Secrets) => "vault",
-        Subject::Setting(Setting::Repositories) => "repos",
-        Subject::Sync(SyncKind::Peers) => "sync-peers",
-        Subject::Sync(SyncKind::Identity) => "sync-identity",
-        Subject::Sync(SyncKind::Fleet) => "sync-fleet",
-        Subject::Sync(SyncKind::Accounts) => "sync-accounts",
-        Subject::Sync(SyncKind::SharedData) => "sync-shared-data",
-        Subject::Sync(SyncKind::Name) => "sync-name",
-    }
+    let cached: Vec<_> = rows
+        .iter()
+        .filter(|row| row.managed)
+        .map(|row| {
+            format!(
+                "{}:{}",
+                row.subject.status_word(),
+                row.standing.map_or("unread", Standing::status_word)
+            )
+        })
+        .collect();
+    let cached = if cached.is_empty() {
+        "-".into()
+    } else {
+        cached.join(",")
+    };
+    format!(
+        "setup={} verified={} observed_generation={} rows={cached}",
+        setup_field_with_rows(status, selection, &rows),
+        verified.bits(),
+        status.observed_generation,
+    )
 }
 
 /// The one quiet signal (§3.6, pure): `System State: Needs you: <row>`, from the managed rows

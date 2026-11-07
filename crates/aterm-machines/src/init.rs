@@ -161,6 +161,7 @@ struct Options {
     trigger: Option<crate::sync::Trigger>,
     /// Requested repository work for one owned converge job, never effect authority.
     repository_work: Option<aterm_secrets::converge::RepositoryWork>,
+    repository_request: Option<aterm_secrets::converge::RepositoryRequest>,
 }
 
 impl Options {
@@ -496,6 +497,22 @@ fn options(args: &[OsString]) -> Result<Options, String> {
             );
             continue;
         }
+        let request = match arg.to_str() {
+            Some("--repository-request") => {
+                Some(args.next().and_then(|word| word.to_str()).unwrap_or(""))
+            }
+            Some(arg) => arg.strip_prefix("--repository-request="),
+            None => None,
+        };
+        if let Some(json) = request {
+            if json.len() > 4096 {
+                return Err("repository request is too large".into());
+            }
+            options.repository_request = Some(
+                aterm_json::from_str(json).map_err(|_| "invalid repository scheduling request")?,
+            );
+            continue;
+        }
         let work = match arg.to_str() {
             Some("--repository-work") => {
                 Some(args.next().and_then(|word| word.to_str()).unwrap_or(""))
@@ -574,7 +591,12 @@ fn options(args: &[OsString]) -> Result<Options, String> {
     if options.trigger.is_some() && !options.converge {
         return Err("--trigger names who started a --converge pass".into());
     }
-    if options.repository_work.is_some() && !options.converge {
+    if options.repository_work.is_some() && options.repository_request.is_some() {
+        return Err("choose repository work or a retained repository request".into());
+    }
+    if (options.repository_work.is_some() || options.repository_request.is_some())
+        && !options.converge
+    {
         return Err("--repository-work describes one --converge job".into());
     }
     if options.converge
@@ -763,8 +785,9 @@ pub struct Host<'a> {
     /// aterm's macOS grants, as the Permissions phase reads them ([`Grants`]).
     pub grants: Grants,
     /// The running window's already-published workstation observation. Only a read-only
-    /// check away from a person's terminal asks this port; it never probes other apps.
-    pub workstation_check: &'a dyn Fn() -> WorkstationObservation,
+    /// check away from a person's terminal asks this port for its selected private settings;
+    /// it never probes other apps.
+    pub workstation_check: &'a dyn Fn(Selection) -> WorkstationObservation,
     /// Hand the grants the Permissions phase left to the person to the running aterm window's
     /// permission walk (`permissions walk now <grants>`), for a person at this Mac's console,
     /// Full Disk Access and Accessibility only when that window is the app macOS holds
@@ -1424,9 +1447,25 @@ fn tab(
 fn converge_entry(options: &Options, ports: &dyn crate::sync::Ports) -> ExitCode {
     let trigger = options.trigger.unwrap_or(crate::sync::Trigger::Init);
     ports.background(trigger);
+    let request = options.repository_request.unwrap_or_else(|| {
+        let observed = if options.action == Action::Check {
+            Default::default()
+        } else {
+            ports
+                .state_dir()
+                .map(|state| crate::sync::repository_refresh::observe(&state, ports.now_ms()))
+                .unwrap_or_default()
+        };
+        crate::sync::repository_refresh::Job::from(
+            options
+                .repository_work
+                .unwrap_or(aterm_secrets::converge::RepositoryWork::Refresh),
+        )
+        .request(observed)
+    });
     if trigger == crate::sync::Trigger::Subscriber
         && let Some(program) = ports.installed_release_elsewhere()
-        && let Some(code) = hand_off(options, ports, &program)
+        && let Some(code) = hand_off(options, ports, &program, request)
     {
         return code;
     }
@@ -1437,15 +1476,7 @@ fn converge_entry(options: &Options, ports: &dyn crate::sync::Ports) -> ExitCode
         (Mode::Apply, Action::Apply)
     };
     let printer = Printer::new(options.verbose, options.json);
-    let pass = crate::sync::converge(
-        ports,
-        trigger,
-        mode,
-        options
-            .repository_work
-            .unwrap_or(aterm_secrets::converge::RepositoryWork::Refresh),
-        &mut |row| printer.row(row),
-    );
+    let pass = crate::sync::converge(ports, trigger, mode, request, &mut |row| printer.row(row));
     printer.flush();
     let pass = match pass {
         Ok(pass) => pass,
@@ -1509,14 +1540,21 @@ fn converge_entry(options: &Options, ports: &dyn crate::sync::Ports) -> ExitCode
 /// writes its own ledger line. `None` where it could not be started or waited for, or ended
 /// with a usage error (an installed app older than this copy, with no such pass; each said in
 /// aterm.log): this copy runs the pass itself, as before.
-fn hand_off(options: &Options, ports: &dyn crate::sync::Ports, program: &Path) -> Option<ExitCode> {
+fn hand_off(
+    options: &Options,
+    ports: &dyn crate::sync::Ports,
+    program: &Path,
+    request: aterm_secrets::converge::RepositoryRequest,
+) -> Option<ExitCode> {
     let mut args = ["init", "--converge", "--trigger"]
         .map(str::to_owned)
         .to_vec();
     args.push(crate::sync::Trigger::Subscriber.word().to_owned());
-    if let Some(work) = options.repository_work {
-        args.extend(["--repository-work".to_owned(), work.word().to_owned()]);
-    }
+    let encoded = match aterm_json::to_string(&request) {
+        Ok(encoded) => encoded,
+        Err(_) => return None,
+    };
+    args.extend(["--repository-request".to_owned(), encoded]);
     if options.action == Action::Check {
         args.push("--check".to_owned());
     }
@@ -2155,8 +2193,21 @@ pub fn clone_owed(
     state: &Path,
     work: aterm_secrets::converge::RepositoryWork,
 ) -> Result<String, String> {
+    clone_owed_in_pass(sys, state, work, None)
+}
+
+/// Reuse the enclosing converge pass's alignment lease; standalone callers own
+/// their lease lazily at the default native effect boundary.
+/// # Errors
+/// As [`clone_owed`], including a changed source or an unfulfilled shared refresh.
+pub fn clone_owed_in_pass(
+    sys: &dyn System,
+    state: &Path,
+    work: aterm_secrets::converge::RepositoryWork,
+    execution: Option<crate::sync::repository_refresh::Execution>,
+) -> Result<String, String> {
     let ctx = repository_context(sys)?;
-    let items = crate::init_github::items_for_work(sys, &ctx, None, work)?;
+    let items = crate::init_github::items_for_execution(sys, &ctx, None, work, execution)?;
     let bound = crate::engine::bind(
         items
             .iter()
@@ -2281,6 +2332,7 @@ fn person_line(how: &str) -> String {
 /// waits on it runs then, so it is no step of this run's. A sign-out that found nobody at the
 /// screen right before its own clicks (the person left during the other's) is deferred as the
 /// sign-outs are when nobody is there as they start ([`NOBODY_AT_THE_SCREEN`]).
+/// A read-only relay retains the coordinator's scoped reason rather than claiming vault work.
 fn owe(mut row: ItemReport) -> ItemReport {
     if crate::init_accounts::found_nobody(&row) {
         row.outcome = Outcome::Deferred;
@@ -2290,7 +2342,9 @@ fn owe(mut row: ItemReport) -> ItemReport {
     }
     if row.outcome == Outcome::Blocked && waiting(&row) && !waits_by_itself(&row) {
         row.outcome = Outcome::Deferred;
-        row.why = Some(OWED.into());
+        if row.class != Some(Class::Relay) {
+            row.why = Some(OWED.into());
+        }
     }
     row
 }
@@ -4279,7 +4333,7 @@ fn prepare_groups_with(
         .relayed
         .as_ref()
         .map_or_else(|| runs.workstation(), |selection| selection.requested);
-    let observation = observation.map(|observation| observation.for_scope(requested));
+    let observation = observation.map(|observation| observation.for_scope(requested.workstation()));
     let decided = standing.decided;
     if !sys.macos() {
         return Ok((
@@ -4715,13 +4769,13 @@ fn observed_workstation(
     sys: &dyn System,
     action: Action,
     requested: Selection,
-    check: &dyn Fn() -> WorkstationObservation,
+    check: &dyn Fn(Selection) -> WorkstationObservation,
 ) -> Option<WorkstationObservation> {
     (action == Action::Check
         && !requested.workstation().is_empty()
         && sys.macos()
         && observes_background(crate::console::presence(sys)))
-    .then(check)
+    .then(|| check(requested.workstation()))
 }
 
 /// Read in any shell of the account rather than blocked by the engine's console gate;
@@ -4733,15 +4787,17 @@ fn away_from_console(presence: Presence, observation: Option<WorkstationObservat
     } else {
         Class::Person
     };
+    let mut place = workstation_place(class);
+    place.requires = Requires::Account;
+    if class == Class::Relay {
+        place.remedy = Remedy::None;
+    }
     (
         vec![Box::new(AwayFromConsole {
             presence,
             observation,
         })],
-        Place {
-            requires: Requires::Account,
-            ..workstation_place(class)
-        },
+        place,
     )
 }
 
@@ -7416,7 +7472,7 @@ mod tests {
             full_disk_access: &|| panic!("--converge measured Full Disk Access"),
             records: &NoSetup,
             grants: grants_unread,
-            workstation_check: &|| panic!("--converge read workstation observations"),
+            workstation_check: &|_| panic!("--converge read workstation observations"),
             walk: &|_| panic!("--converge walked the grants"),
             converge: ports,
             alab: &|| panic!("--converge read the ALab scope"),
@@ -7517,10 +7573,23 @@ mod tests {
         let words = |args: &[&str]| args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
         assert_eq!(
             *ports.ran_elsewhere.lock().unwrap(),
-            [(
-                app.clone(),
-                words(&["init", "--converge", "--trigger", "subscriber", "--json"])
-            )]
+            [(app.clone(), {
+                let mut args = words(&[
+                    "init",
+                    "--converge",
+                    "--trigger",
+                    "subscriber",
+                    "--repository-request",
+                ]);
+                args.push(
+                    aterm_json::to_string(&aterm_secrets::converge::RepositoryRequest::Refresh(
+                        aterm_secrets::converge::RefreshRequest::after(None, Default::default()),
+                    ))
+                    .unwrap(),
+                );
+                args.push("--json".into());
+                args
+            })]
         );
         assert!(ports.applies().is_empty(), "no pass here");
         assert!(crate::sync::read_record(scratch.path()).is_none());
@@ -8501,14 +8570,14 @@ mod tests {
         );
         for action in [Action::Apply, Action::Plan] {
             assert!(
-                observed_workstation(&sys, action, Selection::all(), &|| panic!(
+                observed_workstation(&sys, action, Selection::all(), &|_| panic!(
                     "a non-check queried observations"
                 ))
                 .is_none()
             );
         }
         assert_eq!(
-            observed_workstation(&sys, Action::Check, Selection::all(), &|| {
+            observed_workstation(&sys, Action::Check, Selection::all(), &|_| {
                 WorkstationObservation::Complete(Selection::all().workstation())
             }),
             Some(WorkstationObservation::Complete(
@@ -8517,7 +8586,7 @@ mod tests {
         );
         let other = alice_at(502);
         assert!(
-            observed_workstation(&other, Action::Check, Selection::all(), &|| panic!(
+            observed_workstation(&other, Action::Check, Selection::all(), &|_| panic!(
                 "another login queried observations"
             ))
             .is_none()
@@ -8968,15 +9037,54 @@ mod tests {
 
     #[test]
     fn a_scoped_agent_check_reaches_its_advertised_workstation_selector() {
-        for (selector, console, terminal, agent, held, dock_verified, expected) in [
-            ("github", 501, true, Some("Codex"), false, false, Some(0)),
-            ("widgets", 501, true, Some("Codex"), false, false, Some(75)),
-            ("keyboard", 501, true, Some("Codex"), false, false, Some(0)),
+        let unread = "selected preference has no current cached reading";
+        for (selector, console, terminal, agent, held, dock_verified, waiting, expected) in [
+            (
+                "github",
+                501,
+                true,
+                Some("Codex"),
+                false,
+                false,
+                false,
+                Some(0),
+            ),
+            (
+                "widgets",
+                501,
+                true,
+                Some("Codex"),
+                false,
+                false,
+                false,
+                Some(75),
+            ),
+            (
+                "keyboard",
+                501,
+                true,
+                Some("Codex"),
+                false,
+                false,
+                false,
+                Some(0),
+            ),
+            (
+                "keyboard",
+                501,
+                true,
+                Some("Codex"),
+                false,
+                false,
+                true,
+                Some(75),
+            ),
             (
                 "keyboard.caps-lock.seen@alice",
                 501,
                 false,
                 Some("Codex"),
+                false,
                 false,
                 false,
                 Some(0),
@@ -8986,6 +9094,7 @@ mod tests {
                 501,
                 true,
                 Some("Codex"),
+                false,
                 false,
                 false,
                 Some(75),
@@ -8997,11 +9106,30 @@ mod tests {
                 Some("Codex"),
                 false,
                 true,
+                false,
                 Some(0),
             ),
-            ("keybord", 501, true, Some("Codex"), false, false, None),
-            ("keyboard", 501, false, None, true, false, None),
-            ("keyboard", 502, true, Some("Codex"), false, false, Some(77)),
+            (
+                "keybord",
+                501,
+                true,
+                Some("Codex"),
+                false,
+                false,
+                false,
+                None,
+            ),
+            ("keyboard", 501, false, None, true, false, false, None),
+            (
+                "keyboard",
+                502,
+                true,
+                Some("Codex"),
+                false,
+                false,
+                false,
+                Some(77),
+            ),
         ] {
             let mut sys = alice_at(console);
             sys.terminal = terminal;
@@ -9025,12 +9153,24 @@ mod tests {
                         sys,
                         Action::Check,
                         reading.context_scope,
-                        &|| {
+                        &|required| {
                             assert_ne!(
                                 selector, "github",
                                 "GitHub-only needs no window's cached preference observation"
                             );
-                            WorkstationObservation::Complete(verified)
+                            if selector.starts_with("keyboard") {
+                                assert!(required.contains(Setting::CapsLock));
+                                assert_eq!(
+                                    required.contains(Setting::Dock),
+                                    selector.contains("dock")
+                                );
+                                assert!(!required.contains(Setting::Repositories));
+                            }
+                            if waiting {
+                                WorkstationObservation::Waiting(unread.into())
+                            } else {
+                                WorkstationObservation::Complete(verified)
+                            }
                         },
                     ),
                     holds: standing.holds.clone(),
@@ -9096,6 +9236,18 @@ mod tests {
                             "{selector}: only the selected aggregate runs"
                         );
                         assert_eq!(rows[0].id, AWAY);
+                        if waiting {
+                            assert_eq!(rows[0].why.as_deref(), Some(unread));
+                        }
+                        if console == 501 {
+                            assert!(
+                                rows[0]
+                                    .explain
+                                    .as_ref()
+                                    .is_none_or(|explain| explain.remedy == Remedy::None),
+                                "a read-only cached observation starts no setup"
+                            );
+                        }
                         assert_eq!(
                             rows[0].class,
                             Some(if console == 501 {
@@ -9616,6 +9768,78 @@ mod tests {
                 "the distribution's git: {calls:?}"
             );
         }
+    }
+
+    /// The ordinary `init --only github` producer shares the existing alignment
+    /// lease too; it cannot slip past a subscriber's admitted repository wave.
+    #[test]
+    fn plain_github_apply_respects_the_existing_repository_pass_lease() {
+        let mut sys = Fake::root();
+        sys.euid = 501;
+        sys.linux = true;
+        sys.terminal = true;
+        let alice = user("alice", 501);
+        sys.logged_in(&alice);
+        crate::init_github::scripted::converged(&sys, &alice, "notes");
+        let mut picked = options(&["--only".into(), "github".into()]).unwrap();
+        picked.station = vec!["github".into()];
+        let groups = |sys: &dyn System, ctx: &Ctx, mode: Mode, reading: &Reading<'_>| {
+            prepare_groups_with(
+                sys,
+                ctx,
+                mode,
+                None,
+                reading,
+                &alab_standing(),
+                no_grants,
+                |_| panic!("GitHub-only init does not open a Secrets stage"),
+            )
+        };
+        let run = || {
+            converge(
+                &sys,
+                &picked,
+                &Front {
+                    base: &|_| Base::none(),
+                    groups: &groups,
+                    full_disk_access: &|| panic!("repository init reads no workstation permission"),
+                    targo: None,
+                    cwd: None,
+                    records: &NoRecords,
+                    on_row: &|_| {},
+                    present: &|| false,
+                    on_held: &|_| {},
+                },
+                &mut NoJournal,
+                &mut Laps::start(),
+            )
+            .unwrap()
+        };
+        let held = sys.repository_pass().unwrap().pass.unwrap();
+        let rows = run();
+        assert!(
+            rows.iter()
+                .any(|row| row.id == "init.github.native@alice" && row.outcome == Outcome::Failed),
+            "{rows:?}"
+        );
+        assert!(
+            sys.calls()
+                .iter()
+                .all(|call| !call.contains("--symref") && !call.contains(" fetch "))
+        );
+        drop(held);
+        let rows = run();
+        assert!(
+            rows.iter()
+                .any(|row| row.id == "init.github.native@alice" && row.outcome == Outcome::Ok),
+            "{rows:?}"
+        );
+        let record = sys.repository_pass().unwrap().pass.unwrap().record();
+        assert!(record.converged_ms.is_none());
+        assert_eq!(
+            crate::sync::due(Some(&record), "current", &[], 0),
+            crate::sync::Due::NewBuild
+        );
     }
 
     #[test]
@@ -11988,7 +12212,7 @@ mod tests {
             full_disk_access: &|| panic!("the tab's run measured Full Disk Access"),
             records: &NoRecords,
             grants: |_| panic!("the tab's run read the grants"),
-            workstation_check: &|| panic!("the tab's run read workstation observations"),
+            workstation_check: &|_| panic!("the tab's run read workstation observations"),
             walk: &|_| panic!("the tab's run walked the grants"),
             converge: &ports,
             alab: &|| panic!("the tab's run read the ALab scope first"),
@@ -12091,7 +12315,7 @@ mod tests {
     }
 
     /// Every way the tab's install falls short, early ones included, ends on its one plain line
-    /// `Mac Setup did not finish: <reason>. Running aterm init in a terminal tries again.` and
+    /// `Mac Setup did not finish: <reason>.` and
     /// its class's exit (1, or a stop's and Apple's window closed's own): `sudo`'s own refusal, each
     /// class the root half exits with, a signal, a `sudo` that never ran, a run outside the
     /// person's own login, and a refused converge.

@@ -4152,7 +4152,7 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
             .iter()
             .any(|a| a.starts_with("agent=") || a.starts_with("program="))
     {
-        let (mut verb_args, label) = board::take_label(verb_args)?;
+        let (verb_args, label) = board::take_label(verb_args)?;
         let starter = worker_starter(env::var(SELF_SID_ENV).ok());
         let selector = worker_selector(selector, pinned, starter.as_deref());
         let here = env::current_dir().ok();
@@ -4163,31 +4163,15 @@ fn real_main(argv: Vec<std::ffi::OsString>, local: LocalVerbs) -> io::Result<Exi
             here.as_deref(),
         )?;
         let payload = read_task_payload()?;
-        let head = format!("{head} len={}", payload.len());
-        let spawned = std::cell::RefCell::new(None);
-        let code = targets
-            .run(|t| worker_exchange(&t.path, t.origin, (&head, &payload), deadline, &spawned))?;
-        if let Some(sid) = spawned.into_inner() {
-            // The row names the folder the worker was sent, as the request's head resolved it.
-            let folder = worker_folder(&verb_args, here.as_deref());
-            verb_args.retain(|a| !a.starts_with("cwd="));
-            if let Some(dir) = folder.as_deref().and_then(Path::to_str) {
-                verb_args.push(format!("cwd={dir}"));
-            }
-            board::record_spawned(&board::spawned(
-                &sid,
-                board::Placed {
-                    node: None,
-                    host: board::host_name(),
-                    account: None,
-                },
-                label,
-                (&verb_args, &payload),
-                starter.as_deref(),
-                board::now_ms(),
-            ));
-        }
-        return Ok(code);
+        let worker = HereWorker {
+            head: &head,
+            task: &payload,
+            args: verb_args,
+            label,
+            starter: starter.as_deref(),
+            pwd: here.as_deref(),
+        };
+        return spawn_worker_here(&targets, worker, deadline);
     }
 
     {
@@ -4657,15 +4641,28 @@ pub fn usage_predates_workers(answer: &str) -> bool {
         .is_some_and(|grammar| !grammar.contains("agent="))
 }
 
+/// What a worker's spawn on this Mac came to ([`worker_exchange`]).
+#[derive(Debug, PartialEq)]
+enum WorkerAnswer {
+    /// The instance answered the task: its answer, not yet printed, and the sid of the worker it
+    /// names (`OK <sid> …`), where it named one.
+    Task(String, Option<String>),
+    /// The instance gave no answer to the task, and what it said instead was printed: the exit
+    /// status. It took no connection, refused the line, or cut the task's send short with its
+    /// refusal; none of these names a worker.
+    Said(ExitCode),
+}
+
 /// A worker's spawn over the instance at `path`: `head`, then its task once the instance asks
-/// for it, and the answer printed; the sid it answers `OK <sid>` with goes in `spawned`.
+/// for it, and its answer to the task, for the caller to print once it has recorded the worker
+/// ([`spawn_worker_here`]). A refusal that comes instead of an answer to the task is printed here
+/// ([`WorkerAnswer::Said`]).
 fn worker_exchange(
     path: &str,
     origin: TargetOrigin,
     (head, task): (&str, &[u8]),
     deadline: Option<std::time::Duration>,
-    spawned: &std::cell::RefCell<Option<String>>,
-) -> io::Result<ExitCode> {
+) -> io::Result<WorkerAnswer> {
     let path = &aterm_uds::latest::resolve(path);
     let go = aterm_types::control_verbs::task_frame_go(task.len());
     let go = go.trim_end_matches('\n');
@@ -4673,7 +4670,7 @@ fn worker_exchange(
         let mut line = String::from(head);
         line.push('\n');
         if let Some(code) = send_served(&stream, line.as_bytes())? {
-            return Ok(code);
+            return Ok(WorkerAnswer::Said(code));
         }
         let mut reader = reply_on(&stream);
         let mut answer = read_frame_answer(&mut reader)?;
@@ -4681,20 +4678,83 @@ fn worker_exchange(
             if usage_predates_workers(&answer) {
                 stderr_line(&answer)?;
                 stderr_line(PREDATES_WORKERS)?;
-                return Ok(ExitCode::FAILURE);
+                return Ok(WorkerAnswer::Said(ExitCode::FAILURE));
             }
-            return print_frame_answer(&answer);
+            return print_frame_answer(&answer).map(WorkerAnswer::Said);
         }
         if let Some(code) = send_served(&stream, task)? {
-            return Ok(code);
+            return Ok(WorkerAnswer::Said(code));
         }
         while answer == go {
             answer = read_frame_answer(&mut reader)?;
         }
-        *spawned.borrow_mut() = remote::spawned_sid_from_answer(&answer);
-        print_frame_answer(&answer)
+        let sid = remote::spawned_sid_from_answer(&answer);
+        Ok(WorkerAnswer::Task(answer, sid))
     })?;
-    Ok(served.unwrap_or_else(std::convert::identity))
+    Ok(served.unwrap_or_else(WorkerAnswer::Said))
+}
+
+/// A worker's spawn on this Mac, its words judged and its task read ([`spawn_worker_here`]).
+struct HereWorker<'a> {
+    /// Its request line, without its `len=` ([`worker_spawn_head`]).
+    head: &'a str,
+    /// Its task.
+    task: &'a [u8],
+    /// Its words after `spawn`, `label=` taken off.
+    args: Vec<String>,
+    /// Its `label=`.
+    label: Option<String>,
+    /// The session that starts it ([`worker_starter`]).
+    starter: Option<&'a str>,
+    /// This client's working folder, which a relative `cwd=` (or none) names.
+    pwd: Option<&'a Path>,
+}
+
+/// A worker's spawn on the first of `targets` that hosts it, `deadline` its reply's: the
+/// exchange ([`worker_exchange`]); then the board's row of the worker its answer named, from
+/// that answer; and only then the answer printed ([`print_frame_answer`]). A print that fails
+/// (stdout closed: `… spawn … - | head -0`) is the call's own error and sets its exit status
+/// alone: the worker started all the same, and the board says so.
+fn spawn_worker_here(
+    targets: &Targets,
+    worker: HereWorker<'_>,
+    deadline: Option<std::time::Duration>,
+) -> io::Result<ExitCode> {
+    let HereWorker {
+        head,
+        task,
+        mut args,
+        label,
+        starter,
+        pwd,
+    } = worker;
+    let head = format!("{head} len={}", task.len());
+    let (answer, sid) =
+        match targets.run(|t| worker_exchange(&t.path, t.origin, (&head, task), deadline))? {
+            WorkerAnswer::Task(answer, sid) => (answer, sid),
+            WorkerAnswer::Said(code) => return Ok(code),
+        };
+    if let Some(sid) = sid {
+        // The row names the folder the worker was sent, as the request's head resolved it.
+        let folder = worker_folder(&args, pwd);
+        args.retain(|a| !a.starts_with("cwd="));
+        if let Some(dir) = folder.as_deref().and_then(Path::to_str) {
+            args.push(format!("cwd={dir}"));
+        }
+        board::record_spawned(&board::spawned(
+            &sid,
+            board::Placed {
+                node: None,
+                host: board::host_name(),
+                account: None,
+            },
+            label,
+            (&args, task),
+            starter,
+            board::now_ms(),
+        ));
+    }
+    print_frame_answer(&answer)
 }
 
 fn read_frame_answer<R: BufRead>(reader: &mut R) -> io::Result<String> {
@@ -5645,7 +5705,7 @@ fn stderr_line(msg: &str) -> io::Result<()> {
 }
 
 /// `act`, and the lines it told the person on this thread ([`stderr_line`]), kept from stderr.
-#[cfg(all(test, unix))]
+#[cfg(test)]
 fn stderr_lines_of<R>(act: impl FnOnce() -> R) -> (R, Vec<String>) {
     let before = STDERR_LINES.replace(Some(Vec::new()));
     let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(act));
@@ -5682,7 +5742,43 @@ fn stdout_handle() -> io::Stdout {
     None::<io::Stdout>.unwrap_or_else(io::stdout)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// This thread's stdout in a test ([`stdout_lines_of`]): the lines printed, and whether its
+    /// reader closed it.
+    static STDOUT_LINES: std::cell::RefCell<Option<(Vec<String>, bool)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `act` with this thread's stdout kept from the process's, closed by its reader where `closed`
+/// (each print fails as one into a pipe whose reader left does), and every line it printed or
+/// tried to ([`print_stdout_line`]).
+#[cfg(test)]
+fn stdout_lines_of<R>(closed: bool, act: impl FnOnce() -> R) -> (R, Vec<String>) {
+    let before = STDOUT_LINES.replace(Some((Vec::new(), closed)));
+    let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(act));
+    let lines = STDOUT_LINES
+        .replace(before)
+        .map(|(lines, _)| lines)
+        .unwrap_or_default();
+    let done = done.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    (done, lines)
+}
+
 fn print_stdout_line(line: &str) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(closed) = STDOUT_LINES.with_borrow_mut(|seam| {
+        seam.as_mut().map(|(lines, closed)| {
+            lines.push(line.to_owned());
+            *closed
+        })
+    }) {
+        return if closed {
+            Err(stdout_failure(io::ErrorKind::BrokenPipe.into()))
+        } else {
+            Ok(())
+        };
+    }
     let stdout = stdout_handle();
     let mut out = StdoutSink::new(stdout.lock());
     out.write_all(line.as_bytes())?;

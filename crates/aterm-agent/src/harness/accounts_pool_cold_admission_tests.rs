@@ -235,7 +235,7 @@ fn admit_witness(world: &World, login: Option<&Path>) -> ColdLaunchAdmission {
         accounts::ProcessLogin {
             login: login.map(|path| path.to_str().unwrap().to_owned()),
             default_home: true,
-            stored_login: true,
+            route: crate::harness::accounts::AuthRoute::Stored,
         },
         &NoUsage,
         Some(&world.exe),
@@ -395,7 +395,7 @@ fn cold_witness_unavailable_profiles_never_become_missing_evidence() {
                 accounts::ProcessLogin {
                     login: Some(work.to_str().unwrap().into()),
                     default_home: true,
-                    stored_login: true,
+                    route: crate::harness::accounts::AuthRoute::Stored,
                 },
                 &NoUsage,
                 Some(&world.exe)

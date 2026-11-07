@@ -9,9 +9,15 @@ use super::repos;
 use crate::model::User;
 use crate::port::System;
 use serde::Deserialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-pub(super) const FILE: &str = ".secrets/github-repositories.json";
+/// The vault entry the inventory arrives as ([`aterm_secrets::entry_class::GITHUB_REPOSITORIES`]).
+pub(super) const ENTRY: &str = aterm_secrets::entry_class::GITHUB_REPOSITORIES;
+
+/// Where the vault writes the inventory under the home `home`.
+pub(super) fn file(home: &str) -> PathBuf {
+    Path::new(home).join(".secrets").join(ENTRY)
+}
 pub(super) const MAX_BYTES: usize = 1024 * 1024;
 
 #[derive(Deserialize)]
@@ -29,7 +35,7 @@ pub(super) struct Inventory(Vec<repos::Repo>);
 impl Inventory {
     pub(super) fn read(sys: &dyn System, user: &User) -> Result<Self, String> {
         let bytes = sys
-            .read_owned_file(&Path::new(&user.home).join(FILE), user.uid, MAX_BYTES, true)
+            .read_owned_file(&file(&user.home), user.uid, MAX_BYTES, true)
             .map_err(|_| {
                 "repository metadata is not ready in the Secrets vault; waiting for its private github-repositories.json entry".to_owned()
             })?;

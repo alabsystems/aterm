@@ -16413,7 +16413,7 @@ fn a_juniors_move_ahead_the_relaunch_defers_waits_on_its_yield() {
         account: Some("work-1"),
         left: None,
         default_home: true,
-        stored_login: true,
+        route: crate::harness::accounts::AuthRoute::Stored,
     };
     // Rotation is `early` and work-1 is walled, so a session that owns it moves ahead too; a
     // junior's is held by m1's senior claim besides.

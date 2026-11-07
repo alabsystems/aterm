@@ -355,7 +355,7 @@ pub fn login_pin(sources: &[Source]) -> super::login::LoginPin {
         match pin_in(&value) {
             LoginPin::Method => return LoginPin::Method,
             LoginPin::Gateway => gateway = true,
-            LoginPin::Picker | LoginPin::Unread => {}
+            LoginPin::Picker | LoginPin::Unread | LoginPin::Token => {}
         }
         if let Value::Object(map) = &value
             && POLICY_HELPER_KEYS
@@ -397,7 +397,7 @@ fn pin_in(value: &Value) -> super::login::LoginPin {
                 match pin_in(nested) {
                     LoginPin::Method => return LoginPin::Method,
                     LoginPin::Gateway => found = LoginPin::Gateway,
-                    LoginPin::Picker | LoginPin::Unread => {}
+                    LoginPin::Picker | LoginPin::Unread | LoginPin::Token => {}
                 }
             }
             found
@@ -408,7 +408,7 @@ fn pin_in(value: &Value) -> super::login::LoginPin {
                 match pin_in(item) {
                     LoginPin::Method => return LoginPin::Method,
                     LoginPin::Gateway => found = LoginPin::Gateway,
-                    LoginPin::Picker | LoginPin::Unread => {}
+                    LoginPin::Picker | LoginPin::Unread | LoginPin::Token => {}
                 }
             }
             found

@@ -312,9 +312,19 @@ impl Metered {
     /// resident peak) as [`atpkg::build_admit::Ended::keep`] judges it, write its row, and let its
     /// claim go.
     pub fn end(self, end: atpkg::build_admit::BuildEnd, floor: u64) {
+        #[cfg(test)]
+        tests::ENDED.with(|ended| ended.borrow_mut().push(end));
         let peak = self.meter.stop(floor);
         self.held
             .end(end, peak, &mut |line| eprintln!("aterm-lab: {line}"));
+    }
+
+    /// The build's wait came back `waited`: end the claim ([`Self::end`]) with the status it read,
+    /// or, where the wait failed, as an end nothing is known of (`outcome=unknown`), never let go
+    /// unended. `floor` is as [`Self::end`] takes it.
+    fn end_waited(self, waited: Option<std::process::ExitStatus>, floor: u64) {
+        use atpkg::build_admit::BuildEnd;
+        self.end(waited.map_or(BuildEnd::Unknown, BuildEnd::Status), floor);
     }
 }
 
@@ -342,9 +352,9 @@ pub fn spawn_claimed(
     Ok((child, metered))
 }
 
-/// Run `cmd`, the build [`claim_build`] claimed `claim` for, to its end ([`spawn_claimed`]):
-/// metered while a claim is held, its peak kept as `atpkg::build_admit::Held::end` keeps one.
-/// Its status.
+/// Run `cmd`, the build [`claim_build`] claimed `claim` for, to its end ([`spawn_claimed`],
+/// [`wait_claimed`]): metered while a claim is held, its peak kept as
+/// `atpkg::build_admit::Held::end` keeps one. Its status.
 ///
 /// # Errors
 /// The spawn's or the wait's.
@@ -353,17 +363,31 @@ pub fn status_claimed(
     claim: BuildClaim,
 ) -> io::Result<std::process::ExitStatus> {
     let (mut child, metered) = spawn_claimed(cmd, claim)?;
-    let usage = child.wait_with_rusage()?;
-    if let Some(m) = metered {
-        m.end(
-            atpkg::build_admit::BuildEnd::Status(usage.status),
-            usage.maxrss,
-        );
-    }
-    Ok(usage.status)
+    wait_claimed(&mut child, metered)
 }
 
-/// [`status_claimed`], its stdout and stderr captured.
+/// WAIT FOR `child`, a build [`spawn_claimed`] started under `metered`'s claim, AND END THE CLAIM
+/// whatever the wait came to ([`Metered::end`]): with the status the wait read, its reaped tree's
+/// resident peak the floor, or, where it failed, as an end nothing is known of, with no floor. A
+/// wait fails where this process lost the child: a debugger that attaches to the build takes it
+/// as its own until it lets go, and a wait that looks in that time finds no child (`ECHILD`). Its
+/// status.
+///
+/// # Errors
+/// The wait's.
+pub fn wait_claimed(
+    child: &mut aterm_uds::spawnfd::Child,
+    metered: Option<Metered>,
+) -> io::Result<std::process::ExitStatus> {
+    let waited = child.wait_with_rusage();
+    if let Some(m) = metered {
+        let usage = waited.as_ref().ok();
+        m.end_waited(usage.map(|u| u.status), usage.map_or(0, |u| u.maxrss));
+    }
+    waited.map(|u| u.status)
+}
+
+/// [`status_claimed`], its stdout and stderr captured ([`output_waited`]).
 ///
 /// # Errors
 /// The spawn's, reading's or the wait's.
@@ -376,11 +400,25 @@ pub fn output_claimed(
             .stderr(aterm_uds::spawnfd::Stdio::piped()),
         claim,
     )?;
-    let out = child.wait_with_output()?;
+    output_waited(child, metered)
+}
+
+/// [`wait_claimed`] for a child whose stdout and stderr are piped: read both to their ends, wait,
+/// and end the claim whatever the read and the wait came to, with no floor (this wait reads no
+/// resident peak). A build that exits while a debugger holds it closes its pipes before the
+/// debugger hands it back, so the wait after the reads can find no child (`ECHILD`).
+///
+/// # Errors
+/// Reading's or the wait's.
+pub fn output_waited(
+    child: aterm_uds::spawnfd::Child,
+    metered: Option<Metered>,
+) -> io::Result<std::process::Output> {
+    let out = child.wait_with_output();
     if let Some(m) = metered {
-        m.end(atpkg::build_admit::BuildEnd::Status(out.status), 0);
+        m.end_waited(out.as_ref().ok().map(|o| o.status), 0);
     }
-    Ok(out)
+    out
 }
 
 /// Atomically replaces `path` with `bytes` via [`atomic_write_mode`], through no link: the
@@ -894,6 +932,7 @@ pub fn b64url_decode(text: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use aterm_capacity::{Admit, Fixed, Ledger, Pace, Reading};
+    use atpkg::build_admit::BuildEnd;
 
     const GIB: u64 = 1 << 30;
 
@@ -978,14 +1017,94 @@ mod tests {
         .env_remove(aterm_capacity::COVER_ENV)
         .stdout(aterm_uds::spawnfd::Stdio::piped());
         let (child, metered) = super::spawn_claimed(&mut cmd, Some(claim)).expect("spawned");
-        let out = child.wait_with_output().expect("its end");
-        if let Some(m) = metered {
-            m.end(atpkg::build_admit::BuildEnd::Status(out.status), 0);
-        }
+        let out = super::output_waited(child, metered).expect("its end");
         assert_eq!(
             String::from_utf8_lossy(&out.stdout),
             format!("{marker}\nheld\n")
         );
+    }
+
+    thread_local! {
+        /// How [`super::Metered::end`] ended each claim this thread ended, in turn.
+        pub(super) static ENDED: std::cell::RefCell<Vec<BuildEnd>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// This thread's claim ends since the last call.
+    fn ended() -> Vec<BuildEnd> {
+        ENDED.with(|ended| std::mem::take(&mut *ended.borrow_mut()))
+    }
+
+    /// A claimed lab build's claim ends ([`super::Metered::end`], which writes the row of a claim
+    /// held in this user's own ledger) whatever its wait came to ([`super::wait_claimed`],
+    /// [`super::output_waited`]): a build this process lost leaves the wait with `ECHILD`, and its
+    /// claim ends as an end nothing is known of (`outcome=unknown`).
+    /// A debugger's attach is such a loss; here the test reaps the child behind its handle's back,
+    /// which leaves the handle's wait the same `ECHILD` (macOS hands out pids in turn, so the pid
+    /// names no other child by then). NEGATIVE CONTROL: the same build, kept, ends its claim with
+    /// the status its wait read.
+    #[test]
+    fn a_claimed_build_whose_wait_fails_still_ends_its_claim() {
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let m = Fixed::new(Reading::of_gib(24, 20, 14));
+        let s = seat(dir.path(), &m, std::process::id().wrapping_add(41));
+        let args = ["--unverified", "build", "-p", "aterm-lab", "--bin", "x"];
+        let start = |piped: bool| {
+            let claim = super::claim_build_at(&args, None, dir.path(), &s, &mut |_| {})
+                .expect("admitted")
+                .expect("claimed");
+            let mut cmd = aterm_uds::spawnfd::command("/bin/sh");
+            cmd.args(["-c", "echo out; echo err >&2; exit 3"]);
+            if piped {
+                cmd.stdout(aterm_uds::spawnfd::Stdio::piped())
+                    .stderr(aterm_uds::spawnfd::Stdio::piped());
+            } else {
+                cmd.stdout(aterm_uds::spawnfd::Stdio::null())
+                    .stderr(aterm_uds::spawnfd::Stdio::null());
+            }
+            super::spawn_claimed(&mut cmd, Some(claim)).expect("spawned")
+        };
+        let lose = |child: &aterm_uds::spawnfd::Child| {
+            let pid = i32::try_from(child.id()).expect("a pid");
+            let mut raw = 0;
+            // SAFETY: `raw` is a live local `waitpid` writes; the pid is this test's own child.
+            #[expect(
+                unsafe_code,
+                reason = "waitpid(2): reap the child behind its handle's back"
+            )]
+            let reaped = unsafe { libc::waitpid(pid, &raw mut raw, 0) };
+            assert_eq!(reaped, pid);
+        };
+        let exit_3 = |end: &BuildEnd| matches!(end, BuildEnd::Status(s) if s.code() == Some(3));
+        // Ends an earlier test left on this thread (libtest runs a test on its own thread when it
+        // can spawn none) are not this test's.
+        ended();
+
+        let (mut child, metered) = start(false);
+        assert_eq!(
+            super::wait_claimed(&mut child, metered)
+                .expect("kept")
+                .code(),
+            Some(3)
+        );
+        let (child, metered) = start(true);
+        let out = super::output_waited(child, metered).expect("kept");
+        assert_eq!(
+            (out.status.code(), &out.stdout[..]),
+            (Some(3), &b"out\n"[..])
+        );
+        let kept = ended();
+        assert!(kept.len() == 2 && kept.iter().all(exit_3), "{kept:?}");
+
+        let (mut child, metered) = start(false);
+        lose(&child);
+        let waited = super::wait_claimed(&mut child, metered).expect_err("lost");
+        assert_eq!(waited.raw_os_error(), Some(libc::ECHILD), "{waited}");
+        let (child, metered) = start(true);
+        lose(&child);
+        let waited = super::output_waited(child, metered).expect_err("lost");
+        assert_eq!(waited.raw_os_error(), Some(libc::ECHILD), "{waited}");
+        assert_eq!(ended(), [BuildEnd::Unknown, BuildEnd::Unknown]);
     }
 
     /// A lab process that holds a claim of its own (a lane's VM) builds unclaimed and says so: a

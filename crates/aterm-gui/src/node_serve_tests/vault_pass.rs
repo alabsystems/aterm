@@ -187,7 +187,7 @@ fn config_of_m2(
                 look: Duration::from_millis(1),
                 ..NodePassPace::LIVE
             },
-            pass_converge: Arc::new(|| None),
+            pass_converge: Arc::new(|_| None),
             bus: None,
             ..NodeMesh::live()
         },

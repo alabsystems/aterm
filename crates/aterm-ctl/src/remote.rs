@@ -305,34 +305,22 @@ pub(crate) fn run(
         let (args, label) = board::take_label(args)?;
         let starter = worker_starter(env::var(SELF_SID_ENV).ok());
         let head = spawn_head(&args, starter.as_deref())?;
-        let (chosen_host, mut placed) = if is_any_host(host) {
+        let (chosen_host, placed) = if is_any_host(host) {
             any_host_node(&args, &needs, total, local)?
         } else {
             (host.to_owned(), board::Placed::default())
         };
         let task = read_task_payload()?;
-        let began = std::time::Instant::now();
-        let dialled = drive(&chosen_host, within.get()).map_err(io::Error::other);
-        if let Ok(link) = &dialled {
-            placed.node = placed.node.or_else(|| link.node.clone());
-            placed.host = placed.host.or_else(|| Some(link.label.clone()));
-        }
-        placed.node = placed.node.or(Some(chosen_host));
-        let exchanged = dialled
-            .map(|link| spawn_exchange(link, &format!("{head} len={}", task.len()), &task, within));
-        crate::fleet_telemetry::spawned(&args, began, &exchanged, placed.node.as_deref());
-        let (code, spawned_sid) = exchanged??;
-        if let Some(sid) = spawned_sid {
-            board::record_spawned(&board::spawned(
-                &sid,
-                placed,
-                label,
-                (&args, &task),
-                starter.as_deref(),
-                board::now_ms(),
-            ));
-        }
-        return Ok(code);
+        let worker = Worker {
+            host: chosen_host,
+            placed,
+            args: &args,
+            label,
+            starter: starter.as_deref(),
+            head: &head,
+            task: &task,
+        };
+        return spawn_worker(worker, within, drive, aterm_telemetry::log::default_dir());
     }
     if matches!(verb, "feed-bin" | "paste")
         || (verb == "send" && matches!(args, [one] if one == "--stdin" || one == "-"))
@@ -717,15 +705,81 @@ fn spawn_head(args: &[String], starter: Option<&str>) -> io::Result<String> {
     Ok(head)
 }
 
+/// A worker's fleet spawn, its words judged and its task read ([`spawn_worker`]).
+struct Worker<'a> {
+    /// The Mac it is sent to: the one named, or the node `--host any` chose.
+    host: String,
+    /// Where the board records it runs, as far as `--host any`'s choice proved it.
+    placed: board::Placed,
+    /// Its words after `spawn`, its `need=` and `label=` taken off.
+    args: &'a [String],
+    /// Its `label=`.
+    label: Option<String>,
+    /// The session that starts it ([`worker_starter`]).
+    starter: Option<&'a str>,
+    /// Its request line, without its `len=` ([`spawn_head`]).
+    head: &'a str,
+    /// Its task.
+    task: &'a [u8],
+}
+
+/// A worker's spawn over the drive `drive` dials, `within` its deadline: the exchange
+/// ([`spawn_exchange`]); then, from what it answered, the sender's `kind=spawn` row in the log in
+/// `log` ([`crate::fleet_telemetry::spawned`]: `refused` where the dial failed and nothing was
+/// sent) and the board's row of the worker the answer named; and only then the answer printed as
+/// on one Mac ([`print_frame_answer`]). A print that fails (stdout closed:
+/// `… spawn … - | head -0`) is the call's own error and sets its exit status alone: the worker
+/// started all the same, and the row and the board say so.
+fn spawn_worker(
+    worker: Worker<'_>,
+    within: Within,
+    drive: FleetDriveFn,
+    log: Option<std::path::PathBuf>,
+) -> io::Result<ExitCode> {
+    let Worker {
+        host,
+        mut placed,
+        args,
+        label,
+        starter,
+        head,
+        task,
+    } = worker;
+    let began = Instant::now();
+    let dialled = drive(&host, within.get()).map_err(io::Error::other);
+    if let Ok(link) = &dialled {
+        placed.node = placed.node.or_else(|| link.node.clone());
+        placed.host = placed.host.or_else(|| Some(link.label.clone()));
+    }
+    placed.node = placed.node.or(Some(host));
+    let exchanged = dialled
+        .map(|link| spawn_exchange(link, &format!("{head} len={}", task.len()), task, within));
+    crate::fleet_telemetry::spawned(log, args, began, &exchanged, placed.node.as_deref());
+    let (answer, sid) = exchanged??;
+    if let Some(sid) = sid {
+        board::record_spawned(&board::spawned(
+            &sid,
+            placed,
+            label,
+            (args, task),
+            starter,
+            board::now_ms(),
+        ));
+    }
+    print_frame_answer(&answer)
+}
+
 /// A worker's spawn over `link`: the line `head`; then, once it is answered
-/// `GO <n>`, the `task`, and the answer printed as on one Mac (a second `GO`
-/// read past), all `within` the connection's deadline.
+/// `GO <n>`, the `task`, all `within` the connection's deadline. What it answered (a second `GO`
+/// read past), for its caller to print as on one Mac once it has recorded the worker, and the sid
+/// of that worker, where the answer to the task named one ([`spawned_sid_from_answer`]). Nothing
+/// is printed here: a print that fails is no lost exchange.
 fn spawn_exchange(
     link: DriveLink,
     head: &str,
     task: &[u8],
     within: Within,
-) -> io::Result<(ExitCode, Option<String>)> {
+) -> io::Result<(String, Option<String>)> {
     let DriveLink {
         mut stream, label, ..
     } = link;
@@ -739,7 +793,7 @@ fn spawn_exchange(
     let mut reader = BufReader::new(stream);
     let mut answer = read_frame_answer(&mut reader).map_err(cut)?;
     if answer != go {
-        return Ok((print_frame_answer(&answer)?, None));
+        return Ok((answer, None));
     }
     let sent = reader.get_mut();
     sent.write_all(task)
@@ -749,7 +803,7 @@ fn spawn_exchange(
         answer = read_frame_answer(&mut reader).map_err(cut)?;
     }
     let spawned_sid = spawned_sid_from_answer(&answer);
-    Ok((print_frame_answer(&answer)?, spawned_sid))
+    Ok((answer, spawned_sid))
 }
 
 fn is_any_host(host: &str) -> bool {

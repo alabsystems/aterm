@@ -63,6 +63,13 @@ pub(crate) struct LabScreen {
 }
 
 impl LabScreen {
+    /// Account row `index`'s vault token offer, as the page last showed it.
+    pub(crate) fn account_offer(&self, index: usize) -> Option<crate::token_shown::TokenOffer> {
+        self.accounts
+            .as_ref()
+            .and_then(|lab| lab.rows.get(index)?.offer.clone())
+    }
+
     fn record_accounts(&mut self, accounts: LabAccounts) {
         self.accounts = Some(match self.accounts.take() {
             Some(mut previous)
@@ -585,6 +592,7 @@ mod tests {
             rows: vec![crate::lab_accounts::LabAccount {
                 label: "alternate".into(),
                 facts: vec![("Sign-in".into(), "Unknown".into())],
+                offer: None,
             }],
         };
         app.lab_screen.accounts = Some(previous.clone());
@@ -714,7 +722,7 @@ mod tests {
             account: Some("own"),
             left: None,
             default_home: true,
-            stored_login: true,
+            route: aterm_agent::harness::accounts::AuthRoute::Stored,
         };
         let unrecorded = State {
             machine: "0a0b".into(),
@@ -1014,6 +1022,7 @@ mod tests {
         previous.rows.push(crate::lab_accounts::LabAccount {
             label: "alternate".into(),
             facts: vec![("Authentication".into(), "Signed out".into())],
+            offer: None,
         });
         app.lab_screen.accounts = Some(previous.clone());
         app.lab_screen.pending = Some(1);

@@ -17,10 +17,7 @@
 
 use std::time::Duration;
 
-pub use aterm_types::update_boundary::{
-    Boundary, GuardedItem, HandoffLatch, Held, any_held, handoff_pending, is_held, latch_handoff,
-    waiting,
-};
+pub use aterm_types::update_boundary::{Boundary, GuardedItem, HandoffLatch, Held};
 
 /// The longest an update's handoff stays in flight, which bounds how long an item waits on its
 /// latch ([`latch_handoff`]): its successor held for a quiet moment (at most four minutes), then
@@ -32,3 +29,66 @@ pub const HANDOFF_PENDING_BOUND: Duration = Duration::from_secs(8 * 60);
 /// The longest one try of an update's handoff follows items at a boundary, across its start and
 /// its Commit. Past it the try is refused, and the updater's next check tries again.
 pub const MAX_BOUNDARY_WAIT: Duration = Duration::from_secs(10);
+
+/// The registry the handoff reads and latches. A running aterm has one, the process's, which
+/// every item holds. A test of this crate reads a second: no port reaches the handoff to hand it a
+/// private one, and every test shares the process's, where the native items run on every parallel
+/// run. On it, another test's item would read as activity and a test's latch would refuse another
+/// test's item, each at random. A test that makes an item and a handoff meet holds its guard here.
+#[must_use]
+pub fn registry() -> &'static Boundary {
+    #[cfg(test)]
+    {
+        static UNDER_TEST: Boundary = Boundary::new();
+        &UNDER_TEST
+    }
+    #[cfg(not(test))]
+    {
+        Boundary::process()
+    }
+}
+
+/// [`registry`]'s [`Boundary::any_held`].
+#[must_use]
+pub fn any_held() -> Option<GuardedItem> {
+    registry().any_held()
+}
+
+/// [`registry`]'s [`Boundary::is_held`].
+#[must_use]
+pub fn is_held(item: GuardedItem) -> bool {
+    registry().is_held(item)
+}
+
+/// [`registry`]'s [`Boundary::latch_handoff`].
+pub fn latch_handoff(bound: Duration) -> HandoffLatch<'static> {
+    registry().latch_handoff(bound)
+}
+
+/// [`registry`]'s [`Boundary::handoff_pending`].
+#[must_use]
+pub fn handoff_pending() -> bool {
+    registry().handoff_pending()
+}
+
+/// [`registry`]'s [`Boundary::waiting`].
+#[must_use]
+pub fn waiting() -> u32 {
+    registry().waiting()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Boundary, GuardedItem, is_held};
+
+    #[test]
+    fn an_item_on_the_process_registry_stays_out_of_a_tests_handoff() {
+        let _held = Boundary::process()
+            .try_hold(GuardedItem::HarnessNativeMutation)
+            .expect("no test latches the process's registry");
+        assert!(
+            !is_held(GuardedItem::HarnessNativeMutation),
+            "another test's handoff would read this guard as activity"
+        );
+    }
+}

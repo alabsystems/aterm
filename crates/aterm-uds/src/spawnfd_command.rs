@@ -1126,6 +1126,14 @@ impl Child {
         self.usage.is_some() || self.handle.status.is_some()
     }
 
+    /// The resource accounting its owning reap collected ([`Self::wait_with_rusage`],
+    /// [`Self::try_wait_with_rusage`], an acknowledged exit): `None` before the reap, or
+    /// after one that collected none ([`Self::wait`], [`Self::try_wait`]). It waits on nothing.
+    #[must_use]
+    pub const fn usage(&self) -> Option<Rusage> {
+        self.usage
+    }
+
     /// `SIGKILL` the child; once it is reaped, signal nothing and answer `Ok` (the pid may
     /// name another process by then).
     /// # Errors

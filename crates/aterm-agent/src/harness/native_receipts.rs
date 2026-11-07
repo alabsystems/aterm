@@ -1402,7 +1402,11 @@ fn observe_prepare_at(paths: &Paths, prepare: &Prepare) -> io::Result<Option<Obs
 /// # Errors
 /// Refuses damaged, incomplete or untrusted established custody.
 pub fn contains_operation(id: &str) -> io::Result<bool> {
-    let Some((key, view)) = read(&Paths::locate().map_err(|_| invalid())?)? else {
+    contains_operation_at(&Paths::locate().map_err(|_| invalid())?, id)
+}
+
+fn contains_operation_at(paths: &Paths, id: &str) -> io::Result<bool> {
+    let Some((key, view)) = read(paths)? else {
         return Ok(false);
     };
     Ok(view.entries.contains_key(&key.operation(id)))
@@ -1514,6 +1518,23 @@ pub mod testing {
             binding: &Binding,
         ) -> io::Result<AccountObservation> {
             account::claim_at(&self.paths, relation, binding, LIMITS)
+        }
+
+        /// Fence an exact candidate through the production journal transaction.
+        /// # Errors
+        /// Refuses a claimed candidate, invalid relation or damaged custody.
+        pub fn fence_account(
+            &self,
+            relation: AccountRelation<'_>,
+        ) -> io::Result<AccountObservation> {
+            account::fence_at(&self.paths, relation, LIMITS)
+        }
+
+        /// Inspect permanent ID ownership with the production history reader.
+        /// # Errors
+        /// Refuses damaged or untrusted established custody.
+        pub fn contains_operation(&self, id: &str) -> io::Result<bool> {
+            contains_operation_at(&self.paths, id)
         }
 
         /// Recover an existing exact claim with the production durability path.

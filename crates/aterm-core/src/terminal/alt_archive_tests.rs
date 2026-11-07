@@ -236,6 +236,50 @@ fn independently_priced_archive_eviction_conforms_to_ring() {
     assert_eq!((read.first, read.lost, read.rows.len()), (4, 3, KEPT));
 }
 
+/// Rows of every length, some longer than a whole chunk of the text store.
+fn varied_row(i: usize) -> String {
+    let len = if i % 97 == 0 { 20_000 } else { i % 50 };
+    format!("{i:06}:{}", "x".repeat(len))
+}
+
+/// The text store keeps each retained row's text across chunk boundaries while eviction drops
+/// the chunks behind the oldest row: the archive reads as the rows that left, by index and by
+/// page, and its chunks never hold more than the budget and one chunk of evicted text.
+#[test]
+fn retained_text_survives_chunk_turnover() {
+    let budget = 64 * 1024;
+    let mut a = AltArchive::with_limits(budget, ALT_ARCHIVE_MAX_ROWS);
+    for s in 0..3_000 {
+        commit(&mut a, &frame_with(varied_row, s, 20, &CHROME));
+        let held = a.store.held();
+        assert!(
+            held <= budget + TextStore::CHUNK,
+            "step {s}: the chunks hold {held} bytes for a budget of {budget}"
+        );
+    }
+    assert!(a.lost() > 2_000, "only {} rows evicted", a.lost());
+    assert!(
+        a.store.first > 8,
+        "only {} chunks turned over",
+        a.store.first
+    );
+    let (oldest, last) = (a.oldest(), a.last());
+    let want: Vec<String> = (oldest..=last)
+        .map(|k| varied_row(usize::try_from(k - 1).expect("an index")))
+        .collect();
+    assert_eq!(a.texts(), want);
+    for (k, text) in (oldest..).zip(&want) {
+        assert_eq!(a.row(k), Some(text.as_str()), "row {k}");
+    }
+    let read = a.read(AltArchiveQuery::oldest(0, usize::MAX));
+    assert!(
+        read.rows
+            .iter()
+            .map(|r| &**r)
+            .eq(want.iter().map(String::as_str))
+    );
+}
+
 #[test]
 fn the_row_cap_evicts_and_gaps_leave_with_their_rows() {
     let mut b = AltArchive::with_limits(usize::MAX, 7);
@@ -767,6 +811,210 @@ fn matcher_survives_a_split_at_every_byte() {
         );
         assert_eq!(found, vec![(9, HitKind::Enter)], "cut at {cut}");
     }
+}
+
+/// The scan the leap between bytes that can start a mode or an RIS replaced: on the alt screen
+/// every ESC enters the machine, which reads each byte after it.
+fn scan_reference(m: &mut DecModeMatcher, bytes: &[u8], on_alt: bool) -> Option<DecModeHit> {
+    let hit = scan_inner_reference(m, bytes, on_alt);
+    let seen = hit.map_or(bytes.len(), |h| h.final_at + 1);
+    m.tail = match seen {
+        0 => m.tail,
+        1 => [m.tail[1], bytes[0]],
+        n => [bytes[n - 2], bytes[n - 1]],
+    };
+    hit
+}
+
+fn scan_inner_reference(m: &mut DecModeMatcher, bytes: &[u8], on_alt: bool) -> Option<DecModeHit> {
+    let mut i = 0;
+    while i < bytes.len() {
+        if m.state == MatchState::Ground {
+            if on_alt {
+                i += bytes[i..].iter().position(|&b| b == 0x1b)? + 1;
+                m.state = MatchState::Esc;
+            } else {
+                i += bytes[i..].iter().position(|&b| b == b'?')?;
+                if m.csi_before(bytes, i) {
+                    m.state = MatchState::Params;
+                    m.param = 0;
+                    m.esu = false;
+                    m.alt = 0;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        let b = bytes[i];
+        match m.state {
+            MatchState::Ground => {}
+            MatchState::Esc => {
+                m.state = match b {
+                    b'[' => MatchState::CsiEntry,
+                    0x00..=0x17 | 0x19 | 0x1b..=0x1f => MatchState::Esc,
+                    _ => MatchState::Ground,
+                };
+                if b == b'c' && on_alt {
+                    return Some(DecModeHit {
+                        final_at: i,
+                        kind: HitKind::Reset,
+                    });
+                }
+            }
+            MatchState::CsiEntry => match b {
+                b'?' => {
+                    m.state = MatchState::Params;
+                    m.param = 0;
+                    m.esu = false;
+                    m.alt = 0;
+                }
+                0x1b => m.state = MatchState::Esc,
+                0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f => {}
+                _ => m.state = MatchState::Ground,
+            },
+            MatchState::Params => match b {
+                b'0'..=b'9' => {
+                    m.param = (m.param * 10 + u32::from(b - b'0')).min(100_000);
+                }
+                b';' | b':' => m.finish_param(),
+                b'l' | b'h' | b'r' => {
+                    m.finish_param();
+                    m.state = MatchState::Ground;
+                    if let Some(kind) = m.classify(b, on_alt) {
+                        return Some(DecModeHit { final_at: i, kind });
+                    }
+                }
+                0x1b => m.state = MatchState::Esc,
+                0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f => {}
+                _ => m.state = MatchState::Ground,
+            },
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Runs one generated stream through the reference scan and the new one, a read at a time, on
+/// a screen that flips at random, and says where they first disagreed and how many hits and
+/// sequences the new scan leaps over (CSIs that set no mode) the stream held.
+fn scan_both(seed: u64, plant: bool) -> (Option<String>, usize, usize) {
+    const PIECES: &[&[u8]] = &[
+        b"text ",
+        b"\x1b[38;5;7;48;5;8m",
+        b"\x1b[0m",
+        b"\x1b[m",
+        b"\x1b[12;40H",
+        b"\x1b[K",
+        b"\x1b[?2026h",
+        b"\x1b[?2026l",
+        b"\x1b[?25;2026l",
+        b"\x1b[?1049h",
+        b"\x1b[?1049l",
+        b"\x1b[?47;1047r",
+        b"\x1b[?25l",
+        b"\x1bc",
+        b"\x1b7",
+        b"\x1b8",
+        b"\x1b]0;title\x07",
+        b"\x1b\x1b[?2026l",
+        b"\x1b[\x07?2026l",
+        b"\x1b[?20\x186l",
+        b"\x1b\x1a",
+        b"\x1b[\x7f3m",
+        b"\x1b",
+        b"[",
+        b"?",
+        b"\n\r",
+        b"cc?c",
+        b"\x1b\x07c",
+        b"\x1b[c",
+        b"\x1b\x7fc",
+        b"\x1b\x18c",
+        b"\x1b[\x1b\x07[?2026l",
+        b"\x1b[?2026c",
+        b"\x07",
+    ];
+    let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut next = |n: usize| {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        usize::try_from(rng % n as u64).expect("below n")
+    };
+    let mut stream = Vec::new();
+    for _ in 0..400 {
+        stream.extend_from_slice(PIECES[next(PIECES.len())]);
+    }
+    let stepped = stream
+        .windows(3)
+        .filter(|w| w[0] == 0x1b && w[1] == b'[' && w[2].is_ascii_digit())
+        .count();
+    let (mut old, mut new) = (DecModeMatcher::default(), DecModeMatcher::default());
+    new.misses_reset = plant;
+    let mut hits = 0;
+    let mut on_alt = false;
+    let mut at = 0;
+    while at < stream.len() {
+        if next(4) == 0 {
+            on_alt = !on_alt;
+        }
+        let end = (at + 1 + next(48)).min(stream.len());
+        let mut rest = &stream[at..end];
+        loop {
+            let (a, b) = (
+                scan_reference(&mut old, rest, on_alt),
+                new.scan(rest, on_alt),
+            );
+            let state = |m: &DecModeMatcher| (m.state, m.param, m.esu, m.alt, m.tail);
+            if a != b || state(&old) != state(&new) {
+                return (
+                    Some(format!(
+                        "seed {seed} at {at}: {a:?} {:?} / {b:?} {:?} in {rest:?}",
+                        state(&old),
+                        state(&new)
+                    )),
+                    hits,
+                    stepped,
+                );
+            }
+            let Some(hit) = a else {
+                break;
+            };
+            hits += 1;
+            rest = &rest[hit.final_at + 1..];
+        }
+        at = end;
+    }
+    (None, hits, stepped)
+}
+
+#[test]
+fn the_scan_leaping_over_sequences_finds_what_the_machine_finds() {
+    let (mut hits, mut stepped) = (0, 0);
+    for seed in 1..=200 {
+        let (diverged, h, s) = scan_both(seed, false);
+        if let Some(why) = diverged {
+            panic!("the scan diverged from the machine: {why}");
+        }
+        hits += h;
+        stepped += s;
+    }
+    assert!(hits > 5_000, "only {hits} hits: the comparison is vacuous");
+    assert!(
+        stepped > 5_000,
+        "only {stepped} sequences to leap over: the leap goes untested"
+    );
+}
+
+#[test]
+fn a_planted_missed_reset_is_caught() {
+    let caught = (1..=10)
+        .filter(|&seed| scan_both(seed, true).0.is_some())
+        .count();
+    assert!(
+        caught >= 8,
+        "a missed ESC c was caught on only {caught} of 10 streams"
+    );
 }
 
 fn sync_frame(rows: &[String]) -> Vec<u8> {
@@ -1324,7 +1572,7 @@ mod property_walk {
                 } else {
                     a.rows
                         .iter()
-                        .map(|r| r.text.trim_end_matches(" (done)"))
+                        .map(|r| a.store.text(r).trim_end_matches(" (done)"))
                         .collect()
                 };
                 for i in left_top {
@@ -2124,5 +2372,53 @@ mod handoff_carry {
             outcomes.iter().all(|&n| n > 0),
             "every outcome exercised: {outcomes:?}"
         );
+    }
+}
+
+/// The differ's hash index answers as a map does: across clears, a wrapped stamp and growth,
+/// with keys that share their high or low bits or repeat.
+#[test]
+fn hash_index_answers_as_a_map() {
+    let mut idx = HashIndex::<(u32, usize)>::default();
+    let mut map = std::collections::HashMap::new();
+    let mut x = 0x2545_f491_4f6c_dd1d_u64;
+    let mut next = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    for round in 0..400 {
+        if round == 200 {
+            idx.stamp = u32::MAX;
+        }
+        idx.clear();
+        map.clear();
+        for i in 0..2 * (1 + (round % 7) * 50) {
+            let r = next();
+            let key = match r % 4 {
+                0 => r,
+                1 => r & 0xff,
+                2 => r << 48,
+                _ => r % 64,
+            };
+            let (v, fresh) = idx.entry(key, (1, i));
+            assert_eq!(fresh, !map.contains_key(&key), "round {round}");
+            if !fresh {
+                v.0 += 1;
+            }
+            map.entry(key)
+                .and_modify(|e: &mut (u32, usize)| e.0 += 1)
+                .or_insert((1, i));
+        }
+        for (&k, &v) in &map {
+            assert_eq!(idx.get(k), Some(v), "round {round}");
+        }
+        assert_eq!(idx.iter().count(), map.len(), "round {round}");
+        for (k, v) in idx.iter() {
+            assert_eq!(map.get(&k), Some(&v), "round {round}");
+        }
+        let probe = next();
+        assert_eq!(idx.get(probe), map.get(&probe).copied(), "round {round}");
     }
 }

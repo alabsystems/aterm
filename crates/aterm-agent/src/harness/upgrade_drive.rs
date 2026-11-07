@@ -8860,7 +8860,7 @@ fn snapshot_login_env_with(
             let who = super::accounts::ProcessLogin::of_exec_env(&args.env)?;
             args.env_var(super::accounts::LOGIN_ENV) == snap.login.as_deref()
                 && args.env_var(super::accounts::HOME_ENV) == snap.home.as_deref()
-                && who.stored_login == snap.stored_login
+                && who.route == snap.route
         }
         super::relaunch::AgentRun::Codex(codex) => {
             !args.env.is_empty()
@@ -10997,7 +10997,7 @@ fn visit_models(
                     true,
                     home,
                     args.env_var(super::accounts::LOGIN_ENV),
-                    stored_login_of(&args.env),
+                    route_of(&args.env),
                     !args.env.is_empty(),
                 )
             },
@@ -11235,7 +11235,7 @@ fn visit_models(
                 model: hand.as_deref(),
                 login: args.env_var(super::accounts::LOGIN_ENV),
                 home: args.env_var(super::accounts::HOME_ENV),
-                stored_login: stored_login_of(&args.env),
+                route: route_of(&args.env),
                 auth_observed: !args.env.is_empty(),
                 profile: profile.as_ref(),
                 launch_env: launch_record.as_ref(),
@@ -12451,7 +12451,7 @@ fn launch_of<'a>(
     resume: bool,
     home: Option<&'a str>,
     login: Option<&'a str>,
-    stored_login: bool,
+    route: super::accounts::AuthRoute,
     auth_observed: bool,
 ) -> Launch<'a> {
     Launch {
@@ -12466,10 +12466,11 @@ fn launch_of<'a>(
         home,
         homedir: None,
         login,
-        stored_login,
+        route,
         auth_observed,
         launch_env: None,
         billing: crate::harness::relaunch::ModelBilling::Keep,
+        serve: crate::harness::relaunch::Serve::Judge,
     }
 }
 
@@ -12483,8 +12484,11 @@ pub(crate) fn homedir_holding(dir: &Path) -> Option<String> {
         .flatten()
 }
 
-fn stored_login_of(env: &[String]) -> bool {
-    super::accounts::ProcessLogin::of_exec_env(env).is_some_and(|who| who.stored_login)
+/// How a process whose exec environment is `env` authenticates: an unread one is outside. An
+/// upgrade is a launch path, so it carries a token route.
+fn route_of(env: &[String]) -> super::accounts::AuthRoute {
+    super::accounts::ProcessLogin::of_exec_env(env)
+        .map_or(super::accounts::AuthRoute::Outside, |who| who.route)
 }
 
 pub(super) fn home_carried(
@@ -12833,7 +12837,7 @@ struct Restarting<'a> {
     model: Option<&'a str>,
     login: Option<&'a str>,
     home: Option<&'a str>,
-    stored_login: bool,
+    route: super::accounts::AuthRoute,
     auth_observed: bool,
     profile: Option<&'a super::profile::Context>,
     /// What the agent's own exec environment records of its shell's
@@ -12876,7 +12880,7 @@ fn restart(
         model: hand_model,
         login,
         home,
-        stored_login,
+        route,
         auth_observed,
         profile,
         launch_env,
@@ -12950,7 +12954,7 @@ fn restart(
             !fresh,
             home,
             login,
-            stored_login,
+            route,
             auth_observed,
         )
     };
@@ -12965,6 +12969,7 @@ fn restart(
         shell,
         line,
         tap_dropped,
+        token_dropped,
         line_dir,
         command,
         ..
@@ -12978,10 +12983,13 @@ fn restart(
         .map(|(program, _)| program)
         .filter(|program| *program != target.exe)
         .and_then(|program| {
+            // The rollback execs the replaced process's own image, which a native restart holds it
+            // to: it is typed on the row's stored login, never through the token wrapper.
             let back = Launch {
                 exe: &program,
                 model: hand_model,
                 billing: super::relaunch::ModelBilling::Keep,
+                serve: super::relaunch::Serve::Never,
                 ..launch
             };
             home_carried(&opts.home, home, &sf.cwd, &records)
@@ -13169,7 +13177,7 @@ fn restart(
             "SIGTERM"
         },
     );
-    super::relaunch::note_tap_dropped(opts, &r, tap_dropped.as_deref());
+    super::relaunch::note_dropped(opts, &r, tap_dropped.as_deref(), token_dropped.as_deref());
     relaunch(opts, r, st, c, &sf.session_id, k)
 }
 

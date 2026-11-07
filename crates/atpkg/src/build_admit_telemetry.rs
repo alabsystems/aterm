@@ -6,15 +6,21 @@
 //! `test`, `build` for every other) as its claim ends ([`super::Ended::keep`]), from the process
 //! that saw it end: the holder, the supervising front, the host job or the epoch table.
 //!
-//! - `wall_ms`: from its admission to its end (`now - admitted_ms`), the claim's own clock.
-//! - `wait_ms`: its admission wait, `admitted_ms - start_ms` (the claim's record; an adopted
-//!   claim's own `waited` is zero). Each subtracts two wall-clock stamps (end, admission,
-//!   ask): where they run backwards (the clock set back by more than the interval), it is
-//!   `?clock`, never a known 0; a smaller step back reads as a shorter known interval.
+//! - `wall_ms`: from its admission to its end (`now - admitted_ms`), by the wall clock.
+//! - `wait_ms`: its admission wait, the one its admission row says
+//!   ([`aterm_capacity::telemetry::wait`]): its grant's `admitted_ms` less its ask
+//!   ([`aterm_capacity::Claim::asked_ms`], its record's `start_ms`; an adopted claim's own
+//!   `waited` is zero), by the wall clock, whose stamps both processes read from the claim's
+//!   record. A monotonic clock cannot cross into the holder, and macOS's stops while the Mac
+//!   sleeps. Each figure subtracts two wall-clock stamps (end, admission, ask): where they run
+//!   backwards (the clock set back by more than the interval), it is `?clock`, never a known 0
+//!   ([`aterm_capacity::telemetry::interval`]); a smaller step back reads as a shorter known
+//!   interval.
 //! - `peak_bytes`: the build tree's meter's peak ([`aterm_capacity::tree_meter::TreeMeter`]),
-//!   a lower bound read every 500 ms (`meter=sampled`), never below a supervising front's floor
-//!   from its reaped children's accounting where that floor rose while the build ran
-//!   ([`super::supervise`]); none read is unknown.
+//!   a lower bound read every 500 ms (`meter=sampled`), never below the root's own resident peak
+//!   where the process that saw it end reaped it (a supervising front, the host job), from that
+//!   reap's accounting (`wait4`: the root's and its reaped descendants', no other child's of that
+//!   process); none read is unknown.
 //! - `outcome`, `stop`, `code`, `sig`: as the end site knows the end ([`BuildEnd`]).
 //! - `cpu_ms=na`: no end site but the host job reads the build's CPU, and that is the work's,
 //!   which its command or agent-call row carries; `cache=?targo`: Targo names no cache tier yet.
@@ -25,10 +31,18 @@
 //! one: its file lies in [`aterm_capacity::Ledger::user`]'s folder, a holder's claim directly
 //! and a cohort claim (the host job's, an epoch's) in a subfolder of it. A scratch ledger (every
 //! test's) writes none.
+//!
+//! The admissions this module's caller decides itself (a host job's one look, a nested build's
+//! look in its turn: [`super::admit_cohort_job`], [`super::possible_build_lock`]) write their
+//! `kind=admission` rows here too ([`admitted`]), once each, where they are decided.
+//!
+//! A unit-test build writes no row to this user's log: where a test installed stand-ins for this
+//! user's ledger and the log on its thread ([`capture`]), its rows go to them, else nowhere.
 
 use std::path::{Path, PathBuf};
 
-use aterm_capacity::Claim;
+use aterm_capacity::telemetry::Asked;
+use aterm_capacity::{Claim, Error, Ledger};
 use aterm_telemetry::{Digest, Fig, HostFacts, Kind, Meter, Outcome, Row, Stop};
 
 /// How a build ended, as the site that saw it end knows it ([`super::Ended::keep`]).
@@ -122,7 +136,7 @@ const fn signal(_status: &std::process::ExitStatus) -> Option<i32> {
 /// ledger it was held in.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Run {
-    /// When the claim was made, unix ms.
+    /// When its admission was asked, unix ms ([`Claim::asked_ms`]: its record's `start_ms`).
     start_ms: u64,
     /// When it was admitted, unix ms (`None` where its record holds no grant, or a clock read
     /// before 1970 left it 0).
@@ -144,7 +158,7 @@ impl Run {
             .parent()
             .map(|dir| std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()));
         Self {
-            start_ms: record.start_ms,
+            start_ms: claim.asked_ms(),
             admitted_ms: record
                 .held
                 .as_ref()
@@ -175,20 +189,116 @@ impl Run {
 }
 
 /// Write the row of `run`'s build, of stage `stage` (`targo test`), that ended `end` with the
-/// meter's `peak`, where its ledger is this user's own.
+/// meter's `peak`, where its ledger is this user's own: held in the folder of the ledger
+/// [`aterm_capacity::Ledger::user`] opens, its [`Ledger::dir`] (the capacity folder, or the
+/// backend of the memory namespace that account's ledger was adopted into), not the folder it
+/// is opened from.
 pub(crate) fn ended(run: &Run, stage: &str, end: &BuildEnd, peak: u64) {
-    if cfg!(test) {
+    let Some((user, log)) = rows_go() else {
+        return;
+    };
+    let _ = ended_in(run, stage, end, peak, user.dir(), |row| log.write(row));
+}
+
+/// Write the `kind=admission` row `asked` owes: its admission's decision `result` in `ledger`,
+/// where `ledger` is this user's own, held to the folder its ledger opens as [`ended`] holds a
+/// build's ([`Asked::decided_in`]). The caller decided it itself, by driving a
+/// [`aterm_capacity::Waiter`]: one call an admission, however many looks it took.
+pub(crate) fn admitted(ledger: &Ledger, asked: Asked, result: &Result<Claim, Error>) {
+    let Some((user, log)) = rows_go() else {
+        return;
+    };
+    // Another ledger's admission writes none, before it reads the host's facts.
+    if !aterm_telemetry::direct::same_folder(ledger.dir(), user.dir()) {
         return;
     }
-    let Some(user) = aterm_capacity::Ledger::user() else {
-        return;
-    };
-    let Some(dir) = aterm_telemetry::log::default_dir() else {
-        return;
-    };
-    let _ = ended_in(run, stage, end, peak, user.dir(), |row| {
-        aterm_telemetry::direct::write_now(dir, row)
+    let (facts, digest) = aterm_telemetry::direct::facts();
+    asked.decided_in(ledger, user.dir(), &facts.host, *digest, result, |row| {
+        log.write(row)
     });
+}
+
+/// Where this module's rows go: this user's ledger, whose folder holds a claim as its own, and
+/// the log. In a unit-test build, the stand-ins a test installed on its thread ([`capture`]),
+/// else none.
+fn rows_go() -> Option<(Ledger, Log)> {
+    #[cfg(test)]
+    {
+        SEAM.with(|seam| seam.borrow().as_ref().map(|s| (s.user.clone(), Log::Seam)))
+    }
+    #[cfg(not(test))]
+    {
+        let user = Ledger::user()?;
+        Some((user, Log::Direct(aterm_telemetry::log::default_dir()?)))
+    }
+}
+
+/// A log a row is written to.
+enum Log {
+    /// This Mac's telemetry log in the folder named, through its one direct writer.
+    #[cfg_attr(
+        test,
+        expect(dead_code, reason = "a unit-test build writes to its seam alone")
+    )]
+    Direct(PathBuf),
+    /// The rows a test's [`capture`] collects.
+    #[cfg(test)]
+    Seam,
+}
+
+impl Log {
+    /// Write `row`: whether it was.
+    fn write(self, row: &Row) -> bool {
+        match self {
+            Self::Direct(dir) => aterm_telemetry::direct::write_now(dir, row),
+            #[cfg(test)]
+            Self::Seam => SEAM.with(|seam| {
+                seam.borrow_mut()
+                    .as_mut()
+                    .map(|s| s.rows.push(row.clone()))
+                    .is_some()
+            }),
+        }
+    }
+}
+
+/// A test's stand-ins for this user's ledger and the log ([`capture`]).
+#[cfg(test)]
+struct Seam {
+    user: Ledger,
+    rows: Vec<Row>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static SEAM: std::cell::RefCell<Option<Seam>> = const { std::cell::RefCell::new(None) };
+}
+
+/// TEST SEAM, past the unit-test build's silence: run `f` on this thread with `user` standing for
+/// this user's ledger ([`aterm_capacity::Ledger::user`]) and a log of its own, and return what
+/// it returned with every row this module wrote meanwhile, in order.
+#[cfg(test)]
+pub(crate) fn capture<T>(user: Ledger, f: impl FnOnce() -> T) -> (T, Vec<Row>) {
+    struct Unset;
+    impl Drop for Unset {
+        fn drop(&mut self) {
+            SEAM.with(|seam| seam.borrow_mut().take());
+        }
+    }
+    SEAM.with(|seam| {
+        *seam.borrow_mut() = Some(Seam {
+            user,
+            rows: Vec::new(),
+        });
+    });
+    let unset = Unset;
+    let out = f();
+    let rows = SEAM
+        .with(|seam| seam.borrow_mut().take())
+        .map(|s| s.rows)
+        .unwrap_or_default();
+    drop(unset);
+    (out, rows)
 }
 
 /// [`ended`] with this user's ledger folder `user`, the row handed to `write`: whether a row was
@@ -234,13 +344,6 @@ fn row(
         Kind::Build
     };
     let unknown = || Fig::Unknown("aterm-capacity".to_owned());
-    // The three stamps are wall-clock times: one that runs backwards (the clock was set back
-    // between them) is no interval, never a known 0.
-    let since = |later: u64, earlier: u64| {
-        later
-            .checked_sub(earlier)
-            .map_or_else(|| Fig::Unknown("clock".to_owned()), Fig::Known)
-    };
     let (outcome, stop, code, sig) = end.words();
     let program = run.what.split_whitespace().next().unwrap_or("");
     Row {
@@ -253,18 +356,18 @@ fn row(
         on: None,
         host: aterm_telemetry::row::host_word(&facts.host),
         facts: digest,
-        wall_ms: run
-            .admitted_ms
-            .map_or_else(unknown, |admitted| since(at_ms, admitted)),
+        // The three stamps are wall-clock times: one that runs backwards (the clock was set back
+        // between them) is no interval, never a known 0.
+        wall_ms: run.admitted_ms.map_or_else(unknown, |admitted| {
+            aterm_capacity::telemetry::interval(at_ms, admitted)
+        }),
         cpu_ms: Fig::Na,
         peak_bytes: if peak > 0 {
             Fig::Known(peak)
         } else {
             unknown()
         },
-        wait_ms: run
-            .admitted_ms
-            .map_or_else(unknown, |admitted| since(admitted, run.start_ms)),
+        wait_ms: aterm_capacity::telemetry::wait(run.start_ms, run.admitted_ms),
         cache: Fig::Unknown("targo".to_owned()),
         outcome,
         stop,

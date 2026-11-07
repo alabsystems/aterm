@@ -866,7 +866,7 @@ fn a_sweep_takes_the_dead_and_the_old_and_nothing_else() {
 fn all_clear<'a>(argv: &'a [String], settings: &'a [(String, Source)]) -> GateFacts<'a> {
     GateFacts {
         exe: Some(Path::new(EXE)),
-        stored_login: true,
+        route: crate::harness::accounts::AuthRoute::Stored,
         login: None,
         lone_login: None,
         home: None,
@@ -948,7 +948,7 @@ fn each_guard_alone_refuses_the_tap() {
     );
     refused(
         GateFacts {
-            stored_login: false,
+            route: crate::harness::accounts::AuthRoute::Outside,
             ..all_clear(&argv, &quiet)
         },
         "a credential, profile or route variable",

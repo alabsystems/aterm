@@ -8,21 +8,10 @@ use super::*;
 use ring::signature::{Ed25519KeyPair, KeyPair as _};
 use zeroize::Zeroizing;
 
-const LEGACY: [&str; 3] = [
-    "~/.aterm/machine.key",
-    "~/.aterm/machine.toml",
-    "~/.aterm/release-credentials.toml",
-];
-const CANONICAL: [&str; 3] = [
-    "~/.aterm/release-ring/machine.key",
-    "~/.aterm/release-ring/machine.toml",
-    "~/.aterm/release-ring/release-credentials.toml",
-];
-const LEGACY_ROSTER: &str = "~/.aterm/roster/aterm-machines.toml";
-const CANONICAL_ROSTER: [&str; 2] = [
-    "~/.aterm/release-ring/roster/aterm-machines.toml",
-    "~/.aterm/release-ring/roster/aterm-machines.toml.sig",
-];
+const LEGACY: [&str; 3] = crate::entry_class::LEGACY_RELEASE_RING;
+const CANONICAL: [&str; 3] = crate::entry_class::RELEASE_RING;
+const LEGACY_ROSTER: &str = crate::entry_class::LEGACY_ROSTER[0];
+const CANONICAL_ROSTER: [&str; 2] = crate::entry_class::PUBLIC_ROSTER;
 const RECHECK: Duration = Duration::from_secs(300);
 
 #[derive(Default)]

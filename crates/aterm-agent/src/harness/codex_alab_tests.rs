@@ -440,7 +440,7 @@ fn only_an_interactive_tui_is_a_tui_never_the_daemon_or_its_updater() {
             claude_dir: None,
             login: None,
             home: None,
-            stored_login: false,
+            route: crate::harness::accounts::AuthRoute::Outside,
             profile: None,
         };
         assert_eq!(
@@ -506,7 +506,7 @@ fn only_an_interactive_tui_is_a_tui_never_the_daemon_or_its_updater() {
             claude_dir: None,
             login: None,
             home: None,
-            stored_login: false,
+            route: crate::harness::accounts::AuthRoute::Outside,
             profile: None,
         };
         assert_eq!(

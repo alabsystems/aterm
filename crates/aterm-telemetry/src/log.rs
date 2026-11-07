@@ -7,17 +7,19 @@
 //! never holds more than about `file_bytes * files` bytes.
 //!
 //! Every append and rotation from any process of this account goes under one exclusive lock
-//! (`.lock`, [`aterm_uds::file_lock::lock_exclusive_until`]), one `write` a batch. A crash
-//! mid-write leaves a line with no line feed: the next append ends it first, so the fragment
-//! is a line of its own whose checksum fails, and every reader skips it as torn. Nothing is
-//! flushed to disk: a power loss may take the newest rows, which the reader shows as missing,
-//! never as wrong.
+//! (`.lock`, [`aterm_uds::file_lock::lock_exclusive_until`]), one `write` a batch and one its
+//! gap line. A write that fails (a disk that filled) is cut back to the length the file had,
+//! so it leaves none of its bytes. A crash mid-write leaves a line with no line feed: the next
+//! append ends it first, so the fragment is a line of its own whose checksum fails, and every
+//! reader skips it as torn; a line cut only of its line feed is whole, and reads as written.
+//! Nothing is flushed to disk: a power loss may take the newest rows, which the reader shows
+//! as missing, never as wrong.
 //!
 //! A writer that could not append a row leaves a loss record in the folder
 //! (`lost-<writer>-<rows>`, [`mark_lost`]), with no lock; the next append of any writer, under
 //! the lock, takes each one it can remove and says their rows in a `kind=gap` line before its
 //! batch. So a row lost by a process that writes no other (a build's holder) is still said.
-//! The window's writer says its own losses in its next batch.
+//! The window's writer says its own losses in the gap line before its next batch.
 //!
 //! The folder is the account's own (`0700`) and each file in it (`0600`): rows say what this
 //! account ran, and no other account reads them.
@@ -94,6 +96,22 @@ pub struct Log {
     facts: crate::facts::HostFacts,
     /// How long an append waits for the lock.
     lock_wait: Duration,
+    /// The bytes its writes may still put before one is cut short, as a disk that fills does
+    /// ([`Self::cut_after`]); `None` for a log no test cuts.
+    #[cfg(test)]
+    cut: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread's appends waited for the lock ([`locks_waited`]).
+    static LOCKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times this thread's appends have waited for the lock.
+#[cfg(test)]
+pub(crate) fn locks_waited() -> u64 {
+    LOCKS.with(std::cell::Cell::get)
 }
 
 /// The lock file held for one append, released by `LOCK_UN` before it closes.
@@ -117,7 +135,47 @@ impl Log {
             },
             facts,
             lock_wait: LOCK_WAIT,
+            #[cfg(test)]
+            cut: None,
         }
+    }
+
+    /// This log, its writes cut short once they would put more than `left` holds (each write
+    /// takes what it put): the write that would pass it puts what fits and fails, as one does on
+    /// a disk that fills.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn cut_after(mut self, left: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
+        self.cut = Some(left);
+        self
+    }
+
+    /// Write all of `bytes` to `file`, `at` bytes long, with the lock held: a write that fails
+    /// is cut back to `at`, so it leaves none of its bytes for a reader to take as a line (a
+    /// gap line cut only of its line feed is whole) or as a row the caller counts lost. Where the
+    /// cut itself fails, what the write put stays, as after a crash mid-write.
+    fn put(&self, file: &mut File, at: u64, bytes: &[u8]) -> io::Result<()> {
+        let wrote = self.put_all(file, bytes);
+        if wrote.is_err() {
+            let _ = file.set_len(at);
+        }
+        wrote
+    }
+
+    fn put_all(&self, file: &mut File, bytes: &[u8]) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(left) = &self.cut {
+            use std::sync::atomic::Ordering::SeqCst;
+            let room = left.load(SeqCst);
+            let fits = usize::try_from(room).unwrap_or(usize::MAX).min(bytes.len());
+            left.store(room - fits as u64, SeqCst);
+            file.write_all(&bytes[..fits])?;
+            if fits < bytes.len() {
+                return Err(io::ErrorKind::StorageFull.into());
+            }
+            return Ok(());
+        }
+        file.write_all(bytes)
     }
 
     /// This log, its appends waiting at most `wait` for another writer's lock.
@@ -140,6 +198,8 @@ impl Log {
     }
 
     fn lock(&self) -> io::Result<Held> {
+        #[cfg(test)]
+        LOCKS.with(|n| n.set(n.get() + 1));
         own_dir(&self.dir)?;
         let file = own_file(
             OpenOptions::new()
@@ -175,8 +235,9 @@ impl Log {
     }
 
     /// [`Self::append`] under one wait for the lock, its gap line also saying `said` rows the
-    /// caller lost and kept no record of (a direct writer's own count). The gap line is a write
-    /// of its own, so a batch that fails after it never leaves its rows to be said again. `Err`
+    /// caller lost and kept no record of (a direct writer's own count, or the window's queue's).
+    /// The gap line is a write of its own, so a batch that fails after it never leaves its rows
+    /// to be said again. `Err`
     /// says whether the gap line was written: where it was not, the folder's records it took are
     /// left again as one, and the caller's `said` rows are still its own to say.
     ///
@@ -223,7 +284,7 @@ impl Log {
         let batch: usize = lines.iter().map(String::len).sum();
         let (mut file, mut len) = self.open_current()?;
         if len > 0 && !ends_in_line_feed(&mut file, len)? {
-            file.write_all(b"\n")?;
+            self.put(&mut file, len, b"\n")?;
             len += 1;
             done.mended = true;
         }
@@ -234,7 +295,7 @@ impl Log {
             (file, len) = self.open_current()?;
         }
         if len > 0 && lines.len() == 1 {
-            file.write_all(lines[0].as_bytes())?;
+            self.put(&mut file, len, lines[0].as_bytes())?;
             return Ok(done);
         }
         let mut out = String::with_capacity(if len == 0 { batch + 256 } else { batch });
@@ -244,7 +305,7 @@ impl Log {
         for line in lines {
             out.push_str(line);
         }
-        file.write_all(out.as_bytes())?;
+        self.put(&mut file, len, out.as_bytes())?;
         Ok(done)
     }
 

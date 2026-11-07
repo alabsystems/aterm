@@ -1402,8 +1402,10 @@ fn the_tab_the_page_names_carries_that_name() {
 /// own end line in the tab, in plain words; one that said why itself gets no second line.
 #[test]
 fn the_tab_ends_on_a_plain_line_when_its_program_said_nothing() {
-    use aterm_types::macos_setup::{COMMAND_LINE_TOOLS_NOT_FINISHED, COMMAND_LINE_TOOLS_TRY_AGAIN};
-    let end = format!("{COMMAND_LINE_TOOLS_NOT_FINISHED}. {COMMAND_LINE_TOOLS_TRY_AGAIN}");
+    let end = format!(
+        "{}.",
+        aterm_types::macos_setup::COMMAND_LINE_TOOLS_NOT_FINISHED
+    );
     for (exit, written) in [
         (aterm_pty::ChildExit::Signal(9), true),
         (aterm_pty::ChildExit::Code(127), true),

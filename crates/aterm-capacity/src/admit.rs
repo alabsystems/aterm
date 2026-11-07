@@ -1443,6 +1443,8 @@ pub struct Claim {
     laid: Laid,
     record: Record,
     waited: Duration,
+    /// When its admission first entered the queue, unix ms ([`Self::asked_ms`]).
+    asked_ms: u64,
     /// Where its measured writes lie in its file, once written ([`Self::wrote`]).
     wrote_at: Option<u64>,
     /// How a quiet claim started; `None` for any other, a load-only one a held quiet claim
@@ -1807,10 +1809,31 @@ impl Claim {
         &self.record
     }
 
-    /// How long it waited.
+    /// How long it waited, by this process's monotonic clock (`Instant`, which on macOS stops
+    /// while the Mac sleeps): what its lines say. Zero for an adopted claim. Its telemetry rows
+    /// say its wait by the wall clock instead ([`crate::telemetry::wait`]).
     #[must_use]
     pub const fn waited(&self) -> Duration {
         self.waited
+    }
+
+    /// When its admission first entered the ledger's queue, unix ms: its record's `start_ms`,
+    /// the stamp its file was laid with, except for a need a relief resized and entered again,
+    /// whose record is the later entry's while its wait counts from the first. An adopted claim
+    /// reads its record's. With its grant's `admitted_ms`, the wait its telemetry rows say
+    /// ([`crate::telemetry::wait`]).
+    #[must_use]
+    pub const fn asked_ms(&self) -> u64 {
+        self.asked_ms
+    }
+
+    /// TEST: the wall clock ran `by_ms` ahead of this process's monotonic one while it waited (a
+    /// Mac that slept through the wait): its ask and its record's laying read that much earlier,
+    /// its [`Self::waited`] as this process's clock read it.
+    #[cfg(test)]
+    pub(crate) fn slept_while_waiting(&mut self, by_ms: u64) {
+        self.asked_ms -= by_ms;
+        self.record.start_ms -= by_ms;
     }
 
     /// Whether repeatable background work must end before its next stage. Ledger errors
@@ -1919,6 +1942,7 @@ impl Claim {
                 record.need.rank,
             )?,
             laid,
+            asked_ms: record.start_ms,
             record,
             waited: Duration::ZERO,
             wrote_at: None,
@@ -1976,6 +2000,7 @@ impl Claim {
         Ok(Claim {
             _background: None,
             laid,
+            asked_ms: record.start_ms,
             record,
             waited: Duration::ZERO,
             wrote_at: None,
@@ -2230,6 +2255,9 @@ pub struct Waiter {
     /// The path whose volume the reading is taken for.
     at: Option<PathBuf>,
     since: Instant,
+    /// When its admission first entered the queue, unix ms ([`Claim::asked_ms`]): its record's
+    /// `start_ms`, or the first entry's for a need entered again.
+    asked_ms: u64,
     mark: Option<aterm_toolchain::waits::Mark>,
     /// How long a holder's tree may make no progress before it is called stuck: the need's
     /// [`Need::stuck_ends`], else [`aterm_toolchain::stall::STALLED_AFTER`].
@@ -2322,6 +2350,7 @@ impl Waiter {
         };
         Ok(Waiter {
             ledger: ledger.clone(),
+            asked_ms: record.start_ms,
             record,
             laid,
             at,
@@ -2766,6 +2795,7 @@ impl Waiter {
             mut laid,
             at,
             since,
+            asked_ms,
             mark,
             stalled_after,
             stuck_looks,
@@ -2807,6 +2837,7 @@ impl Waiter {
                     laid,
                     record,
                     waited: since.elapsed(),
+                    asked_ms,
                     wrote_at: None,
                     quiet,
                     alone: granted.alone,
@@ -2834,6 +2865,7 @@ impl Waiter {
                     laid,
                     at,
                     since,
+                    asked_ms,
                     mark,
                     stalled_after,
                     stuck_looks,
@@ -3455,8 +3487,10 @@ fn admit_deciding(
     // The need it waits with, entered again once a relief's resizing grew its disk.
     let mut entered = need.clone();
     let mut waiter = Waiter::enter(ledger, machine, need).map_err(Error::Ledger)?;
-    // When it first entered: a need entered again keeps it, so its wait counts from there.
+    // When it first entered: a need entered again keeps it, so its wait counts from there, by
+    // either clock.
     let first = waiter.since;
+    let first_ms = waiter.asked_ms;
     if mode == Admit::Now {
         // It overrides room, never the ledger's lock: one that meets another admission deciding
         // (a verify run admits several stages at once) waits its turn as the wait loop does,
@@ -3565,6 +3599,7 @@ fn admit_deciding(
     let enter_again = |need: &Need| -> Result<Waiter, Error> {
         let mut again = Waiter::enter(ledger, machine, need.clone()).map_err(Error::Ledger)?;
         again.since = first;
+        again.asked_ms = first_ms;
         Ok(again)
     };
     loop {

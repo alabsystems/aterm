@@ -47,7 +47,8 @@
 //! build by its group ([`front`]); and the build's status is this process's: a death by a
 //! signal that dumps no core is this process's death by it, a core signal's `128 + n`
 //! ([`end_like`]); what a build a signal ended left running is sent that signal too, and its
-//! claim waits for it ([`end_tree`]). Its tree's memory is metered ([`aterm_capacity::tree_meter`])
+//! claim waits for it ([`end_tree`]). Its tree's memory is metered ([`aterm_capacity::tree_meter`]),
+//! never below its root's own resident peak (the accounting of the reap that consumed its exit),
 //! and its peak kept when it succeeded, or when it failed above what it claimed ([`Held::end`]).
 
 use std::path::{Path, PathBuf};
@@ -852,27 +853,8 @@ fn admit_for(
         say(line);
     };
     let attempt = |need: Need, speak: &mut dyn FnMut(&str)| {
-        if independent {
-            if let Some(why) = aterm_capacity::never(&need, &reading) {
-                return Err(Error::Never(why));
-            }
-            return match aterm_capacity::Waiter::enter(ledger, seat.machine, need)
-                .map_err(Error::Ledger)?
-                .poll(seat.machine)
-            {
-                aterm_capacity::Polled::Admitted(claim) => Ok(claim),
-                aterm_capacity::Polled::Waiting(waiter, short) => {
-                    drop(waiter);
-                    Err(Error::Stopped {
-                        signal: None,
-                        short: Some(short),
-                    })
-                }
-                aterm_capacity::Polled::Gone(error) => Err(Error::Ledger(error)),
-                aterm_capacity::Polled::Unqualified(why) => Err(Error::Timing(why)),
-            };
-        }
-        if seat.mode != Admit::Wait || possible_lock.is_none() {
+        if !independent && (seat.mode != Admit::Wait || possible_lock.is_none()) {
+            // `admit_with` writes this admission's row where it decides it.
             return aterm_capacity::admit_with(
                 ledger,
                 seat.machine,
@@ -882,70 +864,16 @@ fn admit_for(
                 speak,
             );
         }
-        if let Some(why) = aterm_capacity::never(&need, &reading) {
-            return Err(Error::Never(why));
-        }
-        let watch = aterm_toolchain::interrupt::Watch::enter();
-        if let Some(signal) = watch.take() {
-            return Err(Error::Stopped {
-                signal: Some(signal),
-                short: None,
-            });
-        }
-        // One look decides, but only in its turn: the ledger's lock is held only while another
-        // admission decides, and a look waits on no build, so a wait for it can close no cycle.
-        // A look that met it is tried again every turn gap, saying who holds it by the wait
-        // loop's rule, until a look decides or an interrupt ends the wait.
-        let mut waiter =
-            aterm_capacity::Waiter::enter(ledger, seat.machine, need).map_err(Error::Ledger)?;
-        let mut turn: Option<Instant> = None;
-        let mut said: Option<Instant> = None;
-        let polled = loop {
-            let polled = waiter.poll(seat.machine);
-            if let Some(signal) = watch.take() {
-                drop(polled);
-                return Err(Error::Stopped {
-                    signal: Some(signal),
-                    short: None,
-                });
-            }
-            match polled {
-                aterm_capacity::Polled::Waiting(w, short)
-                    if matches!(short.shorts[..], [aterm_capacity::Short::Turn { .. }]) =>
-                {
-                    let since = *turn.get_or_insert_with(Instant::now);
-                    if let Some(line) = w.turn_line(&short, seat.pace, since, said) {
-                        speak(&line);
-                        said = Some(Instant::now());
-                    }
-                    if watch.nap(seat.pace.turn_gap(), &|| false)
-                        && let Some(signal) = watch.take()
-                    {
-                        drop(w);
-                        return Err(Error::Stopped {
-                            signal: Some(signal),
-                            short: Some(short),
-                        });
-                    }
-                    waiter = w;
-                }
-                decided => break decided,
-            }
+        // Decided here instead: its row is owed from its ask to its decision, written once
+        // however many looks met the ledger's lock.
+        let asked = aterm_capacity::telemetry::Asked::of(&need);
+        let decided = if independent {
+            one_look(ledger, seat.machine, &reading, need)
+        } else {
+            look_in_turn(ledger, seat, &reading, need, speak)
         };
-        match polled {
-            aterm_capacity::Polled::Admitted(claim) => Ok(claim),
-            aterm_capacity::Polled::Waiting(waiter, short) => {
-                drop(waiter);
-                Err(Error::Stopped {
-                    signal: None,
-                    short: Some(short),
-                })
-            }
-            // Its claim file was removed between its entry and its look: no look could admit
-            // it, as `admit_waiting` ends such a wait.
-            aterm_capacity::Polled::Gone(e) => Err(Error::Ledger(e)),
-            aterm_capacity::Polled::Unqualified(why) => Err(Error::Timing(why)),
-        }
+        telemetry::admitted(ledger, asked, &decided);
+        decided
     };
     let mut admitted = attempt(ask(beyond), &mut speak);
     if !beyond && matches!(admitted, Err(Error::Never(_))) {
@@ -982,68 +910,108 @@ fn admit_for(
     }
 }
 
-/// The largest resident peak of this process's reaped children, bytes (`getrusage`'s
-/// `RUSAGE_CHILDREN`): the floor a front puts under its meter's read where it rose while the
-/// build ran ([`supervise`]), since a process that reaped an earlier child (another tool's run)
-/// holds that child's peak too. 0 where it is unread.
-#[cfg(all(
-    unix,
-    target_pointer_width = "64",
-    any(target_vendor = "apple", target_os = "linux")
-))]
-#[must_use]
-pub fn children_maxrss() -> u64 {
-    /// `struct timeval` as this ABI lays it out.
-    #[repr(C)]
-    #[derive(Default)]
-    struct Timeval {
-        sec: i64,
-        #[cfg(target_vendor = "apple")]
-        usec: i32,
-        #[cfg(target_vendor = "apple")]
-        pad: i32,
-        #[cfg(target_os = "linux")]
-        usec: i64,
+/// A HOST JOB'S ADMISSION ([`admit_cohort_job`]): one look decides it, admitted or refused with
+/// what it was short of; it never waits, not even for the ledger's lock. One look is one
+/// admission, so one row ([`telemetry::admitted`]).
+fn one_look(
+    ledger: &Ledger,
+    machine: &dyn Machine,
+    reading: &aterm_capacity::Reading,
+    need: Need,
+) -> Result<Claim, Error> {
+    if let Some(why) = aterm_capacity::never(&need, reading) {
+        return Err(Error::Never(why));
     }
-    /// `struct rusage` as this ABI lays it out: two times, then fourteen longs.
-    #[repr(C)]
-    #[derive(Default)]
-    struct NativeUsage {
-        user: Timeval,
-        system: Timeval,
-        maxrss: i64,
-        rest: [i64; 13],
-    }
-    /// `RUSAGE_CHILDREN` on both.
-    const CHILDREN: i32 = -1;
-    unsafe extern "C" {
-        fn getrusage(who: i32, usage: *mut NativeUsage) -> i32;
-    }
-    let mut usage = NativeUsage::default();
-    // SAFETY: `usage` is one writable `struct rusage` of the native layout, live across the call;
-    // `getrusage` keeps no pointer to it.
-    if unsafe { getrusage(CHILDREN, &raw mut usage) } != 0 {
-        return 0;
-    }
-    let rss = u64::try_from(usage.maxrss).unwrap_or(0);
-    if cfg!(target_vendor = "apple") {
-        rss
-    } else {
-        rss.saturating_mul(1024)
+    match aterm_capacity::Waiter::enter(ledger, machine, need)
+        .map_err(Error::Ledger)?
+        .poll(machine)
+    {
+        aterm_capacity::Polled::Admitted(claim) => Ok(claim),
+        aterm_capacity::Polled::Waiting(waiter, short) => {
+            drop(waiter);
+            Err(Error::Stopped {
+                signal: None,
+                short: Some(short),
+            })
+        }
+        aterm_capacity::Polled::Gone(error) => Err(Error::Ledger(error)),
+        aterm_capacity::Polled::Unqualified(why) => Err(Error::Timing(why)),
     }
 }
 
-/// 0: no reader of the children's accounting on this platform.
-#[cfg(all(
-    unix,
-    not(all(
-        target_pointer_width = "64",
-        any(target_vendor = "apple", target_os = "linux")
-    ))
-))]
-#[must_use]
-pub fn children_maxrss() -> u64 {
-    0
+/// A NESTED BUILD'S ADMISSION UNDER A POSSIBLE BUILD LOCK ([`possible_build_lock`]): one look
+/// decides, but only in its turn. The ledger's lock is held only while another admission
+/// decides, and a look waits on no build, so a wait for it can close no cycle: a look that met it
+/// is tried again every turn gap, saying who holds it by the wait loop's rule, until a look
+/// decides or an interrupt ends the wait. However many looks met the lock, it is one admission,
+/// so one row ([`telemetry::admitted`]).
+fn look_in_turn(
+    ledger: &Ledger,
+    seat: &Seat<'_>,
+    reading: &aterm_capacity::Reading,
+    need: Need,
+    speak: &mut dyn FnMut(&str),
+) -> Result<Claim, Error> {
+    if let Some(why) = aterm_capacity::never(&need, reading) {
+        return Err(Error::Never(why));
+    }
+    let watch = aterm_toolchain::interrupt::Watch::enter();
+    if let Some(signal) = watch.take() {
+        return Err(Error::Stopped {
+            signal: Some(signal),
+            short: None,
+        });
+    }
+    let mut waiter =
+        aterm_capacity::Waiter::enter(ledger, seat.machine, need).map_err(Error::Ledger)?;
+    let mut turn: Option<Instant> = None;
+    let mut said: Option<Instant> = None;
+    let polled = loop {
+        let polled = waiter.poll(seat.machine);
+        if let Some(signal) = watch.take() {
+            drop(polled);
+            return Err(Error::Stopped {
+                signal: Some(signal),
+                short: None,
+            });
+        }
+        match polled {
+            aterm_capacity::Polled::Waiting(w, short)
+                if matches!(short.shorts[..], [aterm_capacity::Short::Turn { .. }]) =>
+            {
+                let since = *turn.get_or_insert_with(Instant::now);
+                if let Some(line) = w.turn_line(&short, seat.pace, since, said) {
+                    speak(&line);
+                    said = Some(Instant::now());
+                }
+                if watch.nap(seat.pace.turn_gap(), &|| false)
+                    && let Some(signal) = watch.take()
+                {
+                    drop(w);
+                    return Err(Error::Stopped {
+                        signal: Some(signal),
+                        short: Some(short),
+                    });
+                }
+                waiter = w;
+            }
+            decided => break decided,
+        }
+    };
+    match polled {
+        aterm_capacity::Polled::Admitted(claim) => Ok(claim),
+        aterm_capacity::Polled::Waiting(waiter, short) => {
+            drop(waiter);
+            Err(Error::Stopped {
+                signal: None,
+                short: Some(short),
+            })
+        }
+        // Its claim file was removed between its entry and its look: no look could admit
+        // it, as `admit_waiting` ends such a wait.
+        aterm_capacity::Polled::Gone(e) => Err(Error::Ledger(e)),
+        aterm_capacity::Polled::Unqualified(why) => Err(Error::Timing(why)),
+    }
 }
 
 /// RUN `command`, a pass-through build, under `held` ([`Admission::Claimed`]; `None`: unclaimed):
@@ -1051,9 +1019,10 @@ pub fn children_maxrss() -> u64 {
 /// catchable one that ends a process with no core, and the terminal keys' where the terminal's
 /// key would not reach it itself), handed the claim's cover marker ([`aterm_capacity::COVER_ENV`])
 /// so the builds it starts claim nothing more, its tree metered while a claim is held, and its
-/// peak kept as [`Held::end`] keeps one: never below `floor`'s read once it is reaped where that
-/// read rose past its read before the launch (a peak `floor` held before is an earlier child's,
-/// no floor of this build). Its status.
+/// peak kept as [`Held::end`] keeps one: never below its root's own resident peak, which the
+/// reap that consumes the root's exit reads from its accounting (`wait4`: the root's and those of
+/// the descendants it reaped), as a host job's does, so a child this process reaped before, which
+/// is no part of this build, is no floor of it. Its status.
 /// Build pass-through commands with [`aterm_uds::spawnfd::TransparentCommand::into_command`]
 /// to preserve inherited handles such as compiler jobserver pipes. The native owned-child
 /// boundary uses ordinary spawn for ordinary admission. [`admit_cohort`] instead requires
@@ -1068,14 +1037,12 @@ pub fn children_maxrss() -> u64 {
 pub fn supervise(
     held: Option<Held>,
     command: &mut aterm_uds::spawnfd::Command,
-    floor: &dyn Fn() -> u64,
     say: &mut dyn FnMut(&str),
 ) -> std::io::Result<std::process::ExitStatus> {
     let cohort = held.as_ref().is_some_and(|held| held.cohort);
     supervise_with(
         held,
         command,
-        floor,
         say,
         || {
             if cohort {
@@ -1099,11 +1066,9 @@ pub fn supervise_terminal(
     held: Held,
     command: &mut aterm_uds::spawnfd::Command,
     terminal: std::fs::File,
-    floor: &dyn Fn() -> u64,
     say: &mut dyn FnMut(&str),
 ) -> std::io::Result<std::process::ExitStatus> {
-    supervise_job_using(held, command, Some(terminal), floor, say, None, None)
-        .map(JobOutcome::root_status)
+    supervise_job_using(held, command, Some(terminal), say, None, None).map(JobOutcome::root_status)
 }
 
 /// Notifications from the actual supervised root, not proof that its whole cohort
@@ -1228,20 +1193,11 @@ pub fn supervise_terminal_events(
     held: Held,
     command: &mut aterm_uds::spawnfd::Command,
     terminal: std::fs::File,
-    floor: &dyn Fn() -> u64,
     say: &mut dyn FnMut(&str),
     events: JobEvents<'_>,
 ) -> std::io::Result<std::process::ExitStatus> {
-    supervise_job_using(
-        held,
-        command,
-        Some(terminal),
-        floor,
-        say,
-        Some(events),
-        None,
-    )
-    .map(JobOutcome::root_status)
+    supervise_job_using(held, command, Some(terminal), say, Some(events), None)
+        .map(JobOutcome::root_status)
 }
 
 /// Supervise live job-local cancellation. The receiver's explicit grace retains
@@ -1255,7 +1211,6 @@ pub fn supervise_terminal_controlled(
     held: Held,
     command: &mut aterm_uds::spawnfd::Command,
     terminal: std::fs::File,
-    floor: &dyn Fn() -> u64,
     say: &mut dyn FnMut(&str),
     cancellation: Cancellation,
     events: JobEvents<'_>,
@@ -1265,7 +1220,6 @@ pub fn supervise_terminal_controlled(
         held,
         command,
         Some(terminal),
-        floor,
         say,
         Some(events),
         Some(cancellation),
@@ -1286,21 +1240,12 @@ pub fn supervise_terminal_controlled(
 pub fn supervise_headless_controlled(
     held: Held,
     command: &mut aterm_uds::spawnfd::Command,
-    floor: &dyn Fn() -> u64,
     say: &mut dyn FnMut(&str),
     cancellation: Cancellation,
     events: JobEvents<'_>,
 ) -> std::io::Result<JobOutcome> {
     cancellation.check_owner()?;
-    supervise_job_using(
-        held,
-        command,
-        None,
-        floor,
-        say,
-        Some(events),
-        Some(cancellation),
-    )
+    supervise_job_using(held, command, None, say, Some(events), Some(cancellation))
 }
 
 #[cfg(target_os = "macos")]
@@ -1308,7 +1253,6 @@ fn supervise_job_using(
     held: Held,
     command: &mut aterm_uds::spawnfd::Command,
     terminal: Option<std::fs::File>,
-    floor: &dyn Fn() -> u64,
     say: &mut dyn FnMut(&str),
     events: Option<JobEvents<'_>>,
     live: Option<Cancellation>,
@@ -1332,7 +1276,6 @@ fn supervise_job_using(
     supervise_launch(
         Some(held),
         &mut *restore.command,
-        floor,
         say,
         || {
             if forwarding {
@@ -1357,7 +1300,6 @@ fn supervise_job_using(
 fn supervise_with(
     held: Option<Held>,
     command: &mut aterm_uds::spawnfd::Command,
-    floor: &dyn Fn() -> u64,
     say: &mut dyn FnMut(&str),
     arm: impl FnOnce() -> Option<front::Front>,
     before_wait: impl FnOnce(&mut aterm_uds::spawnfd::Child, Option<&TreeMeter>),
@@ -1365,7 +1307,6 @@ fn supervise_with(
     supervise_launch(
         held,
         command,
-        floor,
         say,
         arm,
         |owned, meter| before_wait(owned.child_mut(), meter),
@@ -1378,7 +1319,6 @@ fn supervise_with(
 fn supervise_launch(
     mut held: Option<Held>,
     command: &mut aterm_uds::spawnfd::Command,
-    floor: &dyn Fn() -> u64,
     say: &mut dyn FnMut(&str),
     arm: impl FnOnce() -> Option<front::Front>,
     before_wait: impl FnOnce(&mut SupervisedChild, Option<&TreeMeter>),
@@ -1396,8 +1336,6 @@ fn supervise_launch(
             held.claim().record().cover_marker(),
         );
     }
-    // The floor's read before the launch: a peak it already held is an earlier child's.
-    let floor_before = held.as_ref().map(|_| floor());
     let front = arm();
     let (mut owned, mut launch_error) = match launch_held(held.as_mut(), command) {
         Ok(child) => child,
@@ -1514,12 +1452,9 @@ fn supervise_launch(
         });
     if let (Some(held), Some(meter)) = (held, meter) {
         let ended = held.let_go();
-        let after = floor();
-        let peak = meter.stop(if floor_before.is_some_and(|before| after > before) {
-            after
-        } else {
-            0
-        });
+        // The root's own peak, from the reap that consumed its exit: no other child's.
+        let own = owned.child_mut().usage().map_or(0, |usage| usage.maxrss);
+        let peak = meter.stop(own);
         ended.keep(
             BuildEnd::judged(status.as_ref().ok().copied(), !cancelled && settled),
             peak,
@@ -1531,6 +1466,29 @@ fn supervise_launch(
         cancelled,
         settlement,
     })
+}
+
+/// REAP the owned `child` with its resource accounting (`wait4`), which it keeps
+/// ([`aterm_uds::spawnfd::Child::usage`]): the root's own resident peak, and those of the
+/// descendants it reaped, a supervised build's floor ([`supervise`]). Where this platform's
+/// kernel gives no accounting, a plain reap: no floor. A child reaped already (a cohort's
+/// capture reaps a root that ended before it, [`aterm_capacity::cohort::Cohort::of_spawned`])
+/// gives the status that reap took, and keeps what accounting it collected.
+///
+/// # Errors
+/// The reap's.
+#[cfg(unix)]
+fn reap_accounted(
+    child: &mut aterm_uds::spawnfd::Child,
+) -> std::io::Result<std::process::ExitStatus> {
+    if child.is_reaped() {
+        return child.wait();
+    }
+    match child.wait_with_rusage() {
+        Ok(usage) => Ok(usage.status),
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => child.wait(),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(unix)]
@@ -1557,7 +1515,7 @@ fn wait_supervised(
         let child = owned.child_mut();
         let cleanup = match front {
             Some(front) => front.reap(child),
-            None => child.wait(),
+            None => reap_accounted(child),
         };
         if let Err(error) = cleanup {
             say(&format!(
@@ -1624,7 +1582,7 @@ fn wait_supervised_events(
     let Some(terminal) = terminal.filter(|run| run.events.is_some()) else {
         return match front {
             Some(front) => front.reap(child),
-            None => child.wait(),
+            None => reap_accounted(child),
         };
     };
     if child.is_reaped() {
@@ -2059,15 +2017,13 @@ pub fn run_if_claimed_at(
             for (k, v) in env {
                 command.env(k, v);
             }
-            Some(
-                match supervise(Some(*held), &mut command, &children_maxrss, &mut say) {
-                    Ok(status) => end_like(status),
-                    Err(e) => {
-                        eprintln!("atpkg {VERB}: {}: {e}", target.display());
-                        std::process::ExitCode::from(127)
-                    }
-                },
-            )
+            Some(match supervise(Some(*held), &mut command, &mut say) {
+                Ok(status) => end_like(status),
+                Err(e) => {
+                    eprintln!("atpkg {VERB}: {}: {e}", target.display());
+                    std::process::ExitCode::from(127)
+                }
+            })
         }
         Admission::Stopped(Error::Stopped {
             signal: Some(sig), ..
@@ -2333,7 +2289,7 @@ fn front_exec_bounded(
             ));
             let mut command = aterm_uds::spawnfd::transparent(target).into_command();
             command.args(args);
-            match supervise(Some(held), &mut command, &children_maxrss, &mut say) {
+            match supervise(Some(held), &mut command, &mut say) {
                 Ok(status) => end_like(status),
                 Err(e) => {
                     say(&format!(

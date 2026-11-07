@@ -49,7 +49,7 @@ pub(crate) fn usage_observation_transition(
             let mut who = ProcessLogin {
                 login: captured.dir.clone(),
                 default_home: true,
-                stored_login: true,
+                route: crate::harness::accounts::AuthRoute::Stored,
             };
             let mut initial = State::default();
             note_auth(&mut initial, "main", Auth::Ok, NOW);
@@ -81,7 +81,7 @@ pub(crate) fn usage_observation_transition(
                     }
                     std::fs::write(&path, row_text(&changed).unwrap()).unwrap();
                 }
-                5 => who.stored_login = false,
+                5 => who.route = crate::harness::accounts::AuthRoute::Outside,
                 6 => who.default_home = false,
                 7 => std::fs::rename(store.logins_file(), root.path().join("retained-bindings"))
                     .unwrap(),

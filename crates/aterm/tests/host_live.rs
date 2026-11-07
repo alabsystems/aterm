@@ -1755,8 +1755,8 @@ fn an_agent_that_exits_unasked_is_relaunched_on_its_conversation() {
             .expect("the native fixture's actual execution context");
         assert_eq!(
             aterm_agent::harness::accounts::ProcessLogin::of_exec_env(&context.env)
-                .map(|who| who.stored_login),
-            Some(true),
+                .map(|who| who.route),
+            Some(aterm_agent::harness::accounts::AuthRoute::Stored),
             "the native cold regression must exercise stored-login admission"
         );
     }

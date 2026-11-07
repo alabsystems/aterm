@@ -202,7 +202,14 @@ impl Capture {
                 crate::native_defaults::Launcher::recorded(content).as_ref(),
             );
             full.push_str(&crate::launch_tap::sh_prelude(&program, atpkg.as_deref()));
-            if content == sh_shim_body(&target, &env, route.as_deref(), launch.as_deref(), &full) {
+            let rendered = sh_shim_body(&target, &env, route.as_deref(), launch.as_deref(), &full);
+            // A twin with the token block (`launch_tap::with_token_block`; a dev link and an
+            // older atpkg's twin have none): the snapshots run `--help`/`--version`, which the
+            // wrapper runs as typed, so the body below renders without it.
+            if content == rendered
+                || content
+                    == crate::launch_tap::with_token_block(&program, rendered, atpkg.as_deref())
+            {
                 matched = Some((program, prefix, full));
                 break;
             }

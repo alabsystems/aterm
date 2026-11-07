@@ -922,3 +922,41 @@ fn lab_account_refresh_ages_cached_journal_windows_without_reading_again() {
     );
     assert_eq!(seen, original);
 }
+
+/// Each row carries its vault token, value-free, and the offer's step while one stands; a read
+/// that names no row's account adds nothing, nor does no read at all
+/// (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.9).
+#[test]
+fn a_rows_vault_token_and_its_offer_join_the_rows_facts() {
+    use crate::token_shown::{TokenFact, TokenOffer, Tokens};
+    let view = project(&records(), 200_000);
+    let mut unread = view.clone();
+    with_tokens(&mut unread, None);
+    assert_eq!(unread, view, "no read, nothing said");
+
+    let mut none = view.clone();
+    with_tokens(&mut none, Some(&Tokens::default()));
+    assert_eq!(none, view, "a read naming no row's account, nothing said");
+
+    let offer = TokenOffer {
+        line: "a vault token would keep one signed in: make one".into(),
+        label: "one".into(),
+        replace: false,
+    };
+    let mut read = view;
+    with_tokens(
+        &mut read,
+        Some(&Tokens(vec![TokenFact {
+            key: JOURNAL_ACCOUNT.into(),
+            label: Some("one".into()),
+            email: "one@example.test".into(),
+            state: "none".into(),
+            words: "none".into(),
+            phrase: Some("token: none".into()),
+            offer: Some(offer.clone()),
+        }])),
+    );
+    assert_eq!(fact(&read, "Vault token"), "none");
+    assert_eq!(fact(&read, "Vault token offer"), offer.line);
+    assert_eq!(read.rows[0].offer, Some(offer));
+}

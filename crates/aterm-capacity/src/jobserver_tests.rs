@@ -254,40 +254,361 @@ fn malformed_or_foreign_pool_values_are_refused() {
 fn a_waiter_is_woken_by_the_write_not_by_its_clock() {
     let dir = aterm_tempfile::tempdir().unwrap();
     let pool = Jobserver::new(&dir.path().join("jobs"), 1).unwrap();
-    let held = pool.try_acquire().unwrap().unwrap();
+    // The one token, held by another holder of the pool, which returns it by a write to the
+    // FIFO (a token of this handle would be handed to the waiter instead, never written).
+    let mut byte = [0];
+    (&pool.file).read_exact(&mut byte).unwrap();
     let started = Instant::now();
     let stopped = || started.elapsed() >= MUST_HAPPEN;
     let (waiting, is_waiting) = mpsc::channel();
     std::thread::scope(|scope| {
         let waiter = scope.spawn(|| {
             // Its clock would wake it only at the hang detector: a token before then came from
-            // the write that woke it.
+            // the write.
             pool.acquire_waking(&stopped, MUST_HAPPEN, &|| waiting.send(()).unwrap())
                 .map(drop)
         });
         // The waiter has found the FIFO empty and is about to wait: the token comes back now.
         is_waiting.recv().unwrap();
-        drop(held);
+        (&pool.file).write_all(&byte).unwrap();
         // Negative control: a waiter its clock woke would end at its stop predicate, an error.
         waiter.join().unwrap().unwrap();
     });
     assert!(pool.try_acquire().unwrap().is_some(), "the token is back");
 }
 
+/// A wait whose caller stops ends its reader's blocked `read(2)` and leaves nothing reading the
+/// FIFO: it ends with the stop's error well before the hang detector, and the token returned
+/// after it is in the FIFO, not taken by a reader the stop left behind. NEGATIVE CONTROL: a stop
+/// that only stops asking, leaving the reader in its read, never ends the wait (the test then
+/// frees the reader with the token, which it takes: no error, and nothing in the FIFO).
 #[test]
-fn a_poll_reads_nothing_and_ends_on_a_write() {
+fn a_stopped_wait_ends_its_read_and_leaves_no_reader_behind() {
     let dir = aterm_tempfile::tempdir().unwrap();
     let pool = Jobserver::new(&dir.path().join("jobs"), 1).unwrap();
-    let held = pool.try_acquire().unwrap().unwrap();
-    std::thread::scope(|scope| {
-        let poll = scope.spawn(|| pool.readable_within(MUST_HAPPEN).unwrap());
-        drop(held);
-        assert!(poll.join().unwrap(), "readable before the hang detector");
+    let mut byte = [0];
+    (&pool.file).read_exact(&mut byte).unwrap();
+    let stop = AtomicBool::new(false);
+    let started = Instant::now();
+    let stopped = || stop.load(Ordering::SeqCst) || started.elapsed() >= MUST_HAPPEN;
+    let (waiting, is_waiting) = mpsc::channel();
+    let (ended, has_ended) = mpsc::channel();
+    let outcome = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let got = pool.acquire_waking(&stopped, WAKE_EVERY, &|| {
+                let _ = waiting.send(());
+            });
+            ended.send(got.map(drop)).unwrap();
+        });
+        is_waiting.recv().unwrap();
+        stop.store(true, Ordering::SeqCst);
+        let outcome = has_ended.recv_timeout(MUST_HAPPEN);
+        // Whatever the wait did, the token comes back now, so a reader it left can end.
+        (&pool.file).write_all(&byte).unwrap();
+        outcome.unwrap_or_else(|_| has_ended.recv().unwrap())
     });
+    let error = outcome.expect_err("the stop ends the wait with no token");
+    assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    assert!(
+        started.elapsed() < MUST_HAPPEN,
+        "the stop, not the hang detector, ended the wait"
+    );
     assert!(
         pool.try_acquire().unwrap().is_some(),
-        "the wait left the byte for its reader"
+        "the token returned is in the FIFO: no reader of the stopped wait took it"
     );
+}
+
+/// A token that reaches a wait after its caller stopped, before the wait would ask `stopped`
+/// again, goes back. A write may bring it to the wait's reader, or this handle may hand the
+/// wait its own return. Either way the wait ends with the stop's error and the token is in the
+/// FIFO, so a token comes back only after `stopped` said no. NEGATIVE CONTROL: returning the
+/// wait's token without asking `stopped` again ends each wait with that token, after the stop.
+#[test]
+fn a_token_that_reaches_a_wait_after_its_stop_goes_back() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let pool = Jobserver::new(&dir.path().join("jobs"), 1).unwrap();
+    for handed in [false, true] {
+        // The one token: this handle's, whose return is handed to the wait, or another
+        // holder's, whose return is a write to the FIFO.
+        let (mut held, mut byte) = (None, [0]);
+        if handed {
+            held = pool.try_acquire().unwrap();
+        } else {
+            (&pool.file).read_exact(&mut byte).unwrap();
+        }
+        let stop = AtomicBool::new(false);
+        let started = Instant::now();
+        let stopped = || stop.load(Ordering::SeqCst) || started.elapsed() >= MUST_HAPPEN;
+        let (waiting, is_waiting) = mpsc::channel();
+        let outcome = std::thread::scope(|scope| {
+            // Its clock would ask `stopped` only at the hang detector, so the stop is seen
+            // only where a token ends the wait.
+            let waiter = scope.spawn(|| {
+                pool.acquire_waking(&stopped, MUST_HAPPEN, &|| {
+                    let _ = waiting.send(());
+                })
+                .map(drop)
+            });
+            is_waiting.recv().unwrap();
+            // The stop comes first; then the token reaches the waiting acquire.
+            stop.store(true, Ordering::SeqCst);
+            match held.take() {
+                Some(token) => drop(token),
+                None => (&pool.file).write_all(&byte).unwrap(),
+            }
+            waiter.join().unwrap()
+        });
+        let error = outcome.expect_err("a token after the stop is no token for the caller");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted, "handed: {handed}");
+        assert!(
+            started.elapsed() < MUST_HAPPEN,
+            "the token, not the hang detector, ended the wait (handed: {handed})"
+        );
+        assert_eq!(
+            every_free_token(&pool).len(),
+            1,
+            "the token went back to the FIFO (handed: {handed})"
+        );
+    }
+}
+
+/// Block [`INTERRUPT`] in the calling thread's signal mask. A caller may do this itself, and a
+/// process can start with it blocked, because a mask survives `fork` and `exec`.
+fn block_interrupt_in_this_thread() {
+    let mut set = std::mem::MaybeUninit::<libc::sigset_t>::zeroed();
+    // SAFETY: sigemptyset initialises the set it is handed and sigaddset adds a valid signal to
+    // it; pthread_sigmask changes only this thread's mask, from that initialised set.
+    let blocked = unsafe {
+        libc::sigemptyset(set.as_mut_ptr());
+        libc::sigaddset(set.as_mut_ptr(), INTERRUPT);
+        libc::pthread_sigmask(libc::SIG_BLOCK, set.as_ptr(), std::ptr::null_mut())
+    };
+    assert_eq!(blocked, 0, "block SIGURG in the waiter's thread");
+}
+
+/// A wait still ends its read when it must, though its caller's thread blocks [`INTERRUPT`]: its
+/// reader starts with that mask and unblocks the signal in its own. A stopped wait ends with the
+/// stop's error, and a wait handed this handle's return ends with that token. Each ends before
+/// the hang detector, and every token is back afterwards. NEGATIVE CONTROL: a reader that keeps
+/// the mask it started with leaves each signal pending and its read blocked. Each wait then ends
+/// only at the hang detector, when the test frees that reader with another holder's token.
+#[test]
+fn a_wait_ends_its_read_though_its_caller_blocks_the_interrupt() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let pool = Jobserver::new(&dir.path().join("jobs"), 2).unwrap();
+    for handed in [false, true] {
+        // Another holder's token, which frees a reader the wait left in its read, and this
+        // handle's, which a handed wait gets: the FIFO is empty.
+        let mut byte = [0];
+        (&pool.file).read_exact(&mut byte).unwrap();
+        let mut held = pool.try_acquire().unwrap();
+        let stop = AtomicBool::new(false);
+        let started = Instant::now();
+        let stopped = || stop.load(Ordering::SeqCst) || started.elapsed() >= MUST_HAPPEN;
+        let (waiting, is_waiting) = mpsc::channel();
+        let (ended, has_ended) = mpsc::channel();
+        let outcome = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                block_interrupt_in_this_thread();
+                let got = pool.acquire_waking(&stopped, WAKE_EVERY, &|| {
+                    let _ = waiting.send(());
+                });
+                ended.send(got.map(drop)).unwrap();
+            });
+            is_waiting.recv().unwrap();
+            if handed {
+                drop(held.take());
+            } else {
+                stop.store(true, Ordering::SeqCst);
+            }
+            let outcome = has_ended.recv_timeout(MUST_HAPPEN);
+            // Whatever the wait did, the other holder's token comes back now, so a reader it
+            // left can end.
+            (&pool.file).write_all(&byte).unwrap();
+            outcome.unwrap_or_else(|_| has_ended.recv().unwrap())
+        });
+        assert!(
+            started.elapsed() < MUST_HAPPEN,
+            "the {} ended the wait's read, not the hang detector",
+            if handed { "handed token" } else { "stop" }
+        );
+        if handed {
+            outcome.expect("the handed token ends the wait with it");
+        } else {
+            let error = outcome.expect_err("the stop ends the wait with no token");
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        }
+        drop(held);
+        assert_eq!(
+            every_free_token(&pool).len(),
+            2,
+            "none lost, none made (handed: {handed})"
+        );
+    }
+}
+
+/// A stop predicate that panics mid-wait ends the wait as a stop does, then the panic goes on:
+/// the waiter's thread panics before the hang detector, and the wait left neither a reader in
+/// the FIFO nor a record a return would be handed to. NEGATIVE CONTROL: a panic let through the
+/// wait's scope leaves it joining a reader still blocked in `read(2)`, so the wait ends only
+/// once the test frees that reader with the token, which its record then keeps.
+#[test]
+fn a_panicking_stop_predicate_ends_the_wait_and_keeps_every_token() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let pool = Jobserver::new(&dir.path().join("jobs"), 1).unwrap();
+    let mut byte = [0];
+    (&pool.file).read_exact(&mut byte).unwrap();
+    let started = Instant::now();
+    let asked = std::sync::atomic::AtomicU32::new(0);
+    // Asked first before the wait, then each `wake` inside it, where it panics.
+    let stopped = || {
+        assert!(
+            asked.fetch_add(1, Ordering::SeqCst) == 0,
+            "a stop predicate's panic mid-wait"
+        );
+        false
+    };
+    let (ended, has_ended) = mpsc::channel();
+    let outcome = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let waiter = std::thread::scope(|inner| {
+                inner
+                    .spawn(|| pool.acquire_waking(&stopped, WAKE_EVERY, &|| {}).map(drop))
+                    .join()
+            });
+            ended.send(waiter.is_err()).unwrap();
+        });
+        let outcome = has_ended.recv_timeout(MUST_HAPPEN);
+        // Whatever the wait did, the token comes back now, so a reader it left can end.
+        (&pool.file).write_all(&byte).unwrap();
+        outcome.unwrap_or_else(|_| has_ended.recv().unwrap())
+    });
+    assert!(outcome, "the predicate's panic reached the waiter's caller");
+    assert!(
+        started.elapsed() < MUST_HAPPEN,
+        "the panic, not the hang detector, ended the wait"
+    );
+    let token = pool
+        .try_acquire()
+        .unwrap()
+        .expect("the token returned is in the FIFO: no reader of the wait took it");
+    drop(token);
+    assert!(
+        pool.try_acquire().unwrap().is_some(),
+        "a return goes to the FIFO: no record of the ended wait was handed it"
+    );
+}
+
+/// A token this handle returns while one of its waits waits is handed to that wait, never
+/// written to the FIFO, though a blocked reader that has slept longer waits there for it (as
+/// Cargo keeps a finished job's token for its next queued job). NEGATIVE CONTROL: writing the
+/// return to the FIFO lets the helper, which has slept longer, take it in most rounds.
+#[test]
+fn a_token_the_handle_returns_goes_to_its_waiting_acquire_not_the_fifo() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let path = dir.path().join("jobs");
+    let pool = Jobserver::new(&path, 1).unwrap();
+    let mut held = pool.try_acquire().unwrap();
+    // Cargo's helper thread: its own descriptor, blocking, in read(2) whenever it has no token.
+    let helper = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let done = AtomicBool::new(false);
+    let (took, taken) = mpsc::channel();
+    let started = Instant::now();
+    let stopped = || started.elapsed() >= MUST_HAPPEN;
+    std::thread::scope(|scope| {
+        let (helper, done) = (&helper, &done);
+        scope.spawn(move || {
+            let mut helper: &File = helper;
+            loop {
+                let mut b = [0];
+                helper.read_exact(&mut b).unwrap();
+                if !done.load(Ordering::SeqCst) {
+                    took.send(()).unwrap();
+                }
+                // Its job ran on it; the token goes back, so the round goes on.
+                helper.write_all(&b).unwrap();
+                if done.load(Ordering::SeqCst) {
+                    return;
+                }
+            }
+        });
+        for _ in 0..20 {
+            let (waiting, is_waiting) = mpsc::channel();
+            let waiter = scope.spawn(|| {
+                pool.acquire_waking(&stopped, WAKE_EVERY, &move || {
+                    let _ = waiting.send(());
+                })
+            });
+            is_waiting.recv().unwrap();
+            drop(held.take());
+            held = Some(waiter.join().unwrap().unwrap());
+        }
+        done.store(true, Ordering::SeqCst);
+        drop(held.take());
+    });
+    assert_eq!(
+        taken.try_iter().count(),
+        0,
+        "the helper took none of the handle's returns"
+    );
+    assert!(
+        pool.try_acquire().unwrap().is_some(),
+        "the one token is back"
+    );
+}
+
+/// However this handle's waits, its returns and a blocked reader's reads interleave (a token
+/// handed to a wait whose reader took one too, a wait whose reader the handoff ends), the pool
+/// keeps every token: none lost, none made. NEGATIVE CONTROL: dropping the byte a reader took
+/// beside a handed one, in place of giving it on, ends with fewer tokens than slots.
+#[test]
+fn waits_returns_and_a_blocked_reader_keep_every_token() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let path = dir.path().join("jobs");
+    let pool = Jobserver::new(&path, 3).unwrap();
+    let helper = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let done = AtomicBool::new(false);
+    let started = Instant::now();
+    let stopped = || started.elapsed() >= MUST_HAPPEN;
+    std::thread::scope(|scope| {
+        let (helper, done) = (&helper, &done);
+        scope.spawn(move || {
+            let mut helper: &File = helper;
+            loop {
+                let mut b = [0];
+                helper.read_exact(&mut b).unwrap();
+                helper.write_all(&b).unwrap();
+                if done.load(Ordering::SeqCst) {
+                    return;
+                }
+            }
+        });
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                scope.spawn(|| {
+                    for _ in 0..200 {
+                        drop(pool.acquire(&stopped).unwrap());
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        done.store(true, Ordering::SeqCst);
+        // The helper is in read(2) or about to be: one of the pool's tokens ends it.
+        drop(pool.acquire(&stopped).unwrap());
+    });
+    assert_eq!(every_free_token(&pool).len(), 3, "none lost, none made");
 }
 
 /// What the threads of [`a_waiter_gets_a_token_while_a_blocked_reader_competes_for_it`] tell the
@@ -295,7 +616,7 @@ fn a_poll_reads_nothing_and_ends_on_a_write() {
 enum Said {
     /// Cargo's helper took the token and its job ran on it: the test returns it.
     Byte(u8),
-    /// The waiter found the FIFO empty and is about to wait.
+    /// The waiter is about to wait: as it begins its wait, and again each `wake` it waits on.
     Waiting,
     /// The waiter holds the token.
     Got,
@@ -350,8 +671,10 @@ fn a_waiter_gets_a_token_while_a_blocked_reader_competes_for_it() {
                 Err(why) => to_test.send(Said::Failed(why.to_string())).unwrap(),
             }
         });
-        // The test returns a token only once the waiter waits: each write wakes the waiter in
-        // poll(2) beside the helper in read(2), and only the race decides who takes it.
+        // The test returns a token only once the waiter waits, as another holder of the pool
+        // would, by a write to the FIFO: each write but the wait's first lands with the waiter's
+        // reader in read(2) beside the helper in read(2), and only the race decides who takes it
+        // (the first can land before the waiter's reader has started, and so goes to the helper).
         let (mut held, mut armed, mut races) = (Some(byte[0]), false, 0u64);
         loop {
             match heard.recv().unwrap() {

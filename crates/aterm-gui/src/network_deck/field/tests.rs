@@ -703,7 +703,7 @@ fn prevailing_build() {
         .collect();
     assert_eq!(odd, ["m4"]);
     assert!(
-        field.words[0].contains("1 other builds"),
+        field.words[0].contains("1 other build"),
         "{:?}",
         field.words
     );
@@ -1265,9 +1265,31 @@ fn network_field_gallery() {
     };
     let mut tsv = String::from("seats\tpt\tlook\ttext\n");
     let mut written = 0;
-    for n in [0, 5, 63, 250] {
-        let field = field_of(if n == 63 { live_lab() } else { fleet(n) }, NOW);
-        assert_eq!(field.seats.len(), n);
+    let mut scenes: Vec<(String, Field)> = [0, 5, 63, 250]
+        .into_iter()
+        .map(|n| {
+            let field = field_of(if n == 63 { live_lab() } else { fleet(n) }, NOW);
+            assert_eq!(field.seats.len(), n);
+            (format!("{n}seats"), field)
+        })
+        .collect();
+    // A captured `aterm ctl survey --fleet --json` (`ATERM_FIELD_SURVEY=<file>`) is drawn as the
+    // glance would parse it, so the field can be judged on what the fleet's builds really write.
+    // The capture holds session ids and titles: it stays outside the checkout.
+    if let Some(path) = std::env::var_os("ATERM_FIELD_SURVEY") {
+        let json = std::fs::read_to_string(&path).expect("the captured survey reads");
+        let snapshot = crate::fleet_glance::parse(&json, None, NOW).expect("the capture parses");
+        let field = field_of(snapshot, NOW);
+        tsv.push_str(&format!(
+            "# capture: {} seats, {} answered\n",
+            field.seats.len(),
+            field.tallies.answered
+        ));
+        scenes.push(("capture".into(), field));
+    }
+    for (scene, field) in &scenes {
+        let field = field.clone();
+        let n = scene;
         for w in [700.0f32, 1100.0] {
             let g = crate::stats_deck::DeckGeom {
                 w: w * scale,
@@ -1308,14 +1330,14 @@ fn network_field_gallery() {
                 );
                 let png = crate::app_introspect::encode_rgba8_png(&rgba, pw, ph)
                     .expect("the frame encodes");
-                std::fs::write(dir.join(format!("field_{n}seats_{w}pt_2x_{look}.png")), png)
+                std::fs::write(dir.join(format!("field_{n}_{w}pt_2x_{look}.png")), png)
                     .expect("the PNG writes");
                 written += 1;
             }
         }
     }
     std::fs::write(dir.join("field_text.tsv"), tsv).expect("the text table writes");
-    assert_eq!(written, 4 * 2 * looks.len());
+    assert_eq!(written, scenes.len() * 2 * looks.len());
 }
 
 /// The App re-projects the field with no new read where a freshness edge passes, a stale read's
@@ -1473,7 +1495,7 @@ fn activity_spread_is_a_partition() {
         .1;
     assert_eq!(
         line,
-        "1 Macs busy · 1 waiting, at a limit or stuck · 0 quiet · 1 no agents · 0 not read"
+        "1 Mac busy · 1 waiting, at a limit or stuck · 0 quiet · 1 no agents · 0 not read"
     );
 }
 
@@ -1677,4 +1699,64 @@ fn builds_line_names_a_prevailing_seat_that_needs_an_update() {
     );
     snapshot.macs[1].needs_update = false;
     assert_eq!(builds(snapshot), "0.160.0 ×3 · 0.156.0 m4", "control");
+}
+
+/// The words count every session whose seat draws a waiting diamond: an agent the tally counts
+/// waiting once, and a shell's need a person decides beside it, but an agent's need never twice.
+#[test]
+fn waiting_words_count_what_the_diamonds_draw() {
+    let waiting_agent = FleetSession {
+        sid: "s-agent".into(),
+        program: Some("claude".into()),
+        agent: AgentWord::Waiting,
+        task: None,
+        ctx_left_pct: None,
+        usage_5h_pct: None,
+        usage_7d_pct: None,
+    };
+    let mut snapshot = fleet(3);
+    snapshot.macs[0].activity = tally(0, 1, 0);
+    snapshot.macs[0].agent_sessions.push(waiting_agent);
+    snapshot.macs[0].needs.push(need("s-agent", NeedWord::Ask));
+    snapshot.macs[1].needs.push(need("s-shell", NeedWord::Ask));
+    // A stuck need is no decision: it adds nothing to waiting (on its own Mac, which it marks
+    // stuck rather than waiting).
+    snapshot.macs[2]
+        .needs
+        .push(need("s-stuck", NeedWord::Stalled));
+    let field = field_of(snapshot.clone(), NOW);
+    assert_eq!(field.tallies.waiting, 2, "the agent once, the shell once");
+    let diamonds = field
+        .seats
+        .iter()
+        .filter(|seat| seat.activity == Some(Activity::Waiting))
+        .count();
+    assert_eq!(diamonds, 2);
+    // Control: a read that left agents out cannot tell a shell's need from an unlisted agent's.
+    snapshot.macs[1].sessions_more = 1;
+    assert_eq!(field_of(snapshot, NOW).tallies.waiting, 1);
+}
+
+/// An older node counts an idle agent that ended its turn on a question by its word alone: it
+/// lists the agent idle and its tally holds no waiting. The field still counts it once, from its
+/// need, as its seat's diamond draws it.
+#[test]
+fn an_older_nodes_idle_asking_agent_still_counts_waiting() {
+    let mut snapshot = fleet(2);
+    snapshot.macs[0].activity = tally(0, 0, 0);
+    snapshot.macs[0].agent_sessions.push(FleetSession {
+        sid: "s-idle".into(),
+        program: Some("claude".into()),
+        agent: AgentWord::Idle,
+        task: None,
+        ctx_left_pct: None,
+        usage_5h_pct: None,
+        usage_7d_pct: None,
+    });
+    snapshot.macs[0].needs.push(need("s-idle", NeedWord::Ask));
+    assert_eq!(field_of(snapshot.clone(), NOW).tallies.waiting, 1);
+    // Control: a newer node lists it waiting and counts it in its tally; still once.
+    snapshot.macs[0].agent_sessions[0].agent = AgentWord::Waiting;
+    snapshot.macs[0].activity = tally(0, 1, 0);
+    assert_eq!(field_of(snapshot, NOW).tallies.waiting, 1);
 }

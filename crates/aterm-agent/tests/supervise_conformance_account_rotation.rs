@@ -470,7 +470,7 @@ fn asked_at(
         account: Some(&mine),
         left: None,
         default_home: true,
-        stored_login: true,
+        route: aterm_agent::harness::accounts::AuthRoute::Stored,
     };
     asker(&w.roster, real, &w.enrolled, &me, &point, mode, now)
 }
@@ -791,6 +791,7 @@ fn turn_end(worked: Option<Duration>) -> TurnEndReading {
         program: aterm_phase::Program::Claude,
         seat: Default::default(),
         account: None,
+        route: None,
         autopilot: aterm_agent::supervise::Autopilot::Cruise,
         login_label: None,
         autopilot_by_person: false,
@@ -1285,7 +1286,7 @@ fn the_owners_clearing(
         account: Some(&mine),
         left: None,
         default_home: true,
-        stored_login: true,
+        route: aterm_agent::harness::accounts::AuthRoute::Stored,
     };
     let asked_at = |written: Option<i64>| {
         let point = Point::Wall {

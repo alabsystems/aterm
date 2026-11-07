@@ -33,6 +33,7 @@ fn listed(local_id: u64, view: AutopilotView, task: Option<TaskFace>) -> Harness
         need: None,
         hold: None,
         receipt: None,
+        token: None,
     }
 }
 

@@ -616,7 +616,7 @@ impl Rig {
         Snapshot {
             launch_env: None,
             auth_observed: true,
-            stored_login: false,
+            route: crate::harness::accounts::AuthRoute::Outside,
             profile: None,
             tab: TAB.to_string(),
             pid: TUI,

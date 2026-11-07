@@ -12,7 +12,7 @@ use crate::{
 use aterm_secrets::client::{self, Config, EntrySnapshot, Paths, VerifiedEntry};
 use std::time::Instant;
 
-pub const ENTRY: &str = "ai-billing.toml";
+pub const ENTRY: &str = aterm_secrets::entry_class::AI_BILLING;
 
 /// Configured source and account to observe. Every preparation reopens current
 /// root account history and current authenticated policy bytes locally.

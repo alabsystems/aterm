@@ -22,6 +22,7 @@ pub mod b64;
 pub mod bech32;
 pub mod commons;
 pub mod crossing;
+pub mod entry_class;
 pub mod envelope;
 pub mod join;
 pub mod mailbox_component;
@@ -35,6 +36,8 @@ pub mod token_line;
 pub mod transport;
 pub mod x25519;
 
+#[cfg(unix)]
+pub mod claude_token;
 pub mod cli;
 #[cfg(unix)]
 pub mod client;
@@ -125,21 +128,11 @@ pub const SWARM_POLICY_ENTRY: &str = swarm_roster::POLICY_ENTRY;
 /// Reserved admin vault entry carrying the active steward lease (`holder`, `epoch`, `until`).
 pub const SWARM_LEASE_ENTRY: &str = swarm_roster::LEASE_ENTRY;
 
-/// Whether an entry is consumed in place and must never become a secret file.
+/// Whether an entry is consumed in place and must never become a secret file, in any spelling
+/// ([`entry_class::reserved`]): a control record or a Claude Code token.
+#[must_use]
 pub fn reserved_name(name: &str) -> bool {
-    let bare = name
-        .strip_prefix("~/.secrets/")
-        .or_else(|| {
-            name.get(..11)
-                .filter(|p| p.eq_ignore_ascii_case("~/.secrets/"))
-                .and_then(|_| name.get(11..))
-        })
-        .unwrap_or(name);
-    bare.eq_ignore_ascii_case("aterm-fleet-code")
-        || bare.eq_ignore_ascii_case(SWARM_ROSTER_ENTRY)
-        || bare.eq_ignore_ascii_case(SWARM_POLICY_ENTRY)
-        || bare.eq_ignore_ascii_case(SWARM_LEASE_ENTRY)
-        || commons::reserved_name(name)
+    entry_class::reserved(name)
 }
 
 /// Why a vault identity is a lab identity: one that founds its own lab and never joins the live

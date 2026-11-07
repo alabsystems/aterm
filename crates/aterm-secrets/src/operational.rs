@@ -83,6 +83,25 @@ pub fn metadata(paths: &Paths) -> Value {
         })
     });
     let admin = observed(client::can_administer(paths), |available| json!(available));
+    // Who writes this Mac's vault, read at once: a busy state is unknown, never "no log".
+    let route = client::write_route(paths, std::time::Instant::now()).and_then(|route| {
+        if route == client::WriteRoute::Busy {
+            return Err(Error::new("this Mac's vault state is busy"));
+        }
+        Ok(route)
+    });
+    let verbs = match &route {
+        Ok(route) => json!({"state": "known", "value": crate::cli::admin_verbs(*route)}),
+        Err(error) => json!({"state": "unknown", "reason": error.to_string()}),
+    };
+    let writer = observed(route, |route| {
+        json!(match route {
+            client::WriteRoute::Seated => "member",
+            client::WriteRoute::NoLog => "admin",
+            client::WriteRoute::NotSeated => "none",
+            client::WriteRoute::Busy => "unknown",
+        })
+    });
     let steward = observed(client::swarm_lease_holder(paths), |holder| {
         json!({
             "recorded_holder": holder, "reachability": "unobserved",
@@ -102,7 +121,10 @@ pub fn metadata(paths: &Paths) -> Value {
         "schema": 1,
         "kind": "vault-operational-status",
         "vault": status,
-        "capabilities": {"vault_admin": admin, "release_signing": signing},
+        "capabilities": {
+            "vault_admin": admin, "vault_writer": writer, "admin_verbs": verbs,
+            "release_signing": signing,
+        },
         "authority": steward,
         "operations": {
             "inspect_pending": "aterm secrets requests --json",

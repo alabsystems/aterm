@@ -11,10 +11,10 @@
 //! design §3.3). Until they exist the shim keeps Apple's own dialog away from everything aterm
 //! starts ([`crate::clt_shim`]).
 //!
-//! aterm opens the tab by itself once per account and build on this Mac ([`Mark`], the record of
-//! aterm's own ask the package follow-up's `aterm init` shares: a person who closed it without
-//! installing is not asked again by a later launch of that build, nor by that build's follow-up,
-//! and an update retries unfinished setup once), once no macOS dialog is up, no installer is up,
+//! aterm opens the tab by itself once per account on this Mac ([`Mark`], the record of aterm's
+//! own ask that terminal init and package follow-ups share across updates; only a proven
+//! preprompt outcome releases that opening's exact claim), once no macOS dialog is up,
+//! no installer is up,
 //! no tab an earlier aterm opened runs on with no custody here, the keyboard was quiet for 2.5 s,
 //! Low Data Mode is not holding the download back (a tab that found it on spends no opening, and
 //! the next opens once it is off), and the account is one of the Mac's administrators, whom alone
@@ -561,9 +561,8 @@ const TAB_STOP: &str = "stop";
 /// therefore never started.
 fn not_started_line() -> String {
     format!(
-        "{}: aterm could not save what it needs to keep track of it. {}",
-        aterm_types::macos_setup::COMMAND_LINE_TOOLS_NOT_FINISHED,
-        aterm_types::macos_setup::COMMAND_LINE_TOOLS_TRY_AGAIN
+        "{}: aterm could not save what it needs to keep track of it.",
+        aterm_types::macos_setup::COMMAND_LINE_TOOLS_NOT_FINISHED
     )
 }
 
@@ -1472,9 +1471,8 @@ impl App {
                 }
                 if !told {
                     let line = format!(
-                        "{}. {}",
-                        aterm_types::macos_setup::COMMAND_LINE_TOOLS_NOT_FINISHED,
-                        aterm_types::macos_setup::COMMAND_LINE_TOOLS_TRY_AGAIN
+                        "{}.",
+                        aterm_types::macos_setup::COMMAND_LINE_TOOLS_NOT_FINISHED
                     );
                     self.write_developer_tools_line(session, &line);
                 }

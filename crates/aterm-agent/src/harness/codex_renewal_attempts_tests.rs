@@ -27,6 +27,7 @@ fn fixture() -> (aterm_tempfile::TempDir, Env, Receipt, Prepare) {
         image: image.clone(),
     };
     let command = RestartCommand {
+        settles: None,
         account_intent: None,
         image: image.clone(),
         program: "/fixture/codex".into(),

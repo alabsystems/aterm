@@ -508,13 +508,12 @@ impl Grid {
                         (to_write as u16) * 2,
                         Cell::bce_blank(colors),
                     );
-                    for i in 0..to_write {
-                        let col = cursor_col + (i as u16) * 2;
-                        // SAFETY: `col + 1 < cells_len()` on a wide boundary; writes are disjoint.
-                        unsafe {
-                            row.write_wide_char_packed_no_fixup(col, chars[pos + i], colors, flags);
-                        }
-                    }
+                    row.write_wide_run_packed_no_fixup(
+                        cursor_col,
+                        &chars[pos..pos + to_write],
+                        colors,
+                        |_| flags,
+                    );
                     row.settle_len_after_wide_run(cursor_col, end_col_run, end_half_blanked);
                     row.mark_has_wide_chars();
                 } else {
@@ -606,13 +605,12 @@ impl Grid {
                         (to_write as u16) * 2,
                         Cell::bce_blank(colors),
                     );
-                    for j in 0..to_write {
-                        let col = cursor_col + (j as u16) * 2;
-                        // SAFETY: `col + 1 < cells_len()` on a wide boundary; writes are disjoint.
-                        unsafe {
-                            row.write_wide_char_packed_no_fixup(col, chars[pos + j], colors, flags);
-                        }
-                    }
+                    row.write_wide_run_packed_no_fixup(
+                        cursor_col,
+                        &chars[pos..pos + to_write],
+                        colors,
+                        |_| flags,
+                    );
                     row.settle_len_after_wide_run(cursor_col, end_col, end_half_blanked);
                     row.mark_has_wide_chars();
                 } else {
@@ -711,18 +709,13 @@ impl Grid {
                         (to_write as u16) * 2,
                         Cell::bce_blank(bmp_colors),
                     );
-                    for (j, &c) in slice.iter().enumerate() {
-                        let col = cursor_col + (j as u16) * 2;
-                        let fl = if (c as u32) > 0xFFFF {
+                    row.write_wide_run_packed_no_fixup(cursor_col, slice, bmp_colors, |c| {
+                        if (c as u32) > 0xFFFF {
                             nonbmp_flags
                         } else {
                             bmp_flags
-                        };
-                        // SAFETY: `col + 1 < cells_len()` on a wide boundary; writes are disjoint.
-                        unsafe {
-                            row.write_wide_char_packed_no_fixup(col, c, bmp_colors, fl);
                         }
-                    }
+                    });
                     row.settle_len_after_wide_run(cursor_col, end_col, end_half_blanked);
                     row.mark_has_wide_chars();
                 } else {

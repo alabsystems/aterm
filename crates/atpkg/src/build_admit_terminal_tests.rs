@@ -447,7 +447,6 @@ fn native_terminal_actor_if_requested() {
             *held,
             &mut command,
             std::fs::File::open("/dev/tty").unwrap(),
-            &|| 1,
             &mut |_| {},
             &mut |event| match event {
                 SupervisedEvent::Stopped(signal) => {
@@ -567,7 +566,7 @@ fn native_terminal_actor_if_requested() {
             "/dev/tty"
         })
         .unwrap();
-        let result = supervise_terminal(*held, &mut command, terminal, &|| 0, &mut |_| {});
+        let result = supervise_terminal(*held, &mut command, terminal, &mut |_| {});
         if mode == "bad-terminal" {
             assert!(result.is_err());
             assert!(

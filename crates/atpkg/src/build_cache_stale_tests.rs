@@ -139,7 +139,7 @@ fn output_metadata(schema: u64, rustc: u64) -> aterm_json::Value {
             "sha256": "b".repeat(64)
         }]
     });
-    if schema == 2 {
+    if schema == 2 || schema == 3 {
         value.as_object_mut().unwrap().insert(
             "compiler".into(),
             aterm_json::json!({
@@ -149,6 +149,12 @@ fn output_metadata(schema: u64, rustc: u64) -> aterm_json::Value {
                 "mode": "build",
                 "build_script": false
             }),
+        );
+    }
+    if schema == 3 {
+        value.as_object_mut().unwrap().insert(
+            "compiler_outputs".into(),
+            aterm_json::json!([{"path_sha256": "a".repeat(64), "emit": "link"}]),
         );
     }
     value
@@ -398,7 +404,7 @@ fn a_survey_ticks_for_each_stamp_and_fingerprint_it_reads() {
 #[test]
 fn native_output_metadata_preserves_named_layout_compiler_evidence() {
     let folder = format!("{PROFILE}/.fingerprint/aterm-grid-{OLD}");
-    for schema in [1, 2] {
+    for schema in [1, 2, 3] {
         let mut fs = world(now() - 2 * DAY, 4 * DAY);
         fs.file(
             &format!("{folder}/outputs-lib-aterm_grid.json"),
@@ -433,7 +439,7 @@ fn native_output_metadata_preserves_named_layout_compiler_evidence() {
 
 #[test]
 fn native_output_metadata_preserves_folder_layout_compiler_evidence() {
-    for schema in [1, 2] {
+    for schema in [1, 2, 3] {
         for mode in ["build", "check", "check-test", "test"] {
             let mut fs = Fake::default();
             folder_unit(
@@ -446,7 +452,7 @@ fn native_output_metadata_preserves_folder_layout_compiler_evidence() {
                 now() - 4 * DAY,
             );
             let mut metadata = output_metadata(schema, 7);
-            if schema == 2 {
+            if schema == 2 || schema == 3 {
                 metadata
                     .as_object_mut()
                     .unwrap()
@@ -475,7 +481,7 @@ fn output_metadata_does_not_hide_bad_or_conflicting_compiler_records() {
     let folder = format!("{PROFILE}/.fingerprint/aterm-grid-{OLD}");
     let actual = format!("{folder}/lib-aterm_grid.json");
     let other = format!("{folder}/test-lib-aterm_grid.json");
-    for schema in [1, 2] {
+    for schema in [1, 2, 3] {
         for fault in 0..4 {
             let mut fs = world(now() - 2 * DAY, 4 * DAY);
             fs.file(
@@ -545,68 +551,73 @@ fn malformed_or_unsupported_native_output_metadata_keeps_compiler_unknown() {
         .unwrap()
         .replace("\"schema\":1", "\"schema\":1,\"schema\":1");
     bad.push(duplicate.into_bytes());
-    for schema in [0, 3] {
+    for schema in [0, 4] {
         bad.push(aterm_json::to_vec(&output_metadata(schema, 1)).unwrap());
     }
-    for fault in 0..10 {
-        let mut value = output_metadata(2, 1);
-        match fault {
-            0 => {
-                value.as_object_mut().unwrap().remove("compiler");
-            }
-            1 => {
-                value
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("extra".into(), true.into());
-            }
-            2 => {
-                value
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("outputs".into(), aterm_json::json!([]));
-            }
-            3 => {
-                value.as_object_mut().unwrap().insert(
+    for schema in [2, 3] {
+        for fault in 0..10 {
+            let mut value = output_metadata(schema, 1);
+            match fault {
+                0 => {
+                    value.as_object_mut().unwrap().remove("compiler");
+                }
+                1 => {
+                    value
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("extra".into(), true.into());
+                }
+                2 => {
+                    value
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("outputs".into(), aterm_json::json!([]));
+                }
+                3 => {
+                    value.as_object_mut().unwrap().insert(
                     "outputs".into(),
                     aterm_json::json!([{"path_sha256":"bad", "size":0, "sha256":"b".repeat(64)}]),
                 );
-            }
-            4 => {
-                value.as_object_mut().unwrap().insert(
+                }
+                4 => {
+                    value.as_object_mut().unwrap().insert(
                     "outputs".into(),
                     aterm_json::json!([{"path_sha256":"a".repeat(64), "size":8_589_934_593u64, "sha256":"b".repeat(64)}]),
                 );
-            }
-            _ => {
-                let compiler = value
-                    .as_object_mut()
-                    .unwrap()
-                    .get_mut("compiler")
-                    .unwrap()
-                    .as_object_mut()
-                    .unwrap();
-                match fault {
-                    5 => {
-                        compiler.insert("rustc_key".into(), 2u64.into());
-                    }
-                    6 => {
-                        compiler.insert("mode".into(), "doc".into());
-                    }
-                    7 => {
-                        compiler.insert("content_blake3".into(), aterm_json::json!(vec![7u8; 31]));
-                    }
-                    8 => {
-                        compiler
-                            .insert("content_blake3".into(), aterm_json::json!(vec![256u64; 32]));
-                    }
-                    _ => {
-                        compiler.remove("workspace");
+                }
+                _ => {
+                    let compiler = value
+                        .as_object_mut()
+                        .unwrap()
+                        .get_mut("compiler")
+                        .unwrap()
+                        .as_object_mut()
+                        .unwrap();
+                    match fault {
+                        5 => {
+                            compiler.insert("rustc_key".into(), 2u64.into());
+                        }
+                        6 => {
+                            compiler.insert("mode".into(), "doc".into());
+                        }
+                        7 => {
+                            compiler
+                                .insert("content_blake3".into(), aterm_json::json!(vec![7u8; 31]));
+                        }
+                        8 => {
+                            compiler.insert(
+                                "content_blake3".into(),
+                                aterm_json::json!(vec![256u64; 32]),
+                            );
+                        }
+                        _ => {
+                            compiler.remove("workspace");
+                        }
                     }
                 }
             }
+            bad.push(aterm_json::to_vec(&value).unwrap());
         }
-        bad.push(aterm_json::to_vec(&value).unwrap());
     }
     let mut trailing = aterm_json::to_vec(&output_metadata(1, 1)).unwrap();
     trailing.extend_from_slice(b"false");
@@ -624,38 +635,207 @@ fn malformed_or_unsupported_native_output_metadata_keeps_compiler_unknown() {
 }
 
 #[test]
-fn native_output_metadata_reads_have_one_conservative_directory_budget() {
-    let folder = format!("{PROFILE}/.fingerprint/aterm-grid-{OLD}");
-    let receipt = format!("{folder}/outputs-lib-aterm_grid.json");
-    let mut bytes = aterm_json::to_vec(&output_metadata(1, 1)).unwrap();
-    bytes.resize(OUTPUT_METADATA_BUDGET - 1, b' ');
-    let mut fs = world(now() - 2 * DAY, 4 * DAY);
-    fs.file(&receipt, now(), &bytes);
-    assert_eq!(compiler(&fs, Path::new(&folder)), Some(1));
-    bytes.push(b' ');
-    fs.file(&receipt, now(), &bytes);
-    assert_eq!(compiler(&fs, Path::new(&folder)), None);
-    bytes.push(b' ');
-    fs.file(&receipt, now(), &bytes);
-    assert_eq!(compiler(&fs, Path::new(&folder)), None);
+fn legacy_metadata_cannot_acquire_compiler_coverage_fields() {
+    for schema in [1, 2] {
+        let legacy = output_metadata(schema, 1);
+        assert!(native_output_metadata(
+            &aterm_json::to_vec(&legacy).unwrap(),
+            1
+        ));
+        let mut mislabeled = output_metadata(3, 1);
+        mislabeled
+            .as_object_mut()
+            .unwrap()
+            .insert("schema".into(), schema.into());
+        assert!(!native_output_metadata(
+            &aterm_json::to_vec(&mislabeled).unwrap(),
+            1
+        ));
+    }
+}
 
-    bytes.truncate(OUTPUT_METADATA_BUDGET / 2 + 1);
-    fs.file(&receipt, now(), &bytes);
+#[test]
+fn native_schema_three_coverage_preserves_auxiliary_outputs_without_path_reads() {
+    let mut value = output_metadata(3, 1);
+    value
+        .as_object_mut()
+        .unwrap()
+        .get_mut("outputs")
+        .unwrap()
+        .as_array_mut()
+        .unwrap()
+        .extend([
+            aterm_json::json!({"path_sha256": "c".repeat(64), "size": 11, "sha256": "d".repeat(64)}),
+            aterm_json::json!({"path_sha256": "e".repeat(64), "size": 13, "sha256": "f".repeat(64)}),
+        ]);
+    value.as_object_mut().unwrap().insert(
+        "compiler_outputs".into(),
+        aterm_json::json!([
+            {"path_sha256": "a".repeat(64), "emit": "link"},
+            {"path_sha256": "c".repeat(64), "emit": "metadata"}
+        ]),
+    );
+    let folder = format!("{PROFILE}/.fingerprint/aterm-grid-{OLD}");
+    let mut fs = world(now() - 2 * DAY, 4 * DAY);
     fs.file(
-        &format!("{folder}/test-lib-aterm_grid.json"),
+        &format!("{folder}/outputs-lib-aterm_grid.json"),
         now(),
-        &fingerprint(1),
+        &aterm_json::to_vec(&value).unwrap(),
     );
-    fs.file(
-        &format!("{folder}/outputs-test-lib-aterm_grid.json"),
-        now(),
-        &bytes,
+    assert_eq!(compiler(&fs, Path::new(&folder)), Some(1));
+    assert!(
+        fs.looked
+            .borrow()
+            .iter()
+            .all(|path| path.starts_with(&folder))
     );
-    assert_eq!(
-        compiler(&fs, Path::new(&folder)),
-        None,
-        "budget is shared across receipts"
+}
+
+#[test]
+fn malformed_schema_three_compiler_coverage_keeps_compiler_unknown() {
+    let mut missing = output_metadata(3, 1);
+    missing.as_object_mut().unwrap().remove("compiler_outputs");
+    let mut bad = vec![aterm_json::to_vec(&missing).unwrap()];
+    for coverage in [
+        aterm_json::json!(null),
+        aterm_json::json!([]),
+        aterm_json::json!({}),
+        aterm_json::json!([{}]),
+        aterm_json::json!([{"path_sha256": "a".repeat(64)}]),
+        aterm_json::json!([{"emit": "link"}]),
+        aterm_json::json!([{"path_sha256": "a".repeat(64), "emit": "link", "extra": true}]),
+        aterm_json::json!([{"path_sha256": "a".repeat(64), "emit": "Link"}]),
+        aterm_json::json!([{"path_sha256": "a".repeat(64), "emit": "rmeta"}]),
+        aterm_json::json!([{"path_sha256": "a".repeat(64), "emit": null}]),
+        aterm_json::json!([{"path_sha256": "a".repeat(64), "emit": 1}]),
+        aterm_json::json!([{"path_sha256": "bad", "emit": "link"}]),
+        aterm_json::json!([{"path_sha256": "A".repeat(64), "emit": "link"}]),
+        aterm_json::json!([{"path_sha256": "g".repeat(64), "emit": "link"}]),
+        aterm_json::json!([{"path_sha256": "c".repeat(64), "emit": "metadata"}]),
+        aterm_json::json!([
+            {"path_sha256": "a".repeat(64), "emit": "link"},
+            {"path_sha256": "a".repeat(64), "emit": "metadata"}
+        ]),
+    ] {
+        let mut value = output_metadata(3, 1);
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("compiler_outputs".into(), coverage);
+        bad.push(aterm_json::to_vec(&value).unwrap());
+    }
+    let valid = String::from_utf8(aterm_json::to_vec(&output_metadata(3, 1)).unwrap()).unwrap();
+    bad.push(
+        valid
+            .replacen(
+                "\"compiler_outputs\":",
+                "\"compiler_outputs\":[],\"compiler_outputs\":",
+                1,
+            )
+            .into_bytes(),
     );
+    bad.push(
+        valid
+            .replace(
+                "\"emit\":\"link\"",
+                "\"emit\":\"link\",\"emit\":\"metadata\"",
+            )
+            .into_bytes(),
+    );
+    let folder = format!("{PROFILE}/.fingerprint/aterm-grid-{OLD}");
+    for (index, bytes) in bad.iter().enumerate() {
+        assert!(!native_output_metadata(bytes, 1), "{index}");
+        let mut fs = world(now() - 2 * DAY, 4 * DAY);
+        fs.file(
+            &format!("{folder}/outputs-lib-aterm_grid.json"),
+            now(),
+            bytes,
+        );
+        assert_eq!(compiler(&fs, Path::new(&folder)), None, "{index}");
+        assert!(
+            fs.looked
+                .borrow()
+                .iter()
+                .all(|path| path.starts_with(&folder))
+        );
+    }
+}
+
+#[test]
+fn native_schema_three_coverage_has_a_bounded_nonempty_inventory() {
+    let mut value = output_metadata(3, 1);
+    let outputs: Vec<_> = (0..4096)
+        .map(|index| {
+            aterm_json::json!({
+                "path_sha256": format!("{index:064x}"),
+                "size": 1,
+                "sha256": "b".repeat(64)
+            })
+        })
+        .collect();
+    let coverage: Vec<_> = (0..4096)
+        .map(
+            |index| aterm_json::json!({"path_sha256": format!("{index:064x}"), "emit": "metadata"}),
+        )
+        .collect();
+    let fields = value.as_object_mut().unwrap();
+    fields.insert("outputs".into(), outputs.into());
+    fields.insert("compiler_outputs".into(), coverage.into());
+    // The pure shape recognizer admits the producer's upper bound. The survey
+    // still has its existing smaller directory byte budget, checked separately.
+    assert!(native_output_metadata(
+        &aterm_json::to_vec(&value).unwrap(),
+        1
+    ));
+    value
+        .as_object_mut()
+        .unwrap()
+        .get_mut("compiler_outputs")
+        .unwrap()
+        .as_array_mut()
+        .unwrap()
+        .push(aterm_json::json!({"path_sha256": format!("{:064x}", 4096), "emit": "link"}));
+    assert!(!native_output_metadata(
+        &aterm_json::to_vec(&value).unwrap(),
+        1
+    ));
+}
+
+#[test]
+fn native_output_metadata_reads_have_one_conservative_directory_budget() {
+    for schema in [1, 2, 3] {
+        let folder = format!("{PROFILE}/.fingerprint/aterm-grid-{OLD}");
+        let receipt = format!("{folder}/outputs-lib-aterm_grid.json");
+        let mut bytes = aterm_json::to_vec(&output_metadata(schema, 1)).unwrap();
+        bytes.resize(OUTPUT_METADATA_BUDGET - 1, b' ');
+        let mut fs = world(now() - 2 * DAY, 4 * DAY);
+        fs.file(&receipt, now(), &bytes);
+        assert_eq!(compiler(&fs, Path::new(&folder)), Some(1));
+        bytes.push(b' ');
+        fs.file(&receipt, now(), &bytes);
+        assert_eq!(compiler(&fs, Path::new(&folder)), None);
+        bytes.push(b' ');
+        fs.file(&receipt, now(), &bytes);
+        assert_eq!(compiler(&fs, Path::new(&folder)), None);
+
+        bytes.truncate(OUTPUT_METADATA_BUDGET / 2 + 1);
+        fs.file(&receipt, now(), &bytes);
+        fs.file(
+            &format!("{folder}/test-lib-aterm_grid.json"),
+            now(),
+            &fingerprint(1),
+        );
+        fs.file(
+            &format!("{folder}/outputs-test-lib-aterm_grid.json"),
+            now(),
+            &bytes,
+        );
+        assert_eq!(
+            compiler(&fs, Path::new(&folder)),
+            None,
+            "budget is shared across receipts"
+        );
+    }
 }
 
 /// THE WINDOW IS THE PASS'S: parts written four hours ago stay for a pass with room and go for

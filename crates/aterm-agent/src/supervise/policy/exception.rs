@@ -1017,6 +1017,12 @@ fn claude_login(
         {
             told(&notice::LOGIN_NOT_RUN_DRAFT, roster, None)
         }
+        // Over the vault token, `/login` replaces nothing: the way back is a new token.
+        TurnEndAction::Escalate { .. }
+            if cfg.retry_api_errors && reading.login_pin == super::login::LoginPin::Token =>
+        {
+            told(&notice::LOGIN_TOKEN_REFUSED, roster, None)
+        }
         TurnEndAction::Escalate { .. } => {
             let why = if !cfg.retry_api_errors {
                 notice::WHY_RETRY_OFF

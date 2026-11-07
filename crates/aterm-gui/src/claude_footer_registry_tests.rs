@@ -63,7 +63,7 @@ const ASKS: Asks = Asks {
     args: args_of,
     roster: no_roster,
     home: super::rig::scratch_home,
-    stored_login: |_, _, _| true,
+    route: |_, _, _| aterm_agent::harness::accounts::AuthRoute::Stored,
 };
 
 fn lay(pid: i32, sessions: bool) {

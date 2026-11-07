@@ -153,6 +153,7 @@ fn point(
         program: aterm_phase::Program::Claude,
         seat: Default::default(),
         account: None,
+        route: None,
         autopilot: Autopilot::Land,
         login_label: None,
         autopilot_by_person: false,

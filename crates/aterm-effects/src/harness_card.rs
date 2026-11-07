@@ -712,11 +712,12 @@ impl LineInks {
 
     #[inline]
     const fn solve(&mut self, palette: CardPalette, ground: u32) {
+        let ground = ground & 0x00FF_FFFF;
         if matches!(self.key, Some((p, g)) if p as u8 == palette as u8 && g == ground) {
             return;
         }
         let table = crate::color_math::relative_luminance_table();
-        let y_bg = crate::color_math::relative_luminance_with(table, ground & 0x00FF_FFFF);
+        let y_bg = crate::color_math::relative_luminance_with(table, ground);
         let mut i = 0;
         while i < self.ink.len() {
             self.ink[i] =
@@ -2453,6 +2454,9 @@ impl HarnessCard {
             return None;
         }
         self.palette = scene.palette;
+        if !scene.dark {
+            self.inks.solve(scene.palette, scene.ground);
+        }
         self.still = !(animate && drawable) || scene.serious;
         self.drew = Drew::Settled;
         Some(kept.at(origin))
@@ -2485,6 +2489,9 @@ impl HarnessCard {
             return None;
         }
         self.palette = scene.palette;
+        if !scene.dark {
+            self.inks.solve(scene.palette, scene.ground);
+        }
         self.still = false;
         self.drawn = Some((now, Some((step, self.grid_gen))));
         Some(kept.at(origin))
@@ -5575,6 +5582,26 @@ mod tests {
         dark.arm(t0, 7);
         dark.tick(t0, &scene(), true, &mut Vec::new(), &mut Vec::new());
         assert_eq!(dark.inks.key, None);
+
+        let mut masked = LineInks::default();
+        masked.solve(CardPalette::Land, 0xFF00_0000 | cream);
+        assert_eq!(masked.key, Some((CardPalette::Land, cream)));
+        let _ = take_line_ink_solves();
+        assert_eq!(
+            masked.at(CardPalette::Land, 0xFF00_0000 | cream, step(7)),
+            CardPalette::Land.text_at(step(7), cream)
+        );
+        assert_eq!(take_line_ink_solves(), 0);
+
+        let mut frames = CardFrames::default();
+        let mut drawn = HarnessCard::default();
+        let _ = drawn.draw(t0, &page, false, &mut frames);
+        let mut replayed = HarnessCard::default();
+        assert!(replayed.replay(&page, false, &frames).is_some());
+        assert_eq!(replayed.inks.key, Some((CardPalette::Land, cream)));
+        let _ = take_line_ink_solves();
+        let _ = replayed.line_ink(t0, 4, 2, 9, cream, false);
+        assert_eq!(take_line_ink_solves(), 0);
     }
 
     fn star_boxes(quads: &[GlowQuad]) -> Vec<Rect> {

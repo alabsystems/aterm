@@ -34,6 +34,7 @@ use ring::{aead, hkdf};
 use std::collections::{BTreeMap, BTreeSet};
 use zeroize::{Zeroize, Zeroizing};
 
+pub(crate) mod inner;
 mod keyed;
 mod register;
 
@@ -153,6 +154,11 @@ pub struct OpenedAudienceEntries {
     /// `(Audience, name)`: its winning `Put`, or for a carry the op whose value it carries. F21
     /// rule 8 reads who signed it, when, and under which epoch ([`Log::read_after_cutoff`]).
     pub winning_ops: BTreeMap<(Audience, String), RecordId>,
+    /// The winning `Put` itself of each winning live entry, by `(Audience, name)`: for a carry,
+    /// the carry, not the op whose value it carries ([`OpenedAudienceEntries::winning_ops`]). Who
+    /// signed the entry as it stands now, under which epoch and in which draft
+    /// (`claude_token`'s one-draft check, a member write's outcome).
+    pub winning_puts: BTreeMap<(Audience, String), RecordId>,
     /// The winning `Delete` of each register whose winner is one, by `(Audience, name)`: the op
     /// that took the entry away. One-mesh W3's journal of overtaken writes names it
     /// (`client::log_entries`' `Overtaken`).
@@ -717,6 +723,56 @@ pub(super) fn open_wrap(
     Ok(Some(key))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A build before the Claude Code token class, on for one test thread: a class name's value
+    /// is neither sealed again on encode nor opened on decode, so it reads and is re-`Put` as the
+    /// outer layer alone holds it (DESIGN-claude-setup-token §4.4).
+    pub(crate) static OUTER_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the value of the entry `name` carries the inner seal: a Claude Code token entry
+/// ([`crate::entry_class::claude_token`]), in a build that knows the class.
+fn inner_sealed(name: &str) -> bool {
+    #[cfg(test)]
+    if OUTER_ONLY.with(std::cell::Cell::get) {
+        return false;
+    }
+    crate::entry_class::claude_token(name)
+}
+
+/// `entry` as a Mac holding the epoch keys `unwrapped` and `keyed` on `network` reads it: a
+/// Claude Code token entry's value opened from its inner seal ([`inner::load`]).
+fn open_inner(
+    network: &RecordId,
+    unwrapped: &EpochKeys,
+    keyed: &EpochKeys,
+    mut entry: Entry,
+) -> Entry {
+    if inner_sealed(&entry.name) {
+        let value = inner::load(
+            network,
+            |epoch| unwrapped.get(epoch).or_else(|| keyed.get(epoch)),
+            &entry.name,
+            entry.value.as_slice(),
+        );
+        entry.value = SecretBytes::from(value.as_slice());
+    }
+    entry
+}
+
+/// How many bytes the value of the entry `name` takes in a `Put`'s plaintext, for the in-memory
+/// `value`: a Claude Code token entry's with its inner seal ([`inner::stored_len`]).
+#[cfg(unix)]
+#[must_use]
+pub(crate) fn stored_value_len(name: &str, value: &[u8]) -> usize {
+    if inner_sealed(name) {
+        inner::stored_len(value)
+    } else {
+        value.len()
+    }
+}
+
 #[derive(Clone)]
 enum DecodedOp {
     Put(EntryMeta),
@@ -799,7 +855,14 @@ impl EntryOpening<'_> {
             .op_key(index, epoch, self.unwrapped, self.keyed, self.effective)
             .ok_or_else(|| Error::new("entry reference has no readable epoch"))?;
         let plain = open_aead(key, record, audience, epoch, salt, ciphertext)?;
-        decode_put_plaintext(&text_audience, &plain)
+        let entry = decode_put_plaintext(&text_audience, &plain)?;
+        Ok(self.inner(entry))
+    }
+
+    /// `entry` as a reader holds it: a Claude Code token entry's value opened from its inner
+    /// seal where this Mac holds the epoch it names ([`inner::load`]); any other entry as it is.
+    fn inner(&self, entry: Entry) -> Entry {
+        open_inner(self.log.network(), self.unwrapped, self.keyed, entry)
     }
 
     fn commons_put(&self, index: usize) -> Result<SecretBytes> {
@@ -1228,7 +1291,22 @@ impl Log {
         if ep_aud != target_aud {
             return Err(Error::new("Put audience does not match Epoch audience"));
         }
-        let plain = encode_put_plaintext(entry)?;
+        let plain = if inner_sealed(&entry.name) {
+            let mut stored = entry.clone();
+            stored.value = crate::SecretBytes::from(
+                inner::store(
+                    self.network(),
+                    &epoch,
+                    epoch_key,
+                    &entry.name,
+                    entry.value.as_slice(),
+                )?
+                .as_slice(),
+            );
+            encode_put_plaintext(&stored)?
+        } else {
+            encode_put_plaintext(entry)?
+        };
         let sequence = self.next_sequence_for(actor);
         let (salt, ciphertext) = seal_aead(
             epoch_key,
@@ -2124,7 +2202,7 @@ impl Log {
                     };
                     let plain = open_aead(epoch_key, record, audience, epoch, salt, ciphertext)?;
                     if let Some(text_aud) = audience.as_text_audience() {
-                        let entry = decode_put_plaintext(&text_aud, &plain)?;
+                        let entry = opening.inner(decode_put_plaintext(&text_aud, &plain)?);
                         let value_class =
                             value_classes.intern(&opening, i, entry.value.as_slice(), digest)?;
                         let entry = EntryMeta {
@@ -2192,6 +2270,7 @@ impl Log {
         let mut keyed_winning: BTreeMap<EpochAudience, BTreeSet<RecordId>> = BTreeMap::new();
         let mut keyed_deletes: BTreeMap<Audience, BTreeSet<String>> = BTreeMap::new();
         let mut winning_ops: BTreeMap<(Audience, String), RecordId> = BTreeMap::new();
+        let mut winning_puts: BTreeMap<(Audience, String), RecordId> = BTreeMap::new();
         let mut winning_deletes: BTreeMap<(Audience, String), RecordId> = BTreeMap::new();
         let mut host_winners: BTreeMap<String, Vec<(Audience, usize, RecordId)>> = BTreeMap::new();
 
@@ -2228,6 +2307,7 @@ impl Log {
                     (audience.clone(), name.clone()),
                     candidates[register.reps[w]].record_id,
                 );
+                winning_puts.insert((audience.clone(), name.clone()), winner.record_id);
                 by_audience
                     .entry(audience.clone())
                     .or_default()
@@ -2283,11 +2363,13 @@ impl Log {
             }
         }
         drop_dangling_anchors(&mut by_audience, &mut winning_host_audience);
-        winning_ops.retain(|(audience, name), _| {
+        let live = |(audience, name): &(Audience, String)| {
             by_audience
                 .get(audience)
                 .is_some_and(|entries| entries.contains_key(name))
-        });
+        };
+        winning_ops.retain(|key, _| live(key));
+        winning_puts.retain(|key, _| live(key));
 
         Ok(Some(ResolvedEntries {
             entries: by_audience,
@@ -2307,6 +2389,7 @@ impl Log {
                 uncovered_keyed,
                 keyed_deletes,
                 winning_ops,
+                winning_puts,
                 winning_deletes,
                 fully_unwrapped_audiences,
                 hidden_epochs,
@@ -2467,6 +2550,116 @@ impl Log {
     pub fn open_entries(&self, identity: &Identity) -> Result<Option<Vec<Entry>>> {
         Ok(self.open_entry_set(identity)?.map(|opened| opened.entries))
     }
+
+    /// The lineage of the `[everyone]` value `value` of `name`, as `identity` opens this log
+    /// (DESIGN-claude-setup-token §4.3): every counting `[everyone]` `Put` of `name` whose value,
+    /// as this Mac reads it (opened from its inner seal, [`inner::load`]), is `value`, in record
+    /// order, and whether a counting `[everyone]` `Put` this Mac does not open comes before the
+    /// first of them, so an earlier `Put` of the value may stand where this Mac cannot see it.
+    /// `None` where `identity` is removed. Value-free: it returns record ids, never a value.
+    ///
+    /// # Errors
+    /// A `Wrap` or `Put` addressed to `identity` fails to open.
+    #[cfg(unix)]
+    pub(crate) fn put_lineage(
+        &self,
+        identity: &Identity,
+        name: &str,
+        value: &[u8],
+    ) -> Result<Option<Lineage>> {
+        if self.recipient_is_removed(&identity.recipient()) {
+            return Ok(None);
+        }
+        let unwrapped = self.unwrap_epochs(identity)?;
+        let effective = self.effective();
+        let keyed = self.unwrap_keyed_epochs(identity, effective, |_| true)?;
+        let mut lineage = Lineage::default();
+        let mut unopened = false;
+        for (i, record) in self.order.iter().enumerate().skip(1) {
+            if !effective.counts(i) {
+                continue;
+            }
+            let Body::Put {
+                audience: audience @ EpochAudience::Everyone,
+                epoch,
+                salt,
+                ciphertext,
+            } = record.body()
+            else {
+                continue;
+            };
+            let Some(epoch_key) = self.op_key(i, epoch, &unwrapped, &keyed, effective) else {
+                unopened = true;
+                continue;
+            };
+            let plain = open_aead(epoch_key, record, audience, epoch, salt, ciphertext)?;
+            let stored = decode_put_plaintext(&Audience::Everyone, &plain)?;
+            if stored.name != name {
+                continue;
+            }
+            let sealed_under = inner_sealed(name)
+                .then(|| inner::sealing_epoch(stored.value.as_slice()))
+                .flatten();
+            let read = open_inner(self.network(), &unwrapped, &keyed, stored);
+            if !aterm_digest::ct_eq(read.value.as_slice(), value) {
+                continue;
+            }
+            if lineage.puts.is_empty() {
+                lineage.unopened_before = unopened;
+            }
+            lineage.puts.push(LineagePut {
+                record: *record.id(),
+                actor: *record.actor(),
+                epoch: *epoch,
+                sealed_under,
+            });
+        }
+        Ok(Some(lineage))
+    }
+
+    /// Every recipient a `Wrap` of `epoch` in this log hands its key to, whether or not the log
+    /// still counts that `Wrap`: who could open what `epoch` seals, once they held these records.
+    #[cfg(unix)]
+    #[must_use]
+    pub(crate) fn wrapped_to(&self, epoch: &RecordId) -> BTreeSet<Recipient> {
+        self.order
+            .iter()
+            .filter_map(|record| match record.body() {
+                Body::Wrap {
+                    epoch: of,
+                    recipient,
+                    ..
+                } if of == epoch => Some(*recipient),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// The `Put`s of one `[everyone]` value as a Mac opens them ([`Log::put_lineage`]).
+#[cfg(unix)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Lineage {
+    /// Each `Put` of the value, in record order.
+    pub(crate) puts: Vec<LineagePut>,
+    /// A counting `[everyone]` `Put` this Mac does not open comes before the first of them.
+    pub(crate) unopened_before: bool,
+}
+
+/// One `Put` of a [`Lineage`].
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LineagePut {
+    /// The `Put`.
+    pub(crate) record: RecordId,
+    /// Who signed it.
+    pub(crate) actor: MemberId,
+    /// The epoch it is sealed under.
+    pub(crate) epoch: RecordId,
+    /// The epoch its value's inner seal names, for a Claude Code token entry
+    /// ([`inner::sealing_epoch`]): its own epoch where a current build signed it, an older one
+    /// where an older build carried the seal on.
+    pub(crate) sealed_under: Option<RecordId>,
 }
 
 #[cfg(test)]

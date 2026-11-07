@@ -196,3 +196,22 @@ fn a_release_says_whether_a_rows_carry_ended() {
     );
     assert!(!l.abandon_for("@1", &owner));
 }
+
+#[test]
+fn a_token_session_takes_no_sign_in_latch() {
+    use crate::harness::accounts::{AuthRoute, TokenEntry};
+    let entry = TokenEntry::parse("aterm-claude-token-ac-00000000000000a1").expect("an entry");
+    let at = |route| ProcessLogin {
+        login: Some("/work/b".to_owned()),
+        default_home: true,
+        route,
+    };
+    let none = env(&[]);
+    assert_eq!(
+        login_key_of(at(AuthRoute::Stored), &none),
+        Some("dir:/work/b".to_owned())
+    );
+    for route in [AuthRoute::VaultToken { entry }, AuthRoute::Outside] {
+        assert_eq!(login_key_of(at(route), &none), None, "{route:?}");
+    }
+}

@@ -130,6 +130,9 @@ pub const WHY_GATEWAY: &str = "Claude Code's settings sign in through a gateway"
 /// …aterm could not read the tab's Claude Code settings (`super::login::LoginPin::Unread`), so it cannot tell whether `/login` would open the browser at once.
 pub const WHY_PIN_UNREAD: &str = "aterm could not read whether it opens your browser";
 
+/// …the tab runs on its account's vault token (`super::login::LoginPin::Token`), which outranks any stored login, so `/login` would replace nothing.
+pub const WHY_TOKEN: &str = "the tab runs on its vault token, which /login does not replace";
+
 /// Every clause [`LOGIN_NOT_RUN`]'s `{why}` is filled with.
 pub const WHYS: &[&str] = &[
     WHY_RETRY_OFF,
@@ -275,6 +278,23 @@ pub const LOGIN_NOT_RUN: NoticeText = NoticeText {
     expect_reset: None,
     undo: None,
     whys: WHYS,
+    back: BACK,
+};
+
+/// The tab runs on its account's vault token, which Claude Code refused (`super::login::LoginPin::Token`, `docs/DESIGN-claude-setup-token-2026-11-05.md` §5.6): `/login` replaces nothing there, so aterm types none; a new token is the way back, and the harness has recorded the refusal and re-offers one.
+pub const LOGIN_TOKEN_REFUSED: NoticeText = NoticeText {
+    id: "login-token-refused",
+    code: "tr",
+    title: "Claude's vault token was refused",
+    short_title: "Token refused",
+    happened: "Claude Code refused the vault token this tab runs on, so it cannot answer prompts.",
+    did: "aterm did not type /login, because a vault token runs the tab.",
+    todo: "Make its account a new vault token: aterm harness accounts",
+    todo_as: None,
+    expect: "Sessions on the account start on the new token.",
+    expect_reset: None,
+    undo: None,
+    whys: &[],
     back: BACK,
 };
 
@@ -611,6 +631,7 @@ pub const ALL: &[NoticeText] = &[
     LOGIN_STOPPED,
     LOGIN_NOT_RUN,
     LOGIN_NOT_RUN_DRAFT,
+    LOGIN_TOKEN_REFUSED,
     RENEWED_DRAFT,
     ACCOUNT_SIGNED_OUT,
     RENEWAL_WRONG_ACCOUNT,

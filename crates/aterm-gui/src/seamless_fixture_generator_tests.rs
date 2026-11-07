@@ -3530,19 +3530,25 @@ fn fx_agent(
 fn fx_claude_auth(
     config: &str,
     selection: aterm_agent::harness::profile::Selection,
+    route: aterm_agent::harness::accounts::AuthRoute,
 ) -> crate::restore::ClaudeAuthRestore {
+    use aterm_agent::harness::accounts::AuthRoute;
     let records = std::path::PathBuf::from(config);
     // What a stored login on its own home records of its shell's environment: the entries its
-    // account checks read, its custom home and its selector named empty.
-    let launch_env = vec![
-        "HOME=/home/dev".to_string(),
-        format!("{}={config}", aterm_agent::harness::accounts::HOME_ENV),
-        format!("{}=", aterm_agent::harness::accounts::LOGIN_ENV),
-    ];
-    crate::restore::ClaudeAuthRestore {
-        stored_login: true,
-        launch_env: Some(launch_env),
-        profile: Some(
+    // account checks read, its custom home and its selector named empty. A session off its
+    // account's own credential records none (`LaunchEnv::of_exec_env` refuses it).
+    let launch_env = match route {
+        AuthRoute::Stored | AuthRoute::VaultToken { .. } => Some(vec![
+            "HOME=/home/dev".to_string(),
+            format!("{}={config}", aterm_agent::harness::accounts::HOME_ENV),
+            format!("{}=", aterm_agent::harness::accounts::LOGIN_ENV),
+        ]),
+        AuthRoute::Outside => None,
+    };
+    crate::restore::ClaudeAuthRestore::new(
+        route,
+        launch_env,
+        Some(
             aterm_agent::harness::profile::Context {
                 plain: aterm_agent::harness::profile::path_in(
                     std::path::Path::new("/home/dev"),
@@ -3557,7 +3563,7 @@ fn fx_claude_auth(
             }
             .into(),
         ),
-    }
+    )
 }
 
 fn fx_carried_state_desk() -> FxDesk {
@@ -3583,7 +3589,7 @@ fn fx_carried_state_desk() -> FxDesk {
         fx_session(1, "zsh", fx_shell(ROWS, COLS, 40, cwd, 3)),
         worker,
     ];
-    for local_id in 3..=7 {
+    for local_id in 3..=8 {
         let flavour = u8::try_from(local_id).unwrap();
         sessions.push(fx_session(
             local_id,
@@ -3957,6 +3963,7 @@ fn fx_carried_state_desk() -> FxDesk {
         agent.claude_auth = Some(fx_claude_auth(
             "/home/dev/.claude-work",
             aterm_agent::harness::profile::Selection::Standard,
+            aterm_agent::harness::accounts::AuthRoute::Stored,
         ));
         agent.cause = Some("asked".to_string());
         agent.tab = Some(format!("s-{:020x}", 0x00ff_0000_0006_u64));
@@ -3982,13 +3989,42 @@ fn fx_carried_state_desk() -> FxDesk {
         agent.version = Some("2.1.302".to_string());
         agent.home = Some("/home/dev/.claude-work".to_string());
         agent.login = Some(String::new());
+        // A worker started on its environment's credential: its route is outside.
         agent.claude_auth = Some(fx_claude_auth(
             "/home/dev/.claude-work",
             aterm_agent::harness::profile::Selection::CustomOauth,
+            aterm_agent::harness::accounts::AuthRoute::Outside,
         ));
         agent.tab = Some(worker_sid.clone());
         leaf.supervised = Some(Box::new(agent));
         leaf.task = Some(worker_task.clone());
+    });
+    // Since S13 of docs/DESIGN-claude-setup-token-2026-11-05.md session 8's Claude Code is a
+    // person's own that started on its account's vault token (the wrapper's marker named the
+    // entry), so its record carries the token route and a restore relaunches it on the planned
+    // line, which carries the wrapper.
+    let on_token = leaf_of(8, "zsh", &|leaf| {
+        let mut agent = fx_agent(
+            48_805,
+            "claude",
+            Some("c2d4e6f8-0a1b-4c3d-8e5f-6a7b8c9d0e1f"),
+            None,
+            "",
+        );
+        agent.version = Some("2.1.318".to_string());
+        agent.home = Some("/home/dev/.claude".to_string());
+        agent.login = Some(String::new());
+        agent.claude_auth = Some(fx_claude_auth(
+            "/home/dev/.claude",
+            aterm_agent::harness::profile::Selection::Standard,
+            aterm_agent::harness::accounts::AuthRoute::VaultToken {
+                entry: aterm_agent::harness::accounts::TokenEntry::parse(
+                    "aterm-claude-token-ac-0123456789abcdef",
+                )
+                .expect("a token entry"),
+            },
+        ));
+        leaf.agent = Some(Box::new(agent));
     });
     let lost = leaf_of(7, "zsh", &|leaf| {
         leaf.lost = Some(Box::new(LostRestore {
@@ -4006,7 +4042,12 @@ fn fx_carried_state_desk() -> FxDesk {
         rows,
         cols,
         band_rows,
-        vec![pair(first, owed), pair(muse, agy), pair(plain, asked)],
+        vec![
+            pair(first, owed),
+            pair(muse, agy),
+            pair(plain, asked),
+            fx_tab(on_token),
+        ],
     );
     front.inner_px = inner_px;
     let co_view = leaf_of(0, "zsh", &|leaf| leaf.theme = Some("Nord".to_string()));
@@ -4653,6 +4694,10 @@ const NO_HANDOFF_WRITES: &[(&str, &str)] = &[
     // `told_ids=`).
     ("layout", "TerminalLeafRestore.told"),
     ("layout", "CodexRestore.carried"),
+    // v0.157.0 and older wrote the route as `stored_login`; the record now writes `route` and
+    // reads the legacy bit where `route` is absent (restore_claude_auth.rs). The shipped desks
+    // keep the reader to those bytes.
+    ("layout", "ClaudeAuthRestore.stored_login"),
     // Context::of_exec_env returns no profile for an unknown filename selector,
     // so a production capture never writes this variant into Claude attribution.
     ("layout", "Filename::Unknown"),

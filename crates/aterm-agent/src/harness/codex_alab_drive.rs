@@ -282,6 +282,7 @@ pub(super) fn self_claimed_plan(
         dialect,
         line,
         tap_dropped: None,
+        token_dropped: None,
         line_dir: None,
     })
 }
@@ -1040,7 +1041,7 @@ pub(super) fn snapshot_with_claim(
         login: None,
         home: None,
         claude_dir: None,
-        stored_login: false,
+        route: crate::harness::accounts::AuthRoute::Outside,
         profile: None,
     })
 }

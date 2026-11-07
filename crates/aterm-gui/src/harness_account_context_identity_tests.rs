@@ -24,7 +24,10 @@ fn change_field(snap: &mut Snapshot, field: i64) {
         6 => snap.login = Some("/example/another-login".into()),
         7 => snap.home = Some("/example/another-home".into()),
         8 => snap.claude_dir = Some("/example/another-records".into()),
-        9 => snap.stored_login = !snap.stored_login,
+        9 => {
+            snap.route =
+                aterm_agent::harness::accounts::AuthRoute::Stored.unless(snap.route.is_stored())
+        }
         10 => {
             snap.profile = if snap.profile.is_some() {
                 None
@@ -155,7 +158,8 @@ fn changed_authentication_facts_do_not_reattribute_the_session() {
     let (a, idle) = moved_at_wall(sid);
     let kept = Arc::clone(&idle.kept);
     a.at_seat_read(2, move |a| {
-        kept.lock().unwrap().snapshot.as_mut().unwrap().stored_login = false;
+        kept.lock().unwrap().snapshot.as_mut().unwrap().route =
+            aterm_agent::harness::accounts::AuthRoute::Outside;
         edited(a, |state| {
             accounts::note_session(state, sid, "pool-a", None, a.clock());
         });

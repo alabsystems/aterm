@@ -191,7 +191,7 @@ pub(in crate::native_act) fn settle_terminal_native(
         // A writer that captured authority can still be between reservation
         // and publication. Retain its cleanup service until it exits that gap.
         if table.renewal_seals.iter().any(|(id, seal)| {
-            Arc::ptr_eq(&seal.intent, &seed.intent) && table.reservations.contains(id)
+            Arc::ptr_eq(&seal.intent, &seed.intent) && table.reservations.contains_key(id)
         }) {
             return false;
         }

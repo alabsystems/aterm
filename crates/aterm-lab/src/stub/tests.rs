@@ -3012,3 +3012,38 @@ fn a_failed_mode_write_keeps_the_active_mode_and_refuses_the_control_request() {
     );
     assert_eq!(control(&port, "/__mode").unwrap(), r#"{"mode": "ok"}"#);
 }
+
+/// A token session's windows can be told from another credential's: the resets
+/// [`chosen_resets`] names reach only the credential whose blocks they are, and another credential
+/// answers with the shared headers.
+/// NEGATIVE CONTROL: the same resets written as the shared `on200` reach every credential, so the
+/// two answers no longer differ.
+#[test]
+fn chosen_resets_reach_only_their_credential() {
+    let blocks = chosen_resets(("0.25", 1_800_007_200), ("0.40", 1_800_432_000));
+    let spec = headers_file_for(
+        r#"{"on200":{"anthropic-ratelimit-unified-5h-reset":"1"}}"#,
+        "oat:lab-t",
+        blocks.clone(),
+    );
+    let reset = |r: &RateHeaders, window: &str| {
+        r.on200
+            .iter()
+            .find(|(k, _)| k == &format!("anthropic-ratelimit-unified-{window}-reset"))
+            .map(|(_, v)| v.clone())
+    };
+    let token = rate_headers_for(&spec, "oat:lab-t", 0);
+    assert_eq!(reset(&token, "5h").as_deref(), Some("1800007200"));
+    assert_eq!(reset(&token, "7d").as_deref(), Some("1800432000"));
+    let other = rate_headers_for(&spec, "oat:lab-a", 0);
+    assert_eq!(reset(&other, "5h").as_deref(), Some("1"));
+    assert_eq!(reset(&other, "7d"), None);
+
+    let shared = blocks.get("on200").cloned().expect("on200");
+    let spec = J::obj([("on200", shared)]);
+    assert_eq!(
+        rate_headers_for(&spec, "oat:lab-t", 0),
+        rate_headers_for(&spec, "oat:lab-a", 0),
+        "the control: shared resets reach both"
+    );
+}

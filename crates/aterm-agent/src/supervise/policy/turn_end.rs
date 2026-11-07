@@ -9517,6 +9517,11 @@ fn login_gone(program: Program, msg: &str, aside: Option<&str>, how: &str) -> St
     }
 }
 
+/// How a session whose vault token Claude Code refused gets a working one
+/// (`super::login::LoginPin::Token`; `docs/DESIGN-claude-setup-token-2026-11-05.md` §5.6).
+const TOKEN_HOW: &str =
+    "make its account a new token: aterm harness accounts token <account> --replace";
+
 const fn login_command(program: Program) -> Option<&'static str> {
     match program {
         Program::Claude => Some("/login"),
@@ -9782,6 +9787,9 @@ pub const RULE_MEMORY_RESTART: &str = "memory-restart@v1";
 pub const RULE_INPUT_LOST: &str = "input-lost-restart@v1";
 /// A turn the session's host typed (upgrade notice, carry-on; [`TurnEndState::host_typed`]).
 pub const RULE_HOST_TURN: &str = "harness-turn@v1";
+/// The agent relaunched with `--resume` onto its account's vault token, or back onto the row's
+/// stored login ([`Restart::Route`]; `docs/DESIGN-claude-setup-token-2026-11-05.md` §5.5).
+pub const RULE_TOKEN_ROUTE: &str = "token-route@v1";
 
 /// Which turn the session's host typed, told by the host from its own step, never read off the screen or the journal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9821,6 +9829,42 @@ pub enum Restart {
         to: String,
         at: AccountAt,
     },
+    /// The session's own account, onto another credential (§5.5 of
+    /// `docs/DESIGN-claude-setup-token-2026-11-05.md`): onto the account's vault token, now in use
+    /// on this Mac, from its stored login; or back onto the row's stored login from a token that
+    /// was refused, removed, ended or mismatched. The host offers it ([`TurnEndReading::route`])
+    /// and the claims ring decides first: a yield's account move is asked ahead of it.
+    Route {
+        to: RouteTo,
+    },
+}
+
+/// Which credential a route move puts the session on ([`Restart::Route`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteTo {
+    /// The account's vault token, through aterm's wrapper.
+    Token,
+    /// The row's stored login.
+    Stored,
+}
+
+impl RouteTo {
+    /// The one word a ledger and a cause name it by.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Token => "token",
+            Self::Stored => "stored",
+        }
+    }
+
+    /// The route [`Self::word`] names (`None`: a word this build does not know).
+    #[must_use]
+    pub fn of_word(word: &str) -> Option<Self> {
+        [Self::Token, Self::Stored]
+            .into_iter()
+            .find(|to| to.word() == word)
+    }
 }
 
 /// Where an account move is asked ([`Restart::Account`]).
@@ -9864,14 +9908,25 @@ impl Restart {
     pub const MODEL: &'static str = "model";
     /// An account move at a wall's [`Self::word`] ([`Restart::Account`] at [`AccountAt::Wall`]).
     pub const ACCOUNT: &'static str = "account";
+    /// A move onto the account's vault token's [`Self::word`] ([`Restart::Route`] to
+    /// [`RouteTo::Token`]).
+    pub const ROUTE_TOKEN: &'static str = "route-token";
+    /// A move back onto the row's stored login's [`Self::word`] ([`Restart::Route`] to
+    /// [`RouteTo::Stored`]).
+    pub const ROUTE_STORED: &'static str = "route-stored";
 
-    /// THE KINDS ([`Self::word`]) OF THE MOVES PUT OFF TO A QUIET MOMENT: a model's way back and an
-    /// account move ahead, which the turn-end state owes until the move is made or refused, never
-    /// a screen. Where its host answers a wait (`wait:…`, `busy:another-sweep`), the point goes on
-    /// with the act it would have taken (`DEFERRED`) and the move is asked again at a later turn
-    /// end, under the same ask ([`RestartAsk`]) while its run holds a live claim of the
-    /// conversation's record ([`RestartClaim`], [`Self::moves`]).
-    pub const PUT_OFF: [&'static str; 2] = [Self::MODEL_BACK, Self::ACCOUNT_AHEAD];
+    /// THE KINDS ([`Self::word`]) OF THE MOVES PUT OFF TO A QUIET MOMENT: a model's way back, an
+    /// account move ahead and a route move, which the turn-end state owes until the move is made
+    /// or refused, never a screen. Where its host answers a wait (`wait:…`,
+    /// `busy:another-sweep`), the point goes on with the act it would have taken (`DEFERRED`) and
+    /// the move is asked again at a later turn end, under the same ask ([`RestartAsk`]) while its
+    /// run holds a live claim of the conversation's record ([`RestartClaim`], [`Self::moves`]).
+    pub const PUT_OFF: [&'static str; 4] = [
+        Self::MODEL_BACK,
+        Self::ACCOUNT_AHEAD,
+        Self::ROUTE_TOKEN,
+        Self::ROUTE_STORED,
+    ];
 
     /// Whether a restart of the kind `word` ([`Self::word`]) is a move put off to a quiet moment
     /// ([`Self::PUT_OFF`]).
@@ -9881,17 +9936,20 @@ impl Restart {
     }
 
     /// THE KINDS ([`Self::word`]) OF THE MOVES: a model's move onto its fallback and its way back,
-    /// and an account move at a wall or ahead of one. A move is the session's, not its process's:
+    /// an account move at a wall or ahead of one, and a move onto another credential of the same
+    /// account (a route move). A move is the session's, not its process's:
     /// asked again after the loop's other acts it is the same move, so while its run holds a live
     /// claim of the conversation's record ([`RestartClaim`]) the loop keeps that ask until the move
     /// is made, refused or another restart's run takes its place, and the re-ask meets the record
     /// it claimed (carried while its relaunch is in flight, made once that is carried on). A memory
     /// restart's need and a lost line's are the process's: neither is a move.
-    pub const MOVES: [&'static str; 4] = [
+    pub const MOVES: [&'static str; 6] = [
         Self::MODEL,
         Self::MODEL_BACK,
         Self::ACCOUNT,
         Self::ACCOUNT_AHEAD,
+        Self::ROUTE_TOKEN,
+        Self::ROUTE_STORED,
     ];
 
     /// Whether a restart of the kind `word` ([`Self::word`]) is a move ([`Self::MOVES`]).
@@ -9916,6 +9974,10 @@ impl Restart {
                 at: AccountAt::Ahead,
                 ..
             } => Self::ACCOUNT_AHEAD,
+            Restart::Route { to: RouteTo::Token } => Self::ROUTE_TOKEN,
+            Restart::Route {
+                to: RouteTo::Stored,
+            } => Self::ROUTE_STORED,
         }
     }
 
@@ -9962,7 +10024,8 @@ impl RestartAsk {
             Restart::Memory
             | Restart::Model { .. }
             | Restart::ModelBack { .. }
-            | Restart::Account { .. } => Self(format!("{}@{run_at}", why.word())),
+            | Restart::Account { .. }
+            | Restart::Route { .. } => Self(format!("{}@{run_at}", why.word())),
         }
     }
 
@@ -11583,6 +11646,14 @@ pub struct TurnEndReading {
     /// evidence ([`Seat::of`]): what a limit met under one of them binds.
     pub seat: Seat,
     pub account: Option<AccountAdvice>,
+    /// THE ROUTE MOVE THE HOST OFFERS (`IdleHost::route_move`, §5.5 of
+    /// `docs/DESIGN-claude-setup-token-2026-11-05.md`): [`RouteTo::Token`] where the session runs
+    /// on its row's stored login and its account's vault token is in use on this Mac,
+    /// [`RouteTo::Stored`] where it runs on a token this Mac saw refused, or that was removed,
+    /// ended or mismatched, and the row has a stored login here. Read at the points the host's
+    /// account advice is read ([`Self::account`]); `None` everywhere else, and for every program
+    /// but Claude Code.
+    pub route: Option<RouteTo>,
     pub autopilot: Autopilot,
     /// Whether a person set the session's word ([`Self::autopilot`]) where it stands: `meta`'s
     /// `autopilot_by=human:…`, a press on the chip, the Autopilot menu, the composer border or
@@ -12039,6 +12110,7 @@ impl TurnEndReading {
             program: reading.program,
             seat: Seat::of(reading.program, rows),
             account: None,
+            route: None,
             autopilot: Autopilot::Cruise,
             autopilot_by_person: false,
             login_label: None,
@@ -13200,6 +13272,8 @@ pub struct TurnEndState {
     account_unmade_seed: Option<Unmade>,
     account_unmade_ms: Option<i64>,
     account_ahead_unmade: Option<(String, Instant)>,
+    /// The route move the host could not make, and when ([`Self::route_refused`]).
+    route_unmade: Option<(RouteTo, Instant)>,
     account_moves: VecDeque<Instant>,
     stale_input: bool,
     done: u8,
@@ -13472,6 +13546,7 @@ impl TurnEndState {
             account_unmade_seed: None,
             account_unmade_ms: None,
             account_ahead_unmade: None,
+            route_unmade: None,
             account_moves: VecDeque::new(),
             stale_input: false,
             done: 0,
@@ -16856,6 +16931,9 @@ impl TurnEndState {
         if let Some((_, t)) = &mut self.account_ahead_unmade {
             back(t);
         }
+        if let Some((_, t)) = &mut self.route_unmade {
+            back(t);
+        }
         if let Some(t) = &mut self.point_at {
             back(t);
         }
@@ -17086,6 +17164,7 @@ impl TurnEndState {
         self.account_unmade_seed = None;
         self.account_unmade_ms = None;
         self.account_ahead_unmade = None;
+        self.route_unmade = None;
     }
 
     /// Whether a limit's resume is owed to a login moved elsewhere ([`Self::login_resume`]).
@@ -17098,6 +17177,15 @@ impl TurnEndState {
     #[must_use]
     pub const fn account_resume_owed(&self) -> bool {
         self.account_resume
+    }
+
+    /// Whether the host could not make a route move onto `to` within the window ending at `now`
+    /// ([`TurnEndTiming::window`]): it is not asked again until then, or until the accounts' news
+    /// reaches the session ([`Self::account_news`]).
+    fn route_refused(&self, to: RouteTo, now: Instant) -> bool {
+        self.route_unmade.as_ref().is_some_and(|(was, at)| {
+            *was == to && now.saturating_duration_since(*at) < self.timing.window
+        })
     }
 
     fn account_ahead_refused(&self, to: &str, now: Instant) -> bool {
@@ -20228,6 +20316,19 @@ impl TurnEndState {
                 to,
                 at: AccountAt::Ahead,
             } => self.account_ahead_unmade = Some((to.clone(), now)),
+            Restart::Route { .. } if made => {
+                self.route_unmade = None;
+                // The lost login a refused token drew is the token's, left with it: the session
+                // is on the row's stored login now.
+                if self
+                    .wall
+                    .as_ref()
+                    .is_some_and(|t| t.class == WallClass::Auth)
+                {
+                    self.wall = None;
+                }
+            }
+            Restart::Route { to } => self.route_unmade = Some((*to, now)),
         }
     }
 
@@ -22332,7 +22433,39 @@ fn act_past_walls(
             },
         );
     }
+    if let Some(to) = route_ahead(state, reading, now)
+        && !matches!(cont, TurnEndAction::Escalate { .. })
+    {
+        return ended_at(trace, "route", route_to(to, cont));
+    }
     ended_at(trace, "continue-policy", cont)
+}
+
+/// THE ROUTE MOVE AT A TURN END (§5.5 of `docs/DESIGN-claude-setup-token-2026-11-05.md`): the
+/// host's offer ([`TurnEndReading::route`]) where the relaunch reaches the tab, no account move
+/// of the session's is still unanswered, and the host did not refuse the same move within the
+/// window ([`TurnEndState::route_refused`]). It is asked after every account move the claims ring
+/// makes ([`move_ahead`], at a wall [`login_wall_moves`]): a session that must yield its account
+/// does that instead, and its target row starts on its own route. It is asked only at a turn end
+/// and at the lost-login wall ([`wall_action`]): a refused token's move back, or a stored
+/// session's move onto its account's token in use here, where the turn is over too, so no session
+/// is ended mid-turn for it.
+fn route_ahead(state: &TurnEndState, reading: &TurnEndReading, now: Instant) -> Option<RouteTo> {
+    let to = reading.route?;
+    (reading.restartable
+        && !reading.relaunch_off
+        && !reading.upgrading
+        && state.account.is_none()
+        && !state.route_refused(to, now))
+    .then_some(to)
+}
+
+fn route_to(to: RouteTo, otherwise: TurnEndAction) -> TurnEndAction {
+    TurnEndAction::Restart {
+        why: Restart::Route { to },
+        rule_id: RULE_TOKEN_ROUTE,
+        otherwise: Box::new(otherwise),
+    }
 }
 
 fn move_ahead<'a>(
@@ -23433,6 +23566,16 @@ pub(super) fn login_wall_waits(
         why: format!("the login is gone: {why}"),
         wait: WaitKind::Other,
     };
+    // A row whose account's vault token is in use here is never signed in again (its renewal is
+    // off): the tab moves onto the token instead ([`wall_action`]'s route move), so that is what
+    // it waits on.
+    let comes_back = |label: &str| {
+        if reading.route == Some(RouteTo::Token) {
+            format!("the tab moves onto {label}'s vault token, in use here")
+        } else {
+            format!("aterm signs {label} in again by itself")
+        }
+    };
     let held = move_held(state, reading, cfg);
     if held.is_some() || reading.composer.drafted() {
         let label = reading.login_label.as_deref().filter(|_| signs_in)?;
@@ -23442,6 +23585,12 @@ pub(super) fn login_wall_waits(
                 backoff,
                 format!("{label} is signed in again, and the tab cannot move onto it: {held}"),
             )),
+            (false, Some(held)) if reading.route == Some(RouteTo::Token) => Some(wait(
+                backoff,
+                format!(
+                    "{label}'s vault token is in use here, and the tab cannot move onto it: {held}"
+                ),
+            )),
             (false, Some(held)) => Some(wait(
                 backoff,
                 format!(
@@ -23449,10 +23598,7 @@ pub(super) fn login_wall_waits(
                      {held}"
                 ),
             )),
-            (false, None) => Some(wait(
-                backoff,
-                format!("aterm signs {label} in again by itself"),
-            )),
+            (false, None) => Some(wait(backoff, comes_back(label))),
         };
     }
     let (n, free) = state.account_moves_of(now);
@@ -23479,7 +23625,7 @@ pub(super) fn login_wall_waits(
                 .as_deref()
                 .filter(|_| signs_in && !moved)
             {
-                Some(label) => format!("aterm signs {label} in again by itself"),
+                Some(label) => comes_back(label),
                 None => "no move can be made yet".to_string(),
             },
         ),
@@ -23615,7 +23761,14 @@ fn wall_action(
                     rule_id: RULE_ACCOUNT,
                     otherwise: Box::new(wall_breaker(state, now, today)),
                 },
-                None => today,
+                // The route the host offers (§5.5, §5.6): a refused vault token's way back onto
+                // the row's stored login, where it has one here, and a stored session's way onto
+                // its account's token in use here, which carries it past the login's end that
+                // drew this wall (no renewal signs a token row in again).
+                None => match route_ahead(state, reading, now) {
+                    Some(to) => route_to(to, wall_breaker(state, now, today)),
+                    None => today,
+                },
             }
         }
         WallKind::Spend
@@ -23902,6 +24055,14 @@ fn wall_own_act(
             // browser one tick after its Enter, over the person's work (v6 §14.17 rule 1; the
             // post-landing review, 2026-11-02): it is theirs to type, told quietly.
             if let Some(why) = reading.login_pin.why() {
+                // Over the vault token, `/login` is no way back: a new token is.
+                let how = match reading.login_pin {
+                    super::login::LoginPin::Token => TOKEN_HOW.to_string(),
+                    super::login::LoginPin::Picker
+                    | super::login::LoginPin::Method
+                    | super::login::LoginPin::Gateway
+                    | super::login::LoginPin::Unread => how,
+                };
                 return esc(login_gone(reading.program, msg, Some(why), &how));
             }
             budgeted(TurnEndAction::TypeCommand {

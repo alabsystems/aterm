@@ -62,7 +62,7 @@ pub(crate) fn attribution_transition(
             }
             next.insert("phase", 1);
             next.insert("judged", judged);
-            next.insert("stored", i64::from(who.stored_login));
+            next.insert("stored", i64::from(who.route.is_stored()));
             next.insert("retained", i64::from(retained));
         }
         _ => unreachable!(),
@@ -121,7 +121,7 @@ fn drive_relative_and_rooted_file_logins_are_not_machine_defaults() {
             "/nested/auth.json",
         ] {
             let who = ProcessLogin::of_env_for(cli, [(var, value)]);
-            assert!(!who.stored_login, "{value}");
+            assert!(!who.route.is_stored(), "{value}");
             assert_eq!(who.login.as_deref(), Some(value));
             assert_eq!(judged_label(&Roster::own(), &who), None);
         }

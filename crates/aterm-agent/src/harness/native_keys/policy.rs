@@ -9,7 +9,7 @@ use super::Provider;
 use crate::harness::ai_pool;
 use std::collections::BTreeSet;
 
-pub const ENTRY: &str = "ai-native-pool.toml";
+pub const ENTRY: &str = aterm_secrets::entry_class::AI_NATIVE_POOL;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scope {

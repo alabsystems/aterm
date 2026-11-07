@@ -842,6 +842,32 @@ struct NativeOutputMetadataV2 {
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
+struct NativeOutputMetadataV3 {
+    schema: u32,
+    #[serde(rename = "fingerprint")]
+    _fingerprint: u64,
+    compiler: NativeOutputCompiler,
+    outputs: Vec<NativeOutputRecord>,
+    compiler_outputs: Vec<NativeCompilerOutput>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeCompilerOutput {
+    path_sha256: String,
+    #[serde(rename = "emit")]
+    _emit: NativeCompilerEmit,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum NativeCompilerEmit {
+    Link,
+    Metadata,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NativeOutputRecord {
     path_sha256: String,
     size: u64,
@@ -873,14 +899,16 @@ enum NativeOutputMode {
 
 /// Recognize the producer's bounded metadata shape, without verifying output bytes,
 /// trusting declared paths, authenticating execution or granting cleanup authority.
+/// Legacy schemas carry no compiler-output coverage. Schema 3 only checks the
+/// declared coverage shape; the producer's verifier binds it to its current plan.
 fn native_output_metadata(bytes: &[u8], rustc: u64) -> bool {
+    let digest = |value: &str| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
     let outputs_valid = |outputs: &[NativeOutputRecord]| {
-        let digest = |value: &str| {
-            value.len() == 64
-                && value
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        };
         !outputs.is_empty()
             && outputs.len() <= 4096
             && outputs.iter().all(|output| {
@@ -892,10 +920,32 @@ fn native_output_metadata(bytes: &[u8], rustc: u64) -> bool {
     if let Ok(metadata) = aterm_json::from_slice::<NativeOutputMetadataV1>(bytes) {
         return metadata.schema == 1 && outputs_valid(&metadata.outputs);
     }
-    aterm_json::from_slice::<NativeOutputMetadataV2>(bytes).is_ok_and(|metadata| {
-        metadata.schema == 2
+    if let Ok(metadata) = aterm_json::from_slice::<NativeOutputMetadataV2>(bytes) {
+        return metadata.schema == 2
             && metadata.compiler.rustc_key == rustc
-            && outputs_valid(&metadata.outputs)
+            && outputs_valid(&metadata.outputs);
+    }
+    let Ok(metadata) = aterm_json::from_slice::<NativeOutputMetadataV3>(bytes) else {
+        return false;
+    };
+    if metadata.schema != 3
+        || metadata.compiler.rustc_key != rustc
+        || !outputs_valid(&metadata.outputs)
+        || metadata.compiler_outputs.is_empty()
+        || metadata.compiler_outputs.len() > 4096
+    {
+        return false;
+    }
+    let inventory: BTreeSet<_> = metadata
+        .outputs
+        .iter()
+        .map(|output| output.path_sha256.as_str())
+        .collect();
+    let mut covered = BTreeSet::new();
+    metadata.compiler_outputs.iter().all(|output| {
+        digest(&output.path_sha256)
+            && inventory.contains(output.path_sha256.as_str())
+            && covered.insert(output.path_sha256.as_str())
     })
 }
 

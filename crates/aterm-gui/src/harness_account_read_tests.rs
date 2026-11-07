@@ -100,7 +100,7 @@ fn pending_roster(a: &Accts) {
     let who = accounts::ProcessLogin {
         login: row.dir.clone(),
         default_home: true,
-        stored_login: true,
+        route: aterm_agent::harness::accounts::AuthRoute::Stored,
     };
     pause_publication(a, || {
         store.observe_login_within(

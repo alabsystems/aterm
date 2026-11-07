@@ -321,7 +321,7 @@ fn the_relaunch_that_files_an_asked_exit_takes_its_stamp() {
     let snap = Snapshot {
         launch_env: None,
         auth_observed: true,
-        stored_login: false,
+        route: crate::harness::accounts::AuthRoute::Outside,
         profile: None,
         tab: "s-1".to_string(),
         pid: 4242,

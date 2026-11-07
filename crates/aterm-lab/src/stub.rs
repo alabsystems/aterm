@@ -1563,6 +1563,31 @@ pub fn headers_file_with(old: &str, new: J, blocks: bool) -> J {
     J::Obj(out)
 }
 
+/// One credential's `on200` blocks ([`headers_file_for`]) with resets the caller chooses: both
+/// windows allowed at `five`'s and `seven`'s utilization, the five-hour window resetting at
+/// `five_reset` and the week's at `seven_reset` (Unix seconds), so a session's status-line windows
+/// can be told from another credential's (DESIGN-claude-setup-token S9: a token session's windows
+/// against its account's).
+#[must_use]
+pub fn chosen_resets((five, five_reset): (&str, i64), (seven, seven_reset): (&str, i64)) -> J {
+    J::obj([(
+        "on200",
+        J::obj([
+            ("anthropic-ratelimit-unified-status", J::s("allowed")),
+            ("anthropic-ratelimit-unified-5h-status", J::s("allowed")),
+            ("anthropic-ratelimit-unified-5h-utilization", J::s(five)),
+            ("anthropic-ratelimit-unified-5h-reset", J::Int(five_reset)),
+            ("anthropic-ratelimit-unified-7d-status", J::s("allowed")),
+            ("anthropic-ratelimit-unified-7d-utilization", J::s(seven)),
+            ("anthropic-ratelimit-unified-7d-reset", J::Int(seven_reset)),
+            (
+                "anthropic-ratelimit-unified-representative-claim",
+                J::s("five_hour"),
+            ),
+        ]),
+    )])
+}
+
 /// The `--headers-file` `headers-for` leaves: `old` with the credential `label`'s own blocks
 /// ([`BY_AUTH`]) set to `blocks` (`{"on200": {…}, "on429": {…}}`), or removed where `blocks` holds
 /// none; every other entry and credential kept.

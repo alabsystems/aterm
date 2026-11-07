@@ -653,7 +653,7 @@ fn a_cold_completion_keeps_the_selected_intent_and_the_original_seed_with_or_wit
                 login: None,
                 home: None,
                 auth_observed: true,
-                stored_login: true,
+                route: crate::harness::accounts::AuthRoute::Stored,
                 conversation: None,
                 profile: None,
                 mode: super::super::accounts::Mode::Wall,
@@ -1220,6 +1220,155 @@ fn completed_forward_receipt_can_only_prepare_its_fixed_old_slot_as_a_distinct_c
         actual_request(line),
         Some(Request::Signal(_) | Request::Resume(..))
     )));
+}
+
+/// A TOKEN FORWARD'S CRASH ROLLS BACK FROM THE BUILD IT SETTLED ON
+/// (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.4): a token forward's program is aterm's
+/// wrapper, which execs the store build its `--` names in the same pid, so the vendor the host
+/// observes once the forward completes is that build (`RestartCommand::settled`), never the
+/// wrapper. When the build then crashes, the completed operation prepares its fixed old slot.
+/// CONTROL: a vendor still on the wrapper's image is not what the forward settled on, and is
+/// refused as a changed recipe, sending nothing.
+///
+/// NEGATIVE CONTROL (2026-11-06, restored with cp from a backup plus touch, confirmed with cmp):
+/// with `begin_completed_rollback` holding the vendor to `forward.image` again, the vendor still on
+/// the wrapper is admitted: `left: Ok(Admitted)`, `right: Err("native-completed-recipe-changed")`.
+#[test]
+fn a_completed_token_forward_rolls_back_from_the_build_it_settled_on() {
+    use super::super::accounts::TokenEntry;
+    use super::super::accounts_pool::ExecutionIntent;
+    use super::super::native_observe::{ObservationBinding, Registration, SavedObservation};
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let opts = opts(dir.path());
+    let back = planned();
+    let wrapper = dir.path().join("aterm");
+    std::fs::write(&wrapper, b"aterm's wrapper").unwrap();
+    std::fs::set_permissions(
+        &wrapper,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    let build = std::env::current_exe().unwrap();
+    let forward = PlannedCommand {
+        target: wrapper,
+        argv: super::super::token_route::VERB
+            .iter()
+            .map(|word| (*word).to_owned())
+            .chain([
+                "work".to_owned(),
+                "--".to_owned(),
+                build.to_str().unwrap().to_owned(),
+            ])
+            .collect(),
+        account_intent: Some(ExecutionIntent::Token {
+            namespace: "ab".repeat(32),
+            login: None,
+            owner: Some("work".into()),
+            entry: TokenEntry::parse("aterm-claude-token-ac-fedcba9876543210").unwrap(),
+        }),
+        ..planned()
+    };
+    let captured = forward.capture().expect("a token command");
+    let settled = Image::at(&build).expect("the build's image");
+    assert_eq!(
+        captured.settled(),
+        &settled,
+        "CONTROL: it settles on the build"
+    );
+    assert_ne!(
+        captured.image, settled,
+        "CONTROL: its program is the wrapper"
+    );
+    let (mut st, _) = state(&back);
+    st.line = captured.legacy_line().unwrap();
+    let plans = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Prepare>::new()));
+    let recorded = plans.clone();
+    let (mut client, worker) = endpoint(move |line| {
+        if let Some(reply) = common(line) {
+            return Some(reply);
+        }
+        let Request::Prepare(plan) = request(line) else {
+            panic!("no effect may be dispatched by preparation");
+        };
+        recorded.lock().unwrap().push((*plan).clone());
+        Some(format!(
+            "OK native-act state=admitted id={} cap={}\n",
+            plan.id,
+            binding().capability
+        ))
+    });
+    assert_eq!(
+        begin(
+            &opts,
+            &mut client,
+            &mut st,
+            "conversation",
+            Scope::Upgrade,
+            &forward.target,
+            Some(&forward),
+            Some(&back)
+        ),
+        Ok(Recovery::Admitted)
+    );
+    let original = plans.lock().unwrap()[0].clone();
+    let vendor = Process::observe(std::process::id()).unwrap();
+    assert_eq!(vendor.image, settled, "CONTROL: the vendor runs the build");
+    let saved = SavedObservation {
+        registration: Registration {
+            id: "98".repeat(16),
+            host_epoch: original.host_epoch.clone(),
+            vendor: vendor.clone(),
+            shell: vendor,
+        },
+        binding: ObservationBinding {
+            id: "98".repeat(16),
+            host_epoch: original.host_epoch.clone(),
+            capability: "76".repeat(32),
+        },
+    };
+    assert_eq!(
+        terminal_reply(&mut st, &Reply::RestartCommitted(Box::new(saved))),
+        Some(Recovery::Completed)
+    );
+    assert!(st.roll_back(upgrade_drive::now_s(), 0));
+    let mut on_wrapper = st.clone();
+    on_wrapper
+        .native_observation
+        .as_mut()
+        .unwrap()
+        .registration
+        .vendor
+        .image = captured.image.clone();
+    assert_eq!(
+        begin_completed_rollback(&opts, &mut client, &mut on_wrapper, "conversation"),
+        Err("native-completed-recipe-changed"),
+        "CONTROL: a vendor on the wrapper"
+    );
+    assert_eq!(
+        plans.lock().unwrap().len(),
+        1,
+        "the control sends no prepare"
+    );
+    assert_eq!(
+        begin_completed_rollback(&opts, &mut client, &mut st, "conversation"),
+        Ok(Recovery::Admitted)
+    );
+    let next = plans.lock().unwrap()[1].clone();
+    let (
+        NativePlan::Restart {
+            rollback: Some(old),
+            ..
+        },
+        NativePlan::Restart {
+            forward: rolled, ..
+        },
+    ) = (&original.plan, &next.plan)
+    else {
+        panic!("restart plans");
+    };
+    assert_eq!(rolled, old, "the fixed old slot");
+    drop(client);
+    let _ = worker.join().unwrap();
 }
 
 #[test]

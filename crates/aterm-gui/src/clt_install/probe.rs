@@ -76,10 +76,12 @@ pub(super) fn apple_installer_pid() -> Option<u32> {
 pub(super) fn installing_now() -> super::Reading {
     let path = std::path::Path::new(aterm_types::macos_setup::COMMAND_LINE_TOOLS_INSTALLING);
     let placeholder = std::fs::symlink_metadata(path).is_ok();
-    let started = |pid| aterm_sysprobe::kproc::record(pid).map(|record| record.start_s);
     let mut reading = reading_from(placeholder, processes().map(|(_, exe)| exe));
     reading.live_run = stamp_of(path, 0).is_some_and(|stamp| {
-        aterm_types::macos_setup::placeholder_held_by_a_live_run(&stamp, started)
+        aterm_types::macos_setup::placeholder_held_by_a_live_run(
+            &stamp,
+            aterm_sysprobe::kproc::live_start_s,
+        )
     });
     reading
 }

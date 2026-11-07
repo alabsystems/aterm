@@ -2360,10 +2360,10 @@ fn base_ai_accounts_syncs_codex_without_an_unassigned_claude_login() {
         Probe::NotApplicable { .. }
     ));
     assert!(matches!(
-        super::ai_accounts_probe(&env),
+        super::ai_accounts_rows_probe(&env),
         Probe::Change { .. }
     ));
-    let due = super::ai_accounts_observation(super::ai_accounts_probe(&env));
+    let due = super::ai_accounts_observation(super::ai_accounts_rows_probe(&env));
     assert_eq!(due.standing, aterm_types::macos_setup::Standing::Waiting);
     let why = due.note.unwrap();
     assert!(why.contains("codex"), "{why}");
@@ -2378,9 +2378,12 @@ fn base_ai_accounts_syncs_codex_without_an_unassigned_claude_login() {
             .any(|row| row.email.as_deref() == Some("code@example.test"))
     );
     assert!(!env.accounts_roster().unwrap().exists());
-    assert!(matches!(super::ai_accounts_probe(&env), Probe::Ok { .. }));
+    assert!(matches!(
+        super::ai_accounts_rows_probe(&env),
+        Probe::Ok { .. }
+    ));
     assert_eq!(
-        super::ai_accounts_observation(super::ai_accounts_probe(&env)).standing,
+        super::ai_accounts_observation(super::ai_accounts_rows_probe(&env)).standing,
         aterm_types::macos_setup::Standing::InPlace
     );
     assert_eq!(
@@ -2407,7 +2410,7 @@ fn base_ai_accounts_syncs_codex_without_an_unassigned_claude_login() {
     write_sheet(
         "email,computer,claude,Open AI\ncode@example.test,m183,0,1\nclaude@example.test,m183,1,0\n",
     );
-    let due = super::ai_accounts_observation(super::ai_accounts_probe(&env));
+    let due = super::ai_accounts_observation(super::ai_accounts_rows_probe(&env));
     assert_eq!(due.standing, aterm_types::macos_setup::Standing::Waiting);
     assert!(
         due.note
@@ -2431,7 +2434,10 @@ fn base_ai_accounts_syncs_codex_without_an_unassigned_claude_login() {
             .len(),
         1
     );
-    assert!(matches!(super::ai_accounts_probe(&env), Probe::Ok { .. }));
+    assert!(matches!(
+        super::ai_accounts_rows_probe(&env),
+        Probe::Ok { .. }
+    ));
 }
 
 /// `base.ai.accounts` names each other CLI's pool this machine keeps after Claude Code's
@@ -2518,7 +2524,7 @@ fn base_ai_accounts_names_each_kept_pool_after_claudes() {
         "{claude}"
     );
     assert_eq!(
-        format!("{:?}", super::ai_accounts_probe(&env)),
+        format!("{:?}", super::ai_accounts_rows_probe(&env)),
         format!(
             "{:?}",
             Probe::Ok {
@@ -2544,7 +2550,7 @@ fn base_ai_accounts_names_each_kept_pool_after_claudes() {
     };
     codex_fleet("m9");
     assert_eq!(
-        format!("{:?}", super::ai_accounts_probe(&env)),
+        format!("{:?}", super::ai_accounts_rows_probe(&env)),
         format!(
             "{:?}",
             Probe::Ok {
@@ -2555,7 +2561,7 @@ fn base_ai_accounts_names_each_kept_pool_after_claudes() {
     );
     codex_fleet("m16");
     assert_eq!(
-        format!("{:?}", super::ai_accounts_probe(&env)),
+        format!("{:?}", super::ai_accounts_rows_probe(&env)),
         format!(
             "{:?}",
             Probe::Change {
@@ -2573,7 +2579,7 @@ fn base_ai_accounts_names_each_kept_pool_after_claudes() {
         .unwrap();
     }
     assert_eq!(
-        format!("{:?}", super::ai_accounts_probe(&env)),
+        format!("{:?}", super::ai_accounts_rows_probe(&env)),
         format!(
             "{:?}",
             Probe::Ok {
@@ -2598,7 +2604,7 @@ fn base_ai_accounts_names_each_kept_pool_after_claudes() {
             };
             std::fs::write(&path, "{").unwrap();
             assert!(matches!(
-                super::ai_accounts_probe(&unknown),
+                super::ai_accounts_rows_probe(&unknown),
                 Probe::Unusable { .. }
             ));
             assert_eq!(std::fs::read(path).unwrap(), b"{");
@@ -2611,7 +2617,7 @@ fn base_ai_accounts_names_each_kept_pool_after_claudes() {
         Probe::NotApplicable { .. }
     ));
     assert_eq!(
-        format!("{:?}", super::ai_accounts_probe(&env)),
+        format!("{:?}", super::ai_accounts_rows_probe(&env)),
         format!(
             "{:?}",
             Probe::Ok {
@@ -2624,7 +2630,7 @@ fn base_ai_accounts_names_each_kept_pool_after_claudes() {
     // Claude Code's want of a source is no failure of it (a failed Codex sync is what it says).
     std::fs::remove_file(config.join("accounts-codex.toml")).unwrap();
     assert_eq!(
-        format!("{:?}", super::ai_accounts_probe(&env)),
+        format!("{:?}", super::ai_accounts_rows_probe(&env)),
         format!(
             "{:?}",
             Probe::Change {
@@ -2638,7 +2644,7 @@ fn base_ai_accounts_names_each_kept_pool_after_claudes() {
     // machine syncs (Kimi's, whose roster it keeps) are said on the row, as `aterm init` and
     // `aterm doctor` show it: the CLI and the rows, never the address. CONTROL: with no
     // conflicting rows nothing is said.
-    let before = format!("{:?}", super::ai_accounts_probe(&env));
+    let before = format!("{:?}", super::ai_accounts_rows_probe(&env));
     assert!(!before.contains("conflicting"), "{before}");
     let sheet = secrets.join("ai-accounts.csv");
     std::fs::write(
@@ -2649,7 +2655,7 @@ NEW@example.com,m22,global,
 ",
     )
     .unwrap();
-    let said = format!("{:?}", super::ai_accounts_probe(&env));
+    let said = format!("{:?}", super::ai_accounts_rows_probe(&env));
     assert!(
         said.contains("conflicting assignments (kimi rows 2, 3)")
             && !said.to_ascii_lowercase().contains("new@example.com"),
@@ -2664,7 +2670,7 @@ NEW@example.com,m22,global,
     )
     .unwrap();
     assert_eq!(
-        format!("{:?}", super::ai_accounts_probe(&env)),
+        format!("{:?}", super::ai_accounts_rows_probe(&env)),
         format!(
             "{:?}",
             Probe::NotApplicable {
@@ -2672,6 +2678,105 @@ NEW@example.com,m22,global,
             }
         )
     );
+}
+
+/// `base.ai.accounts` ends with the vault tokens' words, its standing kept: how many tokens are
+/// in each state that says something (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.10).
+/// CONTROL: a home with no vault configured says nothing of tokens, never counts that read as a
+/// vault holding none.
+#[test]
+fn base_ai_accounts_counts_the_token_states() {
+    use aterm_agent::harness::cli::Env;
+    use aterm_converge::Probe;
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("aterm-doctor-tokens-")
+        .tempdir()
+        .expect("a scratch directory");
+    let root = dir.path().canonicalize().unwrap();
+    let (home, config, state) = (root.join("home"), root.join("config"), root.join("state"));
+    for d in [&home, &config, &state] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    aterm_uds::atomic_file::write(
+        &config.join("aterm.toml"),
+        b"[fleet]\nmachine = \"m16\"\n",
+        0o600,
+    )
+    .unwrap();
+    let env = Env {
+        state,
+        aterm_state: None,
+        cwd: home.clone(),
+        home: Some(home.clone()),
+        claude_dir: Some(home.join(".claude")),
+        claude_config_unusable: None,
+        claude_profile: Some(home.join(".claude.json")),
+        claude_custom_oauth: false,
+        claude_session: None,
+        claude_pid: None,
+        codex_thread: None,
+        agy_conversation: None,
+        codex_home: None,
+        codex_login: None,
+        now: 1_792_660_000,
+        tz_s: 0,
+        sid: String::new(),
+        sock: None,
+        config: Some(config.join("aterm.toml")),
+        claude_tmp: None,
+        claude_running: None,
+    };
+    let rows = super::ai_accounts_rows_probe(&env);
+    assert_eq!(
+        super::ai_accounts_token_words(&env),
+        None,
+        "no vault is configured under the home"
+    );
+    let vault = aterm_secrets::client::Paths::for_home(&home);
+    std::fs::create_dir_all(&vault.dir).unwrap();
+    aterm_uds::atomic_file::write(
+        &vault.dir.join("source.toml"),
+        format!(
+            "path = \"{}\"\nname = \"scratch\"\n",
+            root.join("vault").display()
+        )
+        .as_bytes(),
+        0o600,
+    )
+    .unwrap();
+    let words = super::ai_accounts_token_words(&env).expect("a scratch vault is known");
+    assert!(words.starts_with("claude tokens: 0 active"), "{words}");
+    let row = super::ai_accounts_probe(&env);
+    assert_eq!(
+        std::mem::discriminant(&row),
+        std::mem::discriminant(&rows),
+        "the words keep the row's standing: {row:?}"
+    );
+    assert!(format!("{row:?}").contains(&words), "{row:?}");
+    // The fold appends to each standing's words and keeps the standing.
+    let words = Some("claude tokens: 1 active".to_owned());
+    for (probe, said) in [
+        (
+            Probe::Ok { now: "m16".into() },
+            "Ok { now: \"m16; claude tokens: 1 active\" }",
+        ),
+        (
+            Probe::NotApplicable { why: "none".into() },
+            "NotApplicable { why: \"none; claude tokens: 1 active\" }",
+        ),
+        (
+            Probe::Change {
+                from: "a".into(),
+                to: "b".into(),
+            },
+            "Change { from: \"a\", to: \"b; claude tokens: 1 active\" }",
+        ),
+    ] {
+        assert_eq!(
+            format!("{:?}", super::with_token_words(probe, words.clone())),
+            said
+        );
+    }
 }
 
 /// A `fleet-accounts.toml` beside the roster that is a symlink to a regular file counts as

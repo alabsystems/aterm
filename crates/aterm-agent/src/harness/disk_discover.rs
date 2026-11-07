@@ -122,7 +122,8 @@ pub struct RunningClaude {
     pub started: Option<String>,
     pub cwd: Option<PathBuf>,
     pub profile: Option<PathBuf>,
-    pub stored_login: bool,
+    /// How it authenticates, by its own exec environment (an unread one is outside).
+    pub route: super::super::accounts::AuthRoute,
 }
 
 const PROJECT_NAME_CAP: usize = 200;
@@ -241,7 +242,8 @@ pub struct Exec {
     pub argv: Vec<String>,
     pub config: Option<String>,
     pub home: Option<String>,
-    pub stored_login: bool,
+    /// How it authenticates, by its exec environment (an unread one is outside).
+    pub route: super::super::accounts::AuthRoute,
 }
 
 impl Exec {
@@ -253,8 +255,10 @@ impl Exec {
         Some(Self {
             config: args.env_var(HOME_ENV).map(str::to_owned),
             home: args.env_var(HOMEDIR_ENV).map(str::to_owned),
-            stored_login: super::super::accounts::ProcessLogin::of_exec_env(&args.env)
-                .is_some_and(|login| login.stored_login),
+            route: super::super::accounts::ProcessLogin::of_exec_env(&args.env)
+                .map_or(super::super::accounts::AuthRoute::Outside, |login| {
+                    login.route
+                }),
             path: args.exec_path,
             argv: args.argv.into_iter().take(2).collect(),
         })
@@ -451,7 +455,7 @@ fn census_of(
                 started,
                 cwd,
                 profile,
-                stored_login: exec.stored_login,
+                route: exec.route,
             });
         }
         if let OwnDir::Read(dir) = dir

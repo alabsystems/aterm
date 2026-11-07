@@ -494,21 +494,27 @@ WHERE THE FIGURES COME FROM
               by its conclusion (finished ok, failed fail), stop by its why= (exit and
               exit-status exit, a stall stalled, any other word unknown), code= its exit=;
               a close writes one only where the board holds a conclusion its Mac
-              reported: the close's record's (a Mac's own failed for a tab closed while
-              its task was working is none), or one heard while the row was open, then
-              its end whatever the close says; a row reopened and closed again writes
-              another only where its end changed; CPU, memory, wait and cache na
-  admission   wall_ms and wait_ms are both the admission's wait: an admitted claim's own
-              clock (meter=exact), a refused or ended one's stopwatch (stamped); CPU and
-              peak memory are na (they are the work's, which its build or test row and
-              its command row carry)
+              reported: the close's record's, which is its end (a Mac's own failed for a
+              tab closed while its task was working is none), or else the last one heard
+              while the row was open, past a live row of a turn typed after it, which is
+              its end whatever words the close merged (a stall's failed only while the
+              stall stood as far as the board read: one it read moving on is none); a
+              row reopened and closed again writes another only where its end changed;
+              CPU, memory, wait and cache na
+  admission   wall_ms and wait_ms are both the admission's wait, by the wall clock,
+              the one its build or test row says: an admitted claim's from its ask to its
+              grant (meter=exact), a refused or ended one's from its ask to its decision
+              (stamped), ?clock where the clock was set back between them; one row an
+              admission, however many looks it took; CPU and peak memory are na (they
+              are the work's, which its build or test row and its command row carry)
   build/test  wall from its admission to its end; wait_ms its admission wait (when it
               was admitted less when it asked); either ?clock where the wall clock was set
               back between its stamps; peak memory its build tree's meter's peak
-              (meter=sampled, a lower bound); outcome and stop as the process that saw it
-              end knows them: its root's exit code or signal, or ok or fail alone (an
-              epoch's roots); a run that was cancelled or left work running and exited 0
-              is unknown; cpu_ms=na, cache=?targo (Targo names no cache tier yet)
+              (meter=sampled, a lower bound), never below its root's own peak where
+              the process that saw it end reaped it; outcome and stop as the process that
+              saw it end knows them: its root's exit code or signal, or ok or fail alone
+              (an epoch's roots); a run that was cancelled or left work running and
+              exited 0 is unknown; cpu_ms=na, cache=?targo (Targo names no cache tier yet)
   A command's CPU is unknown, not charged, when a job of the shell's that ran beside it
   (`make &` from before) was reaped while it ran; a job a command leaves running spends
   its CPU after the command, which its row does not hold.
@@ -1118,9 +1124,19 @@ HOW IT WORKS
   the envelope with the vault's Ed25519 key, and publishes it to a server URL (default
   `http://alab-secrets.local:7484/v1/alab` over mDNS) or a file path. Subscribed
   machines check the pinned signer and a rising version, decrypt their lockers, and
-  write `~/.secrets/<name>` (mode 0600). Claude Code, Codex, Grok Build, Kimi Code and
+  write `~/.secrets/<name>` (mode 0600). Where the vault holds a membership log, as
+  ALab's does, any member seated there writes a shared name with no admin key:
+  `pbpaste | aterm secrets set <name>` signs it into the log for every member (release
+  material, fleet configuration, git's config and control records stay an admin's).
+  With no server answering it is signed here, and while a removal's new key is due it
+  waits; either way it is not yet in vault until this Mac's vault pass posts or signs
+  it. `aterm secrets status` says who writes (`vault writes:`) and what still needs
+  the admin key here (`admin key:`). Claude Code, Codex, Grok Build, Kimi Code and
   Muse Code login files are refused as entries and never written (their refresh tokens
-  are single-use; use `aterm ai login`).
+  are single-use; use `aterm ai login`). Of home paths a Mac writes only gh's hosts.yml,
+  git's config and credentials and the release material aterm names; any other `~/`
+  path, and another spelling of a name aterm holds (`GH_ACCESS_TOKEN_ALABSYSTEMS`), is
+  never written, and two names that differ only in case write neither.
 
 VAULT FORMAT (`aterm secrets edit`)
   [machines]          `<host> = age1…` (delete to revoke)
@@ -1129,7 +1145,8 @@ VAULT FORMAT (`aterm secrets edit`)
   [m3 m22]            entries only those hosts get, overriding `[everyone]`
   [join]              `password = …`, or `open = yes` (aterm writes it as a note
                       older aterms read past), plus `code-only = age1…`
-  name=value          single-line secret (`name` -> `~/.secrets/<name>`, or `~/<path>`)
+  name=value          single-line secret (`name` -> `~/.secrets/<name>`, or a `~/<path>`
+                      aterm names)
   name<<END [base64] [if-absent[=<other>]]
                       multi-line or base64 entry; `if-absent` writes only when absent
                       or still holding what the vault wrote; `if-absent=<other>`
@@ -1137,8 +1154,13 @@ VAULT FORMAT (`aterm secrets edit`)
 
 VERBS
   every machine   status (the default), join, sync, watch, ls, get <name>, agent
-  an admin        create, edit, set, unset, password, requests, approve, revoke,
-                  admins, rotate-key
+  a member        set and unset (seated in the vault's membership log; a shared
+                  name: an unset seals what stays under a new vault key, so no Mac
+                  let in later reads the removed value), and revoke there, as
+                  `aterm members remove`
+  an admin        create, edit, set --for, unset --for, password, requests,
+                  approve, revoke, admins, rotate-key; a set or unset on a vault
+                  with no log
   a server        serve, server on|off|status (`server on` returns once it answers)
   `watch` is the subscriber `agent on` installs; on an admin it also lets in machines
   a member allowed or that type the join password. `agent off` records that
@@ -1639,6 +1661,41 @@ THE VERBS (`aterm harness --help`; `aterm harness <verb> --help` for one)
              and `projection` beside each figure)
   upgrade    move live sessions onto a newer build or model, at an idle point
   tap        the status-line usage tap aterm adds to Claude Code relaunches
+
+VAULT TOKENS (Claude Code's pool, macOS)
+  The token route: a Claude Code account can keep a year-long token (`claude setup-token`) in
+  the vault, and a session on that account starts on it instead of its stored login, which
+  then needs no renewal. `aterm harness accounts token <label|email>` makes one: a person at
+  this Mac's terminal signs in as the account, and aterm stores the token in the vault and
+  records it, value-free, in the accounts store's `tokens.json`; `--replace` makes a new one
+  while the old is still in use, `--remove` deletes it. A busy vault never loses it: it waits
+  in this Mac's vault writes ("not yet in vault") for the next vault pass.
+  The wrapper (`accounts token-run`) hands the token to a session-starting launch of a store
+  Claude Code build over an inherited descriptor, only where today's judgment puts the launch
+  on the row's stored login, and otherwise runs the program exactly as typed, journaling its
+  reason word where the account has a token: `platform`, `no-harness`, `shape` (a
+  subcommand, a one-word prompt, or a line's own `--settings` or `--bare`), `program` (not a
+  store build), `outside` (a route, credential or settings `env` of the person's or a
+  repository's own, named, never its value), `claimed` or `held` (`--auto`: another Mac's
+  claim), and the token's own: `absent`, `busy`, `unverified`, `ended`, `rejected`,
+  `mismatched`, `unreadable`.
+  Verification: a new token serves only the Mac that made it until the first session on it
+  there reads the same 7-day (and 5-hour) windows as the account's stored login, and no other
+  account here shares them; it is then marked verified in the vault and every Mac serves it
+  (else `unverified (windows differ | windows shared | no reading yet | no roster row)`). A
+  sign-in wall on a token session is a rejection: the session moves back to its stored login
+  and the token reads `rejected`.
+  Off for token rows: renewal (`accounts renew <label>` says the row runs on its vault token
+  and that renewal is off for it), `signin.lock`, and typing `/login` into a token session.
+  Where to see it: `aterm harness accounts` (and `--json` under `tokens`), `ctl @self status`
+  (`auth=`, `token=`), `ctl survey` (`auth=`, `token=` on session rows; `token=` on account
+  lines), `aterm doctor`'s accounts row, `aterm secrets ls --describe`, the Accounts card, the
+  Lab page and Settings ▸ Harness's state line. Where an account a session here is on has no
+  token in use, or one ending within 30 days or handed to a removed Mac, each says one quiet
+  offer once per change of the token's and the login's state, never as a dialog, a banner or a
+  notification; its one step opens a tab beside yours that runs the verb (with `--replace` for
+  one still in use). Off macOS the surfaces say a token's state and offer nothing, since the
+  verb makes a token only on macOS. No surface shows a token's value.
 
 THE FOOTER
   A supervised tab's footer bar carries an Autopilot chip (`∞` cruise, `⤓` land,

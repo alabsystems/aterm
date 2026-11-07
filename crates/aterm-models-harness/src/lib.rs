@@ -22,6 +22,8 @@ pub use models_account_continuation::account_continuation_model;
 mod models_account_claim_publication;
 mod models_account_claim_readiness;
 pub use models_account_claim_readiness::account_claim_readiness_model;
+mod models_account_fence;
+pub use models_account_fence::account_fence_model;
 mod models_account_host_observation;
 pub use models_account_claim_publication::{
     account_claim_publication_model, account_noeffect_closure_model,

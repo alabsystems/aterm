@@ -1318,7 +1318,7 @@ fn me(label: &str) -> Me<'_> {
         account: Some(label),
         left: None,
         default_home: true,
-        stored_login: true,
+        route: crate::harness::accounts::AuthRoute::Stored,
     }
 }
 

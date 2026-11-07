@@ -17,7 +17,7 @@ fn fixture() -> (World, accounts::ProcessLogin) {
     let who = accounts::ProcessLogin {
         login: Some(work.display().to_string()),
         default_home: true,
-        stored_login: true,
+        route: crate::harness::accounts::AuthRoute::Stored,
     };
     (world, who)
 }
@@ -239,7 +239,7 @@ fn unowned_login_intents_are_fenced_by_store_generation() {
     let who = accounts::ProcessLogin {
         login: Some(world.root.join("unowned").display().to_string()),
         default_home: true,
-        stored_login: true,
+        route: crate::harness::accounts::AuthRoute::Stored,
     };
     let intent = capture_execution(&world.seat(), Cli::Claude, &who).unwrap();
     world
@@ -338,7 +338,7 @@ fn aliases_keep_namespace_identity_but_cannot_make_managed_credentials_external(
         capture_execution(&seat, Cli::Claude, &alternate).unwrap(),
         intent
     );
-    assert!(intent.matches_process(&alternate, true));
+    assert!(intent.matches_process(&alternate, true, None));
     for path in [
         home.join(".claude"),
         PathBuf::from(alternate.login.unwrap()),
@@ -389,19 +389,19 @@ fn a_writable_policy_cannot_authorize_a_retained_execution() {
 fn execution_environment_must_keep_the_captured_route_and_login() {
     let (world, who) = fixture();
     let intent = capture_execution(&world.seat(), Cli::Claude, &who).unwrap();
-    assert!(intent.matches_process(&who, true));
-    assert!(!intent.matches_process(&who, false));
+    assert!(intent.matches_process(&who, true, None));
+    assert!(!intent.matches_process(&who, false, None));
     let mut different = who.clone();
     different.login = None;
-    assert!(!intent.matches_process(&different, true));
-    different.stored_login = false;
-    assert!(!intent.matches_process(&different, true));
-    assert!(ExecutionIntent::external().matches_process(&different, true));
+    assert!(!intent.matches_process(&different, true, None));
+    different.route = crate::harness::accounts::AuthRoute::Outside;
+    assert!(!intent.matches_process(&different, true, None));
+    assert!(ExecutionIntent::external().matches_process(&different, true, None));
     assert!(
-        !ExecutionIntent::external().matches_process(&who, true),
+        !ExecutionIntent::external().matches_process(&who, true, None),
         "a vanished external override cannot fall back onto the pool"
     );
-    assert!(ExecutionIntent::external().matches_process(&who, false));
+    assert!(ExecutionIntent::external().matches_process(&who, false, None));
 }
 
 #[test]
@@ -504,4 +504,148 @@ fn intent_storage_is_bounded_canonical_and_unknown_fields_cannot_grant_authority
         ExecutionIntent::from_value(&aterm_json::json!({"v": 1, "route": "unattributed"})),
         None
     );
+}
+
+/// The lab key of each login email [`token_fixture`]'s roster names.
+fn token_keyer(_realm: &str, email: &str) -> Option<String> {
+    match email {
+        "main@example.com" => Some("ac-00000000000000a1".to_owned()),
+        "work@example.com" => Some("ac-00000000000000b2".to_owned()),
+        _ => None,
+    }
+}
+
+/// [`fixture`], its rows naming their login emails, and `work`'s login on its own vault token.
+/// Run under [`token_keyer`].
+fn token_fixture() -> (World, accounts::ProcessLogin, accounts::TokenEntry) {
+    let (world, stored) = fixture();
+    let mut roster = world.seat().roster(Cli::Claude).unwrap();
+    for row in &mut roster.rows {
+        row.email = Some(format!("{}@example.com", row.label));
+    }
+    std::fs::write(
+        world.cfg.join(Cli::Claude.accounts().roster_file),
+        accounts::append_rows_for(Cli::Claude, "", &roster.rows).unwrap(),
+    )
+    .unwrap();
+    let entry = accounts::TokenEntry::of_row(roster.row("work").unwrap()).unwrap();
+    let who = accounts::ProcessLogin {
+        route: accounts::AuthRoute::VaultToken { entry },
+        ..stored
+    };
+    (world, who, entry)
+}
+
+#[test]
+fn a_token_route_captures_a_token_intent_for_the_account_its_marker_names() {
+    crate::harness::journal::with_keyer(token_keyer, || {
+        let (world, who, entry) = token_fixture();
+        let seat = world.seat();
+        let intent = capture_execution(&seat, Cli::Claude, &who).unwrap();
+        let ExecutionIntent::Token {
+            owner, entry: got, ..
+        } = &intent
+        else {
+            panic!("a token intent: {intent:?}");
+        };
+        assert_eq!((owner.as_deref(), *got), (Some("work"), entry));
+        let value = intent.to_value();
+        assert_eq!(value["route"].as_str(), Some("token"));
+        assert_eq!(value["entry"].as_str(), Some(entry.name().as_str()));
+        assert_eq!(ExecutionIntent::from_value(&value), Some(intent.clone()));
+        let mut meta = value.clone();
+        meta.as_object_mut().unwrap().insert(
+            "entry".into(),
+            aterm_json::json!(format!("{}-meta", entry.name())),
+        );
+        assert_eq!(ExecutionIntent::from_value(&meta), None, "a record's name");
+        // The process matches on either of the row's routes, never another account's token.
+        let roster = seat.roster(Cli::Claude).unwrap();
+        let main = accounts::TokenEntry::of_row(roster.row("main").unwrap()).unwrap();
+        let stored = accounts::ProcessLogin {
+            route: accounts::AuthRoute::Stored,
+            ..who.clone()
+        };
+        let elsewhere = accounts::ProcessLogin {
+            route: accounts::AuthRoute::VaultToken { entry: main },
+            ..who.clone()
+        };
+        let outside = accounts::ProcessLogin {
+            route: accounts::AuthRoute::Outside,
+            ..who.clone()
+        };
+        assert_eq!(intent.owner_entry(&roster), Some(entry));
+        assert!(intent.matches_process(&who, true, None));
+        assert!(intent.matches_process(&stored, true, None));
+        assert!(!intent.matches_process(&elsewhere, true, None));
+        assert!(!intent.matches_process(&outside, true, None));
+        assert!(!intent.matches_process(&who, false, None));
+        // A stored intent admits the row's token only where the owner's entry is given.
+        let retained = capture_execution(&seat, Cli::Claude, &stored).unwrap();
+        assert!(matches!(retained, ExecutionIntent::Stored { .. }));
+        let owner = retained.owner_entry(&roster);
+        assert_eq!(owner, Some(entry));
+        assert!(retained.matches_process(&who, true, owner));
+        assert!(!retained.matches_process(&who, true, None));
+        assert!(!retained.matches_process(&elsewhere, true, owner));
+        // A marker naming another account's entry is no launch on this one.
+        assert!(capture_execution(&seat, Cli::Claude, &elsewhere).is_err());
+    });
+}
+
+#[test]
+fn a_token_intent_is_refused_on_a_held_row_a_lease_elsewhere_and_an_off_clock() {
+    crate::harness::journal::with_keyer(token_keyer, || {
+        let refusal = |world: &World, intent: &ExecutionIntent| match admit_execution(
+            &world.seat(),
+            Cli::Claude,
+            intent,
+        ) {
+            Ok(_) => panic!("admitted: {intent:?}"),
+            Err(why) => why,
+        };
+        let (world, who, _) = token_fixture();
+        let intent = capture_execution(&world.seat(), Cli::Claude, &who).unwrap();
+        // This scratch Mac's vault holds no token: the standing refuses it last of all.
+        assert!(refusal(&world, &intent).contains("execution token"));
+        held(&world, true);
+        assert!(refusal(&world, &intent).contains("held by another machine"));
+
+        let (world, who, _) = token_fixture();
+        let intent = capture_execution(&world.seat(), Cli::Claude, &who).unwrap();
+        world
+            .seat()
+            .store(Cli::Claude)
+            .transact(NOW, &mut None, |state| {
+                state.note_lease("work", "m7", NOW + 3600, NOW);
+                Ok(Vec::new())
+            })
+            .unwrap();
+        let why = refusal(&world, &intent);
+        assert!(
+            why.contains(accounts::WhyNot::LeasedElsewhere { until: NOW + 3600 }.as_str()),
+            "{why}"
+        );
+
+        let (world, who, _) = token_fixture();
+        let intent = capture_execution(&world.seat(), Cli::Claude, &who).unwrap();
+        world
+            .seat()
+            .store(Cli::Claude)
+            .transact(NOW, &mut None, |state| {
+                state.home_accounts.remove("work");
+                state.clock = Some(accounts::Clock {
+                    standing: accounts::ClockStanding::Off { ahead: true },
+                    by_s: 600,
+                    against: 2,
+                    of: 3,
+                    peers: Vec::new(),
+                    until: NOW + 3600,
+                });
+                Ok(Vec::new())
+            })
+            .unwrap();
+        let why = refusal(&world, &intent);
+        assert!(why.contains(accounts::WhyNot::ClockOff.as_str()), "{why}");
+    });
 }

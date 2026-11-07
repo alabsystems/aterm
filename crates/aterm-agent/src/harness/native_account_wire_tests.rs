@@ -52,6 +52,7 @@ fn fixture() -> Predecessor {
         cwd: None,
         heal: None,
         dialect: Dialect::Zsh,
+        settles: None,
     };
     let prepare = Prepare {
         id: "ab".repeat(16),
@@ -459,7 +460,7 @@ fn predecessor_excludes_cold_observed_and_non_account_restarts() {
                     login: None,
                     home: None,
                     auth_observed: false,
-                    stored_login: false,
+                    route: crate::harness::accounts::AuthRoute::Outside,
                     conversation: None,
                     profile: None,
                     mode: crate::harness::accounts::Mode::Early,

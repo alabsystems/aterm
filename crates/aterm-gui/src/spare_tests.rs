@@ -2929,10 +2929,10 @@ impl Drop for OwnedEscapeFixture {
     }
 }
 
-/// Applying an update retires the spare, and spare lifecycle events do not count as user activity.
+/// Spare lifecycle and retirement events do not count as user activity.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
-fn an_update_retires_the_spare_and_a_spare_is_never_activity() {
+fn a_spares_lifecycle_and_retirement_are_never_user_activity() {
     let mut app = App::headless_for_test();
     let id = 50;
     let mut slot = parked_slot(&app, id, None);
@@ -2957,14 +2957,10 @@ fn an_update_retires_the_spare_and_a_spare_is_never_activity() {
         app.update_handoff_activity_epoch, epoch,
         "a spare's life is not the person's activity"
     );
-    let _ = app.apply_staged_update_now(
-        crate::app_native::NativeUpdateSafetyToken::carrying_for_test(0, 0, 0),
-        crate::native_updater_service::ApplyMode::Immediate,
-        None,
-        None,
-    );
-    assert!(app.spares.slot.is_none(), "retired before the update");
+    app.retire_spare("update", None);
+    assert!(app.spares.slot.is_none());
     assert!(app.spares.swallows(id), "and its late wakes swallowed");
+    assert_eq!(app.update_handoff_activity_epoch, epoch);
 }
 
 /// A spare held by the warm budget or an update handoff has a time to look again, the budget's

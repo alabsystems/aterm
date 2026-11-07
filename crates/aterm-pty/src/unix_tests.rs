@@ -4051,3 +4051,65 @@ fn a_child_forked_while_the_watchdog_is_held_grants_without_it() {
     );
     assert_eq!(said[0], 1, "with the stand-in's success");
 }
+
+/// What `stty size` reads as its terminal's window on a session-leader pty `spawn` made, the
+/// session ended once it said it.
+fn stty_size_on(
+    spawn: impl FnOnce(
+        &mut dyn FnMut(&std::os::fd::OwnedFd) -> io::Result<aterm_uds::spawnfd::StdCommand>,
+    ) -> io::Result<(
+        std::os::fd::OwnedFd,
+        std::os::fd::OwnedFd,
+        std::process::Child,
+    )>,
+) -> String {
+    use std::os::fd::AsRawFd as _;
+    let (master, slave, mut child) = spawn(&mut |slave| {
+        let tty = || slave.try_clone().map(std::process::Stdio::from);
+        let mut cmd = std::process::Command::new("/bin/stty");
+        cmd.arg("size").stdout(tty()?).stderr(tty()?);
+        Ok(cmd)
+    })
+    .expect("stty spawns onto a live pty");
+    set_nonblocking(master.as_raw_fd(), true).expect("nonblocking master");
+    let deadline = std::time::Instant::now() + HANG_DETECTOR;
+    let mut seen = Vec::new();
+    while !seen.contains(&b'\n') {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "stty never said its size: {:?}",
+            String::from_utf8_lossy(&seen)
+        );
+        let mut buf = [0u8; 64];
+        let n = read(master.as_raw_fd(), &mut buf);
+        if n > 0 {
+            seen.extend_from_slice(&buf[..n.unsigned_abs()]);
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    end_session_on_pty(
+        master,
+        Some(slave),
+        &mut child,
+        aterm_spec::wait::MUST_HAPPEN,
+        &mut |_| {},
+    )
+    .expect("the session ends");
+    String::from_utf8_lossy(&seen).trim().to_owned()
+}
+
+/// A SIZED SESSION-LEADER PTY IS THAT SIZE BEFORE ITS CHILD RUNS: `stty size` on one made 25 by
+/// 512 (the setup-token capture's) reads `25 512`. CONTROL: the unsized spawn's pty reads its
+/// 24 by 80, so the read tells the two apart.
+#[test]
+fn a_sized_session_leader_pty_has_its_window_from_the_start() {
+    assert_eq!(
+        stty_size_on(|build| spawn_session_leader_on_pty_sized(25, 512, build)),
+        "25 512"
+    );
+    assert_eq!(
+        stty_size_on(|build| spawn_session_leader_on_pty(build)),
+        "24 80"
+    );
+}

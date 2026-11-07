@@ -9,8 +9,26 @@ use super::*;
 #[derive(Debug, Default)]
 struct Succession {
     retired: bool,
-    pending_account: Option<Prepare>,
+    pending_account: Option<PendingAccount>,
     successor: Option<Prepare>,
+}
+
+#[derive(Debug)]
+enum PendingAccount {
+    Reserved(Prepare),
+    Fenced(Prepare),
+}
+
+impl PendingAccount {
+    fn request(&self) -> &Prepare {
+        match self {
+            Self::Reserved(request) | Self::Fenced(request) => request,
+        }
+    }
+
+    fn reserved_for(&self, request: &Prepare) -> bool {
+        matches!(self, Self::Reserved(pending) if pending == request)
+    }
 }
 
 #[derive(Debug)]
@@ -29,7 +47,10 @@ impl ClosedRestart {
     pub(super) fn account_state(&self) -> (Option<Prepare>, Option<Prepare>, bool) {
         let state = self.succession.lock().unwrap_or_else(|p| p.into_inner());
         (
-            state.pending_account.clone(),
+            state
+                .pending_account
+                .as_ref()
+                .map(|pending| pending.request().clone()),
             state.successor.clone(),
             state.retired,
         )
@@ -253,7 +274,37 @@ impl ClosedRestart {
 
     pub(super) fn pending_account_by(&self, request: &Prepare) -> bool {
         let succession = self.succession.lock().unwrap_or_else(|p| p.into_inner());
-        !succession.retired && succession.pending_account.as_ref() == Some(request)
+        !succession.retired
+            && succession
+                .pending_account
+                .as_ref()
+                .is_some_and(|pending| pending.reserved_for(request))
+    }
+
+    /// Historical recovery survives retirement, unlike admission. A fenced or
+    /// released reservation cannot start another writer through a stale Arc.
+    pub(super) fn recoverable_account(&self, request: &Prepare) -> bool {
+        let succession = self.succession.lock().unwrap_or_else(|p| p.into_inner());
+        succession.successor.as_ref() == Some(request)
+            || succession
+                .pending_account
+                .as_ref()
+                .is_some_and(|pending| pending.reserved_for(request))
+    }
+
+    pub(super) fn pending_account_conflicts(&self, request: &Prepare) -> bool {
+        let succession = self.succession.lock().unwrap_or_else(|p| p.into_inner());
+        succession.pending_account.as_ref().is_some_and(|pending| {
+            pending.request().id == request.id && pending.request() != request
+        })
+    }
+
+    /// An unresolved candidate owns the frontier even after its preparation
+    /// slot unwinds or live authority retires. Only exact settlement releases it.
+    pub(super) fn keeps_account_frontier(&self) -> bool {
+        let succession = self.succession.lock().unwrap_or_else(|p| p.into_inner());
+        succession.pending_account.is_some()
+            || (!succession.retired && succession.successor.is_none())
     }
 
     /// Called only at the matched terminal operation's admission boundary.
@@ -313,9 +364,9 @@ impl ClosedRestart {
             return false;
         }
         match &succession.pending_account {
-            Some(pending) => pending == request,
+            Some(pending) => pending.reserved_for(request),
             None => {
-                succession.pending_account = Some(request.clone());
+                succession.pending_account = Some(PendingAccount::Reserved(request.clone()));
                 true
             }
         }
@@ -328,11 +379,63 @@ impl ClosedRestart {
         if succession.successor.as_ref() == Some(request) {
             return true;
         }
-        if succession.successor.is_some() || succession.pending_account.as_ref() != Some(request) {
+        if succession.successor.is_some()
+            || !succession
+                .pending_account
+                .as_ref()
+                .is_some_and(|pending| pending.reserved_for(request))
+        {
             return false;
         }
-        succession.successor = succession.pending_account.take();
+        succession.successor = succession
+            .pending_account
+            .take()
+            .map(|pending| pending.request().clone());
         true
+    }
+
+    /// A durable journal fence stops the exact pending candidate while its
+    /// original worker and custody drain. The table lock brackets this latch
+    /// with both reservation lookup and insertion-time predecessor validation.
+    pub(super) fn fence_account_successor(
+        &self,
+        fence: &account_fence::DurableFence<'_>,
+        busy: bool,
+    ) -> bool {
+        let relation = fence.relation();
+        if self.predecessor != *relation.predecessor().prepare()
+            || self.closed_phase() != relation.phase()
+            || !self.noexec()
+        {
+            return false;
+        }
+        let request = relation.candidate();
+        let mut succession = self.succession.lock().unwrap_or_else(|p| p.into_inner());
+        if succession.successor.as_ref() == Some(request) {
+            return false;
+        }
+        match &succession.pending_account {
+            Some(pending) if pending.request() == request => {
+                succession.pending_account = Some(PendingAccount::Fenced(request.clone()));
+            }
+            None if busy && succession.successor.is_none() => {
+                succession.pending_account = Some(PendingAccount::Fenced(request.clone()));
+            }
+            Some(_) if busy => return false,
+            _ => {}
+        }
+        true
+    }
+
+    /// Called only after the exact candidate has no reservation, writer or
+    /// undrained custody. A retry for C1 cannot release a pending C2.
+    pub(super) fn release_fenced_account(&self, fence: &account_fence::DurableFence<'_>) {
+        let mut succession = self.succession.lock().unwrap_or_else(|p| p.into_inner());
+        if matches!(&succession.pending_account,
+            Some(PendingAccount::Fenced(request)) if request == fence.relation().candidate())
+        {
+            succession.pending_account = None;
+        }
     }
 
     #[cfg_attr(

@@ -31,14 +31,14 @@ pub use credentials::{sync_vault_git_credentials, vault_git_credentials};
 pub use native::InitialRepositoryInputs;
 pub(crate) use native::{automatic_inventory_counts, automatic_inventory_counts_captured};
 pub use source::{
-    RepositoryControlPaths, RepositoryInputMark, RepositoryInputPathCache,
+    RepositoryControlPaths, RepositoryInputMark, RepositoryInputPathCache, RepositoryRefreshCursor,
     repository_checkout_watch_paths, repository_input_control_watch_paths, repository_input_mark,
     repository_input_watch_paths,
 };
 
 /// The private vault entries that determine default repository acquisition. Other vault
 /// entries must not invalidate a clone whose source and credential remain unchanged.
-pub const VAULT_INPUT_ENTRIES: [&str; 2] = ["gh_access_token", "github-repositories.json"];
+pub const VAULT_INPUT_ENTRIES: [&str; 2] = ["gh_access_token", inventory::ENTRY];
 
 /// Whether a Git executable is installed ([`crate::items::github::installed_git`]): managed
 /// Git is preferred, with developer-tools or system Git as fallbacks. This reads metadata
@@ -127,7 +127,7 @@ pub(crate) fn vault_clones(sys: &dyn System, ctx: &Ctx) -> Result<VaultClones, S
         Asked::Scoped(_) | Asked::Profile(_) => return Ok(VaultClones::Profile),
         Asked::Default => {}
     }
-    match sys.stat(&Path::new(&user.home).join(inventory::FILE)) {
+    match sys.stat(&inventory::file(&user.home)) {
         Err(why) if why.kind() == std::io::ErrorKind::NotFound => {
             return Ok(VaultClones::NoInventory);
         }
@@ -320,6 +320,16 @@ pub(crate) fn items_for_work(
     secrets: Option<&str>,
     work: aterm_secrets::converge::RepositoryWork,
 ) -> Result<Vec<Box<dyn Item>>, String> {
+    items_for_execution(sys, ctx, secrets, work, None)
+}
+
+pub(crate) fn items_for_execution(
+    sys: &dyn System,
+    ctx: &Ctx,
+    secrets: Option<&str>,
+    work: aterm_secrets::converge::RepositoryWork,
+    execution: Option<crate::sync::repository_refresh::Execution>,
+) -> Result<Vec<Box<dyn Item>>, String> {
     let [user] = ctx.users.as_slice() else {
         return Err("aterm init GitHub requires exactly one local user".into());
     };
@@ -329,13 +339,13 @@ pub(crate) fn items_for_work(
         Asked::Default => {
             return Ok(vec![
                 keychain::item(user),
-                native::item(user, secrets.map(str::to_owned), true, work),
+                native::item(user, secrets.map(str::to_owned), true, work, execution),
             ]);
         }
         Asked::Scoped(_) => {
             return Ok(vec![
                 keychain::item(user),
-                native::item(user, secrets.map(str::to_owned), false, work),
+                native::item(user, secrets.map(str::to_owned), false, work, execution),
             ]);
         }
         Asked::Profile(config) => config,
@@ -398,7 +408,7 @@ pub(crate) fn token_read(sys: &dyn System, ctx: &Ctx) -> Result<Option<TokenRead
     let token = read.ok().map(zeroize::Zeroizing::new);
     let inventory = sys
         .read_owned_file(
-            &Path::new(&user.home).join(inventory::FILE),
+            &inventory::file(&user.home),
             user.uid,
             inventory::MAX_BYTES,
             true,

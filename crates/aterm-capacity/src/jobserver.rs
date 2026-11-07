@@ -14,14 +14,20 @@
 //! through [`Jobserver::acquire_many`] (its whole charge). So the jobs running across every branch
 //! never hold more than `S` tokens, and only the pool's creator removes the FIFO.
 
+#[cfg(unix)]
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 #[cfg(unix)]
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::sync::Condvar;
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 /// The variable a release hands its branch children its pool in: `<slots>:<absolute FIFO path>`,
 /// the slots a decimal count in `1..=4096` and the path free of whitespace, as
@@ -31,21 +37,85 @@ pub const POOL_ENV: &str = "ATERM_RELEASE_POOL";
 /// The most tokens a pool holds.
 const MAX_SLOTS: u32 = 4096;
 
-/// How long a wait for a token sleeps in `poll(2)` before it asks its stop predicate again
-/// ([`Jobserver::acquire`]). It never delays a token: a write into the FIFO wakes the wait.
+/// How long a wait for a token goes before it asks its stop predicate again
+/// ([`Jobserver::acquire`]). It never delays a token: the write that brings one ends the wait's
+/// read, and a token this handle returns is handed to the wait at once.
 const WAKE_EVERY: Duration = Duration::from_millis(100);
+
+/// How soon a wait whose read must end (its caller stopped, or a token was handed to it) sends
+/// its reader [`INTERRUPT`] again while the read has not ended: a signal that lands before the
+/// reader is in `read(2)` ends nothing.
+#[cfg(unix)]
+const NUDGE_EVERY: Duration = Duration::from_millis(1);
+
+/// The signal a wait ends its reader's `read(2)` with ([`Jobserver::acquire`]): `SIGURG`, whose
+/// default action discards it and which nothing else in these processes sends or catches, routed
+/// once per process to a handler that does nothing, without `SA_RESTART`, so the read returns
+/// `EINTR` ([`interruptible`]).
+#[cfg(unix)]
+const INTERRUPT: libc::c_int = libc::SIGURG;
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn pthread_self() -> libc::pthread_t;
+}
 
 /// A release-local pool, kept alive until all branch guards have been returned.
 #[derive(Debug)]
 pub struct Jobserver {
     path: PathBuf,
+    /// The FIFO, nonblocking: [`Self::try_acquire`]'s reads and every token's return.
     file: File,
+    /// The FIFO again, by its own open file description, blocking: the descriptor a wait's
+    /// reader blocks in `read(2)` on ([`Self::acquire`]).
+    #[cfg(unix)]
+    wait: File,
     slots: u32,
     /// Whether this handle made the FIFO ([`Self::new`]), and so removes it when dropped; a
     /// handle adopted from [`POOL_ENV`] leaves it to its creator.
     created: bool,
     /// Held across [`Self::acquire_many`]: this handle's one partial holder.
     partial: Mutex<()>,
+    /// This handle's waits for a token now ([`Self::acquire`]).
+    #[cfg(unix)]
+    waiters: Mutex<Waiters>,
+    /// Told when a wait's read ends or a token is handed to a wait.
+    #[cfg(unix)]
+    turn: Condvar,
+}
+
+/// The waits for a token on one handle, oldest first.
+#[cfg(unix)]
+#[derive(Debug, Default)]
+struct Waiters {
+    /// The id the next wait takes; ids rise, so the map's order is the order they began in.
+    next: u64,
+    each: BTreeMap<u64, Waiter>,
+}
+
+/// One wait for a token ([`Jobserver::acquire`]).
+#[cfg(unix)]
+#[derive(Debug)]
+struct Waiter {
+    /// Where its reader's `read(2)` is.
+    reader: Reader,
+    /// A token this handle returned while it waited, handed to it instead of the FIFO
+    /// ([`Jobserver::give`]).
+    handed: Option<u8>,
+}
+
+/// A wait's reader thread, which blocks in `read(2)` on the pool's blocking descriptor.
+#[cfg(unix)]
+#[derive(Debug)]
+enum Reader {
+    /// Spawned, and not yet in its read.
+    Starting,
+    /// In its read, or about to enter it, as this thread, with [`INTERRUPT`] unblocked in its
+    /// mask ([`unblock_interrupt`]).
+    Reading(libc::pthread_t),
+    /// Its read ended: the token it took, none when a signal ended it, or why it failed (its
+    /// mask could not be changed, and it never read).
+    Done(io::Result<Option<u8>>),
 }
 
 impl Jobserver {
@@ -68,24 +138,19 @@ impl Jobserver {
             if unsafe { libc::mkfifo(name.as_ptr(), 0o600) } != 0 {
                 return Err(io::Error::last_os_error());
             }
-            let mut file = match open(&path) {
-                Ok(file) => file,
+            let opened = open(&path).and_then(|mut file| {
+                let wait = blocking_twin(&path, &file)?;
+                file.write_all(&[b'+'; MAX_SLOTS as usize][..slots as usize])?;
+                Ok((file, wait))
+            });
+            let (file, wait) = match opened {
+                Ok(both) => both,
                 Err(error) => {
                     let _ = std::fs::remove_file(&path);
                     return Err(error);
                 }
             };
-            if let Err(error) = file.write_all(&[b'+'; MAX_SLOTS as usize][..slots as usize]) {
-                let _ = std::fs::remove_file(&path);
-                return Err(error);
-            }
-            Ok(Self {
-                path,
-                file,
-                slots,
-                created: true,
-                partial: Mutex::new(()),
-            })
+            Ok(Self::holding(path, file, wait, slots, true))
         }
         #[cfg(not(unix))]
         Err(io::Error::new(
@@ -149,13 +214,8 @@ impl Jobserver {
                     ),
                 ));
             }
-            Ok(Self {
-                path: path.to_owned(),
-                file,
-                slots,
-                created: false,
-                partial: Mutex::new(()),
-            })
+            let wait = blocking_twin(path, &file)?;
+            Ok(Self::holding(path.to_owned(), file, wait, slots, false))
         }
         #[cfg(not(unix))]
         {
@@ -164,6 +224,22 @@ impl Jobserver {
                 io::ErrorKind::Unsupported,
                 "FIFO jobservers require Unix",
             ))
+        }
+    }
+
+    /// A handle on the FIFO at `path`, opened both ways ([`open`], [`blocking_twin`]), with no
+    /// wait yet.
+    #[cfg(unix)]
+    fn holding(path: PathBuf, file: File, wait: File, slots: u32, created: bool) -> Self {
+        Self {
+            path,
+            file,
+            wait,
+            slots,
+            created,
+            partial: Mutex::new(()),
+            waiters: Mutex::default(),
+            turn: Condvar::new(),
         }
     }
 
@@ -265,55 +341,283 @@ impl Jobserver {
     /// Reserve a client's implicit token. The caller must retain the guard until that
     /// client's process group has drained, including on failure.
     ///
-    /// FAIR AGAINST BLOCKED READERS. Cargo's jobserver helper waits in a blocking `read(2)` on
-    /// its own descriptor of the FIFO, and the kernel hands each token written back to a reader
-    /// it wakes. This wait sleeps in `poll(2)` on the FIFO, so the same write wakes it beside
-    /// them and it contends for that byte as one of them. A loop that slept between nonblocking
-    /// reads would only ever see a byte in the instant between its write and a blocked reader
-    /// taking it, and so lose nearly every one to a busy build. The poll's bound
-    /// ([`WAKE_EVERY`]) only sets how soon `stopped` is asked again.
+    /// FAIR AGAINST BLOCKED READERS. Cargo's and rustc's jobserver helpers wait in a blocking
+    /// `read(2)` on their own descriptors of the FIFO, and the kernel gives each byte written to
+    /// one of the readers blocked there, on Darwin 27.2 mostly the one that has slept longest. A
+    /// wait in `poll(2)` or `kevent(2)` is woken by the same write but almost never takes the
+    /// byte: it must return from the poll and read again, and the blocked reader has taken it in
+    /// the kernel by then (2 in 2000 races against one blocked reader, as
+    /// `docs/measured/jobserver-blocked-reader-fairness-2026-11-06.md` records). So
+    /// this wait is itself a blocked reader: a thread of its own blocks in `read(2)` on the
+    /// pool's blocking descriptor ([`Self::wait_for_token`]) and contends for each byte written
+    /// as one more helper (about half the races against one), while the caller's thread asks
+    /// `stopped` every [`WAKE_EVERY`] and, once it answers yes, ends the read with
+    /// [`INTERRUPT`]. And a token this handle returns while one of its waits waits is handed to
+    /// the oldest such wait instead of the FIFO ([`Self::give`]; a wait already ending gives it
+    /// on once its read has ended), as Cargo keeps a finished job's token for its next queued
+    /// job. Without that, each token a release client returned would go to whichever helper had
+    /// slept longest, and the handle would hold only what it won fresh: in a simulation (the
+    /// same record) of 8 slots, 8 Cargo-like helpers and 4 release workers (a fair share 33%),
+    /// the release held 16% with a blocked reader alone, 31% with the handoff too, and 5% in
+    /// `poll(2)`.
+    ///
+    /// LIMIT: `SIGURG` keeps the handler [`interruptible`] gives it for the life of the process,
+    /// so a `SIGURG` sent to the process, which nothing sends these processes, would end one
+    /// thread's blocking call with `EINTR` instead of being discarded. And its disposition is
+    /// read once per process: had another part of the process later given `SIGURG` a handler
+    /// with `SA_RESTART`, or `SIG_IGN` or `SIG_DFL`, a wait whose read must end (stopped, or
+    /// handed a token) would signal its reader until some write ended the read, asking
+    /// `stopped` no more meanwhile, and a handed wait holds the very token such a write could
+    /// be. Nothing in the tree touches `SIGURG` in a process that waits here.
     /// # Errors
-    /// FIFO IO fails, or the caller ends the wait.
+    /// FIFO IO fails, the wait's reader cannot be started or cannot unblock `SIGURG` in its own
+    /// mask, `SIGURG` already has another handler in this process, or the caller ends the wait,
+    /// even when a token reaches the wait after the stop (STOPPED BEFORE EVERY TOKEN at
+    /// `acquire_waking`).
     pub fn acquire(&self, stopped: &dyn Fn() -> bool) -> io::Result<Token<'_>> {
         self.acquire_waking(stopped, WAKE_EVERY, &|| {})
     }
 
     /// [`Self::acquire`], asking `stopped` at least once every `wake`, and telling `waiting` each
-    /// time it found the FIFO empty and is about to wait (a test's hook).
+    /// time it is about to wait for at most `wake`: once as it begins a wait, and again each
+    /// `wake` it waits on (a test's hook).
+    ///
+    /// STOPPED BEFORE EVERY TOKEN. A token is returned only just after `stopped` said no: one
+    /// found in the FIFO is read right after that answer, and one a wait got, which may have
+    /// come up to `wake` after the caller stopped, waits for the next answer. A token that
+    /// arrives after a stop is given back as it drops ([`Token`]'s drop). So a caller whose stop
+    /// came before its token, and still holds, gets the stop's error and not the token, as when
+    /// the wait was a loop of nonblocking reads.
     fn acquire_waking(
         &self,
         stopped: &dyn Fn() -> bool,
         wake: Duration,
         waiting: &dyn Fn(),
     ) -> io::Result<Token<'_>> {
+        let mut won = None;
         loop {
             if stopped() {
+                drop(won);
                 return Err(io::Error::new(
                     io::ErrorKind::Interrupted,
                     "jobserver wait ended",
                 ));
             }
+            if let Some(token) = won.take() {
+                return Ok(token);
+            }
             if let Some(token) = self.try_acquire()? {
                 return Ok(token);
             }
-            waiting();
-            self.readable_within(wake)?;
+            won = self
+                .wait_for_token(stopped, wake, waiting)?
+                .map(|byte| Token { pool: self, byte });
         }
     }
 
-    /// Wait until the FIFO holds a token or `wake` passes, reading nothing: whether it became
-    /// readable before then. Another reader may still take the byte first.
-    fn readable_within(&self, wake: Duration) -> io::Result<bool> {
+    /// One wait for a token, as one of this handle's [`Waiters`]: a reader thread of the wait's
+    /// own blocks in `read(2)` on the blocking descriptor, and this thread waits for its read to
+    /// end or a token to be handed to it ([`Self::give`]), asking `stopped` each `wake`. A stop
+    /// or a handed token ends the read with [`INTERRUPT`], sent again each [`NUDGE_EVERY`] until
+    /// it has ended. The token read or handed; a token read beside a handed one is given on
+    /// ([`Self::give`]), and so is any a stopped wait got, which answers `None`, as a read
+    /// another signal ended does. The reader has ended, and the wait has left [`Waiters`],
+    /// before this returns, so a stopped wait leaves nothing reading the FIFO. A panic in
+    /// `stopped` or `waiting` ends the wait as a stop does, then goes on.
+    #[cfg(unix)]
+    fn wait_for_token(
+        &self,
+        stopped: &dyn Fn() -> bool,
+        wake: Duration,
+        waiting: &dyn Fn(),
+    ) -> io::Result<Option<u8>> {
+        use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+        interruptible()?;
+        let id = {
+            let mut waiters = self.waiters.lock().unwrap_or_else(PoisonError::into_inner);
+            let id = waiters.next;
+            waiters.next += 1;
+            waiters.each.insert(
+                id,
+                Waiter {
+                    reader: Reader::Starting,
+                    handed: None,
+                },
+            );
+            id
+        };
+        let mut panicked = catch_unwind(AssertUnwindSafe(waiting)).err();
+        let outcome = std::thread::scope(|scope| {
+            let spawned = match panicked {
+                Some(_) => None,
+                None => Some(
+                    std::thread::Builder::new()
+                        .name("jobserver wait".to_owned())
+                        .spawn_scoped(scope, || self.read_blocked(id)),
+                ),
+            };
+            let mut waiters = self.waiters.lock().unwrap_or_else(PoisonError::into_inner);
+            if !matches!(spawned, Some(Ok(_))) {
+                if let Some(Waiter {
+                    handed: Some(byte), ..
+                }) = waiters.each.remove(&id)
+                {
+                    self.give_locked(&mut waiters, byte);
+                }
+                return match spawned {
+                    Some(Err(error)) => Err(error),
+                    _ => Ok(None),
+                };
+            }
+            let (mut ending, mut stopping) = (false, false);
+            let mut asked = Instant::now();
+            // Only this wait removes its own record.
+            while let Some(me) = waiters.each.get(&id) {
+                ending |= me.handed.is_some();
+                match me.reader {
+                    Reader::Done(_) => break,
+                    Reader::Reading(thread) if ending => {
+                        // SAFETY: a reader sets `Done` under this lock before its thread
+                        // ends, so one seen `Reading` under it names a live thread, and
+                        // INTERRUPT has the handler `interruptible` gave it; that thread
+                        // unblocked INTERRUPT before it said `Reading`, so it is delivered.
+                        unsafe { libc::pthread_kill(thread, INTERRUPT) };
+                    }
+                    Reader::Starting | Reader::Reading(_) => {}
+                }
+                let pause = if ending {
+                    NUDGE_EVERY
+                } else {
+                    wake.saturating_sub(asked.elapsed())
+                };
+                waiters = self
+                    .turn
+                    .wait_timeout(waiters, pause)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+                if !ending && asked.elapsed() >= wake {
+                    drop(waiters);
+                    match catch_unwind(AssertUnwindSafe(stopped)) {
+                        Ok(true) => stopping = true,
+                        Ok(false) => panicked = catch_unwind(AssertUnwindSafe(waiting)).err(),
+                        Err(panic) => panicked = Some(panic),
+                    }
+                    stopping |= panicked.is_some();
+                    ending = stopping;
+                    asked = Instant::now();
+                    waiters = self.waiters.lock().unwrap_or_else(PoisonError::into_inner);
+                }
+            }
+            let Some(Waiter {
+                reader: Reader::Done(read),
+                handed,
+            }) = waiters.each.remove(&id)
+            else {
+                // Never: the loop ends only on this wait's reader being done.
+                return Err(io::Error::other("jobserver wait lost its reader"));
+            };
+            let mut got = handed;
+            let read = read.map(|byte| match (byte, got) {
+                (Some(byte), None) => got = Some(byte),
+                (Some(extra), Some(_)) => self.give_locked(&mut waiters, extra),
+                (None, _) => {}
+            });
+            if stopping && let Some(byte) = got.take() {
+                self.give_locked(&mut waiters, byte);
+            }
+            match (got, read) {
+                (Some(byte), _) => Ok(Some(byte)),
+                (None, read) => read.map(|()| None),
+            }
+        });
+        if let Some(panic) = panicked {
+            resume_unwind(panic);
+        }
+        outcome
+    }
+
+    #[cfg(not(unix))]
+    fn wait_for_token(
+        &self,
+        _stopped: &dyn Fn() -> bool,
+        _wake: Duration,
+        _waiting: &dyn Fn(),
+    ) -> io::Result<Option<u8>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "FIFO jobservers require Unix",
+        ))
+    }
+
+    /// The reader thread of wait `id` ([`Self::wait_for_token`]): [`INTERRUPT`] unblocked in its
+    /// own mask ([`unblock_interrupt`]), then one blocking `read(2)` of a token, its outcome left
+    /// in the wait's [`Reader`]. A signal ends it with no token. A reader whose mask cannot be
+    /// changed ends with that error and never reads, so no reader blocks with [`INTERRUPT`]
+    /// masked.
+    #[cfg(unix)]
+    fn read_blocked(&self, id: u64) {
+        let read = unblock_interrupt().and_then(|()| {
+            if let Some(me) = self
+                .waiters
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .each
+                .get_mut(&id)
+            {
+                // SAFETY: pthread_self has no preconditions.
+                me.reader = Reader::Reading(unsafe { pthread_self() });
+            }
+            let mut byte = [0];
+            match (&self.wait).read(&mut byte) {
+                Ok(1) => Ok(Some(byte[0])),
+                Ok(_) => Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "jobserver FIFO closed",
+                )),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(None),
+                Err(error) => Err(error),
+            }
+        });
+        let mut waiters = self.waiters.lock().unwrap_or_else(PoisonError::into_inner);
+        match waiters.each.get_mut(&id) {
+            Some(me) => me.reader = Reader::Done(read),
+            None => {
+                if let Ok(Some(byte)) = read {
+                    self.give_locked(&mut waiters, byte);
+                }
+            }
+        }
+        self.turn.notify_all();
+    }
+
+    /// Return a token this handle held: to its oldest wait that holds none yet (neither handed
+    /// one nor done reading one), or, with none, to the FIFO.
+    fn give(&self, byte: u8) {
         #[cfg(unix)]
         {
-            use std::os::fd::AsFd as _;
-            let deadline = std::time::Instant::now() + wake;
-            Ok(!aterm_uds::ready::any_until(&[self.file.as_fd()], deadline)?.is_empty())
+            let mut waiters = self.waiters.lock().unwrap_or_else(PoisonError::into_inner);
+            self.give_locked(&mut waiters, byte);
         }
         #[cfg(not(unix))]
         {
-            std::thread::sleep(wake);
-            Ok(false)
+            let _ = (&self.file).write_all(&[byte]);
+        }
+    }
+
+    /// [`Self::give`] under the lock already held. A return the FIFO refuses loses that token,
+    /// as a token's return always could.
+    #[cfg(unix)]
+    fn give_locked(&self, waiters: &mut Waiters, byte: u8) {
+        let holds_none =
+            |w: &&mut Waiter| w.handed.is_none() && !matches!(w.reader, Reader::Done(Ok(Some(_))));
+        match waiters.each.values_mut().find(holds_none) {
+            Some(oldest) => {
+                oldest.handed = Some(byte);
+                self.turn.notify_all();
+            }
+            None => {
+                let _ = (&self.file).write_all(&[byte]);
+            }
         }
     }
 
@@ -325,7 +629,9 @@ impl Jobserver {
     /// rest. Two partial holds that each wait on what the other holds would deadlock once the
     /// FIFO ran dry; one cannot, since every other holder of the pool holds whole charges for
     /// work that ends (Cargo runs each job on a token it already holds), so the tokens the one
-    /// waiter needs keep coming back. Across processes the same holds while at most one process
+    /// waiter needs keep coming back; one this handle's other holders return goes to the
+    /// handle's oldest wait ([`Self::give`]), the partial holder's or one for a whole charge of
+    /// work that ends. Across processes the same holds while at most one process
     /// waits holding part of a charge: the release takes a branch's fixed reservation at once,
     /// before any branch starts, and a build's Cargo clients take one token each.
     /// # Errors
@@ -399,6 +705,112 @@ fn open(path: &Path) -> io::Result<File> {
     })
 }
 
+/// A second, blocking descriptor of the FIFO `file` holds, by its own open file description (a
+/// wait's reader blocks on it while [`Jobserver::try_acquire`] stays nonblocking on `file`). It
+/// is opened as [`open`] opens, so the open itself never blocks, then refused unless it is the
+/// file `file` is, and only then made blocking.
+/// # Errors
+/// The open fails, `path` names another file by now, or the flag cannot be cleared.
+#[cfg(unix)]
+fn blocking_twin(path: &Path, file: &File) -> io::Result<File> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let wait = open(path)?;
+    let (first, again) = (file.metadata()?, wait.metadata()?);
+    if (first.dev(), first.ino()) != (again.dev(), again.ino()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is no longer the FIFO first opened", path.display()),
+        ));
+    }
+    let fd = wait.as_raw_fd();
+    // SAFETY: `fd` is `wait`'s open descriptor; F_GETFL reads its status flags.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    // SAFETY: as above; F_SETFL writes them back without O_NONBLOCK.
+    if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(wait)
+}
+
+/// Unblock [`INTERRUPT`] in the calling thread's signal mask, so a `pthread_kill` of this thread
+/// with it is delivered at once. A wait's reader calls this before it says it is reading
+/// ([`Jobserver::read_blocked`]), because a thread starts with its creator's mask and a process
+/// with its parent's across `fork` and `exec`. A caller that blocks `SIGURG`, or a supervisor
+/// that blocked every signal before it started the process, would otherwise leave each signal
+/// pending and the read blocked: neither a stop nor a handed token could end the wait. Only this
+/// thread's mask changes; the caller's keeps whatever it blocks.
+/// # Errors
+/// `pthread_sigmask` refuses.
+#[cfg(unix)]
+fn unblock_interrupt() -> io::Result<()> {
+    let mut only = std::mem::MaybeUninit::<libc::sigset_t>::zeroed();
+    // SAFETY: sigemptyset initialises the set it is handed, and sigaddset adds a valid signal to
+    // that initialised set.
+    let only = unsafe {
+        libc::sigemptyset(only.as_mut_ptr());
+        libc::sigaddset(only.as_mut_ptr(), INTERRUPT);
+        only.assume_init()
+    };
+    // SAFETY: changes only the calling thread's mask, from an initialised set; the old mask is
+    // not asked for.
+    match unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &raw const only, std::ptr::null_mut()) }
+    {
+        0 => Ok(()),
+        error => Err(io::Error::from_raw_os_error(error)),
+    }
+}
+
+/// The handler [`INTERRUPT`] runs: nothing. Its one effect is that a `read(2)` it lands in
+/// returns `EINTR`.
+#[cfg(unix)]
+extern "C" fn on_interrupt(_: libc::c_int) {}
+
+/// Route [`INTERRUPT`] to [`on_interrupt`] without `SA_RESTART`, once per process, so a wait can
+/// end its reader's blocked read ([`Jobserver::acquire`]). `SIGURG` found with a handler of
+/// another's is given it back and refused, since taking it over would break its owner and its
+/// owner's `SA_RESTART` would leave a stopped read blocked. A disposition of `SIG_IGN` (inherited
+/// across `exec`) or `SIG_DFL` discards the signal, as the handler does in effect, so the handler
+/// replaces it. Every later call answers as the first did.
+/// # Errors
+/// `sigaction` fails, or `SIGURG` already has another handler.
+#[cfg(unix)]
+fn interruptible() -> io::Result<()> {
+    static ROUTED: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    ROUTED
+        .get_or_init(|| {
+            let ours = on_interrupt as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            // SAFETY: `sigaction` is plain data for which all-zero is a valid value; filled in
+            // below, its flags left 0 (no `SA_RESTART`).
+            let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
+            act.sa_sigaction = ours;
+            // SAFETY: `act.sa_mask` is a valid out-parameter owned by this frame.
+            unsafe { libc::sigemptyset(&raw mut act.sa_mask) };
+            // SAFETY: as for `act`.
+            let mut was: libc::sigaction = unsafe { std::mem::zeroed() };
+            // SAFETY: installs `on_interrupt`, which does nothing and so is async-signal-safe;
+            // `was` receives the disposition it replaces.
+            if unsafe { libc::sigaction(INTERRUPT, &raw const act, &raw mut was) } != 0 {
+                return Err(format!(
+                    "route SIGURG to the jobserver's wait: {}",
+                    io::Error::last_os_error()
+                ));
+            }
+            if ![libc::SIG_DFL, libc::SIG_IGN, ours].contains(&was.sa_sigaction) {
+                // SAFETY: restores the disposition just read into `was`.
+                unsafe { libc::sigaction(INTERRUPT, &raw const was, std::ptr::null_mut()) };
+                return Err(
+                    "SIGURG already has a handler in this process: a jobserver wait could not \
+                     end its read on a stop"
+                        .to_owned(),
+                );
+            }
+            Ok(())
+        })
+        .clone()
+        .map_err(io::Error::other)
+}
+
 impl Drop for Jobserver {
     fn drop(&mut self) {
         if self.created {
@@ -407,7 +819,9 @@ impl Drop for Jobserver {
     }
 }
 
-/// One implicit job. Its lifetime prevents removing the pool while a branch uses it.
+/// One implicit job. Its lifetime prevents removing the pool while a branch uses it. Dropped, it
+/// goes to its handle's oldest wait for a token, or with none back to the FIFO
+/// ([`Jobserver::give`]).
 #[derive(Debug)]
 pub struct Token<'a> {
     pool: &'a Jobserver,
@@ -416,7 +830,7 @@ pub struct Token<'a> {
 
 impl Drop for Token<'_> {
     fn drop(&mut self) {
-        let _ = (&self.pool.file).write_all(&[self.byte]);
+        self.pool.give(self.byte);
     }
 }
 

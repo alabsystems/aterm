@@ -207,8 +207,9 @@ pub(crate) enum AgentWord {
     Busy,
     /// `idle`.
     Idle,
-    /// `prompt` or `question` that its row does not say is answered (`needs=-`): it waits on a
-    /// person.
+    /// It waits on a person: its row names a need a person decides (`ask`, `approval`,
+    /// `question`), whatever its own word, or it is at a `prompt` or `question` its row does not
+    /// say is answered (`needs=-`).
     Waiting,
     /// `wall:<kind>`, its kind kept (`usage-weekly`, `auth`).
     Walled(String),
@@ -217,11 +218,21 @@ pub(crate) enum AgentWord {
 }
 
 impl AgentWord {
-    /// The word a row's `agent=` says, beside its raw `needs=`. A `prompt` or `question` whose
-    /// row read its needs and found none for a person (`needs=-`: its harness answers it) is at
-    /// work, as `aterm ctl survey` classes it; one whose row names a need, or sends no `needs`
-    /// (an older peer), waits on a person.
+    /// The word a row's `agent=` says, beside its raw `needs=`, classed as `aterm ctl survey`
+    /// classes it (`class_of`) for every need this build reads: a need a person decides
+    /// (`Severity::Decide`) waits on a person whatever the agent says (a need word this build
+    /// cannot read, which `class_of` calls asking, keeps the agent's word here, as the glance
+    /// draws no need for it either), so an idle agent that ended its turn on a question is waiting,
+    /// not quiet. Otherwise a `prompt` or `question` whose row read its needs and found none for
+    /// a person (`needs=-`: its harness answers it) is at work, and one whose row names another
+    /// need, or sends no `needs` (an older peer), waits on a person.
     pub(crate) fn of(word: Option<&str>, needs: Option<&str>) -> Self {
+        if needs
+            .and_then(NeedWord::parse)
+            .is_some_and(|need| need.severity() == aterm_types::needs::Severity::Decide)
+        {
+            return Self::Waiting;
+        }
         match word {
             Some("busy") => Self::Busy,
             Some("idle") => Self::Idle,

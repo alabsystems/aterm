@@ -15,6 +15,10 @@ pub(super) struct Preparation {
 }
 
 impl Preparation {
+    pub(super) fn idle(&self) -> bool {
+        self.active.is_none()
+    }
+
     pub(super) fn terminal_already_recorded(&self) -> bool {
         use aterm_agent::harness::native_account_wire::ChildState;
         matches!(
@@ -234,6 +238,18 @@ pub(super) fn retry_preparation(
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         let mut op = operation.lock().unwrap_or_else(|p| p.into_inner());
+        // A stale Arc captured before fence cleanup is not a new reservation.
+        // It cannot restart the old writer once its pending proof was fenced
+        // or released for a different candidate.
+        if !op.preparation.recorded
+            && op
+                .authority
+                .account
+                .as_ref()
+                .is_some_and(|account| !account.proof().recoverable_account(&op.request))
+        {
+            return UNKNOWN.into();
+        }
         let Some(serial) = op.preparation.begin() else {
             return if admit {
                 preparation_pending_reply(&op)

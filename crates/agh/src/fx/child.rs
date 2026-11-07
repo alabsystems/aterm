@@ -38,8 +38,45 @@ pub struct ChildSpec {
     pub cwd: Option<PathBuf>,
     /// Its bound.
     pub budget: Duration,
-    /// Explicit nonsecret Git ref data; never the caller's ambient stdin.
+    /// Explicit owned input; never the caller's ambient stdin. Sensitive Git
+    /// configuration uses `config_input`, which withholds parser stderr.
     pub(crate) input: Option<Vec<u8>>,
+    #[cfg(unix)]
+    config_input: Option<ConfigQuery>,
+}
+
+/// Only these fixed Git parsers may consume repository configuration input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(unix)]
+pub(crate) enum ConfigQuery {
+    Names { read_only: bool },
+    WorktreeFlag,
+}
+
+#[cfg(unix)]
+impl ConfigQuery {
+    pub(crate) fn args(self) -> &'static [&'static str] {
+        match self {
+            Self::Names { .. } => &[
+                "config",
+                "--file",
+                "-",
+                "--no-includes",
+                "--list",
+                "--name-only",
+                "-z",
+            ],
+            Self::WorktreeFlag => &[
+                "config",
+                "--file",
+                "-",
+                "--no-includes",
+                "--type=bool",
+                "--get",
+                "extensions.worktreeconfig",
+            ],
+        }
+    }
 }
 
 impl fmt::Debug for ChildSpec {
@@ -66,6 +103,8 @@ impl ChildSpec {
             cwd: None,
             budget: DEFAULT_BUDGET,
             input: None,
+            #[cfg(unix)]
+            config_input: None,
         }
     }
 
@@ -101,6 +140,16 @@ impl ChildSpec {
     #[cfg(unix)]
     pub(crate) fn input(mut self, bytes: &[u8]) -> ChildSpec {
         self.input = Some(bytes.to_vec());
+        self
+    }
+
+    /// Git configuration can contain secrets. Only use this for the runner's
+    /// fixed name-only or boolean queries: their stdout contains no values,
+    /// and their stderr is withheld before it reaches Fx recording or errors.
+    #[cfg(unix)]
+    pub(crate) fn config_input(mut self, bytes: &[u8], query: ConfigQuery) -> ChildSpec {
+        self.input = Some(bytes.to_vec());
+        self.config_input = Some(query);
         self
     }
 }
@@ -200,6 +249,18 @@ pub(crate) fn check(spec: &ChildSpec) -> Result<()> {
 /// (ls-remote, clone, `gh auth token`) may lower the side effect to none.
 pub(crate) fn run(spec: &ChildSpec) -> Result<ChildOut> {
     check(spec)?;
+    #[cfg(unix)]
+    if let Some(query) = spec.config_input
+        && !spec
+            .args
+            .iter()
+            .map(|arg| arg.as_os_str())
+            .eq(query.args().iter().map(std::ffi::OsStr::new))
+    {
+        return Err(Error::local(
+            "sensitive configuration requires a fixed Git parser query",
+        ));
+    }
     let program = spec.program.display();
     let Some(until) = Instant::now().checked_add(spec.budget) else {
         return Err(Error::local(format!(
@@ -231,13 +292,40 @@ pub(crate) fn run(spec: &ChildSpec) -> Result<ChildOut> {
         spawnfd::Stdio::null()
     };
     match deadline::output_until_from(&mut cmd, input, until) {
-        Ok(output) => Ok(ChildOut {
-            code: output.status.code(),
-            stdout: output.stdout,
-            stderr: output.stderr,
-        }),
+        Ok(output) => {
+            let out = ChildOut {
+                code: output.status.code(),
+                stdout: output.stdout,
+                stderr: output.stderr,
+            };
+            #[cfg(unix)]
+            let out = config_output(spec, out);
+            Ok(out)
+        }
         Err(error) => Err(classify_failure(spec, error)),
     }
+}
+
+#[cfg(unix)]
+fn config_output(spec: &ChildSpec, mut out: ChildOut) -> ChildOut {
+    if let Some(query) = spec.config_input {
+        out.stdout = match query {
+            ConfigQuery::Names { read_only } if out.code == Some(0) => {
+                crate::git::project_config_names(&out.stdout, read_only)
+            }
+            ConfigQuery::WorktreeFlag
+                if out.code == Some(0)
+                    && matches!(out.stdout.as_slice(), b"true\n" | b"false\n") =>
+            {
+                out.stdout
+            }
+            _ => Vec::new(),
+        };
+        if !out.stderr.is_empty() {
+            out.stderr = b"configuration parser stderr withheld\n".to_vec();
+        }
+    }
+    out
 }
 
 /// Dispatch classification is independent of the collector's cleanup contract.

@@ -4697,6 +4697,20 @@ impl crate::App {
             .ctx
             .bells
             .wire(aterm_time::unix_millis().unwrap_or(0));
+        // How a Claude Code tab signs in, and its account's vault token state (§5.10).
+        let auth = {
+            let timeline = pooled
+                .ctx
+                .timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let facts = timeline.claude_footer();
+            crate::token_shown::status_fields(
+                facts.and_then(|f| f.route.as_ref()),
+                crate::token_shown::footer_account(facts),
+                crate::token_shown::shown().as_deref(),
+            )
+        };
         let Some(status) = self.session_status.status(session) else {
             return Ok(format!(
                 "schema=1 sid={session} subject={} subject_source={subject_source} observed=false \
@@ -4704,7 +4718,7 @@ impl crate::App {
                  confidence=unknown reasons=- attribution={} fs_consent={} conflict=false \
                  revision=0 enabled={enabled} hold={hold} hold_advisory={hold_advisory} \
                  fabric={fabric} {fabric_tail} fleet={fleet} units={units} setup={setup} {net} \
-                 {presence} needs={needs} hold_by={hold_by} {typed} path={path} {agent} {program_state} last_act={last_act} {appearance}{conpty} integration={integration} \
+                 {presence} needs={needs} hold_by={hold_by} {typed} path={path} {agent} {program_state} last_act={last_act} {auth} {appearance}{conpty} integration={integration} \
                  {input} {authority} supervisor={supervisor} supervisor_act={supervisor_act} autopilot={autopilot} human_ms={human_ms} \
                  human_typed_ms={human_typed_ms} human_seq={human_seq} {launch} {owner} \
                  history_lost={history_lost} {journal} integration_rev={integration_rev} {born} {resize} \
@@ -4738,7 +4752,7 @@ impl crate::App {
              detail={} confidence={} reasons={reasons} attribution={} fs_consent={} \
              conflict={} revision={} enabled={enabled} hold={hold} hold_advisory={hold_advisory} \
              fabric={fabric} {fabric_tail} fleet={fleet} units={units} setup={setup} {net} \
-             {presence} needs={needs} hold_by={hold_by} {typed} path={path} {agent} {program_state} last_act={last_act} {appearance}{conpty} integration={integration} \
+             {presence} needs={needs} hold_by={hold_by} {typed} path={path} {agent} {program_state} last_act={last_act} {auth} {appearance}{conpty} integration={integration} \
              {input} {authority} supervisor={supervisor} supervisor_act={supervisor_act} autopilot={autopilot} human_ms={human_ms} \
              human_typed_ms={human_typed_ms} human_seq={human_seq} {launch} {owner} \
              history_lost={history_lost} {journal} integration_rev={integration_rev} {born} {resize} \

@@ -48,6 +48,11 @@ pub struct SurveyAccountFact {
     /// [`crate::harness::accounts_pool::unstarted_launch_row`]). `None` from an aterm older than
     /// the field, which says nothing of it (no `launch=`, or `launch=-`).
     pub launch: Option<bool>,
+    /// Claude Code's row: its vault token's state here
+    /// ([`crate::harness::accounts_tokens::TokenState::word`], `docs/DESIGN-claude-setup-token-2026-11-05.md`
+    /// §5.10). `None` for another pool, on a Mac with no vault configured, and from an aterm older
+    /// than the field (no `token=`, or `token=-`).
+    pub token: Option<String>,
 }
 
 /// One subscriber last-heard record from a vault server running on this machine (§7.2, C16).
@@ -344,7 +349,7 @@ impl SwarmSurveyFacts {
         for acc in &self.accounts {
             lines.push(format!(
                 "account pool={} id={} condition={} enrolled={} pct5={} pct7={} \
-                 week_reset={} walled_until={} last_used={} read_at={} launch={}",
+                 week_reset={} walled_until={} last_used={} read_at={} launch={} token={}",
                 aterm_codec::pct::encode(&acc.pool),
                 aterm_codec::pct::encode(&aterm_ctl::masked_label(&acc.id)),
                 aterm_codec::pct::encode(&acc.condition),
@@ -357,6 +362,9 @@ impl SwarmSurveyFacts {
                 opt_i64_token(acc.read_at),
                 acc.launch
                     .map_or("-", |launch| if launch { "1" } else { "0" }),
+                acc.token
+                    .as_deref()
+                    .map_or_else(|| "-".to_owned(), aterm_codec::pct::encode),
             ));
         }
         for repo in repos {
@@ -679,6 +687,10 @@ fn parse_account_line(fields: &[(String, String)]) -> Result<SurveyAccountFact, 
             .filter(|raw| *raw != "-")
             .map(|raw| parse_bool01(raw, "launch"))
             .transpose()?,
+        // A member older than the field sends none.
+        token: field_raw(fields, "token")
+            .filter(|raw| !raw.is_empty() && *raw != "-")
+            .map(str::to_owned),
     })
 }
 
@@ -828,9 +840,9 @@ fn config_label(config: &Path, denied: &dyn Fn(&str) -> bool) -> Option<String> 
 
 /// Each pooled CLI's rows, the pools that could not be read, the row each session runs on, as
 /// `aterm harness accounts --json` reads them beside `env`'s `aterm.toml`, and when its ledgers
-/// say it rotated.
+/// say it rotated. Claude Code's rows carry their vault token's state ([`claude_token_states`]).
 fn collect_account_facts(env: &Env) -> AccountFacts {
-    account_facts_of(Cli::ALL.into_iter().map(|cli| {
+    let mut facts = account_facts_of(Cli::ALL.into_iter().map(|cli| {
         let read = env
             .config
             .as_deref()
@@ -843,7 +855,55 @@ fn collect_account_facts(env: &Env) -> AccountFacts {
                 )
             });
         (cli, read)
-    }))
+    }));
+    let states = claude_token_states(env);
+    for row in facts
+        .0
+        .iter_mut()
+        .filter(|row| row.pool == Cli::Claude.id())
+    {
+        row.token = states.get(&row.id).cloned();
+    }
+    facts
+}
+
+/// Each Claude Code row's vault token state word by label (§5.10): one read of this Mac's vault
+/// and its token table ([`crate::harness::accounts_token_view::states_by_label`]); none off Unix,
+/// where no home is known, or where no vault is configured
+/// ([`crate::harness::accounts_tokens::configured_vault`]), so such a Mac's rows say `token=-`
+/// as every other surface says nothing of tokens there.
+fn claude_token_states(env: &Env) -> BTreeMap<String, String> {
+    #[cfg(unix)]
+    {
+        use crate::harness::accounts_token_view as view;
+        let Some(home) = env.home.as_deref() else {
+            return BTreeMap::new();
+        };
+        let store = accounts::Store::at(&env.state);
+        let roster = env
+            .config
+            .as_deref()
+            .and_then(|config| accounts::roster_beside_for(config, Cli::Claude));
+        let Some(vault) = crate::harness::accounts_tokens::configured_vault(
+            aterm_secrets::client::Paths::for_home(home),
+        ) else {
+            return BTreeMap::new();
+        };
+        view::states_by_label(
+            &view::Places {
+                store: &store,
+                roster: roster.as_deref(),
+                logins: &[],
+                now: env.now,
+            },
+            &vault,
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = env;
+        BTreeMap::new()
+    }
 }
 
 /// What [`collect_account_facts`] reads: the rows, the unread pools, each session's row, and its
@@ -891,6 +951,7 @@ fn account_facts_of(
             last_used: row.used_at,
             read_at: row.read_at,
             launch: Some(row.launch),
+            token: None,
         }));
         sessions.extend(
             read.sessions
@@ -1039,6 +1100,7 @@ mod tests {
                     last_used: Some(1_793_159_900),
                     read_at: None,
                     launch: Some(true),
+                    token: None,
                 },
                 SurveyAccountFact {
                     pool: "codex".to_owned(),
@@ -1052,6 +1114,7 @@ mod tests {
                     last_used: Some(1_793_158_000),
                     read_at: None,
                     launch: Some(false),
+                    token: None,
                 },
                 SurveyAccountFact {
                     pool: "claude".to_owned(),
@@ -1065,6 +1128,7 @@ mod tests {
                     last_used: None,
                     read_at: None,
                     launch: None,
+                    token: None,
                 },
             ],
             accounts_unread: vec!["grok".to_owned(), "kimi".to_owned()],
@@ -1664,6 +1728,126 @@ mod tests {
         )]);
         let launches: Vec<_> = rows.iter().map(|row| row.launch).collect();
         assert_eq!(launches, [Some(true), Some(false)]);
+    }
+
+    /// A Claude Code row's vault token state crosses the wire as `token=` (§5.10 of the
+    /// setup-token design), and an older member's line, which has none, still parses as saying
+    /// nothing; the extra line a member writes reads back as the same fact.
+    #[test]
+    fn an_account_rows_token_state_crosses_the_wire_and_an_older_member_sends_none() {
+        let line = |token: Option<&str>| {
+            let mut fields: Vec<(String, String)> = [
+                ("pool", "claude"),
+                ("id", "work"),
+                ("condition", "usable"),
+                ("enrolled", "1"),
+                ("pct5", "-"),
+                ("pct7", "-"),
+                ("week_reset", "-"),
+                ("walled_until", "-"),
+                ("last_used", "-"),
+                ("read_at", "-"),
+                ("launch", "1"),
+            ]
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+            if let Some(token) = token {
+                fields.push(("token".to_owned(), token.to_owned()));
+            }
+            parse_account_line(&fields).expect("the line parses")
+        };
+        assert_eq!(line(Some("soon")).token.as_deref(), Some("soon"));
+        assert_eq!(line(Some("-")).token, None);
+        assert_eq!(line(None).token, None, "an older member");
+        let mut facts = sample_facts();
+        facts.accounts[0].token = Some("active".to_owned());
+        let lines = facts.extra_lines(false);
+        let written = lines
+            .iter()
+            .find(|line| line.starts_with("account pool=claude id=c01 "))
+            .expect("the claude row's line");
+        assert!(written.ends_with(" token=active"), "{written}");
+        let other = lines
+            .iter()
+            .find(|line| line.starts_with("account pool=codex "))
+            .expect("the codex row's line");
+        assert!(other.ends_with(" token=-"), "{other}");
+    }
+
+    /// A MAC WITH NO VAULT CONFIGURED SAYS NOTHING OF TOKENS ON ITS ACCOUNT LINES (§5.10 of the
+    /// setup-token design): its Claude Code row with an email has no token state (`token=-`), as
+    /// `ctl @self status` and the doctor say nothing there, never `unknown`, which says a vault
+    /// that could not be read. CONTROL: the same row read through that unconfigured vault reads
+    /// `unknown`.
+    ///
+    /// NEGATIVE CONTROL (2026-11-06, restored with cp from a backup plus touch, confirmed with
+    /// cmp): with `claude_token_states` reading the unconfigured vault again, the row reads
+    /// `{"work": "unknown"}`.
+    #[cfg(unix)]
+    #[test]
+    fn a_mac_with_no_vault_says_no_token_state_on_its_account_lines() {
+        use crate::harness::accounts_token_view as view;
+        fn keyer(_realm: &str, _email: &str) -> Option<String> {
+            Some("ac-fedcba9876543210".to_owned())
+        }
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        let state = dir.path().join("state");
+        let config = dir.path().join("config/aterm.toml");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let roster = dir.path().join("config/accounts.toml");
+        std::fs::write(
+            &roster,
+            "[[account]]\nlabel = \"work\"\nclass = \"dedicated\"\nemail = \"person@example.com\"\n",
+        )
+        .unwrap();
+        let env = Env {
+            state: state.clone(),
+            aterm_state: None,
+            cwd: dir.path().to_path_buf(),
+            home: Some(home.clone()),
+            claude_dir: None,
+            claude_config_unusable: None,
+            claude_profile: None,
+            claude_custom_oauth: false,
+            claude_session: None,
+            claude_pid: None,
+            codex_thread: None,
+            codex_home: None,
+            codex_login: None,
+            agy_conversation: None,
+            now: 1_800_000_000,
+            sid: String::new(),
+            sock: None,
+            config: Some(config),
+            claude_tmp: None,
+            claude_running: None,
+            tz_s: 0,
+        };
+        let states = crate::harness::journal::with_keyer(keyer, || claude_token_states(&env));
+        assert!(states.is_empty(), "{states:?}");
+        let store = accounts::Store::at(&state);
+        let unread = crate::harness::journal::with_keyer(keyer, || {
+            view::states_by_label(
+                &view::Places {
+                    store: &store,
+                    roster: Some(&roster),
+                    logins: &[],
+                    now: env.now,
+                },
+                &crate::harness::accounts_tokens::Vault(aterm_secrets::client::Paths::for_home(
+                    &home,
+                )),
+            )
+        });
+        assert_eq!(
+            unread.get("work").map(String::as_str),
+            Some("unknown"),
+            "CONTROL"
+        );
     }
 
     #[cfg(unix)]

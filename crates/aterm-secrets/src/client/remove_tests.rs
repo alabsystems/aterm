@@ -22,6 +22,15 @@ mod capacity;
 #[path = "log_entries/waiting_tests.rs"]
 mod waiting;
 
+/// The tests of `log_entries/member.rs` (DESIGN-claude-setup-token S2), beside it, declared here
+/// for this lab.
+#[path = "log_entries/member_tests.rs"]
+mod member;
+
+/// The tests of `claude_token.rs` (DESIGN-claude-setup-token S4), declared here for this lab.
+#[path = "../claude_token/tests.rs"]
+mod claude_token;
+
 /// P3's binding (3) for waiting writes, beside them, declared here for this lab.
 #[path = "log_entries/waiting_conformance_tests.rs"]
 mod waiting_conformance;

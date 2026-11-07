@@ -99,6 +99,11 @@ impl Laid {
     /// Lay Claude Code's twin as atpkg lays it (its `--yolo` block, then the usage tap's) and run
     /// it with `args` under `env` (every other variable of the usage tap's removed).
     fn run(&self, args: &[&str], env: &[(&str, &str)]) -> String {
+        self.run_twin(args, env, false)
+    }
+
+    /// [`Self::run`] with the token block laid too where `token` (a twin that is no dev link).
+    fn run_twin(&self, args: &[&str], env: &[(&str, &str)], token: bool) -> String {
         let mut prelude = crate::platform::twin_prelude(
             "claude",
             &self.root.join("pkg"),
@@ -108,14 +113,19 @@ impl Laid {
         );
         prelude.push_str(&sh_prelude("claude", Some(&self.atpkg)));
         let twin = self.root.join("claude");
+        let body = crate::platform::sh_shim_content_twin(
+            &self.root.join("store-build"),
+            &crate::shim_env::ShimEnv::NONE,
+            None,
+            &prelude,
+        );
         std::fs::write(
             &twin,
-            crate::platform::sh_shim_content_twin(
-                &self.root.join("store-build"),
-                &crate::shim_env::ShimEnv::NONE,
-                None,
-                &prelude,
-            ),
+            if token {
+                with_token_block("claude", body, Some(&self.atpkg))
+            } else {
+                body
+            },
         )
         .unwrap();
         set_exec(&twin);
@@ -220,6 +230,101 @@ fn the_twin_taps_a_launch_in_an_aterm_tab_and_otherwise_runs_it_as_typed() {
     std::fs::remove_file(aterm_beside(&laid.atpkg).unwrap()).unwrap();
     assert_eq!(
         laid.run(&["--model", "opus"], &tab),
+        typed,
+        "no aterm there"
+    );
+}
+
+/// THE TOKEN BLOCK (DESIGN-claude-setup-token S8, §5.4): right before the twin's last line, the
+/// plain exec, which still names the build; absent for another program
+/// and where atpkg names no file.
+#[cfg(unix)]
+#[test]
+fn the_token_block_sits_before_the_last_line_of_a_claude_twin() {
+    let body = crate::platform::sh_shim_content_twin(
+        Path::new("/store/claude/7/bin/claude"),
+        &crate::shim_env::ShimEnv::NONE,
+        None,
+        &sh_prelude("claude", Some(Path::new("/A/MacOS/atpkg"))),
+    );
+    let atpkg = Some(Path::new("/A/MacOS/atpkg"));
+    let with = with_token_block("claude", body.clone(), atpkg);
+    let lines: Vec<&str> = with.lines().collect();
+    assert_eq!(
+        lines.last().copied(),
+        body.lines().last(),
+        "the last line stays the plain exec"
+    );
+    assert_eq!(
+        crate::platform::sh_exec_target(lines.last().unwrap().trim()),
+        Some(PathBuf::from("/store/claude/7/bin/claude"))
+    );
+    let block = lines.len() - 5;
+    assert!(
+        lines[block].starts_with("# atpkg: aterm's token route"),
+        "{with}"
+    );
+    assert_eq!(
+        lines[block + 2],
+        "  exec '/A/MacOS/aterm' harness accounts token-run --auto -- \
+         '/store/claude/7/bin/claude' \"$@\"",
+        "{with}"
+    );
+    assert_eq!(lines[block + 3], "fi");
+    assert!(
+        with.find("token-run") > with.find("harness tap --launch"),
+        "after the tap's block"
+    );
+    assert_eq!(with_token_block("codex", body.clone(), atpkg), body);
+    assert_eq!(with_token_block("claude", body.clone(), None), body);
+    let not_plain = format!("{body}echo trailing\n");
+    assert_eq!(
+        with_token_block("claude", not_plain.clone(), atpkg),
+        not_plain,
+        "a last line that is not the plain exec"
+    );
+}
+
+/// THE TWIN WITH THE TOKEN BLOCK, EXECUTED: inside a tab the launch runs as the aterm beside
+/// atpkg's `harness accounts token-run --auto -- <build> <args…>`, after the usage tap's block;
+/// outside a tab, under `--no-harness` and with that aterm missing, it runs exactly as typed.
+#[cfg(unix)]
+#[test]
+fn the_twin_hands_a_tab_launch_to_the_token_wrapper_and_otherwise_runs_it_as_typed() {
+    let laid = Laid::new();
+    let tab = [("ATERM_PARENT_SESSION_ID", "s-60776b6e2ed1b73bd013")];
+    // The stand-in aterm prints no tap value, and prints the wrapper's words.
+    laid.aterm("case \"$2\" in tap) exit 0;; esac\nprintf '[%s]' \"$@\"\nprintf '\\n'");
+    let typed = "<--model><opus>\n";
+    assert_eq!(
+        laid.run_twin(&["--model", "opus"], &tab, true),
+        format!(
+            "[harness][accounts][token-run][--auto][--][{}][--model][opus]\n",
+            laid.root.join("store-build").display()
+        )
+    );
+    assert_eq!(
+        laid.run_twin(&["--model", "opus"], &[], true),
+        typed,
+        "outside a tab"
+    );
+    assert_eq!(
+        laid.run_twin(
+            &["--model", "opus"],
+            &[tab[0], ("ATERM_NO_HARNESS", "1")],
+            true
+        ),
+        typed,
+        "under --no-harness"
+    );
+    assert_eq!(
+        laid.run_twin(&["--model", "opus"], &tab, false),
+        typed,
+        "the switch off: no block"
+    );
+    std::fs::remove_file(aterm_beside(&laid.atpkg).unwrap()).unwrap();
+    assert_eq!(
+        laid.run_twin(&["--model", "opus"], &tab, true),
         typed,
         "no aterm there"
     );

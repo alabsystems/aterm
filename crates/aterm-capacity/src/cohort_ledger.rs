@@ -1844,8 +1844,12 @@ pub(super) mod tests {
         let reference = claim.cohort_closure_ref().unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let caller = aterm_uds::process::read_identity(std::process::id() as i32).unwrap();
+        // Each path is its process's native records as far as this account reads them. Under
+        // SSH a root-owned `sshd` is an ancestor of the test and its child, and
+        // `Ancestry::capture` refuses that path whole, as aterm-uds' own tests check. Membership
+        // reads a path only through its nodes.
         let ancestry =
-            aterm_uds::process::Ancestry::capture(std::process::id(), caller.birth, deadline)
+            aterm_uds::process::Ancestry::readable_prefix(std::process::id(), caller.birth)
                 .unwrap();
         let unarmed = f.ledger.funded_scopes(deadline).unwrap();
         assert_eq!(unarmed.len(), 1);
@@ -1858,8 +1862,7 @@ pub(super) mod tests {
         let (mut running, root) = start(&mut claim);
         let child = aterm_uds::process::read_identity(running.child.id() as i32).unwrap();
         let child_path =
-            aterm_uds::process::Ancestry::capture(running.child.id(), child.birth, deadline)
-                .unwrap();
+            aterm_uds::process::Ancestry::readable_prefix(running.child.id(), child.birth).unwrap();
         let bound = f.ledger.funded_scopes(deadline).unwrap();
         assert_eq!(bound[0].membership(&child_path), Inside);
         assert_eq!(

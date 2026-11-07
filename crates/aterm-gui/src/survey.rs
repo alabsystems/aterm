@@ -762,6 +762,21 @@ fn claude_tap(sid: &str, pgid: i32, started: u64) -> Option<aterm_agent::harness
     aterm_agent::harness::tap::Reading::read(&dir, sid, pid, started).map(|(reading, _)| reading)
 }
 
+/// A session row's `auth=` and `token=` (§5.10 of the setup-token design): `stored`, `token` or
+/// `outside`, and the token's account key on the token route; `-` for each where it says nothing
+/// (another program, or before its footer read the process). A reader of an older row, which has
+/// neither, reads both as absent.
+pub(crate) fn auth_fields(
+    route: Option<aterm_agent::harness::accounts::AuthRoute>,
+) -> (&'static str, String) {
+    use aterm_agent::harness::accounts::AuthRoute;
+    match route {
+        Some(AuthRoute::VaultToken { entry }) => ("token", entry.key().as_str().to_owned()),
+        Some(route) => (route.word(), "-".to_owned()),
+        None => ("-", "-".to_owned()),
+    }
+}
+
 fn session_row(
     h: &SessionHandle,
     level: SurveyLevel,
@@ -865,6 +880,13 @@ fn session_row(
             .cloned(),
         None => None,
     };
+    // How a Claude Code session authenticates, and on the token route its token's account key
+    // (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.10): value-free, as its footer judged it.
+    let route = match agent.reader.and_then(crate::harness_host::pool_cli) {
+        Some(Cli::Claude) => footer.as_ref().and_then(|f| f.route),
+        _ => None,
+    };
+    let (auth, token) = auth_fields(route);
     let tapped = claude.and_then(|(pgid, started)| claude_tap(h.sid.as_str(), pgid, started?));
     let usage = Usage::of(gauges.ctx_pct, tapped.as_ref(), codex_facts);
     let excerpts = excerpts.or_else(|| codex.as_ref().map(CodexSurvey::excerpts));
@@ -901,7 +923,8 @@ fn session_row(
         "session local={} sid={} state={} program={} program_kind={}{} agent={} agent_detail={} \
          agent_ms={} human_ms={} bg={} task={} task_rev={} task_from={} task_ms={} \
          task_conclusion={} model={} \
-         effort={} ctx_left_pct={} usage_5h_pct={} usage_7d_pct={} account={} detail={} \
+         effort={} ctx_left_pct={} usage_5h_pct={} usage_7d_pct={} account={} auth={auth} \
+         token={token} detail={} \
          doing={} role={} supervisor={} \
          attention={attention} goal={goal} needs={needs} needs_by={needs_by} hold_by={hold_by} \
          held_from={} typed_by={} typed_ms={} {}",

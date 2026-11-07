@@ -1529,7 +1529,7 @@ pub(crate) enum SystemStateAction {
     /// already open, comes to the front (`App::go_to_developer_tools_installer`). It starts no
     /// install and asks for no permission.
     GoToToolsInstaller,
-    /// A Copy Command: the line a vault admin runs to save a new GitHub token
+    /// A Copy Command: the line a member runs to save a new GitHub token
     /// ([`aterm_types::macos_setup::GITHUB_TOKEN_COMMAND`]), or the one an admin Mac runs to
     /// approve this Mac, goes on the clipboard, for a person's press alone.
     CopyCommand { command: String, by_person: bool },
@@ -1719,7 +1719,7 @@ pub(crate) struct RowView {
     /// their terminal tab (§3.3).
     pub(crate) install_tools: bool,
     /// The GitHub repositories row's Copy Command button: GitHub refuses the vault's token, and
-    /// only a vault admin saves a new one, with the line it copies
+    /// any member saves a new one, with the line it copies
     /// ([`aterm_types::macos_setup::GITHUB_TOKEN_COMMAND`]).
     pub(crate) copy_command: bool,
     /// Where the row stands (`None`: not read yet).
@@ -2204,9 +2204,9 @@ fn row_view_as(
 /// The GitHub repositories row's note when GitHub refuses the vault's token
 /// ([`aterm_types::macos_setup::GITHUB_TOKEN_REFUSED`]): who renews it, and the exact line they
 /// run, which the row's Copy Command ([`COPY_TOKEN_COMMAND`]) copies.
-pub(crate) const GITHUB_TOKEN_RENEW_NOTE: &str = "GitHub refuses your token, and only a vault \
-     admin can save a new one: with a new token from GitHub copied, they run this on their Mac: \
-     pbpaste | aterm secrets set gh_access_token";
+pub(crate) const GITHUB_TOKEN_RENEW_NOTE: &str = "GitHub refuses your token, and any member of \
+     the vault can save a new one: with a new token from GitHub copied, run this here or on any \
+     member Mac: pbpaste | aterm secrets set gh_access_token";
 
 /// The GitHub repositories row's Copy Command button ([`RowView::copy_command`]).
 pub(crate) const COPY_TOKEN_COMMAND: &str = "system-state/row/repositories/copy-command";

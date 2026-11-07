@@ -945,11 +945,13 @@ fn after_now(d: Duration) -> Instant {
         .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365))
 }
 
-extern "C" fn restore_and_end(signal: libc::c_int) {
+/// Puts the unshown terminal's local flags back as they were before it read (from a signal
+/// handler: async-signal-safe calls only).
+fn put_back_unshown() {
     let fd = UNSHOWN_FD.load(std::sync::atomic::Ordering::SeqCst);
     if fd >= 0 {
-        // SAFETY: `termios` is plain C data, and `fd` is the open `/dev/tty` held by
-        // `read_unshown` while `UNSHOWN_FD >= 0`; both `tcgetattr` and `tcsetattr` are POSIX
+        // SAFETY: `termios` is plain C data, and `fd` is the open `/dev/tty` held by an
+        // `Unshown` while `UNSHOWN_FD >= 0`; both `tcgetattr` and `tcsetattr` are POSIX
         // async-signal-safe.
         unsafe {
             let mut term: libc::termios = std::mem::zeroed();
@@ -963,6 +965,10 @@ extern "C" fn restore_and_end(signal: libc::c_int) {
             }
         }
     }
+}
+
+extern "C" fn restore_and_end(signal: libc::c_int) {
+    put_back_unshown();
     // SAFETY: `sigaction` is plain data for which all-zero is a valid value (an empty mask, no
     // flags).
     let mut default: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -981,92 +987,119 @@ extern "C" fn restore_and_end(signal: libc::c_int) {
     }
 }
 
+/// SIGINT's handler while [`read_unshown_secret`] reads: the terminal's settings put back, as
+/// [`restore_and_end`] puts them, and the interruption noted ([`UNSHOWN_INTERRUPTED`]) for the
+/// read to see within a tick, so its caller ends what it runs before it exits.
+extern "C" fn restore_and_note(_signal: libc::c_int) {
+    put_back_unshown();
+    UNSHOWN_INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether SIGINT came while [`read_unshown_secret`] read.
+static UNSHOWN_INTERRUPTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The controlling terminal, opened with nothing echoed but a newline: its settings, and the
+/// SIGINT disposition it replaced, put back when it drops.
+struct Unshown {
+    tty: std::fs::File,
+    fd: i32,
+    saved: libc::termios,
+    claimed: bool,
+    interrupt: Option<libc::sigaction>,
+}
+
+impl Drop for Unshown {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        // SAFETY: `fd` is the open /dev/tty `tty` holds for the guard's whole life, and `saved`
+        // a termios `tcgetattr` filled.
+        unsafe {
+            libc::tcsetattr(self.fd, libc::TCSAFLUSH, &self.saved);
+        }
+        if let Some(was) = &self.interrupt {
+            // SAFETY: Puts back the disposition `Unshown::open` replaced.
+            unsafe {
+                libc::sigaction(libc::SIGINT, was, std::ptr::null_mut());
+            }
+        }
+        if self.claimed {
+            UNSHOWN_FD.store(-1, Ordering::SeqCst);
+        }
+    }
+}
+
+impl Unshown {
+    /// Opens `/dev/tty`, turns its echo off (all but a newline's), sets `on_interrupt` as
+    /// SIGINT's handler where no other unshown read holds the terminal, and writes `prompt`.
+    fn open(prompt: &str, on_interrupt: extern "C" fn(libc::c_int)) -> io::Result<Self> {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        use std::sync::atomic::Ordering;
+        let tty = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open("/dev/tty")?;
+        let fd = tty.as_raw_fd();
+        // SAFETY: an all-zero termios is a valid value of the plain C struct, and `tcgetattr`
+        // overwrites it before it is read.
+        let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+        // SAFETY: `fd` is open, and `saved` is a writable termios.
+        if unsafe { libc::tcgetattr(fd, &mut saved) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        #[allow(clippy::unnecessary_cast)]
+        let saved_lflag = saved.c_lflag as u64;
+        let claimed = UNSHOWN_FD
+            .compare_exchange(-1, -2, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok();
+        if claimed {
+            UNSHOWN_LFLAG.store(saved_lflag, Ordering::SeqCst);
+            UNSHOWN_FD.store(fd, Ordering::SeqCst);
+        }
+        let interrupt = claimed
+            .then(|| {
+                // SAFETY: `sigaction` is plain data for which all-zero is a valid value (an
+                // empty mask, no flags).
+                let mut handling: libc::sigaction = unsafe { std::mem::zeroed() };
+                handling.sa_sigaction = on_interrupt as libc::sighandler_t;
+                // SAFETY: As above.
+                let mut was: libc::sigaction = unsafe { std::mem::zeroed() };
+                // SAFETY: A valid disposition for SIGINT; `was` receives the one it replaces.
+                (unsafe { libc::sigaction(libc::SIGINT, &handling, &mut was) } == 0).then_some(was)
+            })
+            .flatten();
+        let mut quiet = saved;
+        quiet.c_lflag &= !libc::ECHO;
+        quiet.c_lflag |= libc::ECHONL;
+        let mut unshown = Self {
+            tty,
+            fd,
+            saved,
+            claimed,
+            interrupt,
+        };
+        // SAFETY: `fd` is open, and `quiet` is a termios `tcgetattr` filled, then edited.
+        if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &quiet) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        unshown.tty.write_all(prompt.as_bytes())?;
+        unshown.tty.flush()?;
+        Ok(unshown)
+    }
+}
+
 /// One line typed at the controlling terminal after `prompt`, with nothing echoed but its newline
 /// while it reads, the terminal's settings (and SIGINT's disposition) put back however the
 /// program leaves; the line keeps its newline. A join code's prompt, and `aterm members join`'s
 /// phrase prompt.
 pub(crate) fn read_unshown(prompt: &str) -> io::Result<String> {
-    use std::os::fd::AsRawFd as _;
-    use std::sync::atomic::Ordering;
-    struct Restore {
-        fd: i32,
-        saved: libc::termios,
-        claimed: bool,
-        interrupt: Option<libc::sigaction>,
-    }
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            // SAFETY: `fd` is the open /dev/tty this function holds for the guard's whole life,
-            // and `saved` a termios `tcgetattr` filled.
-            unsafe {
-                libc::tcsetattr(self.fd, libc::TCSAFLUSH, &self.saved);
-            }
-            if let Some(was) = &self.interrupt {
-                // SAFETY: Puts back the disposition `read_unshown` replaced.
-                unsafe {
-                    libc::sigaction(libc::SIGINT, was, std::ptr::null_mut());
-                }
-            }
-            if self.claimed {
-                UNSHOWN_FD.store(-1, Ordering::SeqCst);
-            }
-        }
-    }
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let mut tty = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_NOCTTY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open("/dev/tty")?;
-    let fd = tty.as_raw_fd();
-    // SAFETY: an all-zero termios is a valid value of the plain C struct, and `tcgetattr`
-    // overwrites it before it is read.
-    let mut saved: libc::termios = unsafe { std::mem::zeroed() };
-    // SAFETY: `fd` is open, and `saved` is a writable termios.
-    if unsafe { libc::tcgetattr(fd, &mut saved) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    #[allow(clippy::unnecessary_cast)]
-    let saved_lflag = saved.c_lflag as u64;
-    let claimed = UNSHOWN_FD
-        .compare_exchange(-1, -2, Ordering::SeqCst, Ordering::SeqCst)
-        .is_ok();
-    if claimed {
-        UNSHOWN_LFLAG.store(saved_lflag, Ordering::SeqCst);
-        UNSHOWN_FD.store(fd, Ordering::SeqCst);
-    }
-    let interrupt = claimed
-        .then(|| {
-            // SAFETY: `sigaction` is plain data for which all-zero is a valid value (an empty
-            // mask, no flags).
-            let mut restoring: libc::sigaction = unsafe { std::mem::zeroed() };
-            restoring.sa_sigaction =
-                restore_and_end as extern "C" fn(libc::c_int) as libc::sighandler_t;
-            // SAFETY: As above.
-            let mut was: libc::sigaction = unsafe { std::mem::zeroed() };
-            // SAFETY: A valid disposition for SIGINT; `was` receives the one it replaces.
-            (unsafe { libc::sigaction(libc::SIGINT, &restoring, &mut was) } == 0).then_some(was)
-        })
-        .flatten();
-    let mut quiet = saved;
-    quiet.c_lflag &= !libc::ECHO;
-    quiet.c_lflag |= libc::ECHONL;
-    let restore = Restore {
-        fd,
-        saved,
-        claimed,
-        interrupt,
-    };
-    // SAFETY: `fd` is open, and `quiet` is a termios `tcgetattr` filled, then edited.
-    if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &quiet) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    tty.write_all(prompt.as_bytes())?;
-    tty.flush()?;
+    let mut unshown = Unshown::open(prompt, restore_and_end)?;
     let mut raw = Vec::with_capacity(128);
     let mut byte = [0u8; 1];
     while (raw.len() as u64) < CODE_READ_MAX {
-        match tty.read(&mut byte) {
+        match unshown.tty.read(&mut byte) {
             Ok(0) => break,
             Ok(_) => {
                 raw.push(byte[0]);
@@ -1082,12 +1115,69 @@ pub(crate) fn read_unshown(prompt: &str) -> io::Result<String> {
             }
         }
     }
-    drop(restore);
+    drop(unshown);
     String::from_utf8(raw).map_err(|bad| {
         scrub_vec(bad.into_bytes());
         io::Error::new(io::ErrorKind::InvalidData, "join code is not valid UTF-8")
     })
 }
+
+/// [`read_unshown`] for a secret the caller hands on (the code a browser shows to paste into a
+/// Claude Code setup-token): the line, without its newline, in a buffer that is wiped when it
+/// drops and was made at its full size first, so no growth leaves a copy behind; `Ok(None)` once
+/// `cancelled` is set (the caller got its answer another way), looked at every
+/// [`UNSHOWN_TICK`] while no line is typed. Ctrl-C does not end the process: the terminal's settings are put back and
+/// the read returns `Interrupted` within a tick, so the caller ends what it runs and exits.
+///
+/// # Errors
+/// `/dev/tty` cannot be opened or set; a read fails; `Interrupted` at Ctrl-C.
+pub(crate) fn read_unshown_secret(
+    prompt: &str,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> io::Result<Option<zeroize::Zeroizing<Vec<u8>>>> {
+    use std::os::fd::AsRawFd as _;
+    use std::sync::atomic::Ordering;
+    UNSHOWN_INTERRUPTED.store(false, Ordering::SeqCst);
+    let mut unshown = Unshown::open(prompt, restore_and_note)?;
+    // macOS's poll(2) refuses a terminal device, so the read is made nonblocking on this open of
+    // `/dev/tty` alone (its own file description) and tried once a tick.
+    let fd = unshown.tty.as_raw_fd();
+    // SAFETY: `fd` is the open /dev/tty `unshown` holds; F_GETFL and F_SETFL take and give flags.
+    let nonblocking = unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        flags >= 0 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) == 0
+    };
+    if !nonblocking {
+        return Err(io::Error::last_os_error());
+    }
+    let cap = usize::try_from(CODE_READ_MAX).unwrap_or(4096);
+    let mut line = zeroize::Zeroizing::new(Vec::with_capacity(cap));
+    let mut byte = zeroize::Zeroizing::new([0u8; 1]);
+    loop {
+        if UNSHOWN_INTERRUPTED.load(Ordering::SeqCst) {
+            return Err(io::Error::from(io::ErrorKind::Interrupted));
+        }
+        if cancelled.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        match unshown.tty.read(&mut byte[..]) {
+            Ok(0) => break,
+            Ok(_) if byte[0] == b'\n' => break,
+            Ok(_) if line.len() < cap => line.push(byte[0]),
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => std::thread::sleep(UNSHOWN_TICK),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    Ok(Some(line))
+}
+
+/// How often [`read_unshown_secret`] looks at whether it was cancelled or interrupted.
+const UNSHOWN_TICK: Duration = Duration::from_millis(100);
 
 fn short(node: &str) -> &str {
     node.get(..8).unwrap_or(node)

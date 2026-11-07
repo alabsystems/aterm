@@ -41,10 +41,28 @@ enum Look {
 fn look(child: &mut Child, scope: &Scope) -> io::Result<Look> {
     Ok(match Cohort::of_child(child) {
         Ok(cohort) if cohort.scope == *scope => Look::Live(cohort),
-        _ if child.try_wait()?.is_some() => Look::Ended,
+        _ if ended(child)? => Look::Ended,
         _ if exited(child) => Look::Leaving,
         _ => Look::Refused,
     })
+}
+
+/// Whether the owned `child` has ended, reaping it if so, with the resource accounting that reap
+/// collects where this platform's kernel gives it ([`Child::try_wait_with_rusage`]), so the
+/// child's owner still reads its own resident peak ([`Child::usage`]: a supervised build's floor)
+/// once a capture reaped it. A child reaped already has ended.
+///
+/// # Errors
+/// The reap's.
+fn ended(child: &mut Child) -> io::Result<bool> {
+    if child.is_reaped() {
+        return Ok(true);
+    }
+    match child.try_wait_with_rusage() {
+        Ok(usage) => Ok(usage.is_some()),
+        Err(error) if error.kind() == io::ErrorKind::Unsupported => Ok(child.try_wait()?.is_some()),
+        Err(error) => Err(error),
+    }
 }
 
 fn exited(child: &Child) -> bool {
@@ -309,8 +327,9 @@ impl Cohort {
     /// # Errors
     /// The attempt's actual owner/scope is stale or its original child was replaced, a still-live
     /// child cannot be captured as this parent's self-led group, an exited child did not become
-    /// reapable within a second or its pid is not a group, or `Child::try_wait` fails. Members
-    /// leaving the group still require separate custody.
+    /// reapable within a second or its pid is not a group, or its reap fails (an ended child is
+    /// reaped with its resource accounting where the kernel gives it, which its owner reads,
+    /// [`Child::usage`]). Members leaving the group still require separate custody.
     pub fn of_spawned(spawned: &mut aterm_uds::spawnfd::Spawned) -> io::Result<Self> {
         if !spawned.key().is_current() || !spawned.is_original_child() {
             return Err(io::Error::other(
@@ -369,7 +388,8 @@ impl Cohort {
     ///
     /// # Errors
     /// The child has ended, is not this process's child and its own group leader, a required
-    /// boot/namespace/identity read is unavailable or changes, or `Child::try_wait` fails.
+    /// boot/namespace/identity read is unavailable or changes, or the reap of an ended child
+    /// fails (one that ended is reaped, with its resource accounting where the kernel gives it).
     pub fn of_child(child: &mut Child) -> io::Result<Self> {
         let refused = || {
             io::Error::new(
@@ -377,7 +397,7 @@ impl Cohort {
                 "capacity cohort needs a live owned self-led child and a stable kernel scope",
             )
         };
-        if child.try_wait()?.is_some() {
+        if ended(child)? {
             return Err(refused());
         }
         let group = i32::try_from(child.id())
@@ -389,7 +409,7 @@ impl Cohort {
         let second = process::read_lineage(group).ok_or_else(refused)?;
         if !same_leader(&first, &second, child.id())
             || Scope::read().as_ref() != Some(&scope)
-            || child.try_wait()?.is_some()
+            || ended(child)?
         {
             return Err(refused());
         }
@@ -641,6 +661,31 @@ mod tests {
         });
         assert!(matches!(found.unwrap(), Look::Refused));
         assert_eq!(looks, 1);
+    }
+
+    /// A CHILD THAT ENDED BEFORE ITS CAPTURE IS REAPED WITH ITS ACCOUNTING: the capture's reap is
+    /// the child's last, so its owner, a supervised build's front, reads the root's own resident
+    /// peak from it ([`spawnfd::Child::usage`]). NEGATIVE CONTROL (by hand: the capture reaping
+    /// with a plain `try_wait`): no accounting kept.
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_vendor = "apple", target_os = "linux")
+    ))]
+    #[test]
+    fn a_child_that_ended_before_its_capture_keeps_its_accounting() {
+        let mut child = spawnfd::command("/bin/sh")
+            .args(["-c", "exit 3"])
+            .process_group(0)
+            .spawn()
+            .expect("self-led sh");
+        child.wait_exited().expect("its exit, unreaped");
+        let found = look(&mut child, &token().scope).unwrap();
+        assert!(matches!(found, Look::Ended));
+        let usage = child
+            .usage()
+            .expect("the capture's reap kept its accounting");
+        assert_eq!(usage.status.code(), Some(3));
+        assert_eq!(child.wait().expect("its status").code(), Some(3));
     }
 
     /// A live child refused is `Refused`, not one to wait for: it is captured in another scope.

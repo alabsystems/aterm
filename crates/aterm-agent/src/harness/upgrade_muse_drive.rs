@@ -322,7 +322,7 @@ pub(super) fn snapshot(
         login: None,
         home: None,
         claude_dir: None,
-        stored_login: false,
+        route: crate::harness::accounts::AuthRoute::Outside,
         profile: None,
     })
 }
@@ -779,6 +779,7 @@ pub(super) fn plan(opts: &Opts, st: &St, k: &dyn MuseKernel) -> Result<Plan, NoP
         dialect,
         line,
         tap_dropped: None,
+        token_dropped: None,
         line_dir: None,
     })
 }

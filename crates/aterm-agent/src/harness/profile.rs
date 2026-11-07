@@ -736,11 +736,11 @@ pub fn custom_oauth(raw: Option<&std::ffi::OsStr>) -> bool {
 }
 
 /// The method a Claude Code process's login is: a subscription for a stored login on a known
-/// plan, else `None`.
+/// plan, else `None`. A profile read leaves a token route out: its profile may be stale.
 #[must_use]
 pub fn login_method(env: &[String], user_home: &Path) -> Option<aterm_phase::LoginMethod> {
     let who = super::accounts::ProcessLogin::of_exec_env(env)?;
-    if !who.stored_login {
+    if !who.route.is_stored() {
         return None;
     }
     let path = effective_of(env, user_home)?;
@@ -1009,6 +1009,50 @@ pub fn account_of(env: &[String], user_home: &Path) -> Option<AccountKey> {
         Ok(raw
             .and_then(|file| file.oauth.0)
             .and_then(|oauth| oauth.key.0))
+    })
+    .ok()
+    .flatten()
+}
+
+/// The account a Claude Code login record names: its `oauthAccount`'s address and the key of its
+/// `accountUuid` ([`AccountKey::claude`]). What a session's own login record says it is logged
+/// into (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.2), whether or not a roster row names
+/// it. A record of a token session may be stale.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoginRecord {
+    /// `oauthAccount.emailAddress`.
+    pub email: String,
+    /// The account's key, where the record names an `accountUuid`.
+    pub key: Option<AccountKey>,
+}
+
+/// The login record of the login `login` names (a row's absolute `dir`, as
+/// [`account_for_login`] reads one, or `None` for the machine's default login under
+/// `user_home`), where it names an account by its address.
+#[must_use]
+pub fn login_record(user_home: &Path, login: Option<&str>) -> Option<LoginRecord> {
+    let path = match login.filter(|login| !login.is_empty()) {
+        Some(login) => {
+            let home = Path::new(login);
+            if !home.is_absolute() {
+                return None;
+            }
+            profile_in_home(home)
+        }
+        None => effective_of(&[], user_home)?,
+    };
+    read_with(&path, |bytes| {
+        let Obj(who) =
+            aterm_json::from_slice::<Obj<RawWho>>(bytes).map_err(|_| NoProfile::Unreadable)?;
+        let Some(Address(Some(email))) = who.and_then(|who| who.oauth.0).map(|o| o.address) else {
+            return Ok(None);
+        };
+        let key = aterm_json::from_slice::<Obj<RawKey>>(bytes)
+            .ok()
+            .and_then(|Obj(raw)| raw)
+            .and_then(|file| file.oauth.0)
+            .and_then(|oauth| oauth.key.0);
+        Ok(Some(LoginRecord { email, key }))
     })
     .ok()
     .flatten()
@@ -2891,7 +2935,8 @@ fn selected_profile(
     roster: Option<&super::accounts::Roster>,
 ) -> Option<Selected> {
     let who = super::accounts::ProcessLogin::of_exec_env(env)?;
-    if !who.stored_login {
+    // A profile read leaves a token route out: its profile may be stale (§5.7).
+    if !who.route.is_stored() {
         return None;
     }
     let context = Context::of_exec_env(user_home, records, env)?;

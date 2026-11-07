@@ -25,7 +25,7 @@ pub(super) fn snapshot() -> Snapshot {
         login: None,
         home: None,
         claude_dir: None,
-        stored_login: false,
+        route: aterm_agent::harness::accounts::AuthRoute::Outside,
         profile: None,
     }
 }
@@ -806,7 +806,7 @@ fn account_progress_only_reports_a_probe_owned_by_the_current_process() {
         who: accounts::ProcessLogin {
             login: None,
             default_home: true,
-            stored_login: true,
+            route: aterm_agent::harness::accounts::AuthRoute::Stored,
         },
         roster: PathBuf::from("/synthetic/roster"),
         state: PathBuf::from("/synthetic/state"),
@@ -926,7 +926,7 @@ fn a_retired_judgment_keeps_independently_observed_work_visible() {
                         who: accounts::ProcessLogin {
                             login: None,
                             default_home: true,
-                            stored_login: true,
+                            route: aterm_agent::harness::accounts::AuthRoute::Stored,
                         },
                         roster: "/synthetic/roster".into(),
                         state: "/synthetic/state".into(),

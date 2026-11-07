@@ -1619,8 +1619,13 @@ pub const VERBS: &[VerbSpec] = &[
         AnyScopeMeta,
         "setup status: the background coordinator's last published observation",
         "— read-only instance posture, including with no terminal selected. Replies \
-         `OK schema=1 setup=<state>` with the same `setup=` state as `status`: `done`, \
-         `pending[:<rows>][;needs:<rows>]`, or `-` before any observation; `done` may carry \
+         `OK schema=2 setup=<state> verified=<bits> observed_generation=<n> rows=<subject:standing,...|->` \
+         with the same `setup=` state as `status`: `done`, `unknown:<rows>`, \
+         `pending[:<rows>][;needs:<rows>][;unknown:<rows>]`, or `-` before any observation; \
+         `unknown` names settings without a usable cached reading, separately from known work. \
+         The row metadata uses fixed public names and standings (`unread` before any reading), \
+         never notes or values. The generation counts cached observation changes, not time. \
+         Only `verified` supplies already-confirmed private settings. `done` may carry \
          `;asking:<rows>` for automatic work still continuing and `;offered:<rows>` for grants \
          which hold nothing back. Starts no probe or setup, requests no permission, changes \
          no focus and counts as no input.",
@@ -2306,11 +2311,12 @@ pub const VERBS: &[VerbSpec] = &[
          an older one is read again before the reply (which waits at most 10 ms for it), and \
          `-` is no word: the package manager is inert, no store location resolves (no home \
          directory), or no read has landed in the last 4 s). Setup: \
-         `setup=<done[;asking:<row,…>][;offered:<row,…>]|pending|pending:<row,…>[;needs:<row,…>]|->` \
+         `setup=<done[;asking:<row,…>][;offered:<row,…>]|unknown:<row,…>|pending[:<row,…>][;needs:<row,…>][;unknown:<row,…>]|->` \
          (this Mac's first-run setup, read from the last status its worker published: no \
          probe, nothing changed; `done` leaves nothing for anyone to do now, `;asking:` names \
          what a parked run still asks for again by itself (an absent vault), `;offered:` the \
-         macOS grants on offer, which nothing waits for; `;needs:` the pending rows that wait on a \
+         macOS grants on offer, which nothing waits for; `unknown:` names rows without a usable \
+         cached reading, not a failed mapping or an effect still to run; `;needs:` the known pending rows that wait on a \
          person's press; rows `fda`, `devtools`, `debugger`, \
          `lan`, `ax`, `vault`, `repos`, …). Network: \
          `net=<alab-lan|remote|offline|checking|-> net_kind=<hotspot|lan|cellular|vpn|-> \
@@ -2333,7 +2339,8 @@ pub const VERBS: &[VerbSpec] = &[
          agent_rev= agent_since_ms= agent_gen= agent_fp= wait=<memory|-> wait_gib=<GiB|-> \
          wait_ahead=<n|-> \
          program_state=<idle|working|blocked|done|error>[:<permission|question|auth>] \
-         program_state_ms= last_act=` (`wait=memory` while the program in front is a build's \
+         program_state_ms= last_act= auth=<stored|token|outside|-> token=<state|->` \
+         (`wait=memory` while the program in front is a build's \
          front waiting for its memory claim, which `program=` names by the build it becomes, \
          `targo`: `wait_gib=` its claim to a tenth of a GiB and `wait_ahead=` the claims ahead of \
          it, as its ledger said at most about 5 s ago, `-` where its ledger is unread; \
@@ -2343,7 +2350,11 @@ pub const VERBS: &[VerbSpec] = &[
          Build's `app=grok-build`), a claim beside an `agent=` it never moves, `-` otherwise, and \
          `program_state_ms=` how long it has stood, counted through sleep as the survey's \
          `agent_ms=` is; `agent_since_ms=` and `human_ms=` stop while the Mac sleeps, so across \
-         a sleep it is not comparable with them). Theme: `os_appearance= theme_side= reported_scheme= \
+         a sleep it is not comparable with them; `auth=` is how a Claude Code tab signs in, its \
+         `stored` login, its account's vault `token`, or `outside` where its environment brings \
+         its own, and `token=` that account's vault token state (`none`, `soon`, `active`, …), \
+         `-` for another program, before its footer read the process, or where this platform \
+         keeps no vault tokens). Theme: `os_appearance= theme_side= reported_scheme= \
          scheme_from=<theme|program> bg_dark= session_theme= theme_origin=` (`conpty=` on \
          Windows). Input and host: `integration=<on|off|degraded> \
          input=<clear|pending|typeahead|stalled|stopped|-> input_bytes= input_wait_ms= \
@@ -4495,7 +4506,8 @@ pub const VERBS: &[VerbSpec] = &[
          not be read, whose rows are unknown; `moves_7d=` and `last_move=` are the rotations \
          a session proved on its ledgers, `move_tries_7d=` those it tried, `-` where it cannot say): `account pool=<cli> id=<pct> condition=<word> \
          enrolled=<0|1> pct5=<n|-> pct7=<n|-> week_reset=<unix s|-> walled_until=<unix s|-> \
-         last_used=<unix s|-> read_at=<unix s|-> launch=<0|1|->` (on this machine's clock; an id \
+         last_used=<unix s|-> read_at=<unix s|-> launch=<0|1|-> token=<state|->` (on this \
+         machine's clock; an id \
          holding an `@` is sent as `ab…@…`, so no email is; `enrolled`: its login is made here, \
          as a launch judges it, which for a Claude Code row with no dir is no look at a login; \
          `read_at`: when its figures were last read, from the \
@@ -4506,7 +4518,10 @@ pub const VERBS: &[VerbSpec] = &[
          would start on this row here, under the accounts mode, the owner's pin and the Codex \
          build, which no row of a pool says where that launch is refused, runs on a login no \
          row lists, or is Codex's on one nothing here can show a wall on, and `-` or no field is \
-         an aterm too old to say), and one \
+         an aterm too old to say; `token=`: a Claude Code row's vault token state here, `none`, \
+         `unknown`, `unreadable`, `mismatched`, `ended`, `rejected`, `unverified`, `exposed`, \
+         `soon` or `active`, and `-` or no field for another pool, on a platform that keeps no \
+         vault tokens, or from an aterm too old to say), and one \
          `server_heard vault=<pct> subject=<age1…> at=<unix s>` \
          row per subscriber a vault served here last heard from. A `session` row is `local= \
          sid= state= \
@@ -4515,7 +4530,8 @@ pub const VERBS: &[VerbSpec] = &[
          agent_ms=<ms> human_ms=<ms|-> bg=<n|-> task=<state|-> task_rev=<n> task_from=<pct|-> \
          task_ms=<ms|-> task_conclusion=<finished|failed|-> model=<pct|-> effort=<pct|-> \
          ctx_left_pct=<n|-> usage_5h_pct=<n|-> \
-         usage_7d_pct=<n|-> account=<pct|-> detail=<pct|-> \
+         usage_7d_pct=<n|-> account=<pct|-> auth=<stored|token|outside|-> token=<ac key|-> \
+         detail=<pct|-> \
          doing=<pct|-> role=<pct|-> supervisor=<pct|-> attention=<1|pct|-> goal=<1|pct|-> needs=<word|-> \
          needs_by=<program|harness|-> hold_by=<word|-> held_from=<32 hex|-> typed_by=<pct|-> \
          typed_ms=<ms|-> bells=<n> bells_sounded=<n> last_bell=<ms>/<sound>/<program|->[,…]|->`, \
@@ -4549,7 +4565,10 @@ pub const VERBS: &[VerbSpec] = &[
          one, else from its status-line usage tap (`context_window.remaining_percentage`), and \
          `usage_5h_pct= usage_7d_pct=` (the plan's windows used) from that tap; its \
          `account=` is the row its footer judges its login to, another pooled CLI's the row its \
-         pool last read the session on. \
+         pool last read the session on; its `auth=` is how it authenticates (its stored login, \
+         the vault token aterm's wrapper served it, or anything else), and on the token route \
+         `token=` names that token's account key, never a value (`-` for each on another program, \
+         and no field from an aterm too old to say). \
          `needs_by=program` marks a need raised by the \
          program's own report (a codex that says it is `blocked` where no claim speaks for the \
          tab): a claim, never read off its screen. `needs_by=harness` marks a harness's `NEEDS \
@@ -4575,16 +4594,22 @@ pub const VERBS: &[VerbSpec] = &[
          brief=sha256:<64 hex> brief_bytes= from= started_ms= \
          state=<working|done|exited|stalled|failed|closed> rev= conclusion= why= \
          checked=<12 hex>@<ref>|pushed|no-remote|no-repo|gone landed=<12 hex> attention= \
-         accept= accept_ms= heard_ms= after= area= told=<outcome>.<stop>`, values \
-         percent-encoded, `-` for none (`node=-`: this Mac; never the brief's text; `told=` the \
-         end the worker's last `kind=task` telemetry row told, so a close to the same end writes \
-         no second). A row is written when `aterm ctl \
-         [--host <h>|any] spawn agent=… [label=<word>]` starts a worker (`label=` stays on \
-         this Mac), and moved on by the aterm serving it, which waits on each open row, and \
-         by a wait here that asks a worker where its row says it runs. `aterm ctl board \
-         accept <@sid|label> <word>` records the package's accept result on this Mac's board, \
-         and `aterm ctl [--host <h>] await task board [any|all] [since=<rev>]` waits on every \
-         open row (`docs/DESIGN-fleet-task-board-2026-11-04.md`).",
+         accept= accept_ms= heard_ms= after= area= told=<outcome>.<stop> ended= ended_why= \
+         owed=`, values percent-encoded, `-` for none (`node=-`: this Mac; never the brief's \
+         text; `told=` the end the worker's last `kind=task` telemetry row told, so a close to the \
+         end it last told, or the end of the newest row it owes, writes no second; `ended=` and \
+         `ended_why=` the last conclusion its Mac reported while the row stood open, a stall's \
+         excepted, kept past a live row naming none until the row closes; `owed=` the lines of \
+         the `kind=task` rows the log's lock or disk refused, oldest first, at most 4, kept until \
+         a write takes them at their own close's time, each counted lost once where a write fails \
+         an hour or more after its close, a fifth is owed, or the row is pruned or written \
+         over). A row is written when `aterm ctl [--host <h>|any] spawn agent=… \
+         [label=<word>]` starts a worker (`label=` stays on this Mac), and moved on by the \
+         aterm serving it, which waits on each open row, and by a wait here that asks a worker \
+         where its row says it runs. `aterm ctl board accept <@sid|label> <word>` records the \
+         package's accept result on this Mac's board, and `aterm ctl [--host <h>] await task \
+         board [any|all] [since=<rev>]` waits on every open row \
+         (`docs/DESIGN-fleet-task-board-2026-11-04.md`).",
     ),
     va(
         "exits",

@@ -104,7 +104,6 @@ fn headless_host_actor_if_requested() {
         let error = supervise_headless_controlled(
             held,
             &mut command,
-            &|| 0,
             &mut |_| {},
             cancellation,
             &mut |event| {
@@ -219,7 +218,6 @@ fn headless_host_actor_if_requested() {
             let outcome = supervise_headless_controlled(
                 held,
                 &mut command,
-                &|| 0,
                 &mut |_| {},
                 cancellation,
                 &mut |event| {

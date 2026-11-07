@@ -1214,22 +1214,22 @@ pub(super) fn member_key(paths: &Paths) -> (Bootstrap, crate::membership_log::Me
 
 /// A one-admin vault on a loopback server: `m22` (admin) and `m7` (member), Commons enrolled,
 /// `entries` published, Genesis v2 signed and synced to `m7`.
-pub(super) struct TwoMacs {
-    pub(super) root: aterm_tempfile::TempDir,
-    pub(super) server: crate::server::Running,
-    pub(super) url: String,
+pub(crate) struct TwoMacs {
+    pub(crate) root: aterm_tempfile::TempDir,
+    pub(crate) server: crate::server::Running,
+    pub(crate) url: String,
     /// The vault's signer, as a join source names it after `#`.
-    pub(super) signer: String,
-    pub(super) m22: Paths,
-    pub(super) m7: Paths,
+    pub(crate) signer: String,
+    pub(crate) m22: Paths,
+    pub(crate) m7: Paths,
 }
 
-pub(super) fn two_macs(entries: &[(Audience, &str, &[u8])]) -> TwoMacs {
+pub(crate) fn two_macs(entries: &[(Audience, &str, &[u8])]) -> TwoMacs {
     two_macs_with(entries, false)
 }
 
 /// [`two_macs`], with `m7` an admin too where `m7_admin`.
-pub(super) fn two_macs_with(entries: &[(Audience, &str, &[u8])], m7_admin: bool) -> TwoMacs {
+pub(crate) fn two_macs_with(entries: &[(Audience, &str, &[u8])], m7_admin: bool) -> TwoMacs {
     two_macs_at(entries, m7_admin, None)
 }
 
@@ -2650,12 +2650,20 @@ fn a_revoked_mac_cannot_rewrite_an_entry_for_the_macs_that_read_the_log() {
     drop(root);
 }
 
+/// A Claude Code token's entry name ([`crate::entry_class::claude_token`]).
+const SPLIT_TOKEN: &str = "aterm-claude-token-ac-0123456789abcdef";
+
 /// Two admins save different values for one entry while split. After the heal each admin's own
 /// pass mirrors the merged log, every Mac writes the same value, and the other stays a candidate:
-/// status names the conflict until a person saves the entry, which settles it.
+/// status names the conflict until a person saves the entry, which settles it. A Claude Code
+/// token's conflict is named as one (`token`), which the token call picks, not `aterm secrets set`.
 ///
 /// NEGATIVE CONTROL: let a mirror re-put a conflicted name (`resolving` true for every conflicted
 /// name in `draft_document_diff`): the heal settles the conflict and status names nothing.
+///
+/// NEGATIVE CONTROL (2026-11-06, restored with cp from a backup plus touch, confirmed with cmp):
+/// with `conflicts` naming no entry a token, the token's conflict reads `token: false` where the
+/// test expects `token: true`.
 #[test]
 fn a_conflict_stays_until_a_person_saves_it_and_status_names_it() {
     // Every server it reads is its own on loopback, which answers.
@@ -2673,6 +2681,7 @@ fn a_conflict_stays_until_a_person_saves_it_and_status_names_it() {
         d.set_entry(&Audience::Everyone, "split-key", value)
             .unwrap();
         admin_publish(admin, &a, &d).unwrap();
+        test_put_everyone(admin, SPLIT_TOKEN, value).expect("its token call's write");
     }
 
     // --- HEAL --- nobody acts: each admin's own passes run over both servers.
@@ -2682,7 +2691,17 @@ fn a_conflict_stays_until_a_person_saves_it_and_status_names_it() {
         }
     }
     sync_with_candidates(&lab.m_v2, None, &urls).expect("m8 syncs");
-    let conflict = vec!["[everyone] split-key".to_owned()];
+    let token = Conflict {
+        entry: format!("[everyone] {SPLIT_TOKEN}"),
+        token: true,
+    };
+    let conflict = vec![
+        token.clone(),
+        Conflict {
+            entry: "[everyone] split-key".to_owned(),
+            token: false,
+        },
+    ];
     assert_eq!(
         conflicts(&lab.m_v2).unwrap(),
         conflict,
@@ -2708,7 +2727,7 @@ fn a_conflict_stays_until_a_person_saves_it_and_status_names_it() {
     a.resolving(&Audience::Everyone, "split-key");
     admin_publish(&lab.st1, &a, &d).expect("the person's save");
     sync_with_candidates(&lab.m_v2, None, &urls).expect("m8 syncs the save");
-    assert!(conflicts(&lab.m_v2).unwrap().is_empty());
+    assert_eq!(conflicts(&lab.m_v2).unwrap(), vec![token]);
     assert_eq!(
         std::fs::read(lab.m_v2.home.join(".secrets/split-key")).unwrap(),
         winner

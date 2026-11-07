@@ -514,6 +514,22 @@ OUTLOOK (Claude Code's pool):
   for an expired or reset-cut figure. `sampled_at` is the retained sample's publication
   time; each window's `as_of` and `source` identify the observation its figure came from.
 
+VAULT TOKENS (Claude Code's pool, macOS):
+  After the rows, a `vault tokens:` block: for each row with an email and each account a
+  session here is logged into, its token's state (`none`, `unknown`, `unreadable here`,
+  `mismatched`, `ended`, `rejected`, `unverified (<why>)`, `exposed (removed <Mac>)`, `soon`,
+  `active`), its vault entry, when and where it was made, its end and where that came from,
+  its signer, whether it is in the vault or not yet, when this Mac verified or saw it refused,
+  when sessions here used it, and which peers did at one bounded fleet read (or \"peers not
+  read\" and the last read's time). No token value or digest is ever shown. Where an account
+  a session here is on has no token in use (or its token ends within 30 days, or a removed Mac
+  was handed it), an `offer:` line names the one step that makes one; it is noted once per
+  change of its state and of its stored login's (`ok`, `ending` within 7 days, `ended`), and
+  never while a token made here is not yet in vault. Off macOS the block still says each
+  token's state, and no `offer:` line comes, since the step makes a token only on macOS.
+  `--json` carries the same under `tokens`, each account's `offer{state, login, pair, since,
+  step}`, and each session's `route`.
+
 LIMIT RESET (`[harness] limit_reset = true`, default false):
   At Claude Code's usage-limit dialog on the machine's default login (no other account run
   since 25h before the session started, and a limit >24h away or an offer expiring within
@@ -618,6 +634,27 @@ VERBS:
   - `accounts use <label> | --auto`
     Pins an enrolled account that is not signed out (clearing its recorded walls), or
     clears the pin (`--auto`).
+  - `accounts token <label|email> [--replace | --remove]`
+    Claude Code's alone. Makes a year-long Claude Code token for one account with `claude
+    setup-token`, signed in as that account by a person at this Mac's terminal, stores it in
+    the vault and records it in the accounts store's value-free `tokens.json`. An email names an account a session here is
+    logged into or a row names; a label names a row with an email, one another Mac holds
+    included. Refused before any sign-in without a terminal, on a Mac not seated in the vault's
+    log, under a routed environment, or off macOS; a bare run is refused while the account's
+    token is in use, made on another Mac and awaiting verification there, or not yet in vault.
+    A busy vault after the sign-in never loses the token: it waits, then lands in the vault's
+    waiting writes (\"not yet in vault\") for this Mac's next vault pass, at once on Ctrl-C.
+    `--remove` deletes it from the vault. While its token is in use on this Mac, a session on
+    the account starts on it (`accounts token-run`).
+  - `accounts token-run (<label> | <email> | --auto) -- <program> <args…>`
+    Claude Code's token wrapper. A relaunch line types it with the row's label before the
+    store build; the managed `claude` twin types it with `--auto` inside an aterm tab. It serves the account's vault token over an
+    inherited descriptor (`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`, with the marker
+    `ATERM_CLAUDE_TOKEN`) only to a session-starting launch of a store build that today's
+    judgment puts on the row's stored login (no credential, route or profile variable, settings
+    `env` block or `apiKeyHelper`), with the token in use here and, for `--auto`, the account's
+    claim this Mac's; anything else runs exactly as typed, its reason word journaled
+    (`token-fallback`) where the account has a token. It writes nothing and takes no lock.
   - `accounts stats [--json]`
     Reads 5h, week, and Fable windows, plan, credits, 8-day list-price spend (\u{2248}$), login
     state, and running sessions for the current home (`--json` is schema 1 `account-stats`).
@@ -1250,6 +1287,17 @@ pub enum LedgerFile {
     Accounts(Cli),
 }
 
+/// What `accounts token` does ([`AccountsCmd::Token`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TokenMode {
+    /// A bare run: make a token where the account has none in use here and none on its way.
+    Make,
+    /// `--replace`: make a new one in place of the one in use.
+    Replace,
+    /// `--remove`: delete both of its vault entries.
+    Remove,
+}
+
 /// One form of `accounts` (design `docs/DESIGN-claude-accounts-2026-10-01.md` §4, §8).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccountsCmd {
@@ -1327,6 +1375,16 @@ pub enum AccountsCmd {
         name: String,
         /// The JSON form.
         json: bool,
+    },
+    /// `accounts token <label|email> [--replace | --remove]`: make, store and record a Claude Code
+    /// setup-token for one account in one step, or remove it from the vault
+    /// ([`super::accounts_tokens::run`], `docs/DESIGN-claude-setup-token-2026-11-05.md` §4.6).
+    /// Claude Code's alone.
+    Token {
+        /// A row's label, or an account's email.
+        name: String,
+        /// A bare run, `--replace` or `--remove`.
+        mode: TokenMode,
     },
     /// `accounts stats [--json]`: what this machine has of the Claude Code account of the home the environment names ([`super::account_stats`]).
     Stats {
@@ -1732,6 +1790,8 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
     let mut agy = false;
     let mut refresh = false;
     let mut wait = false;
+    let mut replace = false;
+    let mut remove = false;
     let mut email: Option<String> = None;
     let mut identity_email: Option<String> = None;
     let mut browser: Option<String> = None;
@@ -1762,6 +1822,8 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
             "--agy" => agy = true,
             "--refresh" => refresh = true,
             "--wait" => wait = true,
+            "--replace" => replace = true,
+            "--remove" => remove = true,
             "--email" => {
                 email = Some(value(i, "--email")?);
                 i += 1;
@@ -2097,6 +2159,26 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
                     json,
                 },
                 ["refresh"] => AccountsCmd::Refresh { json },
+                ["token", name] => AccountsCmd::Token {
+                    name: (*name).to_string(),
+                    mode: match (std::mem::take(&mut replace), std::mem::take(&mut remove)) {
+                        (false, false) => TokenMode::Make,
+                        (true, false) => TokenMode::Replace,
+                        (false, true) => TokenMode::Remove,
+                        (true, true) => {
+                            return Err(
+                                "accounts token takes --replace or --remove, not both".to_string()
+                            );
+                        }
+                    },
+                },
+                ["token", ..] => {
+                    return Err(
+                        "accounts token takes one label or email: `aterm harness accounts token \
+                         <label|email> [--replace | --remove]`"
+                            .to_string(),
+                    );
+                }
                 ["add", label] => AccountsCmd::Add {
                     label: (*label).to_string(),
                     class: if pool_row {
@@ -2185,7 +2267,8 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
                          [--bind <addr:port>] [--machine <mN>]`, `add <label> \
                          [--pool] [--email <e>] [--browser <b>]`, `adopt-default <label> \
                          --email <e>`, `login <label>`, `browser <label>`, `renew [--due | \
-                         <label>…] [--on <host>,…]` or `use <label> | --auto`, not {other:?}"
+                         <label>…] [--on <host>,…]`, `token <label|email> [--replace | \
+                         --remove]` or `use <label> | --auto`, not {other:?}"
                     ));
                 }
             };
@@ -2214,6 +2297,9 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
     };
     if wait {
         return Err("--wait belongs to `signin`".to_string());
+    }
+    if replace || remove {
+        return Err("--replace and --remove belong to `accounts token <label|email>`".to_string());
     }
     if !owner.is_empty() && !matches!(cmd, Cmd::UpgradeOwner { .. }) {
         return Err("--status, --now, --defer and --skip belong to `upgrade`".to_string());
@@ -2371,7 +2457,9 @@ fn run_accounts_all(
     err: &mut dyn Write,
 ) -> ExitCode {
     let catalog = super::account_catalog::read(env.home.as_deref());
-    run_accounts_all_with_catalog(json, env, host, catalog, out, err)
+    with_token_section(env, host, json, out, err, |out, err| {
+        run_accounts_all_with_catalog(json, env, host, catalog, out, err)
+    })
 }
 
 fn run_accounts_all_with_catalog(
@@ -2424,7 +2512,7 @@ fn run_accounts_all_with_catalog(
                 err,
             );
         }
-        return run_accounts(&AccountsCmd::Report { json }, env, host, out, err);
+        return run_accounts_report((Cli::Claude, Launch::on(host)), env, json, out, err);
     }
     let mut pools = Vec::new();
     let mut code = ExitCode::SUCCESS;
@@ -2854,6 +2942,7 @@ fn accounts_of(
     }
     let verb = match form {
         AccountsCmd::Serve { .. } => Some("serve"),
+        AccountsCmd::Token { .. } => Some("token"),
         AccountsCmd::Report { .. }
         | AccountsCmd::Table { .. }
         | AccountsCmd::Import { .. }
@@ -3371,10 +3460,22 @@ fn no_longer_due(
     format!("no longer one this machine signs in by itself ({because}); nothing was run")
 }
 
+/// What `accounts renew <label>` says of a row that runs on its vault token here until `until`
+/// (unix seconds): renewal is off for it, and nothing was run.
+pub(super) fn token_renewal_words(label: &str, until: u64) -> String {
+    let (y, m, d) =
+        aterm_types::rfc3339::civil_from_days(i64::try_from(until / 86_400).unwrap_or(0));
+    format!(
+        "{label} runs on its vault token until {y:04}-{m:02}-{d:02}; renewal is off for it; \
+         nothing was run"
+    )
+}
+
 /// The sign-in a person's `accounts renew` starts for `label`: their own where they named it
 /// (`named`), else the upkeep's doors over the `records` it read (a row a session here runs on
 /// that lost its login, or a due login this Mac uses), so `--due` signs in only what the upkeep
-/// would; `None` where no door admits it.
+/// would; `None` where no door admits it, and for a row on its vault token here, named or not
+/// (renewal is off for it, `DESIGN-claude-setup-token-2026-11-05` §5.8).
 fn renew_sign_in(
     cli: Cli,
     label: &str,
@@ -3387,6 +3488,9 @@ fn renew_sign_in(
     ),
     now: i64,
 ) -> Option<SignIn> {
+    if others.on_token.contains_key(label) {
+        return None;
+    }
     if named {
         return Some(person_sign_in(cli, label));
     }
@@ -7225,6 +7329,72 @@ pub trait AccountsHost {
         None
     }
 
+    /// Whether this is macOS, the one system aterm's wrapper serves a token on.
+    fn on_macos(&self) -> bool {
+        cfg!(target_os = "macos")
+    }
+
+    /// The environment `accounts token` reads for a route and hands its capture: the process's in
+    /// a run ([`LiveAccounts`]); none on any other host.
+    fn verb_env(&self) -> Vec<(OsString, OsString)> {
+        Vec::new()
+    }
+
+    /// The vault `accounts token` stores in: this Mac's in a run; none on any other host, so a
+    /// test names its scratch one.
+    #[cfg(unix)]
+    fn token_vault(&self) -> Option<Box<dyn super::accounts_tokens::TokenVault>> {
+        None
+    }
+
+    /// The Claude Code `accounts token` runs `setup-token` with, and its version: atpkg's managed
+    /// build in a run; none on any other host.
+    #[cfg(unix)]
+    fn setup_token_program(&self) -> Option<(super::setup_token::Program, String)> {
+        None
+    }
+
+    /// The person `accounts token`'s capture talks to: this terminal in a run; none on any other
+    /// host.
+    #[cfg(unix)]
+    fn token_person(&self) -> Option<Box<dyn super::setup_token::Person>> {
+        None
+    }
+
+    /// How long `accounts token`'s sign-in, and its write after, may take: the hang detector.
+    fn token_hang(&self) -> std::time::Duration {
+        super::login_drive::HANG
+    }
+
+    /// How long `accounts token`'s write after the sign-in waits for a vault pass to let go
+    /// before it lands in the vault's waiting writes: `None`, the rest of [`Self::token_hang`].
+    fn token_write_wait(&self) -> Option<std::time::Duration> {
+        None
+    }
+
+    /// The accounts the sessions on this Mac are logged into, each by its own login record
+    /// ([`super::accounts_tokens::session_logins`]).
+    #[cfg(unix)]
+    fn session_logins(&self, env: &Env) -> Vec<super::accounts_tokens::SessionLogin> {
+        super::accounts_tokens::session_logins(env)
+    }
+
+    /// The report's one fleet read for the peers that use a token
+    /// (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.10): the fleet survey's own client
+    /// ([`crate::fleet_member::survey_fleet`]), bounded as `aterm ctl survey --fleet` is, in a
+    /// run; none on any other host, so the report says "peers not read".
+    fn fleet_survey(&self) -> Option<aterm_ctl::FleetRead> {
+        None
+    }
+
+    /// This aterm's own survey rows, for the report's sessions and their routes (§5.10): its
+    /// `aterm ctl survey` in a run, where the process runs in one of its tabs; none on any other
+    /// host.
+    fn local_survey(&self, env: &Env) -> Option<Vec<String>> {
+        let _ = env;
+        None
+    }
+
     /// Whether a browser installed outside the home (`/Applications`, `PATH`) counts in `accounts renew`'s choice of rows: in a run ([`LiveAccounts`]) it does; on any other host only one the home or [`Self::machine_var`] names does.
     fn system_browsers(&self) -> bool {
         false
@@ -7648,6 +7818,51 @@ impl AccountsHost for LiveAccounts {
 
     fn now(&self) -> i64 {
         crate::supervise::limit::unix_now()
+    }
+
+    fn verb_env(&self) -> Vec<(OsString, OsString)> {
+        std::env::vars_os().collect()
+    }
+
+    // A unit test never reads this Mac's own vault: the trait's default (none) answers there.
+    #[cfg(all(unix, not(test)))]
+    fn token_vault(&self) -> Option<Box<dyn super::accounts_tokens::TokenVault>> {
+        // A Mac with no vault configured has none (the report's `vault: null`).
+        let paths = aterm_secrets::client::Paths::live().ok()?;
+        super::accounts_tokens::configured_vault(paths)
+            .map(|vault| Box::new(vault) as Box<dyn super::accounts_tokens::TokenVault>)
+    }
+
+    #[cfg(unix)]
+    fn setup_token_program(&self) -> Option<(super::setup_token::Program, String)> {
+        let twin = super::upgrade_drive::managed_agent_twin("claude")?;
+        let text = super::accounts::read_bounded(&twin, 64 * 1024).ok()??;
+        let exe = super::upgrade_catalog::twin_binary(&text)?;
+        let version = super::upgrade_drive::twin_version(&twin).unwrap_or_default();
+        Some((super::setup_token::Program::setup_token(exe), version))
+    }
+
+    #[cfg(unix)]
+    fn token_person(&self) -> Option<Box<dyn super::setup_token::Person>> {
+        Some(Box::new(super::setup_token::Terminal::new()))
+    }
+
+    #[cfg(unix)]
+    fn fleet_survey(&self) -> Option<aterm_ctl::FleetRead> {
+        crate::fleet_member::survey_fleet(&aterm_ctl::FleetAsk {
+            host: None,
+            within: aterm_ctl::FLEET_WITHIN,
+        })
+        .ok()
+    }
+
+    fn local_survey(&self, env: &Env) -> Option<Vec<String>> {
+        let sock = env.sock.clone()?;
+        let exe = std::env::current_exe().ok()?;
+        let reply = crate::CtlClient::own_at(exe, Some(sock))
+            .run(&["survey"])
+            .ok()?;
+        Some(reply.lines().map(str::to_owned).collect())
     }
 
     fn machine_var(&self, name: &str) -> Option<OsString> {
@@ -11791,6 +12006,105 @@ fn run_accounts_report(
     }
 }
 
+/// Claude Code's report ([`run_accounts_report`]) and, after its rows, the vault tokens section
+/// ([`with_token_section`]).
+fn run_claude_report(
+    env: &Env,
+    host: &dyn AccountsHost,
+    json: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    with_token_section(env, host, json, out, err, |out, err| {
+        run_accounts_report((Cli::Claude, Launch::on(host)), env, json, out, err)
+    })
+}
+
+/// A report that names Claude Code's pool, `report`, and after it the vault tokens section
+/// (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.10; JSON: `tokens` beside the report's
+/// own keys). A report that fails says what it says, with no section after it.
+fn with_token_section(
+    env: &Env,
+    host: &dyn AccountsHost,
+    json: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    report: impl FnOnce(&mut dyn Write, &mut dyn Write) -> ExitCode,
+) -> ExitCode {
+    let mut local = Vec::new();
+    let code = report(&mut local, err);
+    if code != ExitCode::SUCCESS {
+        let _ = out.write_all(&local);
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        let section = token_report(env, host);
+        if json {
+            let mut value: Value =
+                aterm_json::from_slice(&local).unwrap_or_else(|_| Value::Object(Map::new()));
+            if let Some(object) = value.as_object_mut() {
+                object.insert("tokens".into(), section.json());
+            }
+            let _ = writeln!(out, "{value}");
+        } else {
+            let _ = out.write_all(&local);
+            let _ = write!(out, "{}", section.text());
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (env, host, json);
+        let _ = out.write_all(&local);
+    }
+    code
+}
+
+/// The report's vault tokens section (§5.10): each account's token, peers' use from one bounded fleet read where this Mac's table keeps a token, each offer noted
+/// once per pair, and the sessions this aterm's survey names.
+#[cfg(unix)]
+fn token_report(env: &Env, host: &dyn AccountsHost) -> super::accounts_token_view::Report {
+    use super::accounts_token_view::{self as view, Peers, PeersShown, Report};
+    let (Some(store), Some(vault)) = (env.accounts_store_for(Cli::Claude), host.token_vault())
+    else {
+        return Report::NoVault;
+    };
+    let now = host.now().max(env.now);
+    let at = u64::try_from(now).unwrap_or(0);
+    let kept = super::accounts_tokens::read_table(&store).is_ok_and(|table| !table.rows.is_empty());
+    let peers = if kept {
+        host.fleet_survey()
+            .map_or(Peers::NotRead, |read| view::peers_of(&read, at))
+    } else {
+        Peers::NotRead
+    };
+    let shown = match &peers {
+        Peers::Read { .. } if view::note_peers(&store, &peers).is_ok() => PeersShown::Read,
+        _ => PeersShown::NotRead,
+    };
+    let logins = host.session_logins(env);
+    let roster = env.accounts_roster_for(Cli::Claude);
+    let mut accounts = view::view(
+        &view::Places {
+            store: &store,
+            roster: roster.as_deref(),
+            logins: &logins,
+            now,
+        },
+        vault.as_ref(),
+    );
+    let _ = view::note_posted(&store, &mut accounts, vault.as_ref(), at);
+    let _ = view::note_offers(&store, &mut accounts, at);
+    let sessions = host
+        .local_survey(env)
+        .map(|lines| view::with_logins(view::sessions_of(&lines), &accounts, &logins));
+    Report::Accounts {
+        accounts,
+        peers: shown,
+        sessions,
+    }
+}
+
 /// `accounts history <name> [--json]` ([`super::alab_seen::history`]): this Mac's ledger rows and
 /// every Mac's journal events about one account, oldest first. The name is a row label, a lab
 /// label or legacy label, or an account key; an address is refused. Nothing calls a provider.
@@ -12788,7 +13102,7 @@ fn renewed_since(before: &accounts::Logins, current: &accounts::Logins, label: &
 
 /// Whether a person runs this at a terminal of their own: no automatic call, no pipe on stdin, and
 /// no agent's marker in its environment.
-fn person_at_terminal(host: &dyn AccountsHost) -> bool {
+pub(in crate::harness) fn person_at_terminal(host: &dyn AccountsHost) -> bool {
     !host.automatic_sign_in()
         && host.stdin_is_terminal()
         && aterm_types::domain::agent_marker(&|name| {
@@ -14586,8 +14900,18 @@ fn run_accounts_renew(
         state,
         ..
     } = records;
+    // The rows whose account the source gives to other Macs alone: `--due` signs none in, as the
+    // upkeep does not ([`accounts::renewal_due`]); and the rows on their vault token here, which
+    // no renewal touches, named or not.
+    let others = super::accounts_sync::rows_of_other_macs(Cli::Claude, env, &file_roster, &logins);
     let mut chosen: Vec<String> = Vec::new();
+    let mut on_token = false;
     for label in labels {
+        if let Some(until) = others.on_token.get(label) {
+            let _ = writeln!(out, "{label}: {}", token_renewal_words(label, *until));
+            on_token = true;
+            continue;
+        }
         match roster.row(label) {
             None => {
                 let _ = writeln!(
@@ -14635,9 +14959,6 @@ fn run_accounts_renew(
             )
         })
     };
-    // The rows whose account the source gives to other Macs alone: `--due` signs none in, as the
-    // upkeep does not ([`accounts::renewal_due`]).
-    let others = super::accounts_sync::rows_of_other_macs(Cli::Claude, env, &file_roster, &logins);
     if due {
         let due_labels = accounts::renew_due(&roster, &logins, &state, &others, now);
         for label in &due_labels {
@@ -14691,7 +15012,9 @@ fn run_accounts_renew(
         }
     }
     if chosen.is_empty() && machines.is_empty() {
-        let _ = writeln!(out, "nothing is due on this machine");
+        if !on_token || due {
+            let _ = writeln!(out, "nothing is due on this machine");
+        }
         return ExitCode::SUCCESS;
     }
     let all_can_run_headless = !chosen.is_empty()
@@ -18047,9 +18370,7 @@ pub fn run_accounts(
             out,
             err,
         ),
-        AccountsCmd::Report { json } => {
-            run_accounts_report((Cli::Claude, Launch::on(host)), env, *json, out, err)
-        }
+        AccountsCmd::Report { json } => run_claude_report(env, host, *json, out, err),
         AccountsCmd::Add {
             label,
             class,
@@ -18101,6 +18422,21 @@ pub fn run_accounts(
             let _ = writeln!(err, "aterm harness accounts refresh: use --cli kimi");
             ExitCode::from(2)
         }
+        #[cfg(unix)]
+        AccountsCmd::Token { name, mode } => {
+            super::accounts_tokens::run(env, host, name, *mode, out, err)
+        }
+        #[cfg(not(unix))]
+        AccountsCmd::Token { .. } => {
+            let _ = out;
+            let _ = (env, host);
+            let _ = writeln!(
+                err,
+                "aterm harness accounts token: a token is made only on macOS, where aterm's \
+                 wrapper serves it"
+            );
+            ExitCode::from(1)
+        }
         AccountsCmd::Sync {
             source,
             machine,
@@ -18143,13 +18479,20 @@ pub fn run_accounts_of(
         AccountsCmd::Import { label } => run_accounts_import(cli, env, label, of.vendor, out, err),
         AccountsCmd::Report { json } => {
             let program = host.launch_program(cli);
-            run_accounts_report(
-                (cli, Launch::of(program.as_deref(), host)),
-                env,
-                *json,
-                out,
-                err,
-            )
+            let report = |out: &mut dyn Write, err: &mut dyn Write| {
+                run_accounts_report(
+                    (cli, Launch::of(program.as_deref(), host)),
+                    env,
+                    *json,
+                    out,
+                    err,
+                )
+            };
+            if cli == Cli::Claude {
+                with_token_section(env, host, *json, out, err, report)
+            } else {
+                report(out, err)
+            }
         }
         AccountsCmd::Add {
             label,
@@ -18352,7 +18695,7 @@ pub fn run_accounts_of(
             out,
             err,
         ),
-        AccountsCmd::Serve { .. } => {
+        AccountsCmd::Serve { .. } | AccountsCmd::Token { .. } => {
             let _ = writeln!(
                 err,
                 "aterm harness accounts: {}'s pool takes `list`, `add`, `adopt-default`, \
@@ -18758,7 +19101,12 @@ fn run_accounts_stats(env: &Env, json: bool, out: &mut dyn Write) -> ExitCode {
             } else {
                 Ok(here.len())
             };
-            (sessions, here.iter().any(|c| !c.stored_login))
+            // An API key or another route is outside; a vault token is the account's own.
+            let outside = here.iter().any(|c| match c.route {
+                accounts::AuthRoute::Stored | accounts::AuthRoute::VaultToken { .. } => false,
+                accounts::AuthRoute::Outside => true,
+            });
+            (sessions, outside)
         }
         Some(Err(_)) => (Err("census-unread"), false),
         None => (Err("not-counted"), false),
@@ -19466,6 +19814,10 @@ pub fn main_entry(argv: Vec<OsString>) -> ExitCode {
     #[cfg(unix)]
     if let Some(result) = super::native_launch::entry(&argv) {
         return result;
+    }
+    // The token wrapper runs ahead of everything else: a `claude` a person typed waits on it.
+    if argv.len() >= 2 && argv[0] == "accounts" && argv[1] == "token-run" {
+        return super::accounts_token_run::main_entry(&argv[2..]);
     }
     use std::io::IsTerminal as _;
     let args: Vec<String> = argv

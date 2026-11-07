@@ -2283,6 +2283,9 @@ pub(crate) enum HarnessRequest {
     AiFleetFetch,
     /// Open a tab that runs one AI CLI's fix.
     AiSignIn { id: &'static str },
+    /// Open a tab that runs the quiet vault token offer's step of the Lab page's account row
+    /// `index` (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.9).
+    LabToken { index: usize },
     /// Raise session `session`'s tab and focus its pane (`App::raise_session_pane`).
     Show { session: u64 },
     /// A press on SESSIONS' `Every session` row.

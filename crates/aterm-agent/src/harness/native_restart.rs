@@ -297,8 +297,11 @@ pub(super) fn begin_completed_rollback(
         .native_observation
         .clone()
         .ok_or("native-crash-observation")?;
+    // The crashed vendor is the image the forward settled on: a token forward's is the store
+    // build aterm's wrapper exec'd in the same pid, never the wrapper
+    // ([`native_act::RestartCommand::settled`]).
     if observed.registration.host_epoch != previous.host_epoch
-        || observed.registration.vendor.image != forward.image
+        || observed.registration.vendor.image != *forward.settled()
         || observed.registration.shell != *shell
         || back.legacy_line().as_deref() != Some(st.line.as_str())
     {

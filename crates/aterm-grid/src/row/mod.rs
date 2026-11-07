@@ -510,7 +510,7 @@ impl Row {
         if end_half_blanked && end + 1 == old_len {
             self.len = u16_from_usize(end);
         }
-        Some(&mut self.cells[start..end])
+        Some(self.cells.slice_mut(start..end))
     }
 
     /// Grow `len` to cover content written up to `end_col - 1` by a path that does not keep it (e.g. [`Self::cells_mut_with_fixup`]).
@@ -524,11 +524,13 @@ impl Row {
     /// Overwrite the cells from column `left` with `cells` (clipped to the row), keeping the row's hint as [`Self::set`] does: `HAS_WIDE_CHARS` for a copied wide head.
     #[inline]
     pub(crate) fn overwrite_span(&mut self, left: usize, cells: &[Cell]) {
-        let Some(dst) = self.cells.get_mut(left..) else {
+        let Some(room) = self.cells.len().checked_sub(left) else {
             return;
         };
-        let n = cells.len().min(dst.len());
-        dst[..n].copy_from_slice(&cells[..n]);
+        let n = cells.len().min(room);
+        self.cells
+            .slice_mut(left..left + n)
+            .copy_from_slice(&cells[..n]);
         self.note_cells_written(left, left + n);
         let mut hints = RowFlags::DIRTY;
         if cells[..n]
@@ -562,7 +564,7 @@ impl Row {
     }
 
     /// Settle `len` after a bulk wide-char run written through
-    /// [`Row::write_wide_char_packed_no_fixup`] over `start_col..end_col`, and widen the written
+    /// [`Row::write_wide_run_packed_no_fixup`] over `start_col..end_col`, and widen the written
     /// window over the run.
     pub fn settle_len_after_wide_run(
         &mut self,
@@ -641,6 +643,15 @@ impl Row {
         self.flags |= RowFlags::DIRTY;
         self.note_all_cells_written();
         self.cells.iter_mut()
+    }
+
+    /// The columns whose cells may have changed since this was last asked (all of them for a
+    /// new row), and forgets them: a cell outside the range holds what it held then. Every
+    /// write to the cells notes what it reaches, so one reader that asks before each read of
+    /// the row knows which cells it must look at again.
+    #[inline]
+    pub fn take_touched(&mut self) -> std::ops::Range<usize> {
+        self.cells.take_touched()
     }
 
     /// Get a slice of cells.

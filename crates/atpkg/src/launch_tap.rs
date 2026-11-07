@@ -75,6 +75,66 @@ pub fn sh_prelude(program: &str, atpkg: Option<&Path>) -> String {
     s
 }
 
+/// What the token block asks of the aterm it names, between it and the build: aterm's token
+/// wrapper for a launch a person typed (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.4).
+pub const TOKEN_VERB: [&str; 5] = ["harness", "accounts", "token-run", "--auto", "--"];
+
+/// The note line ahead of the token block.
+const TOKEN_NOTE: &str = "# atpkg: aterm's token route — inside an aterm tab, `aterm harness accounts token-run \
+     --auto` starts this launch on its account's vault token where that token is in use on this \
+     Mac, and runs it exactly as typed anywhere else (aterm help harness).\n";
+
+/// `body`, `program`'s `sh` twin for the atpkg at `atpkg`, with THE TOKEN BLOCK right before its
+/// last line, the plain `exec '<build>' "$@"`: inside an aterm tab (`ATERM_PARENT_SESSION_ID` set), with
+/// the harness on for this launch (`ATERM_NO_HARNESS` empty or unset) and the aterm beside
+/// `atpkg` there, the launch runs as `<aterm> harness accounts token-run --auto -- <build>
+/// <args…>` ([`TOKEN_VERB`]), which serves the account's token or runs the build as typed; with
+/// that aterm missing, the last line runs as typed. The block sits after the tap's (in the
+/// prelude) and after the twin's exports, so the build the wrapper execs holds them, and its
+/// last line stays the plain exec, which `twin_binary` reads the build from. `body` comes back
+/// as it is for a program [`of`] does not name, on Windows (whose
+/// `.cmd` twin carries no prelude), where `atpkg` names no file, or where its last line is not a
+/// plain exec.
+#[must_use]
+pub fn with_token_block(program: &str, body: String, atpkg: Option<&Path>) -> String {
+    if cfg!(windows) || !of(program) {
+        return body;
+    }
+    let Some(aterm) = atpkg.and_then(aterm_beside) else {
+        return body;
+    };
+    let trimmed = body.trim_end_matches('\n');
+    let (head, last) = match trimmed.rsplit_once('\n') {
+        Some((head, last)) => (head, last),
+        None => return body,
+    };
+    let Some(build) = crate::platform::sh_exec_target(last.trim()) else {
+        return body;
+    };
+    let aterm = crate::platform::sh_quote_str(&aterm.to_string_lossy());
+    let build = crate::platform::sh_quote_str(&build.to_string_lossy());
+    let mut s = String::with_capacity(body.len() + 512);
+    s.push_str(head);
+    s.push('\n');
+    s.push_str(TOKEN_NOTE);
+    s.push_str(
+        "if [ -n \"${ATERM_PARENT_SESSION_ID-}\" ] && [ -z \"${ATERM_NO_HARNESS-}\" ] && [ -x ",
+    );
+    s.push_str(&aterm);
+    s.push_str(" ]; then\n  exec ");
+    s.push_str(&aterm);
+    for word in TOKEN_VERB {
+        s.push(' ');
+        s.push_str(word);
+    }
+    s.push(' ');
+    s.push_str(&build);
+    s.push_str(" \"$@\"\nfi\n");
+    s.push_str(last);
+    s.push('\n');
+    s
+}
+
 #[cfg(test)]
 #[path = "launch_tap_tests.rs"]
 mod tests;

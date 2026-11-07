@@ -138,6 +138,9 @@ aterm-tempfile = { workspace = true }
 # front against a scratch ledger. Not a new edge in the build graph: aterm-agent
 # above already depends on it.
 atpkg = { workspace = true }
+# `setup-token-lab`'s lane A person answers the capture's paste prompt in its own zeroizing
+# buffer type. Not a new edge in the build graph: aterm-agent above already depends on it.
+zeroize = { version = "1", default-features = false }
 # The Linux lane builds install.sh's static bootstrap verifier as the release
 # producer does (`pin::static_build_config`, `pin::asset_name`'s crate). A small
 # library whose dependencies are already in this graph.

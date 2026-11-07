@@ -2025,18 +2025,6 @@ pub fn read_key_file(state_dir: &std::path::Path) -> Result<FleetSecret, KeyFile
     parse_key_file(&text)
 }
 
-/// Whether this machine is in a fleet, or was: `state_dir` holds a [`KEY_FILE`], which every
-/// member writes when it joins and the issuer when it mints the fleet, private and readable or
-/// not. A machine with none (or no state directory) has joined no fleet yet. A directory this
-/// process cannot look into counts as holding one, so nothing takes it for a first join.
-#[must_use]
-pub fn holds_fleet_key(state_dir: &std::path::Path) -> bool {
-    !matches!(
-        std::fs::symlink_metadata(state_dir.join(KEY_FILE)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound
-    )
-}
-
 #[cfg(unix)]
 impl From<crate::fleet_member::PrivateFileError> for KeyFileError {
     fn from(error: crate::fleet_member::PrivateFileError) -> Self {
@@ -4626,17 +4614,6 @@ mod tests {
 
         assert_eq!(word(&state), Some("no-key"));
         assert_eq!(word(&root.join("absent")), Some("no-key"));
-        // NEGATIVE CONTROL: `holds_fleet_key` reading the issuer's `CODE_FILE` in place of
-        // `KEY_FILE`: a member, which holds only the key, reads as in no fleet and the
-        // "a member holds a fleet key" assert below fails.
-        assert!(
-            !holds_fleet_key(&state),
-            "a machine with no key is in no fleet"
-        );
-        assert!(
-            !holds_fleet_key(&root.join("absent")),
-            "nor one with no state"
-        );
         mode(&state, 0o755);
         assert_eq!(word(&state), Some("no-key"));
         mode(&state, 0o700);
@@ -4644,15 +4621,9 @@ mod tests {
         std::fs::write(&key, format!("{}\n", "3e".repeat(20))).unwrap();
         mode(&key, 0o600);
         assert_eq!(word(&state), None, "a private key file reads");
-        assert!(!state.join(crate::fleet_member::CODE_FILE).exists());
-        assert!(holds_fleet_key(&state), "a member holds a fleet key");
 
         mode(&key, 0o640);
         assert_eq!(word(&state), Some("key-mode"));
-        assert!(
-            holds_fleet_key(&state),
-            "an unreadable key still says the machine joined"
-        );
         mode(&key, 0o604);
         assert_eq!(word(&state), Some("key-mode"));
         mode(&key, 0o600);

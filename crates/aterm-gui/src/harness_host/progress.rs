@@ -666,7 +666,7 @@ impl WorkerIdle {
                 })
             },
         );
-        if !me.default_home || !me.stored_login || me.label().is_none() {
+        if !me.default_home || !me.route.on_account() || me.label().is_none() {
             bound.value.eligible = None;
         }
         Some(bound)

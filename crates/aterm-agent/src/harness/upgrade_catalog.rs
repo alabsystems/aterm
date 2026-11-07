@@ -430,6 +430,24 @@ pub fn baked_cached(binary: &Path, cache_dir: &Path) -> Option<Baked> {
 mod tests {
     use super::*;
 
+    /// A twin carrying the token block (DESIGN-claude-setup-token S8) still names its build: the
+    /// block sits before the last line, the plain exec, and names the build only inside it.
+    #[cfg(unix)]
+    #[test]
+    fn a_twin_with_the_token_block_still_names_its_build() {
+        let body = "#!/bin/sh\nexport A=1\nexec '/s/store/claude/7/bin/claude' \"$@\"\n";
+        let with = atpkg::launch_tap::with_token_block(
+            "claude",
+            body.to_owned(),
+            Some(Path::new("/A/MacOS/atpkg")),
+        );
+        assert!(with.contains("token-run --auto --"), "{with}");
+        assert_eq!(
+            twin_binary(&with),
+            Some(std::path::PathBuf::from("/s/store/claude/7/bin/claude"))
+        );
+    }
+
     #[test]
     fn a_twin_names_its_binary_in_its_hosts_dialects_and_only_absolutely() {
         let sh = |p: &str| format!("#!/bin/sh\nexec '{p}' \"$@\"\n");

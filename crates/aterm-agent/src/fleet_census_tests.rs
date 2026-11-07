@@ -248,6 +248,7 @@ fn census_joins_five_sources_identically_across_stewards_and_classifies_straggle
                         last_used: Some(now_i64 - 20),
                         read_at: None,
                         launch: None,
+                        token: None,
                     }],
                 ),
                 received_at: Some(now_s - 20),
@@ -591,6 +592,7 @@ fn census_clock_future_sources_do_not_outrank_a_known_contact() {
                     last_used: None,
                     read_at: None,
                     launch: None,
+                    token: None,
                 }],
             ),
             received_at: Some(now + 30),
@@ -724,6 +726,7 @@ fn reported(pool: &str, id: &str, condition: &str, walled_until: Option<i64>) ->
         last_used: None,
         read_at: None,
         launch: None,
+        token: None,
     }
 }
 
@@ -959,6 +962,7 @@ fn wall_report(node: &str, label: &str, received_at: u64) -> HeartbeatInput {
                 last_used: None,
                 read_at: None,
                 launch: None,
+                token: None,
             }],
         ),
         received_at: Some(received_at),
@@ -1393,6 +1397,7 @@ fn census_excludes_denied_and_log_held_out_members_from_book_facts_and_walled_ac
             last_used: Some(now_i64 - 5),
             read_at: None,
             launch: None,
+            token: None,
         }],
     );
     let payload = denied_facts.to_survey_reply(1, Some("m9.local"), now_s * 1_000, 1, false);
@@ -1543,6 +1548,7 @@ fn denied_node_key_excludes_member_peer_and_pushed_facts_in_census() {
             last_used: Some(now_i64 - 5),
             read_at: None,
             launch: None,
+            token: None,
         }],
     );
     let payload = denied_facts.to_survey_reply(1, Some("m8.local"), now_s * 1_000, 1, false);
@@ -1932,6 +1938,7 @@ fn census_walled_accounts_follow_limited_condition_wall_expiry_and_enrollment() 
                         last_used: Some(now_i64 - 10),
                         read_at: None,
                         launch: None,
+                        token: None,
                     }],
                 ),
                 received_at: Some(now_s - 5),
@@ -1959,6 +1966,7 @@ fn census_walled_accounts_follow_limited_condition_wall_expiry_and_enrollment() 
                             last_used: Some(now_i64 - 10),
                             read_at: None,
                             launch: None,
+                            token: None,
                         },
                         SurveyAccountFact {
                             pool: "claude".to_owned(),
@@ -1972,6 +1980,7 @@ fn census_walled_accounts_follow_limited_condition_wall_expiry_and_enrollment() 
                             last_used: None,
                             read_at: None,
                             launch: None,
+                            token: None,
                         },
                     ],
                 ),

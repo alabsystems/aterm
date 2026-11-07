@@ -82,7 +82,7 @@ fn no_forwarder_actor_if_requested() {
     let mut command = aterm_uds::spawnfd::transparent("/bin/sh").into_command();
     command.args(["-c", "exec 3<&0; (trap '' TERM; exec /bin/cat <&3) & printf '%s\\n' \"$!\" > \"$ATPKG_NATIVE_NO_FRONT_WORLD/left\"; wait"]);
     let status = supervise_with(
-        Some(*held), &mut command, &|| 0, &mut |_| {}, || None,
+        Some(*held), &mut command, &mut |_| {}, || None,
         |child, meter| {
             let pid = aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "leftover started", || {
                 std::fs::read_to_string(world.join("left")).ok()?.trim().parse::<u32>().ok()
@@ -231,7 +231,7 @@ fn native_supervision_keeps_inherited_jobserver_style_handles_and_command_contex
         .env("ATPKG_NATIVE_CONTEXT", "preserved")
         .current_dir(dir.path())
         .stdout(std::fs::File::create(&output).unwrap());
-    let status = supervise(Some(*held), &mut command, &|| 0, &mut |_| {}).unwrap();
+    let status = supervise(Some(*held), &mut command, &mut |_| {}).unwrap();
     assert!(status.success());
     assert_eq!(
         std::fs::read_to_string(output).unwrap(),
@@ -254,7 +254,7 @@ fn native_spawn_failure_releases_only_the_unused_ordinary_claim() {
     let mut command =
         aterm_uds::spawnfd::transparent(dir.path().join("missing-native-build")).into_command();
     let mut said = Vec::new();
-    let error = supervise(Some(*held), &mut command, &|| 0, &mut |line| {
+    let error = supervise(Some(*held), &mut command, &mut |line| {
         said.push(line.to_owned());
     })
     .unwrap_err();

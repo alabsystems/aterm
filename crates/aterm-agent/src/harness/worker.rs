@@ -1773,11 +1773,23 @@ pub(super) fn line_of(
         Some(provider) => super::native_keys::launch(provider, exe, &flags, &both, fresh.config)?,
         None => None,
     };
-    let (exe, flags) = wrapped.as_ref().map_or((exe, flags.as_slice()), |launch| {
-        (launch.program.as_path(), launch.args.as_slice())
-    });
-    upgrade::task_line_env_clear(dialect, &both, unset, exe, flags, cli.operand)
-        .or_else(|_| upgrade::task_line_env_clear(dialect, env, unset, exe, flags, cli.operand))
+    // A Claude Code line that types the store build goes through aterm's token wrapper, as the
+    // managed twin's token block would (§5.4 of `docs/DESIGN-claude-setup-token-2026-11-05.md`).
+    let served = match cli.launches {
+        Launches::Claude => super::token_route::auto_line(exe, &flags),
+        Launches::Image { .. } | Launches::Alab => None,
+    };
+    let shim_of = exe;
+    let (exe, flags) = match (&served, &wrapped) {
+        (Some((aterm, args)), _) => (aterm.as_path(), args.as_slice()),
+        (None, Some(launch)) => (launch.program.as_path(), launch.args.as_slice()),
+        (None, None) => (exe, flags.as_slice()),
+    };
+    let shim_of = if served.is_some() { shim_of } else { exe };
+    let line = |env: &[(&str, &str)]| {
+        upgrade::task_line_env_clear_for(dialect, env, unset, shim_of, exe, flags, cli.operand)
+    };
+    line(&both).or_else(|_| line(env))
 }
 
 #[cfg(test)]

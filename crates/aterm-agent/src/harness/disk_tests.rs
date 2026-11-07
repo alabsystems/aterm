@@ -1635,7 +1635,7 @@ fn the_claude_census_passes_over_its_own_process() {
             argv: vec!["claude".to_owned()],
             config: None,
             home: None,
-            stored_login: true,
+            route: crate::harness::accounts::AuthRoute::Stored,
         }),
         cwd: Some(PathBuf::from("/proj")),
         started: None,

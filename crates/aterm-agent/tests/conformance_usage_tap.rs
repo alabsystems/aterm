@@ -99,7 +99,7 @@ fn real_gate(s: &S) -> Option<String> {
     let values = [None, Some(RENEWED)].map(|login| {
         tap::gate(&tap::GateFacts {
             exe: (s["armed"] == 1).then(|| Path::new(EXE)),
-            stored_login: s["cred"] == 1,
+            route: aterm_agent::harness::accounts::AuthRoute::Stored.unless(s["cred"] != 1),
             login,
             lone_login: login,
             home: None,

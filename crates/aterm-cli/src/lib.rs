@@ -921,9 +921,9 @@ const PRIVACY_CONFIG_PARAGRAPH: &str = "\n\
      \x20                         other dialog it can name becomes a record in Messages naming\n\
      \x20                         the tab that asked (with notice on). false: off, which also\n\
      \x20                         stops the Developer Tools row's reads (tccd's log and the\n\
-     \x20                         switch) in the window and both doctors. true: the full stream,\n\
-     \x20                         the tab mark and a banner per dialog. enabled = false turns\n\
-     \x20                         every mode off. Config only; nothing in a session can set it.\n\
+     \x20                         switch) in the window and both doctors. true: the full stream\n\
+     \x20                         and a tab mark per dialog. enabled = false turns every mode\n\
+     \x20                         off. Config only; nothing in a session can set it.\n\
      \x20 warmup                  \"automatic\" (default) | \"on-request\" | \"never\". The warm-up\n\
      \x20                         asks macOS for the folders up front, which RAISES the dialogs\n\
      \x20                         on purpose, while you are at the screen rather than inside an\n\

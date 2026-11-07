@@ -36,7 +36,7 @@ fn a_pooled_turn_end_cannot_prove_a_known_wrong_identity() {
         let who = accounts::ProcessLogin {
             login: Some(directory.display().to_string()),
             default_home: true,
-            stored_login: true,
+            route: crate::harness::accounts::AuthRoute::Stored,
         };
         let _ = super::record_session(&world.seat(), &s, &who, roster.row(&label).unwrap());
         let after = store.load(NOW).unwrap().0;

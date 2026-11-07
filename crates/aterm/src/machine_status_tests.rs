@@ -158,7 +158,7 @@ fn a_step_is_there_exactly_when_one_is_due() {
             name: "alab".into(),
             entries: 3,
             follows: Follows::Off,
-            conflicts: vec!["[everyone] gh-token".into()],
+            conflicts: vec![conflict("[everyone] gh-token", false)],
         },
     ];
     let mut areas = Vec::new();
@@ -354,12 +354,25 @@ fn read_vault_reads_a_dropped_mac_dropped_where_a_revoked_one_reads_revoked() {
     assert_eq!(vault, Vault::Dropped(words));
 }
 
+/// A conflicted vault entry, `token` where it is a Claude Code token's.
+fn conflict(entry: &str, token: bool) -> aterm_secrets::client::Conflict {
+    aterm_secrets::client::Conflict {
+        entry: entry.into(),
+        token,
+    }
+}
+
 /// The vault: a missing subscriber is an agent's `secrets agent on`, a person's Sync off is off,
-/// and a conflict is a person's pick; an unconfigured vault is aterm's while setup joins it.
+/// and a conflict is a person's pick, a Claude Code token's by the token call (no `aterm secrets
+/// set` writes one); an unconfigured vault is aterm's while setup joins it.
+///
+/// NEGATIVE CONTROL (2026-11-06, restored with cp from a backup plus touch, confirmed with cmp):
+/// with `vault_area` naming `aterm secrets set` for every conflict, a token's conflict's step reads
+/// "pick each value with `aterm secrets set <name>`" where the test expects the token call.
 #[test]
 fn vault_steps_follow_who_can_take_them() {
     let none = Setup::NotHere;
-    let vault = |follows, conflicts: Vec<String>| Vault::In {
+    let vault = |follows, conflicts: Vec<aterm_secrets::client::Conflict>| Vault::In {
         name: "alab".into(),
         entries: 2,
         follows,
@@ -376,11 +389,26 @@ fn vault_steps_follow_who_can_take_them() {
         vault_area(&vault(Follows::Runs, Vec::new()), &none).level,
         Level::Ok
     );
-    let conflict = vault_area(
-        &vault(Follows::Runs, vec!["[everyone] gh-token".into()]),
-        &none,
+    let picked = |conflicts| {
+        let area = vault_area(&vault(Follows::Runs, conflicts), &none);
+        assert_eq!(who(&area), Some(Who::Person));
+        area.next.expect("a step").act
+    };
+    let token = "[everyone] aterm-claude-token-ac-0123456789abcdef";
+    let plain = picked(vec![conflict("[everyone] gh-token", false)]);
+    assert_eq!(plain, "pick each value with `aterm secrets set <name>`");
+    let tokens = picked(vec![conflict(token, true)]);
+    assert_eq!(tokens, aterm_secrets::client::TOKEN_CONFLICT_PICK);
+    assert!(!tokens.contains("aterm secrets set"), "{tokens}");
+    let both = picked(vec![
+        conflict("[everyone] gh-token", false),
+        conflict(token, true),
+    ]);
+    assert!(
+        both.starts_with("pick each value with `aterm secrets set <name>`; ")
+            && both.ends_with(aterm_secrets::client::TOKEN_CONFLICT_PICK),
+        "{both}"
     );
-    assert_eq!(who(&conflict), Some(Who::Person));
     let joining = setup_with(vec![stage(SECRETS, "pending", "")], false);
     assert_eq!(
         who(&vault_area(&Vault::Unconfigured, &joining)),

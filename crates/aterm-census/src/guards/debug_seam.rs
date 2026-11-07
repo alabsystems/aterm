@@ -22,24 +22,36 @@
 //! gap rule that read an omitted seat as revoked, a batch read as settled before it is). Its one
 //! reader is `aterm_types::negative_control::on`, under `cfg(any(test, debug_assertions))`; a
 //! lab lane that sets it on a child names it under the same kind of `cfg`.
+//!
+//! `ATERM_DEBUG_TOKEN_RUN_SPARE` makes a debug build's token wrapper hand Claude Code a second,
+//! unread socket holding the token (`aterm_agent::harness::accounts_token_run::SPARE_SEAM`): the
+//! lab's probe of whether a descriptor left open in a session reaches Claude Code's tool children
+//! (DESIGN-claude-setup-token S9 lane C). A release build that read it would leave the token open,
+//! unread, in a session's descriptors.
 
 use super::rules::{CENSUS_CRATE, PRODUCT};
 use super::{Finding, Rule, Tree};
 use crate::lex::Lexed;
 
 /// The seams only a debug build may read: each variable's name.
-const DEBUG_ONLY: &[&str] = &["ATERM_DEBUG_NETPLACE", "ATERM_TEST_NEGATIVE_CONTROL"];
+const DEBUG_ONLY: &[&str] = &[
+    "ATERM_DEBUG_NETPLACE",
+    "ATERM_TEST_NEGATIVE_CONTROL",
+    "ATERM_DEBUG_TOKEN_RUN_SPARE",
+];
 
 pub(super) const DEBUG_SEAM: Rule = Rule {
     id: "debug-seam",
     why: "a debug-only seam (ATERM_DEBUG_NETPLACE scripts where this Mac is on the network; \
-          ATERM_TEST_NEGATIVE_CONTROL restores an old trust rule for a lab process) named by a \
+          ATERM_TEST_NEGATIVE_CONTROL restores an old trust rule for a lab process; \
+          ATERM_DEBUG_TOKEN_RUN_SPARE leaves an unread token socket open in a session) named by a \
           release build lets an environment variable lie to every reporter and to the vault's \
           admission; name it only under a cfg that entails debug_assertions or test (never \
           dev_seam!, whose dev-seams feature a release build can turn on)",
     scope: &[
         "crates/aterm-netplace/src/facts.rs",
         "crates/aterm-types/src/negative_control.rs",
+        "crates/aterm-agent/src/harness/accounts_token_run.rs",
     ],
     check: debug_seam,
 };
@@ -349,6 +361,10 @@ mod tests {
             &DEBUG_SEAM,
             &[
                 ("crates/aterm-types/src/negative_control.rs", READER),
+                (
+                    "crates/aterm-agent/src/harness/accounts_token_run.rs",
+                    SPARE,
+                ),
                 ("crates/aterm-netplace/src/facts.rs", facts),
                 ("crates/aterm-lab/src/away.rs", lab),
                 ("crates/aterm-gui/src/net_place_tests.rs", test_file),
@@ -380,6 +396,13 @@ mod tests {
         );
     }
 
+    /// The token wrapper's spare-socket seam, as `accounts_token_run` binds and reads it: under
+    /// a `cfg` no release build satisfies.
+    const SPARE: &str = "#[cfg(all(unix, any(test, debug_assertions)))]\n\
+                         pub const SPARE_SEAM: &str = \"ATERM_DEBUG_TOKEN_RUN_SPARE\";\n\
+                         #[cfg(all(unix, any(test, debug_assertions)))]\n\
+                         fn with_spare() -> bool { std::env::var_os(SPARE_SEAM).is_some() }\n";
+
     /// The negative-control variable's one reader, as `aterm_types::negative_control::on` reads
     /// it: under a `cfg` no release build satisfies.
     const READER: &str = "#[cfg(any(test, debug_assertions))]\n\
@@ -410,6 +433,10 @@ mod tests {
             &DEBUG_SEAM,
             &[
                 ("crates/aterm-types/src/negative_control.rs", READER),
+                (
+                    "crates/aterm-agent/src/harness/accounts_token_run.rs",
+                    SPARE,
+                ),
                 ("crates/aterm-lab/src/mesh_churn.rs", lane),
                 (
                     "crates/aterm-secrets/src/membership_log/admission.rs",
@@ -433,9 +460,47 @@ mod tests {
         );
     }
 
+    /// `ATERM_DEBUG_TOKEN_RUN_SPARE` is named only under a debug `cfg`, as the token wrapper
+    /// reads it: the lab lane that sets it on a launch under the same kind of `cfg` passes, and an
+    /// ungated read of the wrapper's constant, through its module's path, is found.
+    /// NEGATIVE CONTROL: without `ATERM_DEBUG_TOKEN_RUN_SPARE` in `DEBUG_ONLY` the ungated read
+    /// is not found.
+    #[test]
+    fn the_spare_socket_seam_is_named_only_under_a_debug_cfg() {
+        let lane = "#[cfg(debug_assertions)]\n\
+                    fn control(line: &mut String) {\n\
+                    \x20   line.push_str(\"ATERM_DEBUG_TOKEN_RUN_SPARE=1 \");\n\
+                    }\n";
+        let leak = "fn serve() -> bool {\n\
+                    \x20   std::env::var_os(accounts_token_run::SPARE_SEAM).is_some()\n\
+                    }\n";
+        let found = run(
+            &DEBUG_SEAM,
+            &[
+                ("crates/aterm-types/src/negative_control.rs", READER),
+                (
+                    "crates/aterm-agent/src/harness/accounts_token_run.rs",
+                    SPARE,
+                ),
+                ("crates/aterm-lab/src/setup_token_lab.rs", lane),
+                ("crates/aterm-agent/src/harness/relaunch.rs", leak),
+                (
+                    "crates/aterm-netplace/src/facts.rs",
+                    "#[cfg(debug_assertions)]\n\
+                     fn f() { let _ = std::env::var_os(\"ATERM_DEBUG_NETPLACE\"); }\n",
+                ),
+            ],
+        );
+        assert_eq!(
+            spots(&found),
+            ["crates/aterm-agent/src/harness/relaunch.rs:2"],
+            "{found:#?}"
+        );
+    }
+
     /// A seam the rule finds no mention of outside its bindings is a finding of its own, so a
-    /// renamed variable or constant cannot leave the rule holding nothing: here neither seam is
-    /// read, the netplace one renamed and the negative-control one absent.
+    /// renamed variable or constant cannot leave the rule holding nothing: here no seam is read,
+    /// the netplace one renamed and the others absent.
     /// NEGATIVE CONTROL: dropping the unseen-seam loop leaves this corpus with no finding, and
     /// "a seam with no read is named" fails.
     #[test]
@@ -450,7 +515,7 @@ mod tests {
         );
         assert_eq!(
             found.len(),
-            2,
+            DEBUG_ONLY.len(),
             "each seam with no read is named: {found:#?}"
         );
         for seam in DEBUG_ONLY {

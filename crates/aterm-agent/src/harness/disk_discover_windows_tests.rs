@@ -593,7 +593,7 @@ fn a_native_windows_claude_code_is_read_as_one() {
             argv: argv.iter().map(|a| (*a).to_owned()).collect(),
             config: None,
             home: None,
-            stored_login: true,
+            route: crate::harness::accounts::AuthRoute::Stored,
         }),
         cwd: Some(PathBuf::from(r"C:\Users\x\proj")),
         started: None,
@@ -644,7 +644,7 @@ fn running(pid: u32, exe: &Path, argv: &[&str]) -> Process {
             argv: argv.iter().map(|a| (*a).to_owned()).collect(),
             config: None,
             home: None,
-            stored_login: true,
+            route: crate::harness::accounts::AuthRoute::Stored,
         }),
         cwd: Some(PathBuf::from(r"C:\Users\x\proj")),
         started: None,
@@ -839,7 +839,7 @@ fn a_running_claude_holds_its_project_in_any_windows_spelling() {
         started: None,
         cwd: Some(PathBuf::from(cwd)),
         profile: None,
-        stored_login: true,
+        route: crate::harness::accounts::AuthRoute::Stored,
     };
     let project = std::ffi::OsStr::new("C--Users-m6-an-aterm");
     for cwd in [

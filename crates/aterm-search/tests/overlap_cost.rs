@@ -29,27 +29,39 @@ fn instructions() -> Option<u64> {
 #[ignore = "manual before/after incremental query preparation measurement"]
 fn incremental_query_preparation_cost() {
     const ROWS: usize = 2048;
-    for len in [1, 16, 256, 4096] {
-        let query = "a".repeat(len);
-        let text = format!("{query}b");
-        let rows = vec![text; ROWS];
-        let mut search = BudgetedSearch::new(&query, true, false, 0, ROWS).unwrap();
-        let before = instructions();
-        let began = std::time::Instant::now();
-        for row in rows {
-            search.feed_row_owned(row);
+    for (case_sensitive, unicode_row) in [(true, false), (false, false), (false, true)] {
+        for len in [1, 16, 256, 4096] {
+            let needle = "a".repeat(len);
+            let query = if case_sensitive {
+                needle.clone()
+            } else {
+                needle.to_ascii_uppercase()
+            };
+            let prefix = if unicode_row { "é" } else { "" };
+            let text = format!("{prefix}{needle}b");
+            let rows = vec![text; ROWS];
+            let mut search = BudgetedSearch::new(&query, case_sensitive, false, 0, ROWS).unwrap();
+            let before = instructions();
+            let began = std::time::Instant::now();
+            for row in rows {
+                search.feed_row_owned(row);
+            }
+            let elapsed = began.elapsed();
+            let retired = before.zip(instructions()).map(|(a, b)| b - a);
+            let result = search.results();
+            assert_eq!(result.matches.len(), ROWS);
+            for (row, found) in result.matches.iter().enumerate() {
+                let start = usize::from(unicode_row);
+                assert_eq!(
+                    (found.line, found.start_col, found.end_col),
+                    (row, start, start + len)
+                );
+            }
+            eprintln!(
+                "incremental_preparation query_bytes={len} case_sensitive={case_sensitive} unicode_row={unicode_row} rows={ROWS} instructions={retired:?} elapsed_ns={}",
+                elapsed.as_nanos()
+            );
         }
-        let elapsed = began.elapsed();
-        let retired = before.zip(instructions()).map(|(a, b)| b - a);
-        let result = search.results();
-        assert_eq!(result.matches.len(), ROWS);
-        for (row, found) in result.matches.iter().enumerate() {
-            assert_eq!((found.line, found.start_col, found.end_col), (row, 0, len));
-        }
-        eprintln!(
-            "incremental_preparation query_bytes={len} rows={ROWS} instructions={retired:?} elapsed_ns={}",
-            elapsed.as_nanos()
-        );
     }
 }
 

@@ -935,7 +935,9 @@ pub(super) fn session_signed_out(
 /// itself with nobody asking: a session here runs on it and its login is on record as signed out
 /// here ([`session_signed_out`]), or this Mac used its login within a week, its records say it has
 /// ended or comes due, and it is not one of `others`, the rows whose account may be another Mac's
-/// ([`super::accounts::renewal_due`]). What a report reads before it promises a sign-in.
+/// ([`super::accounts::renewal_due`]). Neither admits a row on its vault token here
+/// ([`super::accounts::OtherMacs::on_token`]): renewal is off for it. What a report reads before
+/// it promises a sign-in.
 #[must_use]
 pub(super) fn upkeep_signs_in(
     row: &super::accounts::Row,
@@ -946,13 +948,15 @@ pub(super) fn upkeep_signs_in(
     ),
     now: i64,
 ) -> bool {
-    session_signed_out(row, state) || super::accounts::renewal_due(row, logins, state, others, now)
+    !others.on_token.contains_key(&row.label)
+        && (session_signed_out(row, state)
+            || super::accounts::renewal_due(row, logins, state, others, now))
 }
 
 /// Why neither door the upkeep holds admits `row` ([`upkeep_signs_in`] false), in a report's
 /// words: the first condition of [`super::accounts::renewal_due`] it fails, `others` being the
 /// rows whose account the source gives to other Macs alone or whose source this Mac cannot
-/// compare. Where it fails only the last (its records say its login has neither ended nor comes
+/// compare, and the rows on their vault token here. Where it fails only the last (its records say its login has neither ended nor comes
 /// due) and its own credential file shows the login lapsed ([`super::accounts::lapsed_here`]),
 /// the words name that file.
 #[must_use]
@@ -964,6 +968,8 @@ pub(super) fn upkeep_waits_because(
 ) -> &'static str {
     if row.held_by.is_some() {
         "this Mac is not in its warm set"
+    } else if others.on_token.contains_key(&row.label) {
+        "it runs on its vault token here, and renewal is off for it"
     } else if row.email.is_none() {
         "it names no email"
     } else if others.named.contains_key(&row.label) {

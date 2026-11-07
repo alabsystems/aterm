@@ -3504,7 +3504,7 @@ fn member_route_wakes_preserve_sharing_holds_and_revocation() {
         };
         let projection = projection::Projection::observing(
             &ports,
-            SubscriberInputs::new(Box::new(|| panic!("maintenance reads no readiness")))
+            ConvergenceInputs::new(Box::new(|_| panic!("maintenance reads no readiness")))
                 .with_maintenance(Box::new(move || {
                     upkeep.fetch_add(1, Ordering::SeqCst);
                 })),
@@ -3568,7 +3568,7 @@ fn member_admission_projects_after_the_previous_runner_without_releasing_the_lon
         let input = std::sync::Mutex::new(Some(input));
         let starts = AtomicUsize::new(0);
         let pid = AtomicI32::new(0);
-        let start = |_: &Path, _: crate::converge::RepositoryWork| {
+        let start = |_: &Path, _: crate::converge::RepositoryRequest| {
             starts.fetch_add(1, Ordering::SeqCst);
             input.lock().unwrap().take().map(|input| {
                 let sh = aterm_uds::deadline::stand_in(Path::new("/bin/sh"));
@@ -3695,18 +3695,18 @@ fn local_inputs_restart_subscriber_projection_while_http_and_retry_time_stand_st
             let observed = ready.clone();
             let (polled, polling) = std::sync::mpsc::channel();
             let mut previous = false;
-            let inputs = SubscriberInputs::new(Box::new(move || {
+            let inputs = ConvergenceInputs::new(Box::new(move |_| {
                 let now = observed.is_file();
                 let moved = now != previous;
                 previous = now;
                 polled.send(()).unwrap();
-                moved.then_some(crate::converge::RepositoryWork::Repair)
+                moved.then_some(crate::converge::RepositoryRequest::Repair)
             }));
             let starts = AtomicUsize::new(0);
             let work_seen = std::sync::Mutex::new(Vec::new());
             let pid = AtomicI32::new(0);
-            let start = |_: &Path, work| {
-                work_seen.lock().unwrap().push(work);
+            let start = |_: &Path, request: crate::converge::RepositoryRequest| {
+                work_seen.lock().unwrap().push(request.work());
                 if starts.fetch_add(1, Ordering::SeqCst) != 0 {
                     return None;
                 }
@@ -3813,16 +3813,16 @@ fn a_failed_readiness_round_recovers_local_inputs_while_http_is_held() {
     let observed = ready.clone();
     let (polled, polling) = mpsc::channel();
     let mut previous = false;
-    let inputs = SubscriberInputs::new(Box::new(move || {
+    let inputs = ConvergenceInputs::new(Box::new(move |_| {
         let now = observed.is_file();
         let moved = now != previous;
         previous = now;
         polled.send(()).unwrap();
-        moved.then_some(crate::converge::RepositoryWork::Repair)
+        moved.then_some(crate::converge::RepositoryRequest::Repair)
     }));
     let starts = AtomicUsize::new(0);
     let pid = AtomicI32::new(0);
-    let start = |_: &Path, _: crate::converge::RepositoryWork| {
+    let start = |_: &Path, _: crate::converge::RepositoryRequest| {
         if starts.fetch_add(1, Ordering::SeqCst) != 0 {
             return None;
         }
@@ -4026,7 +4026,7 @@ fn swarm_off_asks_no_alab_member_from_a_waiting_subscriber() {
         Ok(1)
     };
     let started = std::sync::atomic::AtomicUsize::new(0);
-    let start = |_: &Path, _: crate::converge::RepositoryWork| {
+    let start = |_: &Path, _: crate::converge::RepositoryRequest| {
         started.fetch_add(1, Ordering::SeqCst);
         None
     };
@@ -4209,7 +4209,7 @@ fn the_subscriber_starts_the_converge_pass_as_it_starts_per_applied_version_and_
     assert!(matches!(sync(&mb, None), Ok(SyncOutcome::Applied { .. })));
     let (starts, reads) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let (away, stop) = (AtomicBool::new(false), AtomicBool::new(false));
-    let start = |_: &Path, _: crate::converge::RepositoryWork| {
+    let start = |_: &Path, _: crate::converge::RepositoryRequest| {
         starts.fetch_add(1, Ordering::SeqCst);
         None
     };
@@ -4359,7 +4359,7 @@ fn a_pass_healthy_after_errors_starts_a_runner() {
     let stop = AtomicBool::new(false);
     // The start this test waits for stops the loop as it is made, before the pause after its
     // pass begins.
-    let start = |_: &Path, _: crate::converge::RepositoryWork| {
+    let start = |_: &Path, _: crate::converge::RepositoryRequest| {
         if starts.fetch_add(1, Ordering::SeqCst) == 1 {
             stop.store(true, Ordering::SeqCst);
         }
@@ -4536,9 +4536,10 @@ fn a_runner_that_ended_while_the_vault_cannot_be_reached_is_reaped() {
     std::fs::set_permissions(&quick, std::fs::Permissions::from_mode(0o700)).expect("executable");
     let pid = AtomicI32::new(0);
     // The runner is handed to the loop once it exited, and before anything reaped it.
-    let start = |_: &Path, work| {
-        let child =
-            RefCell::new(crate::converge::start(&quick, "subscriber", work).expect("a runner"));
+    let start = |_: &Path, request| {
+        let child = RefCell::new(
+            crate::converge::start_requested(&quick, "subscriber", request).expect("a runner"),
+        );
         until("the runner exits", || {
             child.borrow_mut().exited().expect("its state")
         });

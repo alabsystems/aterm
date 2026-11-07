@@ -1818,7 +1818,7 @@ fn a_codex_tools_environment_names_its_thread_and_login() {
     let want = accounts::ProcessLogin {
         login: Some(abs("/logins/work")),
         default_home: true,
-        stored_login: true,
+        route: crate::harness::accounts::AuthRoute::Stored,
     };
     assert_eq!(read(&work), (Some(THREAD.to_owned()), Some(want.clone())));
     assert_eq!(
@@ -9326,7 +9326,12 @@ fn the_accounts_report_shows_the_record_of_usage() {
     let tmp = tmp_dir("accounts-usage");
     let env = env_at(&tmp);
     let now = env.now;
+    // The report's rows end before its vault tokens section.
+    let section = token_section();
     let (_, packaged, _) = acc_quiet(AccountsCmd::Report { json: false }, &env);
+    let packaged = packaged
+        .strip_suffix(&section)
+        .expect("the section ends the report");
     let store = env.accounts_store();
     let write = |edit: &dyn Fn(&mut super::super::accounts::Account)| {
         let mut note = None;
@@ -9360,7 +9365,7 @@ fn the_accounts_report_shows_the_record_of_usage() {
     assert_eq!(
         out,
         format!(
-            "{packaged}this machine's own account (main): credits: in use since {}\n",
+            "{packaged}this machine's own account (main): credits: in use since {}\n{section}",
             rfc3339_utc(now - 600)
         )
     );
@@ -9379,7 +9384,7 @@ fn the_accounts_report_shows_the_record_of_usage() {
     let (_, out, _) = acc_quiet(AccountsCmd::Report { json: false }, &env);
     assert!(
         out.ends_with(&format!(
-            "(main): credits: off (org_level_disabled)  warned: weekly 92% (resets {})\n",
+            "(main): credits: off (org_level_disabled)  warned: weekly 92% (resets {})\n{section}",
             rfc3339_utc(now + 3 * 86_400)
         )),
         "{out}"
@@ -10601,7 +10606,7 @@ fn accounts_stats_shows_the_accounts_record_on_this_machine() {
             started: None,
             cwd: None,
             profile,
-            stored_login: true,
+            route: crate::harness::accounts::AuthRoute::Stored,
         })
         .collect(),
         dirs: Vec::new(),
@@ -11304,7 +11309,7 @@ fn a_claude_code_on_no_stored_login_suppresses_the_capacity() {
     std::fs::write(home.join(".claude.json"), stats_profile()).expect("profile");
     let env = stats_env(&tmp, home.join(".claude"), home.join(".claude.json"));
     walled_record(&env, ACCOUNTS_OWN_LABEL, env.now + 3_600, None);
-    let suppressed = |env: &Env, stored_login: bool| {
+    let suppressed = |env: &Env, route: accounts::AuthRoute| {
         let mut env = env.clone();
         env.claude_running = Some(Ok(disk::discover::Running {
             claudes: vec![disk::discover::RunningClaude {
@@ -11312,7 +11317,7 @@ fn a_claude_code_on_no_stored_login_suppresses_the_capacity() {
                 started: None,
                 cwd: None,
                 profile: Some(home.join(".claude.json")),
-                stored_login,
+                route,
             }],
             dirs: Vec::new(),
         }));
@@ -11320,8 +11325,14 @@ fn a_claude_code_on_no_stored_login_suppresses_the_capacity() {
         let doc: Value = aterm_json::from_str(out.trim()).expect("one JSON document");
         doc["accounts"][0]["spend"]["windows"][0]["suppressed"].clone()
     };
-    assert_eq!(suppressed(&env, false), Value::from("api-key-seen"));
-    assert_eq!(suppressed(&env, true), Value::from("low"));
+    assert_eq!(
+        suppressed(&env, accounts::AuthRoute::Outside),
+        Value::from("api-key-seen")
+    );
+    assert_eq!(
+        suppressed(&env, accounts::AuthRoute::Stored),
+        Value::from("low")
+    );
 }
 
 #[test]
@@ -12025,6 +12036,19 @@ fn disk_watch_uses_configured_automatic_policy_and_cannot_be_a_manual_apply() {
     }
 }
 
+/// The section Claude Code's report ends with on a test's host, which names no vault; none on a
+/// platform with no vault tokens.
+fn token_section() -> String {
+    #[cfg(unix)]
+    {
+        super::super::accounts_token_view::Report::NoVault.text()
+    }
+    #[cfg(not(unix))]
+    {
+        String::new()
+    }
+}
+
 fn run_line(line: &str, env: &Env) -> (String, String, String) {
     let cmd = parsed(line).expect(line);
     let mut out = Vec::new();
@@ -12051,8 +12075,9 @@ fn accounts_list_is_claudes_report_byte_for_byte_and_another_cli_reads_its_own_r
         none.1,
         format!(
             "no accounts listed\nroster: {} (no such file)\nlist one: aterm harness accounts add \
-             <label>\n",
-            config.join("accounts.toml").display()
+             <label>\n{}",
+            config.join("accounts.toml").display(),
+            token_section()
         )
     );
     let kimi = run_line("accounts list --cli kimi", &env);

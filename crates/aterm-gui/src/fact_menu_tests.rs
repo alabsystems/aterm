@@ -288,6 +288,7 @@ fn menu_facts(off: FactMask, side: bool) -> FactMenuFacts {
         key_row: Some(true),
         note: None,
         typing: false,
+        token: None,
         outlook: None,
         account_row: None,
         height: None,

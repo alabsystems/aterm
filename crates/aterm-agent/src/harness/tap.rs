@@ -1019,8 +1019,10 @@ pub fn own_login(login: Option<&str>, home: Option<&str>, lone: Option<&str>) ->
 pub struct GateFacts<'a> {
     /// `[harness] usage_tap`.
     pub exe: Option<&'a Path>,
-    /// The process the line replaces authenticates by its stored login.
-    pub stored_login: bool,
+    /// How the process the line replaces authenticates: its stored login or its vault token is
+    /// the account's own, and the tap's consumer credits the row the token's marker names
+    /// (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.7).
+    pub route: accounts::AuthRoute,
     /// The login variable's value the line carries ([`accounts::LOGIN_ENV`]).
     pub login: Option<&'a str>,
     /// The login of the machine's one account, or the line's own where the roster names it
@@ -1045,7 +1047,11 @@ pub struct GateFacts<'a> {
 pub fn gate(f: &GateFacts<'_>) -> Option<String> {
     let exe = f.exe?;
     settings_value(exe)?;
-    if !(f.stored_login && own_login(f.login, f.home, f.lone_login)) || f.profile_store {
+    let own_credential = match f.route {
+        accounts::AuthRoute::Stored | accounts::AuthRoute::VaultToken { .. } => true,
+        accounts::AuthRoute::Outside => false,
+    };
+    if !(own_credential && own_login(f.login, f.home, f.lone_login)) || f.profile_store {
         return None;
     }
     if !line_admits(f.argv) {
@@ -1105,7 +1111,7 @@ pub fn launch_value(f: &LaunchFacts<'_>) -> Option<String> {
     let login = var(accounts::LOGIN_ENV);
     gate(&GateFacts {
         exe: Some(&armed.exe),
-        stored_login: accounts::ProcessLogin::of_env(pairs()).stored_login,
+        route: accounts::ProcessLogin::of_env(pairs()).route,
         login,
         lone_login: armed.lone_for(login),
         home: var(accounts::HOME_ENV).filter(|home| !home.is_empty()),
@@ -1130,6 +1136,32 @@ pub fn launch_admits(argv: &[String]) -> bool {
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
     };
     line_admits(argv) && super::upgrade::first_operand(argv).is_none_or(|w| !subcommand_like(w))
+}
+
+/// `argv` (`argv[0]` first) with the tap's own `--settings` value set aside: each `--settings`
+/// pair (or `--settings=` word) whose value is one [`gate`] or [`launch_value`] makes
+/// ([`is_ours`]), as the managed twin's tap block prepends it (`atpkg::launch_tap::sh_prelude`)
+/// and a relaunch line carries it ([`super::relaunch::with_tap`]). A `--settings` of the line's
+/// own stays, so [`launch_admits`] still refuses it: aterm's token wrapper judges a launch's shape
+/// on what this leaves (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.3).
+#[must_use]
+pub fn without_own_tap(argv: &[String]) -> Vec<String> {
+    let Some((first, flags)) = argv.split_first() else {
+        return Vec::new();
+    };
+    let mut out = vec![first.clone()];
+    for (name, tokens) in super::upgrade::parse_flag_spans(flags) {
+        let ours = name == Some("--settings")
+            && match tokens.as_slice() {
+                [_, value] => is_ours(value),
+                [one] => one.strip_prefix("--settings=").is_some_and(is_ours),
+                _ => false,
+            };
+        if !ours {
+            out.extend(tokens);
+        }
+    }
+    out
 }
 
 /// [`gate`]'s argv half: the line (`argv[0]` first) parses, and carries no `--settings` or
@@ -1178,11 +1210,16 @@ pub fn settings_admit(settings: &[(String, Source)], user: Option<&str>) -> bool
 /// stored login ([`accounts::ProcessLogin::with_settings`]).
 #[must_use]
 pub fn settings_line(settings: &[(String, Source)], user: Option<&str>) -> Option<Option<String>> {
-    if !accounts::ProcessLogin::of_env([])
+    // A document that moves the line off its account's own credential: [`with_settings`] only
+    // weakens a route, so an empty environment's stored login reads outside exactly then.
+    //
+    // [`with_settings`]: accounts::ProcessLogin::with_settings
+    match accounts::ProcessLogin::of_env([])
         .with_settings(settings)
-        .stored_login
+        .route
     {
-        return None;
+        accounts::AuthRoute::Stored | accounts::AuthRoute::VaultToken { .. } => {}
+        accounts::AuthRoute::Outside => return None,
     }
     let mut lines = Vec::new();
     for (name, source) in settings {

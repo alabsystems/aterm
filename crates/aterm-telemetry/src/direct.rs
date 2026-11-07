@@ -11,6 +11,11 @@
 //! process that writes one row and exits (a build's holder) has no next row of its own. Where
 //! no record could be left, the process's next row goes after a gap line that says it, as the
 //! window's writer does. Telemetry never fails the action it reports.
+//!
+//! A writer that keeps a row it could not write, to write it again later (the fleet board's
+//! task rows), writes with [`write_kept`] instead: a row it did not write is not counted, so a
+//! row written late is never also said lost. It counts the row only once it gives it up
+//! ([`give_up`]), exactly as [`write_now`] counts a row it could not write.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -85,10 +90,13 @@ impl Lost {
             .compare_exchange(had, told, Ordering::AcqRel, Ordering::Acquire);
     }
 
-    /// Count one row lost from the log in `dir`: in the folder's loss record where one can be
+    /// Count `rows` rows lost from the log in `dir`: in the folder's loss record where one can be
     /// left (its own renamed to the new count, or a new one), else for this process's next row.
-    fn lose(&self, dir: &Path) {
-        self.lost.fetch_add(1, Ordering::AcqRel);
+    pub fn lose(&self, dir: &Path, rows: u64) {
+        if rows == 0 {
+            return;
+        }
+        self.lost.fetch_add(rows, Ordering::AcqRel);
         let mut marked = self
             .marked
             .lock()
@@ -97,7 +105,7 @@ impl Lost {
             Some(m) if m.dir == dir => (m.writer, Some(m.rows)),
             _ => (crate::log::fresh_writer("direct"), None),
         };
-        match crate::log::mark_lost(dir, &writer, was, 1) {
+        match crate::log::mark_lost(dir, &writer, was, rows) {
             Ok(rows) => {
                 *marked = Some(Marked {
                     dir: dir.to_owned(),
@@ -106,7 +114,7 @@ impl Lost {
                 });
             }
             Err(_) => {
-                self.unmarked.fetch_add(1, Ordering::AcqRel);
+                self.unmarked.fetch_add(rows, Ordering::AcqRel);
             }
         }
     }
@@ -133,25 +141,59 @@ pub fn write_now(dir: PathBuf, row: &Row) -> bool {
     write(dir, &facts().0, row, &LOST)
 }
 
+/// Append `lines` (rows' lines, [`Row::line`]) to the log in `dir` in one write, with this
+/// process's [`facts`] and losses ([`write_kept_with`]): whether they were written. Lines it did
+/// not write are not counted lost: the caller keeps them, to write again or to give up
+/// ([`give_up`]).
+pub fn write_kept(dir: PathBuf, lines: &[String]) -> bool {
+    write_kept_with(dir, &facts().0, lines, &LOST)
+}
+
+/// Count `rows` rows a writer kept ([`write_kept`]) and gave up on as lost from the log in `dir`,
+/// in this process's losses, as [`write_now`] counts a row it could not write.
+pub fn give_up(dir: &Path, rows: u64) {
+    LOST.lose(dir, rows);
+}
+
 /// Append `row` to the log in `dir` within [`LOCK_WAIT`], after a gap line for the rows `lost`
 /// holds that no line has said yet: `false` (and the row counted in `lost`) when it was not
 /// written.
 pub fn write(dir: PathBuf, facts: &HostFacts, row: &Row, lost: &Lost) -> bool {
+    match append(dir, facts, &[row.line()], lost) {
+        Ok(()) => true,
+        Err(dir) => {
+            lost.lose(&dir, 1);
+            false
+        }
+    }
+}
+
+/// Append `lines` to the log in `dir` in one write within [`LOCK_WAIT`], after a gap line for
+/// the rows `lost` holds that no line has said yet: whether they were written. A line it did not
+/// write is not counted in `lost`: its caller keeps it, and counts it once it gives it up
+/// ([`Lost::lose`]), so a row written late is never also said lost.
+pub fn write_kept_with(dir: PathBuf, facts: &HostFacts, lines: &[String], lost: &Lost) -> bool {
+    append(dir, facts, lines, lost).is_ok()
+}
+
+/// Append `lines` to the log in `dir` under one wait of at most [`LOCK_WAIT`] for its lock,
+/// after a gap line for the rows `lost` holds that no line has said: `Err` with the log's folder
+/// where they were not written, which counts nothing of them.
+fn append(dir: PathBuf, facts: &HostFacts, lines: &[String], lost: &Lost) -> Result<(), PathBuf> {
     let log = crate::Log::new(dir, crate::Limits::DEFAULT, facts.clone()).waiting(LOCK_WAIT);
     // One wait for the lock; the gap line is a write of its own, so a row that fails after it
     // never has the line's rows given back and said twice.
     let claim = lost.claim();
     let said = claim.map_or(0, |(told, had)| had - told);
-    match log.append_saying(said, &[row.line()]) {
-        Ok(_) => true,
+    match log.append_saying(said, lines) {
+        Ok(_) => Ok(()),
         Err((_, gap_written)) => {
             if let Some(claim) = claim
                 && !gap_written
             {
                 lost.unclaim(claim);
             }
-            lost.lose(log.dir());
-            false
+            Err(log.dir().to_owned())
         }
     }
 }
@@ -246,6 +288,44 @@ mod tests {
         assert_eq!(again.dropped, 1, "a lost row is said once");
     }
 
+    /// A row its writer keeps ([`write_kept_with`]) is not counted when the lock refuses it:
+    /// written once the lock is free, it is in the log and no gap line says it lost; rows its
+    /// writer gives up ([`Lost::lose`]) are said once, as many as it gave up.
+    /// NEGATIVE CONTROL: the same refusal through [`write`] is said lost.
+    #[test]
+    fn a_kept_row_is_said_lost_only_once_its_writer_gives_it_up() {
+        let (_tmp, dir, held) = held_log();
+        let lost = Lost::new();
+        let kept = |at| write_kept_with(dir.clone(), &host(), &[row(at).line()], &lost);
+        assert!(!kept(1), "refused by the held lock");
+        assert_eq!(lost.lost(), 0, "a kept row is not counted");
+        assert!(
+            !write(dir.clone(), &host(), &row(2), &Lost::new()),
+            "NEGATIVE CONTROL: refused too"
+        );
+        drop(held);
+        assert!(kept(1), "written once the lock is free");
+        let read = crate::log::read(&dir, 4, None).expect("read");
+        assert_eq!(
+            read.rows.iter().map(|r| r.at_ms).collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(
+            read.dropped, 1,
+            "only the control's row, which `write` counted"
+        );
+        lost.lose(&dir, 2);
+        assert_eq!(lost.lost(), 2);
+        assert!(kept(3));
+        assert_eq!(
+            crate::log::read(&dir, 4, None).expect("read").dropped,
+            3,
+            "the two given up, said once"
+        );
+        assert!(kept(4));
+        assert_eq!(crate::log::read(&dir, 4, None).expect("read").dropped, 3);
+    }
+
     /// The log in a scratch folder, its lock held by the test until the guard drops.
     fn held_log() -> (aterm_tempfile::TempDir, PathBuf, std::fs::File) {
         let tmp = aterm_tempfile::tempdir().expect("tempdir");
@@ -331,7 +411,7 @@ mod tests {
 
     /// A row that fails after its gap line was written (its append would rotate the log, and the
     /// rotation fails) never has the line's rows given back: the next write says no second gap,
-    /// only the row it lost. One write waits for the lock once.
+    /// only the row it lost.
     #[test]
     fn a_row_that_fails_after_its_gap_line_never_has_the_line_said_twice() {
         let tmp = aterm_tempfile::tempdir().expect("tempdir");
@@ -377,6 +457,50 @@ mod tests {
         assert!(done.mended, "{done:?}");
         let read = crate::log::read(&dir, 4, None).expect("read");
         assert_eq!((read.dropped, read.torn), (1, 1));
+    }
+
+    /// One write says its own losses and the folder's loss records in one gap line, under one
+    /// wait for the lock.
+    #[test]
+    fn one_write_says_its_own_losses_and_the_folders_in_one_gap_line() {
+        let tmp = aterm_tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("telemetry");
+        std::fs::create_dir(&dir).expect("dir");
+        crate::log::mark_lost(&dir, "other", None, 1).expect("a loss record");
+        let lost = Lost::new();
+        lost.unmarked.store(2, Ordering::Release);
+        let waited = crate::log::locks_waited();
+        assert!(write(dir.clone(), &host(), &row(1), &lost));
+        assert_eq!(
+            crate::log::locks_waited() - waited,
+            1,
+            "one wait for the lock"
+        );
+        let text = std::fs::read_to_string(crate::log::file_path(&dir, 0)).expect("rows.log");
+        let gaps: Vec<&str> = text.lines().filter(|l| l.contains(" kind=gap ")).collect();
+        assert_eq!(gaps.len(), 1, "{text}");
+        assert!(gaps[0].contains(" dropped=3 "), "{text}");
+    }
+
+    /// An append whose gap line rotated the log says so, though its row then fit the new file.
+    #[test]
+    fn an_append_says_it_rotated_where_its_gap_line_did() {
+        let tmp = aterm_tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("telemetry");
+        std::fs::create_dir(&dir).expect("dir");
+        let full = std::fs::File::create(crate::log::file_path(&dir, 0)).expect("rows.log");
+        full.set_len(crate::Limits::DEFAULT.file_bytes - 10)
+            .expect("all but full");
+        drop(full);
+        crate::log::mark_lost(&dir, "test", None, 1).expect("a loss record");
+        let log = crate::Log::new(dir.clone(), crate::Limits::DEFAULT, host());
+        let done = log.append(&[row(1).line()]).expect("appended");
+        assert!(done.rotated, "{done:?}");
+        let read = crate::log::read(&dir, crate::Limits::DEFAULT.files, None).expect("read");
+        assert_eq!(
+            read.rows.iter().map(|r| r.at_ms).collect::<Vec<_>>(),
+            vec![1]
+        );
     }
 
     /// A loss no record holds is claimed by one write's gap line: a second write that starts

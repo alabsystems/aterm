@@ -247,7 +247,9 @@ mod tests {
     fn joined(home: &Path, source: &Path) -> Paths {
         std::fs::write(
             source,
-            format!("gh_access_token={TOKEN}\ngithub-repositories.json={INVENTORY}\n~/.tool/other=before\n"),
+            format!(
+                "gh_access_token={TOKEN}\ngithub-repositories.json={INVENTORY}\ntool-other=before\n"
+            ),
         )
         .unwrap();
         std::fs::set_permissions(source, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -344,12 +346,12 @@ mod tests {
         let paths = joined(&home, &source);
         // Readiness was true. The subscriber now writes a newer token while another
         // entry fails, before the repository stage captures its local inputs.
-        let other = home.join(".tool/other");
+        let other = home.join(".secrets/tool-other");
         std::fs::remove_file(&other).unwrap();
         std::fs::create_dir(&other).unwrap();
         std::fs::write(
             &source,
-            "gh_access_token=fixture_new_repository_token\n~/.tool/other=after\n",
+            "gh_access_token=fixture_new_repository_token\ntool-other=after\n",
         )
         .unwrap();
         client::sync(&paths, None).unwrap();

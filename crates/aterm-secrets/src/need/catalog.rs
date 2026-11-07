@@ -9,14 +9,13 @@
 
 use std::path::{Path, PathBuf};
 
-/// The one path `publish/site.toml`'s `firebase_sa_key` resolves to, relative to its `dir`
-/// (`crates/aterm-release/src/site/mod.rs`): the vault entry the site deployer's key arrives as.
-pub const SITE_DEPLOYER_KEY_ENTRY: &str =
-    "~/company-life/config/local/service-account.alab-site-deployer.json";
+/// The vault entry the site deployer's key arrives as ([`crate::entry_class::SITE_DEPLOYER_KEY`]).
+pub const SITE_DEPLOYER_KEY_ENTRY: &str = crate::entry_class::SITE_DEPLOYER_KEY;
 
-/// The notary credential consumed by the release subscriber. The legacy `notary` entry
-/// triggers older clients before their developer-tools checks, so it is never supplied.
-pub const NOTARY_ENTRY: &str = "release-notary";
+/// The notary credential consumed by the release subscriber ([`crate::entry_class::NOTARY`]).
+/// The legacy `notary` entry triggers older clients before their developer-tools checks, so it
+/// is never supplied.
+pub const NOTARY_ENTRY: &str = crate::entry_class::NOTARY;
 
 /// The catalog's version, cited as a catalog retirement's evidence.
 pub const VERSION: u32 = 2;
@@ -238,7 +237,7 @@ impl Want {
             Self::Mailbox(label) => vec![format!("{label}_password"), format!("{label}_totp")],
             Self::MailboxComponent(component) => vec![component.entry()],
             Self::Gh(GhProfile::Dev) => vec!["gh_access_token".to_owned()],
-            Self::Gh(GhProfile::Release) => vec!["gh_access_token_alabsystems".to_owned()],
+            Self::Gh(GhProfile::Release) => vec![crate::entry_class::RELEASE_GH_TOKEN.to_owned()],
             Self::Entry(name) => vec![name.clone()],
             Self::CommonsControl => vec![crate::commons::ENTRY.to_owned()],
             Self::PaperMaster

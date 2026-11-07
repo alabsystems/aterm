@@ -865,16 +865,14 @@ fn harness_sheets(
             )
             .collect()
     } else {
-        [
-            "fleet-accounts.toml",
-            "ai-accounts-codex.toml",
-            "ai-accounts-grok.toml",
-            "ai-accounts-kimi.toml",
-        ]
-        .into_iter()
-        .map(|name| (SheetKind::FleetAccounts, secrets.join(name)))
-        .chain([(SheetKind::AiPool, secrets.join("ai-pool.toml"))])
-        .collect()
+        std::iter::once(aterm_secrets::entry_class::FLEET_ACCOUNTS.to_owned())
+            .chain(["codex", "grok", "kimi"].map(aterm_secrets::entry_class::cli_accounts))
+            .map(|name| (SheetKind::FleetAccounts, secrets.join(name)))
+            .chain([(
+                SheetKind::AiPool,
+                secrets.join(aterm_secrets::entry_class::AI_POOL),
+            )])
+            .collect()
     };
     let everyone = everyone(paths);
     let mut sheets = Vec::new();
@@ -1446,22 +1444,34 @@ fn import(
         sheet(
             SheetKind::Vault,
             args.vault.as_deref(),
-            paths.home.join(".secrets").join("ai-accounts.csv"),
+            paths
+                .home
+                .join(".secrets")
+                .join(aterm_secrets::entry_class::AI_ACCOUNTS_CSV),
         )?,
         sheet(
             SheetKind::Phones,
             args.phones.as_deref(),
-            paths.home.join(".secrets").join("alab-phones.csv"),
+            paths
+                .home
+                .join(".secrets")
+                .join(aterm_secrets::entry_class::ALAB_PHONES),
         )?,
         sheet(
             SheetKind::Computers,
             args.computers.as_deref(),
-            paths.home.join(".secrets").join("alab-computers.csv"),
+            paths
+                .home
+                .join(".secrets")
+                .join(aterm_secrets::entry_class::ALAB_COMPUTERS),
         )?,
         sheet(
             SheetKind::Emails,
             args.emails.as_deref(),
-            paths.home.join(".secrets").join("alab-emails.csv"),
+            paths
+                .home
+                .join(".secrets")
+                .join(aterm_secrets::entry_class::ALAB_EMAILS),
         )?,
         sheet(
             SheetKind::Logins,

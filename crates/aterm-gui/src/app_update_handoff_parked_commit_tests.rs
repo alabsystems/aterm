@@ -1143,7 +1143,7 @@ fn a_system_state_settle_that_waits_holds_the_commit_through_one_more_fence() {
 fn hold(
     item: crate::app_update_handoff_boundary::GuardedItem,
 ) -> crate::app_update_handoff_boundary::Held<'static> {
-    crate::app_update_handoff_boundary::Boundary::process()
+    crate::app_update_handoff_boundary::registry()
         .hold(item, || Ok::<(), ()>(()))
         .expect("its checks hold")
 }

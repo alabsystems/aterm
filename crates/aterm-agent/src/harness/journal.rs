@@ -128,6 +128,13 @@ pub const KINDS: &[&str] = &[
     "error",
     "switch",
     "probe",
+    "token-minted",
+    "token-served",
+    "token-verified",
+    "token-rejected",
+    "token-fallback",
+    "token-offered",
+    "token-removed",
 ];
 /// Every window word a note can carry.
 pub const WINDOWS: &[&str] = &["5h", "7d", "7d-model"];
@@ -156,6 +163,19 @@ pub const WHYS: &[&str] = &[
     "live-session",
     "at-wall",
     "asked",
+    // Where a minted token's end came from (`TokenEvent::Minted`).
+    "printed",
+    "assumed",
+    // Why aterm's wrapper started a session on its stored login (`TokenEvent::Fallback`,
+    // `token_route::Fallback::word`).
+    "claimed",
+    "held",
+    "busy",
+    "unverified",
+    "ended",
+    "rejected",
+    "mismatched",
+    "unreadable",
 ];
 
 /// One journal note: an event about one account, in the journal's closed vocabulary. `Copy`,
@@ -209,6 +229,66 @@ impl Note {
             to: None,
         }
     }
+}
+
+/// A Claude Code setup-token's life on this Mac, as a journal note's kind
+/// (`docs/DESIGN-claude-setup-token-2026-11-05.md` §4.6, §5.6, §5.9). A token note names the
+/// account by its key alone: it carries no value, entry text, email or reason line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TokenEvent {
+    /// The verb made a token and the vault took it, or holds it waiting (`token-minted`).
+    Minted,
+    /// The first status-line reading under the token (`token-served`).
+    Served,
+    /// The minting Mac verified the token's account (`token-verified`).
+    Verified,
+    /// Claude Code refused the token on this Mac (`token-rejected`).
+    Rejected,
+    /// aterm's wrapper started a session on its stored login instead (`token-fallback`).
+    Fallback,
+    /// A surface offered a token for the account (`token-offered`).
+    Offered,
+    /// The verb removed the account's token from the vault (`token-removed`).
+    Removed,
+}
+
+impl TokenEvent {
+    /// The kind word, one of [`KINDS`].
+    #[must_use]
+    pub const fn kind(self) -> &'static str {
+        match self {
+            Self::Minted => "token-minted",
+            Self::Served => "token-served",
+            Self::Verified => "token-verified",
+            Self::Rejected => "token-rejected",
+            Self::Fallback => "token-fallback",
+            Self::Offered => "token-offered",
+            Self::Removed => "token-removed",
+        }
+    }
+}
+
+/// The note of `event` about Claude Code's `account` at `t`: the verb's own steps (minted,
+/// removed, offered) are a sign-in flow's, the rest Claude Code's output. `why` is one of
+/// [`WHYS`] (a minted token's `printed` or `assumed` end), or none.
+#[must_use]
+pub fn token_note(event: TokenEvent, account: Key, t: u64, why: Option<&'static str>) -> Note {
+    let src = match event {
+        TokenEvent::Minted | TokenEvent::Removed | TokenEvent::Offered => "signin-flow",
+        TokenEvent::Served | TokenEvent::Verified | TokenEvent::Rejected | TokenEvent::Fallback => {
+            "cli-output"
+        }
+    };
+    let mut note = Note::new(t, event.kind(), account, Cli::Claude, src);
+    note.why = why.filter(|why| WHYS.contains(why));
+    note
+}
+
+/// The note of a token the capture made for another account than the one asked for
+/// (`wrong-account`, design §4.5): the account asked for, by its key.
+#[must_use]
+pub fn wrong_token_account(account: Key, t: u64) -> Note {
+    Note::new(t, "wrong-account", account, Cli::Claude, "signin-flow")
 }
 
 /// Where notes go, and how an account is keyed: the `aterm` executable's journal glue.
@@ -271,6 +351,14 @@ pub fn note(note: &Note) {
 #[must_use]
 pub fn realm_key(realm: &str, login: &str) -> Option<Key> {
     Key::new(&account_pk(realm, login)?)
+}
+
+/// The lab key of the Claude Code account whose claims email is `email` (design §5): what a
+/// row-less session's account is keyed by, through the installed sink or a scoped test keyer.
+#[must_use]
+pub fn claude_email_key(email: &str) -> Option<Key> {
+    let lease = LeaseKey::for_cli(Cli::Claude, None, email).ok()?;
+    Key::new(&account_pk(&lease.pool, &lease.email)?)
 }
 
 /// The current row's canonical claims key, independently of a previously learned label key.

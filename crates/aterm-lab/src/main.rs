@@ -235,6 +235,12 @@ mod local_signins {
     pub fn reap_main(_: &[String]) -> i32 {
         2
     }
+
+    pub const SETUP_TOKEN_VERB: &str = "local-signins-setup-token";
+
+    pub fn setup_token_main(_: &[String]) -> i32 {
+        2
+    }
 }
 #[cfg(target_os = "macos")]
 mod cpu_observation;
@@ -343,6 +349,22 @@ mod installer_handoff {
 mod seamless_carry;
 #[cfg(target_os = "macos")]
 mod selftest;
+#[cfg(all(target_os = "macos", debug_assertions))]
+mod setup_token_lab;
+#[cfg(all(target_os = "macos", not(debug_assertions)))]
+mod setup_token_lab {
+    pub const PROBE_VERB: &str = "setup-token-probe";
+
+    pub fn cmd(_: &[String]) -> crate::Res {
+        Err(crate::Fail::die(
+            "setup-token-lab needs a debug lab image for the vault-token seam",
+        ))
+    }
+
+    pub fn probe_main(_: &[String]) -> i32 {
+        2
+    }
+}
 #[cfg(target_os = "macos")]
 mod settings_witness;
 #[cfg(target_os = "macos")]
@@ -816,6 +838,15 @@ Outside any lab (no jail, no stub):
                                  agy logins signed in, out and expired; judge that survey, report, upkeep and fleet
                                  survey read each state from local files alone, contact no provider, open nothing,
                                  sign nothing in, and carry only their own Mac's rows (debug lab image)
+  setup-token-lab [a|b|c|all] [tag] [--keep]
+                                 DESIGN-claude-setup-token S9's gate (debug lab image, no real sign-in): (a) the real
+                                 `claude setup-token` on the capture's terminal in the jail reaches an authorize URL the
+                                 capture admits and its paste prompt, stopped there; (b) `accounts token` on a stand-in
+                                 stores the stub's sentinel token and `token-run` serves it, with no copy in scrollback,
+                                 casts, the lab's files, $TMPDIR or any process's argv and environment (each scanner
+                                 with a planted control); (c) the real Claude Code on the wrapper's descriptor: its
+                                 SessionStart hook, MCP server and statusLine command find no token (control: the
+                                 wrapper's spare socket, which they find); exit 1 on FAIL, 3 when a lane could not run
   fleet-sim [--n N] [--runs R] [--keep] [--record]
                                  run N (default 30, 4-64) private headless aterms on loopback fleet ports and verify
                                  `aterm ctl survey --fleet` across R runs (default 3) under `ulimit -n 256` (--record:
@@ -1212,6 +1243,7 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "artifact-serve" => artifact_serve::cmd(args),
         "fleet-menu" => fleet_menu::cmd(args),
         "local-signins" => local_signins::cmd(args),
+        "setup-token-lab" => setup_token_lab::cmd(args),
         "reveal-tab" => reveal_tab::cmd(args),
         "told-once" => told_once::cmd(args),
         "commons-lan" => commons_lan::cmd(args),
@@ -1432,6 +1464,10 @@ fn main() -> std::process::ExitCode {
                 local_signins::LOOK_UP_VERB => local_signins::look_up_main(rest),
                 #[cfg(target_os = "macos")]
                 local_signins::REAP_VERB => local_signins::reap_main(rest),
+                #[cfg(target_os = "macos")]
+                local_signins::SETUP_TOKEN_VERB => local_signins::setup_token_main(rest),
+                #[cfg(target_os = "macos")]
+                setup_token_lab::PROBE_VERB => setup_token_lab::probe_main(rest),
                 "hold" => recorder::hold(rest),
                 "keeper" => instance::keeper_main(rest),
                 "band" => band::band_main(rest),

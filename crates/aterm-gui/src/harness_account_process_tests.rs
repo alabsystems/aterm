@@ -26,7 +26,7 @@ fn application_case(case: i64) -> Applied {
     let world = Arc::new(World::default());
     let mut hooks = hooks(&world, parking_body(&world));
     let mut snapshot = snap("s-application");
-    snapshot.stored_login = true;
+    snapshot.route = aterm_agent::harness::accounts::AuthRoute::Stored;
     snapshot.login = Some("/login/wanted".into());
     let roster = accounts::Roster {
         rows: vec![
@@ -63,7 +63,7 @@ fn application_case(case: i64) -> Applied {
         }
         5 => {
             env.push(format!("{}=synthetic", accounts::CREDENTIAL_KEYS[0]));
-            snapshot.stored_login = false;
+            snapshot.route = aterm_agent::harness::accounts::AuthRoute::Outside;
         }
         6 => {
             env.push(format!("{}=/another/home", accounts::HOME_ENV));
@@ -293,7 +293,7 @@ fn live_account_decisions_refuse_a_different_snapshot_without_writes() {
         program,
         argv,
         start: aterm_agent::harness::footer::lstart_utc(birth.seconds),
-        stored_login: true,
+        route: aterm_agent::harness::accounts::AuthRoute::Stored,
         ..snap("s-live-process")
     };
     for change in ["same", "start", "login", "command", "credential"] {
@@ -311,7 +311,7 @@ fn live_account_decisions_refuse_a_different_snapshot_without_writes() {
             "start" => observed.start.push_str("-stale"),
             "login" => observed.login = Some("/another/login".into()),
             "command" => observed.argv.push("--settings=another".into()),
-            "credential" => observed.stored_login = false,
+            "credential" => observed.route = aterm_agent::harness::accounts::AuthRoute::Outside,
             _ => {}
         }
         idle.kept.lock().unwrap().snapshot = Some(observed.clone());

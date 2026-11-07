@@ -266,12 +266,16 @@ pub fn reconcile_agents(layout: &Layout) {
                  retried next pass"
             );
         }
+        // The token block goes into the twin alone, before its last line, unless the twin is a
+        // dev link (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.4).
+        let token = !dev_link;
         let twin_file = || {
             if exec.path == target {
                 primary_executable(&twin, &target, exec.managed.as_deref(), &env, &prelude)
             } else {
                 platform::twin_executable_to_env(&twin, &exec.path, &env, &prelude)
             }
+            .map(|file| with_token(file, name, atpkg.as_deref(), token))
         };
         if twin_read.target.as_deref() == Some(exec.path.as_path())
             && twin_read.env == env
@@ -295,6 +299,26 @@ pub fn reconcile_agents(layout: &Layout) {
         }
     }
     sweep_agents(layout);
+}
+
+/// `file`, an agent program's twin, with the token block ([`crate::launch_tap::with_token_block`])
+/// where `on`.
+fn with_token(
+    file: crate::lay::Executable,
+    program: &str,
+    atpkg: Option<&Path>,
+    on: bool,
+) -> crate::lay::Executable {
+    if !on {
+        return file;
+    }
+    match String::from_utf8(file.body) {
+        Ok(body) => crate::lay::Executable::new(
+            file.path,
+            crate::launch_tap::with_token_block(program, body, atpkg),
+        ),
+        Err(error) => crate::lay::Executable::new(file.path, error.into_bytes()),
+    }
 }
 
 fn primary_executable(
@@ -1722,11 +1746,14 @@ mod tests {
                 None,
                 &format!("{yolo}{block}"),
             );
-            assert_eq!(std::fs::read_to_string(&twin).unwrap(), today);
+            let twin_today =
+                crate::launch_tap::with_token_block("claude", today.clone(), Some(&named));
+            assert!(twin_today.contains("token-run"), "{twin_today}");
+            assert_eq!(std::fs::read_to_string(&twin).unwrap(), twin_today);
             assert_eq!(
                 std::fs::read_to_string(layout.shim(&claude)).unwrap(),
                 today,
-                "bin/ carries the twin's block"
+                "bin/ carries the twin's tap block, never its token block"
             );
             let before_the_block =
                 platform::sh_shim_content_twin(&c1.join("bin/claude"), &env, None, &yolo);
@@ -1734,7 +1761,7 @@ mod tests {
             reconcile_agents(&layout);
             assert_eq!(
                 std::fs::read_to_string(&twin).unwrap(),
-                today,
+                twin_today,
                 "a twin laid before the block gains it on the next pass"
             );
             let before = std::fs::metadata(&twin).unwrap().modified().unwrap();

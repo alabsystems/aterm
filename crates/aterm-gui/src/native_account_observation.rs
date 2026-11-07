@@ -24,13 +24,13 @@ pub(super) struct ClaimRecord {
     pub(super) recorded_ms: u64,
 }
 
-enum Refusal {
+pub(super) enum Refusal {
     Authority,
     Unknown,
 }
 
 impl Refusal {
-    fn reply(self) -> AccountReply {
+    pub(super) fn reply(self) -> AccountReply {
         match self {
             Self::Authority => AccountReply::Denied(Denial::Authority),
             Self::Unknown => AccountReply::Unknown,
@@ -38,7 +38,7 @@ impl Refusal {
     }
 }
 
-fn issuer_current(
+pub(super) fn issuer_current(
     op: &Operation,
     ctx: &crate::SessionCtx,
     caller: &SupervisorInputCaller,
@@ -56,7 +56,7 @@ fn issuer_current(
         && host_epoch() == Some(op.request.host_epoch.as_str())
 }
 
-fn closure_witness(
+pub(super) fn closure_witness(
     op: &Operation,
     ctx: &crate::SessionCtx,
     parent: &Predecessor,

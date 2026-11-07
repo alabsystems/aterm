@@ -223,7 +223,7 @@ fn local_case(case: i64) -> [i64; 3] {
             who: accounts::ProcessLogin {
                 login: None,
                 default_home: true,
-                stored_login: true,
+                route: aterm_agent::harness::accounts::AuthRoute::Stored,
             },
             label: None,
             snap: base,

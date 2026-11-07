@@ -106,6 +106,63 @@ pub fn logged(arg: &str) -> Option<String> {
     Some("<a path or app>".into())
 }
 
+/// The variable naming a second log the recorder writes each URL's shape to ([`url_shape`]):
+/// `setup-token-lab`'s lane A judges what Claude Code's sign-in asked for by it.
+pub const SHAPE_LOG: &str = "LAB_OPEN_SHAPE_LOG";
+
+/// The shape of a URL `open` was handed: its scheme, host and path, its query's keys in order,
+/// and the values of `scope` and `expires_in` (URL-decoded), never another value (a state, a
+/// challenge, a client id). `None` for an argument that is no `scheme://` URL.
+#[must_use]
+pub fn url_shape(arg: &str) -> Option<String> {
+    let (scheme, rest) = arg.split_once("://")?;
+    let (place, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let place = place.split('#').next().unwrap_or("");
+    let mut keys = Vec::new();
+    let mut named = Vec::new();
+    for pair in query.split('#').next().unwrap_or("").split('&') {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        if k.is_empty() {
+            continue;
+        }
+        keys.push(k.to_string());
+        if matches!(k, "scope" | "expires_in") {
+            named.push(format!("{k}={}", url_decoded(v)));
+        }
+    }
+    let mut out = format!("{scheme}://{place} keys={}", keys.join(","));
+    for n in named {
+        out.push(' ');
+        out.push_str(&n);
+    }
+    Some(out)
+}
+
+/// `v` with `+` as a space and each `%XX` as its byte (an invalid escape kept as written).
+fn url_decoded(v: &str) -> String {
+    let b = v.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'+' => out.push(b' '),
+            b'%' if i + 2 < b.len() => {
+                let hex = |c: u8| char::from(c).to_digit(16);
+                match (hex(b[i + 1]), hex(b[i + 2])) {
+                    (Some(hi), Some(lo)) => {
+                        out.push(u8::try_from(hi * 16 + lo).unwrap_or(b'?'));
+                        i += 2;
+                    }
+                    _ => out.push(b'%'),
+                }
+            }
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// `open …` as the recorder answers it: 0, having logged each argument.
 #[must_use]
 pub fn main(args: &[String]) -> i32 {
@@ -121,6 +178,15 @@ pub fn main(args: &[String]) -> i32 {
                 .open(&log)
         {
             let _ = f.write_all(format!("{ts} open {what}\n").as_bytes());
+        }
+        if let (Some(shape), Ok(log)) = (url_shape(a), std::env::var(SHAPE_LOG))
+            && let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+                .open(&log)
+        {
+            let _ = f.write_all(format!("{ts} {shape}\n").as_bytes());
         }
     }
     0
@@ -167,6 +233,27 @@ mod tests {
             Some("<a path or app>")
         );
         assert_eq!(logged("-a"), None);
+    }
+
+    /// A URL's shape names its place, its query's keys, and only `scope`'s and `expires_in`'s
+    /// values, decoded; no other value (a state, a challenge) is in it.
+    #[test]
+    fn a_url_shape_holds_its_keys_and_only_the_scope_and_lifetime() {
+        let url = "https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c&\
+                   response_type=code&scope=user%3Ainference&code_challenge=SECRETCH&state=SECRETST";
+        let shape = url_shape(url).expect("a URL");
+        assert_eq!(
+            shape,
+            "https://claude.com/cai/oauth/authorize keys=code,client_id,response_type,scope,\
+             code_challenge,state scope=user:inference"
+        );
+        assert!(!shape.contains("SECRET"), "{shape}");
+        assert_eq!(
+            url_shape("https://a.test/p?scope=a+b%3Ac&expires_in=31536000").as_deref(),
+            Some("https://a.test/p keys=scope,expires_in scope=a b:c expires_in=31536000")
+        );
+        assert_eq!(url_decoded("100%"), "100%", "an escape cut short is kept");
+        assert_eq!(url_shape("/Applications/Safari.app"), None);
     }
 
     /// The recorder's verdict needs both halves: an empty `open.log` and the

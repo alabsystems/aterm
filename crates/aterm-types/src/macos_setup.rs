@@ -321,6 +321,35 @@ pub enum Subject {
 }
 
 impl Subject {
+    /// The fixed public name used by cached setup status, without a setting's value.
+    #[must_use]
+    pub const fn status_word(self) -> &'static str {
+        match self {
+            Self::Access(Access::FullDiskAccess) => "fda",
+            Self::Access(Access::DeveloperTools) => "devtools",
+            Self::Access(Access::Debugger) => "debugger",
+            Self::Access(Access::Accessibility) => "ax",
+            Self::Setting(Setting::CapsLock) => "capslock",
+            Self::Setting(Setting::NaturalScrolling) => "scrolling",
+            Self::Setting(Setting::TrackpadScrolling) => "trackpad",
+            Self::Setting(Setting::Desktop) => "desktop",
+            Self::Setting(Setting::Widgets) => "widgets",
+            Self::Setting(Setting::Dock) => "dock",
+            Self::Setting(Setting::Messages) => "messages",
+            Self::Setting(Setting::FaceTime) => "facetime",
+            Self::Setting(Setting::Spotlight) => "spotlight",
+            Self::Setting(Setting::Permissions) => "permissions",
+            Self::Setting(Setting::Secrets) => "vault",
+            Self::Setting(Setting::Repositories) => "repos",
+            Self::Sync(SyncKind::Peers) => "sync-peers",
+            Self::Sync(SyncKind::Identity) => "sync-identity",
+            Self::Sync(SyncKind::Fleet) => "sync-fleet",
+            Self::Sync(SyncKind::Accounts) => "sync-accounts",
+            Self::Sync(SyncKind::SharedData) => "sync-shared-data",
+            Self::Sync(SyncKind::Name) => "sync-name",
+        }
+    }
+
     /// This reading describes the selected vault or credentials it supplied.
     #[must_use]
     pub const fn uses_vault_source(self) -> bool {
@@ -410,6 +439,37 @@ pub enum Standing {
 }
 
 impl Standing {
+    /// One cached reading's fixed public status, without its note or value.
+    #[must_use]
+    pub const fn status_word(self) -> &'static str {
+        match self {
+            Self::InPlace => "in-place",
+            Self::Differs => "differs",
+            Self::NeedsYou => "needs-you",
+            Self::Waiting => "waiting",
+            Self::AtLogin => "at-login",
+            Self::Failed => "failed",
+            Self::Unknown => "unknown",
+            Self::NotNeeded => "not-needed",
+        }
+    }
+
+    /// Decode a cached status word. An absent reading (`unread`) is no Standing.
+    #[must_use]
+    pub fn from_status_word(word: &str) -> Option<Self> {
+        match word {
+            "in-place" => Some(Self::InPlace),
+            "differs" => Some(Self::Differs),
+            "needs-you" => Some(Self::NeedsYou),
+            "waiting" => Some(Self::Waiting),
+            "at-login" => Some(Self::AtLogin),
+            "failed" => Some(Self::Failed),
+            "unknown" => Some(Self::Unknown),
+            "not-needed" => Some(Self::NotNeeded),
+            _ => None,
+        }
+    }
+
     /// Whether the row counts as in place for the page's "N of M" count.
     #[must_use]
     pub const fn settled(self) -> bool {
@@ -530,8 +590,7 @@ pub const ADMITTED_NAME_RULE_REFUSED: &str = "/private/etc/sudoers.d/.aterm-admi
 /// one line saying how it ended. It exits 0 once it said the tools are installed and 1 once it
 /// said why the install did not finish (Low Data Mode, an account that may not install them, a
 /// stop and Apple's window closed without installing them each with a code of its own); any
-/// other end said nothing, and the window ends the tab with [`COMMAND_LINE_TOOLS_NOT_FINISHED`]
-/// and [`COMMAND_LINE_TOOLS_TRY_AGAIN`].
+/// other end said nothing, and the window ends the tab with [`COMMAND_LINE_TOOLS_NOT_FINISHED`].
 pub const COMMAND_LINE_TOOLS_TAB: &str = "ATERM_COMMAND_LINE_TOOLS_TAB";
 
 /// The line the window types into the Mac Setup tab once it landed, which starts the
@@ -539,15 +598,9 @@ pub const COMMAND_LINE_TOOLS_TAB: &str = "ATERM_COMMAND_LINE_TOOLS_TAB";
 pub const COMMAND_LINE_TOOLS_TAB_GO: &str = "install";
 
 /// How the Mac Setup tab says its run did not finish, before its plain reason:
-/// `Mac Setup did not finish: <reason>. Running aterm init in a terminal tries again.` It names the setup, not an install: on a Mac that has the tools the tab only takes
+/// `Mac Setup did not finish: <reason>.` It names the setup, not an install: on a Mac that has the tools the tab only takes
 /// the elevation's other root steps.
 pub const COMMAND_LINE_TOOLS_NOT_FINISHED: &str = "Mac Setup did not finish";
-
-/// The Mac Setup tab's last words when its run did not finish: what tries again. A person's own
-/// `aterm init` asks for the password each time, with the tools missing or not, where System
-/// State offers Install… only while they are missing and the next launch asks by itself only
-/// after some ends.
-pub const COMMAND_LINE_TOOLS_TRY_AGAIN: &str = "Running aterm init in a terminal tries again.";
 
 /// What the Mac Setup tab's program exits with when the window's go line
 /// ([`COMMAND_LINE_TOOLS_TAB_GO`]) never came, or came behind other typing: it started nothing and
@@ -1842,12 +1895,14 @@ pub mod access_record {
 
 /// The GitHub repositories row's short note when GitHub refuses the token the vault syncs (the
 /// menu line's and `aterm doctor`'s, at most 52 characters): who renews it. The vault's
-/// `gh_access_token` is in its `[everyone]` section, which only a vault admin writes
-/// (`aterm secrets set`). System State's row says it whole, with the line they run.
-pub const GITHUB_TOKEN_REFUSED: &str = "GitHub refuses your token; a vault admin renews it";
+/// `gh_access_token` is a shared `[everyone]` entry, which any member seated in the vault's
+/// membership log writes with `aterm secrets set`, no admin key needed
+/// (`docs/DESIGN-claude-setup-token-2026-11-05.md` §3.5). System State's row says it whole,
+/// with the line they run.
+pub const GITHUB_TOKEN_REFUSED: &str = "GitHub refuses your token; any member renews it";
 
-/// The one line a vault admin runs on their Mac, with a new GitHub token copied, to save it in the
-/// vault for every Mac ([`GITHUB_TOKEN_REFUSED`]).
+/// The one line a member runs on its Mac, with a new GitHub token copied, to save it in the vault
+/// for every Mac ([`GITHUB_TOKEN_REFUSED`]).
 pub const GITHUB_TOKEN_COMMAND: &str = "pbpaste | aterm secrets set gh_access_token";
 
 /// The Secrets vault row's value while this Mac asks ALab's members to let it in

@@ -156,9 +156,13 @@ mod live {
         ]);
         let b = by_pid(records().expect("records"));
         let rows = (dead.id(), pty);
+        let live_start = live_start_s(std::process::id());
+        let dead_start = live_start_s(dead.id());
         let own_pty = a.get(&pty).and_then(|r| r.tty);
         end(script);
         end(dead);
+        assert_eq!(live_start, Some(a[&std::process::id()].start_s));
+        assert_eq!(dead_start, None, "an exited process owns no live work");
         let mut compared = BTreeSet::new();
         for line in &lines {
             let w: Vec<&str> = line.split_whitespace().collect();

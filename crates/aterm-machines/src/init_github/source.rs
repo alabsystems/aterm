@@ -8,6 +8,10 @@
 use super::{Asked, Github, INPUT_MAX, TOKEN_FILE, asked, decode, inventory, profile, read_token};
 use crate::model::User;
 use crate::port::{OwnedFileMetadata, Stat, System};
+use aterm_secrets::converge::{
+    RefreshObservation, RefreshRequest, RefreshScope, RefreshVersion, RepositoryRequest,
+    RepositoryWork,
+};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -214,6 +218,70 @@ pub struct RepositoryInputMark {
     git: Vec<(PathBuf, FileVersion)>,
     paths: Vec<PathBuf>,
     checkouts: super::checkout_inputs::Checkouts,
+    refresh: Result<aterm_secrets::converge::RefreshScope, String>,
+}
+
+/// An automatic producer's last actual source and observed input epoch floor.
+/// These are scheduling facts alone, never permission to read or change a repository.
+pub struct RepositoryRefreshCursor {
+    scope: Option<RefreshScope>,
+    basis: RefreshVersion,
+    first: bool,
+}
+
+impl RepositoryRefreshCursor {
+    /// `initial` must be sampled before reading the initial actual input mark.
+    #[must_use]
+    pub fn new(initial: RefreshObservation, mark: Option<&RepositoryInputMark>) -> Self {
+        Self {
+            scope: mark.and_then(RepositoryInputMark::refresh_scope),
+            basis: initial.version,
+            first: true,
+        }
+    }
+
+    /// `mark` must come from this round's successful actual input observation.
+    /// A transition binds its old epoch before the new sample raises the future floor;
+    /// unchanged actual inputs also request repair when a newer foreign generation reveals
+    /// a missed transition. Receipt epochs grant no source or effect authority.
+    pub fn observe(
+        &mut self,
+        mark: Option<&RepositoryInputMark>,
+        receipt: RefreshObservation,
+        work: Option<RepositoryWork>,
+    ) -> Option<RepositoryRequest> {
+        let scope = mark.and_then(RepositoryInputMark::refresh_scope);
+        let first = std::mem::take(&mut self.first);
+        let missed = scope.is_some()
+            && scope == self.scope
+            && receipt.scope != scope
+            && receipt.version.input > self.basis.input;
+        let request = if work == Some(RepositoryWork::Refresh) || self.scope != scope || missed {
+            Some(RepositoryRequest::Refresh(RefreshRequest {
+                scope,
+                base_input: if missed {
+                    receipt.version.input
+                } else {
+                    self.basis.input
+                },
+                changed: true,
+                after_attempt: None,
+            }))
+        } else if work == Some(RepositoryWork::Repair) {
+            Some(RepositoryRequest::Repair)
+        } else if first {
+            scope.map(|scope| {
+                RepositoryRequest::Refresh(RefreshRequest::ensure(Some(scope), receipt.version))
+            })
+        } else {
+            None
+        };
+        self.scope = scope;
+        if scope.is_some() {
+            self.basis.input = self.basis.input.max(receipt.version.input);
+        }
+        request
+    }
 }
 
 impl RepositoryInputMark {
@@ -226,6 +294,13 @@ impl RepositoryInputMark {
             && self.helper == other.helper
             && self.git == other.git
             && self.paths == other.paths
+            && self.refresh == other.refresh
+    }
+
+    /// Opaque scheduling scope, never permission to use its inputs. It excludes
+    /// every checkout field so a refresh cannot request itself through its own fetch.
+    pub fn refresh_scope(&self) -> Option<aterm_secrets::converge::RefreshScope> {
+        self.refresh.as_ref().ok().copied()
     }
 
     /// Resample the previously derived private-inventory scope using metadata alone.
@@ -266,6 +341,11 @@ fn account(sys: &dyn System) -> Result<User, String> {
 /// This process's own account cannot be identified.
 pub fn repository_input_mark(sys: &dyn System) -> Result<RepositoryInputMark, String> {
     let user = account(sys)?;
+    let source = Stamp::read(sys, &user);
+    let refresh = source
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|stamp| refresh_scope(sys, &user, stamp));
     let helper = (|| {
         let (program, payload) = crate::git_credential::Helper::target(sys, &user)?;
         let version = sys.file_version(&payload)?;
@@ -273,7 +353,7 @@ pub fn repository_input_mark(sys: &dyn System) -> Result<RepositoryInputMark, St
     })()
     .map_err(|why| why.kind());
     Ok(RepositoryInputMark {
-        source: Stamp::read(sys, &user),
+        source,
         develop: super::develop_checkouts(sys, &user),
         helper,
         git: git_paths(sys)
@@ -285,6 +365,7 @@ pub fn repository_input_mark(sys: &dyn System) -> Result<RepositoryInputMark, St
             .collect(),
         paths: watch_paths(sys, &user),
         checkouts: super::checkout_inputs::Checkouts::capture(sys, &user),
+        refresh,
     })
 }
 
@@ -337,6 +418,7 @@ fn dynamic_paths(sys: &dyn System, user: &User, commands: &[PathBuf]) -> Vec<Pat
     let home = Path::new(&user.home);
     let mut paths = vec![
         home.join(".config/aterm/init.toml"),
+        home.join(".config/aterm/secrets/source.toml"),
         aterm_types::installed_command::path(home),
     ];
     // A launcher can precede its installed target. Keep each declared target observable even
@@ -381,7 +463,7 @@ fn selected_paths(profile: Result<Option<super::Config>, String>, user: &User) -
     match profile.and_then(|profile| asked(profile.and_then(|p| p.github), user)) {
         Ok(Asked::Default) => {
             paths.push(home.join(TOKEN_FILE));
-            paths.push(home.join(inventory::FILE));
+            paths.push(inventory::file(&user.home));
         }
         Ok(Asked::Scoped(source) | Asked::Profile(source)) => paths.push(source.token_file),
         Ok(Asked::Off) | Err(_) => {}
@@ -547,6 +629,61 @@ mod tests {
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct Stamp([u8; 32]);
 
+/// Hash only scheduling identity from an already captured credential-source
+/// stamp. No credential bytes, vault authority or checkout state are retained.
+pub(super) fn refresh_scope(
+    sys: &dyn System,
+    user: &User,
+    source: &Stamp,
+) -> Result<aterm_secrets::converge::RefreshScope, String> {
+    let mut hash = aterm_digest::Sha256::new();
+    hash.update(b"aterm repository refresh scope/1\0");
+    let mut part = |bytes: &[u8]| {
+        hash.update((bytes.len() as u64).to_le_bytes());
+        hash.update(bytes);
+    };
+    part(&source.0);
+    part(&user.uid.to_le_bytes());
+    part(user.home.as_bytes());
+    for path in super::develop_checkouts(sys, user)? {
+        part(path.as_os_str().as_encoded_bytes());
+    }
+    let paths = watch_paths(sys, user);
+    // Include declared vault identity/source, independently of the delivered
+    // credential bytes. TOML serialization ignores comment/format-only edits.
+    let selected = Path::new(&user.home).join(".config/aterm/secrets/source.toml");
+    match sys.read_owned_file(&selected, user.uid, 4 << 20, true) {
+        Ok(bytes) => {
+            let text = std::str::from_utf8(&bytes).map_err(|_| "vault source is not UTF-8")?;
+            let table: aterm_toml::Value =
+                aterm_toml::from_str(text).map_err(|_| "vault source cannot be decoded")?;
+            part(
+                aterm_toml::to_string(&table)
+                    .map_err(|_| "vault source cannot be observed")?
+                    .as_bytes(),
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => part(b"no configured vault"),
+        Err(_) => return Err("vault source cannot be safely observed".into()),
+    }
+    for path in paths {
+        part(path.as_os_str().as_encoded_bytes());
+        // The profile's unrelated settings do not change refresh scope.
+        if !path.ends_with("init.toml") && path != selected {
+            part(format!("{:?}", sys.file_version(&path).map_err(|e| e.kind())).as_bytes());
+        }
+        for parent in path.ancestors().skip(1) {
+            let policy = sys
+                .stat(parent)
+                .map(|s| (s.uid, s.gid, s.mode, s.dir, s.symlink))
+                .map_err(|e| e.kind());
+            part(parent.as_os_str().as_encoded_bytes());
+            part(format!("{policy:?}").as_bytes());
+        }
+    }
+    Ok(aterm_secrets::converge::RefreshScope::new(hash.finalize()))
+}
+
 impl Stamp {
     pub(super) fn matches_config(
         sys: &dyn System,
@@ -581,7 +718,7 @@ impl Stamp {
         let token = read_token(sys, user, &source).map_err(|why| why.why)?;
         let inventory = if default {
             sys.read_owned_file(
-                &Path::new(&user.home).join(inventory::FILE),
+                &inventory::file(&user.home),
                 user.uid,
                 inventory::MAX_BYTES,
                 true,

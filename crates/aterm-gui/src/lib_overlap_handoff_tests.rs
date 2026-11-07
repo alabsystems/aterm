@@ -2013,34 +2013,6 @@ fn macos_access_card_stays_inert_off_macos() {
 }
 
 #[test]
-fn an_observed_dialog_banner_names_the_asking_tab() {
-    let app = App::headless_for_test();
-    app.store
-        .read()
-        .unwrap_or_else(|p| p.into_inner())
-        .by_local(0)
-        .expect("the headless instance has tab 0")
-        .ctx
-        .meta
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .user_title = Some("build agent".to_string());
-    let prompt_owner = std::sync::Arc::new(());
-    let prompt = |session| super::consent_observer::ObservedPrompt {
-        session,
-        blocked_on: String::new(),
-        service: "kTCCServiceSystemPolicyDocumentsFolder".to_string(),
-        validity: crate::notify::NoticeValidity::new(&prompt_owner),
-    };
-    let bare = prompt(0).notice().body;
-    assert_eq!(
-        app.consent_prompt_notice(&prompt(0)).body,
-        format!("build agent: {bare}")
-    );
-    assert_eq!(app.consent_prompt_notice(&prompt(777)).body, bare);
-}
-
-#[test]
 fn a_refused_read_under_a_protected_root_marks_that_sessions_tab() {
     let session = |app: &App| {
         app.front_terminal(WindowId(0))
@@ -2066,7 +2038,7 @@ fn a_refused_read_under_a_protected_root_marks_that_sessions_tab() {
         !marked(&app),
         "an ordinary refusal raises no consent attention"
     );
-    assert!(!app.consent_attention.is_spent());
+    assert!(!app.consent_attention.first_refusal_seen());
 
     let Some(root) = roots(&app).first().cloned() else {
         aterm_spec::host::could_not_run("no $HOME resolves here, so nothing is protected");
@@ -2077,8 +2049,8 @@ fn a_refused_read_under_a_protected_root_marks_that_sessions_tab() {
         "outside Full mode the refused session's tab carries no mark"
     );
     assert!(
-        app.consent_attention.is_spent(),
-        "the gate spent its notice"
+        app.consent_attention.first_refusal_seen(),
+        "the gate saw the refusal"
     );
     let mut full = App::headless_for_test();
     full.config.privacy = Some(crate::app_config::PrivacyConfig {
@@ -2306,10 +2278,15 @@ fn a_reload_reconciles_the_observer() {
         app.prepare_cold_exec(7, true, false);
         assert_eq!(app.consent_observer.running(), ObserverMode::Off);
         assert!(!app.consent_observer.is_live());
+        let _ = app.take_status_rebuild();
         app.resume_after_cold_exec();
         assert!(
             app.consent_observer.is_live(),
             "a returned exec restarts the stream"
+        );
+        assert!(
+            app.take_status_rebuild(),
+            "and the chrome hears what the stop moved"
         );
         await_observer_arm("the second Started", |log| log.posted == 2);
         assert_eq!(
@@ -2620,6 +2597,29 @@ fn consent_marks_recover_from_the_probe_with_access_notices_disabled() {
         !a_tab_is_marked(&app),
         "fresh verified grant clears the denial"
     );
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn a_granted_probe_clears_the_denials() {
+    use super::consent_observer::AttentionEvent;
+    use super::consent_state::ConsentState;
+    use aterm_containment::consent::{FdaProbe, FdaState, ProbeLabel};
+
+    let mut app = App::headless_for_test();
+    app.config.privacy = Some(crate::app_config::PrivacyConfig {
+        observer: Some(true),
+        notice: Some(false),
+        ..Default::default()
+    });
+    app.note_consent_attention(AttentionEvent::ProtectedEperm { session: None });
+    assert!(app.consent_attention.has_denials());
+    app.consent = ConsentState::with_cached_probe_for_test(FdaProbe {
+        state: FdaState::Granted,
+        label: ProbeLabel::OpenOk,
+    });
+    app.on_consent_probe_ready(std::time::Instant::now());
+    assert!(!app.consent_attention.has_denials());
 }
 
 #[test]
@@ -2981,14 +2981,19 @@ fn an_observed_dialog_the_card_is_not_about_is_one_record_per_service() {
 }
 
 #[test]
-fn an_eperm_under_a_protected_root_is_a_need_and_posts_no_banner_outside_full_mode() {
+fn an_eperm_under_a_protected_root_is_a_need_and_marks_no_tab_outside_full_mode() {
     use super::consent_card::CardPhase;
     let mut app = App::headless_for_test();
     app.headless = false;
     app.note_protected_eperm(Some(0));
     assert!(
-        app.consent_attention.is_spent(),
-        "the once-per-process gate is spent"
+        app.consent_attention.first_refusal_seen(),
+        "the once-per-process gate saw the refusal"
+    );
+    assert!(!a_tab_is_marked(&app), "outside Full mode no tab is marked");
+    assert!(
+        !app.consent_attention.marks_session(0),
+        "and the refusal stores no mark to show later"
     );
     if cfg!(target_os = "macos") {
         assert_eq!(app.consent_card_host.needs, 1, "the refusal is a need");
@@ -3002,6 +3007,20 @@ fn an_eperm_under_a_protected_root_is_a_need_and_posts_no_banner_outside_full_mo
             .is_none(),
         "a need is not a row: decide_need decides that"
     );
+}
+
+#[test]
+fn only_the_first_refusal_marks_the_status_item_dirty() {
+    let mut app = App::headless_for_test();
+    let sid = app
+        .front_terminal(WindowId(0))
+        .expect("headless_for_test seeds one terminal")
+        .session;
+    let _ = app.take_status_rebuild();
+    app.note_protected_eperm(Some(sid));
+    assert!(app.take_status_rebuild(), "the first refusal is news");
+    app.note_protected_eperm(Some(sid));
+    assert!(!app.take_status_rebuild(), "a later one rebuilds nothing");
 }
 
 #[test]

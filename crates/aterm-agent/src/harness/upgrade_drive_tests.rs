@@ -1918,6 +1918,7 @@ fn a_launch_that_cannot_be_carried_is_refused_before_the_agent_is_asked_to_wind_
             dialect: Dialect::Zsh,
             line,
             tap_dropped: None,
+            token_dropped: None,
             line_dir: None,
             command: None,
         })
@@ -6827,7 +6828,7 @@ fn a_crashs_relaunch_moves_only_onto_a_build_proved_to_start() {
             login: None,
             home: None,
             claude_dir: None,
-            stored_login: false,
+            route: crate::harness::accounts::AuthRoute::Outside,
             profile: None,
         };
         let r = after_exit(&opts, &snap, &ExitRecord::Unread, true, None);
@@ -9613,7 +9614,7 @@ fn a_build_the_conversations_record_holds_it_off_is_no_relaunch_target() {
     let snap = Snapshot {
         launch_env: None,
         auth_observed: true,
-        stored_login: false,
+        route: crate::harness::accounts::AuthRoute::Outside,
         profile: None,
         tab: TAB.to_string(),
         pid: dead,
@@ -10194,7 +10195,7 @@ fn a_relaunch_on_exit_needs_an_exit_and_a_conversation_on_record() {
     let snap = |pid: u32, start: &str, session: Option<&str>| Snapshot {
         launch_env: None,
         auth_observed: true,
-        stored_login: false,
+        route: crate::harness::accounts::AuthRoute::Outside,
         profile: None,
         tab: TAB.to_string(),
         pid,
@@ -10356,7 +10357,7 @@ impl DeadAgent {
         let snap = Snapshot {
             launch_env: None,
             auth_observed: true,
-            stored_login: false,
+            route: crate::harness::accounts::AuthRoute::Outside,
             profile: None,
             tab: TAB.to_string(),
             pid: dead,
@@ -11360,7 +11361,7 @@ fn a_restart_in_place_is_planned_on_the_same_program_and_carried_on_once() {
     let snap = |argv: &[&str]| Snapshot {
         launch_env: None,
         auth_observed: true,
-        stored_login: false,
+        route: crate::harness::accounts::AuthRoute::Outside,
         profile: None,
         tab: TAB.to_string(),
         pid: agent.id(),
@@ -11484,7 +11485,7 @@ fn users_agent(session: &str) -> Snapshot {
     Snapshot {
         launch_env: None,
         auth_observed: true,
-        stored_login: false,
+        route: crate::harness::accounts::AuthRoute::Outside,
         profile: None,
         tab: TAB.to_string(),
         pid: 4242,
@@ -11547,7 +11548,7 @@ fn a_memory_restart_asks_no_hand_chosen_model_of_a_launch_that_named_none() {
     let snap = |argv: &[&str]| Snapshot {
         launch_env: None,
         auth_observed: true,
-        stored_login: false,
+        route: crate::harness::accounts::AuthRoute::Outside,
         profile: None,
         tab: TAB.to_string(),
         pid: agent.id(),
@@ -12038,7 +12039,7 @@ fn restart_driven(
     let snap = Snapshot {
         launch_env: None,
         auth_observed: true,
-        stored_login: false,
+        route: crate::harness::accounts::AuthRoute::Outside,
         profile: Some(live_profile(&opts, login)),
         tab: TAB.to_string(),
         pid: agent.id(),
@@ -12286,7 +12287,7 @@ fn restart_asked_with(
     let snap = Snapshot {
         launch_env: None,
         auth_observed: true,
-        stored_login: false,
+        route: crate::harness::accounts::AuthRoute::Outside,
         profile: Some(live_profile(&opts, None)),
         tab: TAB.to_string(),
         pid: agent.id(),
@@ -13959,7 +13960,7 @@ fn a_relative_claude_home_is_followed_by_the_relaunch_and_the_restart_in_place()
     let snap = Snapshot {
         launch_env: None,
         auth_observed: true,
-        stored_login: false,
+        route: crate::harness::accounts::AuthRoute::Outside,
         profile: None,
         tab: TAB.to_string(),
         pid: agent.id(),
@@ -14028,7 +14029,7 @@ fn a_restart_in_place_records_the_directory_a_relative_homes_agent_files_under()
     let snap = Snapshot {
         launch_env: None,
         auth_observed: true,
-        stored_login: false,
+        route: crate::harness::accounts::AuthRoute::Outside,
         profile: None,
         tab: TAB.to_string(),
         pid: agent.id(),
@@ -14132,7 +14133,7 @@ fn a_restart_in_place_types_the_usage_tap_under_the_switch_and_writes_no_setting
         let snap = Snapshot {
             launch_env: None,
             auth_observed: true,
-            stored_login: true,
+            route: crate::harness::accounts::AuthRoute::Stored,
             profile: None,
             tab: TAB.to_string(),
             pid: agent.id(),
@@ -14592,9 +14593,10 @@ fn the_relaunch_keeps_a_snapshot_of_a_tabs_own_program_and_relaunches_nothing() 
         home: None,
         homedir: None,
         login: None,
-        stored_login: false,
+        route: crate::harness::accounts::AuthRoute::Outside,
         launch_env: None,
         billing: crate::harness::relaunch::ModelBilling::Keep,
+        serve: crate::harness::relaunch::Serve::Judge,
     };
     let planned = match plan(&opts, &launch, NO_SHELL, &[]) {
         Ok(p) => Ok(p.line),
@@ -16551,7 +16553,7 @@ fn a_restarts_line_is_judged_by_the_block_it_was_typed_into() {
         let snap = Snapshot {
             launch_env: None,
             auth_observed: true,
-            stored_login: false,
+            route: crate::harness::accounts::AuthRoute::Outside,
             profile: None,
             tab: TAB.to_string(),
             pid,
@@ -17817,9 +17819,10 @@ fn a_relaunch_into_the_shells_own_directory_spelled_another_way_needs_no_cd() {
         let argv = vec!["claude".to_string()];
         let launch = crate::harness::relaunch::Launch {
             auth_observed: true,
-            stored_login: false,
+            route: crate::harness::accounts::AuthRoute::Outside,
             launch_env: None,
             billing: crate::harness::relaunch::ModelBilling::Keep,
+            serve: crate::harness::relaunch::Serve::Judge,
             session: SESSION,
             resume: true,
             cwd: &cwd,
@@ -17879,9 +17882,10 @@ fn the_planned_relaunch_line_carries_the_usage_tap_only_where_its_gate_holds() {
     let planned_under = |opts: &Opts, argv: &[String], stored: bool, homedir: Option<&str>| {
         let launch = crate::harness::relaunch::Launch {
             auth_observed: true,
-            stored_login: stored,
+            route: crate::harness::accounts::AuthRoute::Stored.unless(!stored),
             launch_env: None,
             billing: crate::harness::relaunch::ModelBilling::Keep,
+            serve: crate::harness::relaunch::Serve::Judge,
             session: SESSION,
             resume: true,
             cwd: &cwd,
@@ -17940,9 +17944,10 @@ fn the_planned_relaunch_line_carries_the_usage_tap_only_where_its_gate_holds() {
         let launch = crate::harness::relaunch::Launch {
             auth_observed: true,
             login: Some(renewed),
-            stored_login: true,
+            route: crate::harness::accounts::AuthRoute::Stored,
             launch_env: None,
             billing: crate::harness::relaunch::ModelBilling::Keep,
+            serve: crate::harness::relaunch::Serve::Judge,
             session: SESSION,
             resume: true,
             cwd: &cwd,
@@ -18131,9 +18136,10 @@ fn a_failed_model_on_the_launch_line_is_dropped_by_a_relaunch_asking_none() {
     let planned = || {
         let launch = crate::harness::relaunch::Launch {
             auth_observed: true,
-            stored_login: false,
+            route: crate::harness::accounts::AuthRoute::Outside,
             launch_env: None,
             billing: crate::harness::relaunch::ModelBilling::Keep,
+            serve: crate::harness::relaunch::Serve::Judge,
             session: SESSION,
             resume: true,
             cwd: "/tmp",
@@ -26722,7 +26728,7 @@ fn a_restart_holds_the_tab_from_its_last_look_and_gives_it_back_when_it_stops() 
             model: None,
             login: None,
             home: None,
-            stored_login: false,
+            route: crate::harness::accounts::AuthRoute::Outside,
             auth_observed: true,
             profile: None,
             launch_env: None,
@@ -26986,7 +26992,7 @@ fn a_restart_in_place_records_its_model_ask_only_with_the_line_that_asks_it() {
             launch_env: None,
             auth_observed: true,
             // The profile below names this fixture's default stored login.
-            stored_login: true,
+            route: crate::harness::accounts::AuthRoute::Stored,
             profile: Some(live_profile(&opts, None)),
             tab: TAB.to_string(),
             pid,
@@ -30432,7 +30438,7 @@ fn the_window_hosts_limit_and_wall_readers_read_the_agents_own_claude_home() {
     let snap = |home: Option<&str>, claude_dir: Option<PathBuf>| Snapshot {
         launch_env: None,
         auth_observed: true,
-        stored_login: false,
+        route: crate::harness::accounts::AuthRoute::Outside,
         profile: None,
         tab: TAB.to_string(),
         pid: 4242,
@@ -30739,7 +30745,7 @@ fn the_transcript_is_found_under_the_live_processs_own_config_dir() {
         let snap = Snapshot {
             launch_env: None,
             auth_observed: true,
-            stored_login: false,
+            route: crate::harness::accounts::AuthRoute::Outside,
             profile: None,
             tab: TAB.to_string(),
             pid,
@@ -30963,7 +30969,7 @@ fn the_walls_tail_is_the_transcript_its_agent_writes_now() {
         let tail = snapshot_transcript_tail(&Snapshot {
             launch_env: None,
             auth_observed: true,
-            stored_login: false,
+            route: crate::harness::accounts::AuthRoute::Outside,
             profile: None,
             tab: TAB.to_string(),
             pid,
@@ -31992,7 +31998,7 @@ fn a_crash_is_never_moved_onto_a_newer_build_not_proved_to_start() {
             run: crate::harness::relaunch::AgentRun::Claude,
             dialect: Some(Dialect::Zsh),
             login: None,
-            stored_login: false,
+            route: crate::harness::accounts::AuthRoute::Outside,
             profile: None,
             home: None,
             claude_dir: None,
@@ -33281,6 +33287,375 @@ fn agy_limit_reset_aligns_with_live_screen_model_and_unnamed_refill() {
             rotate_launch_at(asked, &s4, &both_open_opus_full, &rotation, now, true)
         }),
         Some(u64::try_from(now - past_grace).unwrap())
+    );
+}
+
+/// THE PLAN'S HALF OF THE ONE JUDGMENT (DESIGN-claude-setup-token S8, §5.4): a token decision
+/// types the wrapper, with the row's label, before the store build (the managed twin's, never the
+/// twin), and the plan's account intent is the token's; any other decision types the line of
+/// today. A line after a stored login unsets no token state, so it keeps its length; a twin whose
+/// build cannot be read makes the plan the stored login's, typed through the twin.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_token_decision_types_the_wrapper_before_the_store_build() {
+    use crate::harness::relaunch::{TOKEN_BUILDS, TOKEN_SEAM};
+    use crate::harness::token_route::{self, TokenFact};
+    fn keyer(_realm: &str, _email: &str) -> Option<String> {
+        Some("ac-fedcba9876543210".to_owned())
+    }
+    let dir = scratch("line-token");
+    let opts = drive(&dir);
+    std::fs::create_dir_all(dir.join("config")).expect("config");
+    std::fs::write(
+        dir.join("config/accounts.toml"),
+        "[[account]]\nlabel = \"work\"\nclass = \"dedicated\"\nemail = \"person@example.com\"\n",
+    )
+    .expect("the roster");
+    std::fs::create_dir_all(opts.home.join(".claude")).expect("user dir");
+    let project = dir.join("proj");
+    std::fs::create_dir_all(&project).expect("project");
+    let cwd = project.to_str().expect("utf-8").to_owned();
+    let build = dir.join("store/claude/7/bin/claude");
+    std::fs::create_dir_all(build.parent().unwrap()).expect("the build's folder");
+    std::fs::write(&build, "a build").expect("the build");
+    let agents = dir.join("agents");
+    std::fs::create_dir_all(&agents).expect("agents");
+    let twin = agents.join("claude");
+    std::fs::write(
+        &twin,
+        format!("#!/bin/sh\nexec '{}' \"$@\"\n", build.display()),
+    )
+    .expect("the twin");
+    let aterm = PathBuf::from("/Applications/aterm.app/Contents/MacOS/aterm");
+    let argv = vec!["claude".to_string(), "--verbose".to_string()];
+    let planned = |exe: &Path, fact: TokenFact| {
+        TOKEN_SEAM.with(|seam| *seam.borrow_mut() = Some((aterm.clone(), fact)));
+        TOKEN_BUILDS.with(|seam| *seam.borrow_mut() = Some(dir.join("store/claude")));
+        super::AGENTS_DIR.with(|d| *d.borrow_mut() = Some(agents.clone()));
+        let launch = crate::harness::relaunch::Launch {
+            auth_observed: true,
+            route: crate::harness::accounts::AuthRoute::Stored,
+            launch_env: None,
+            billing: crate::harness::relaunch::ModelBilling::Keep,
+            serve: crate::harness::relaunch::Serve::Judge,
+            session: SESSION,
+            resume: true,
+            cwd: &cwd,
+            agent: 0,
+            argv: &argv,
+            exe,
+            model: None,
+            mode: None,
+            login: None,
+            home: None,
+            homedir: None,
+        };
+        let plan = crate::harness::journal::with_keyer(keyer, || {
+            crate::harness::relaunch::plan(&opts, &launch, 999_999, &[(999_999, 1, "zsh".into())])
+        });
+        TOKEN_SEAM.with(|seam| *seam.borrow_mut() = None);
+        TOKEN_BUILDS.with(|seam| *seam.borrow_mut() = None);
+        super::AGENTS_DIR.with(|d| *d.borrow_mut() = None);
+        plan.unwrap_or_else(|_| panic!("a plan"))
+    };
+    let served = format!(
+        "'{}' 'harness' 'accounts' 'token-run' 'work' '--' '{}' '--verbose' '--resume' '{SESSION}'",
+        aterm.display(),
+        build.display()
+    );
+    for exe in [build.as_path(), twin.as_path()] {
+        let plan = planned(exe, TokenFact::InUse);
+        assert!(plan.line.contains(&served), "{}", plan.line);
+        assert!(
+            !plan.line.contains(&twin.display().to_string()),
+            "{}",
+            plan.line
+        );
+        assert_eq!(plan.token_dropped, None);
+        let command = plan.command.expect("a command");
+        assert_eq!(command.target, aterm);
+        assert!(
+            matches!(
+                command.account_intent,
+                Some(crate::harness::accounts_pool::ExecutionIntent::Token { .. })
+            ),
+            "{:?}",
+            command.account_intent
+        );
+        // The wrapper sets the token state afresh: a line after a stored login unsets none of
+        // it, so it keeps the length it had.
+        assert!(
+            command
+                .unset
+                .iter()
+                .flatten()
+                .all(|name| !token_route::TOKEN_STATE_ENV.contains(&name.as_str())),
+            "{:?}",
+            command.unset
+        );
+    }
+    let stored = planned(&build, TokenFact::Absent);
+    assert!(!stored.line.contains("token-run"), "{}", stored.line);
+    assert!(
+        stored.line.contains(&format!(
+            "'{}' '--verbose' '--resume' '{SESSION}'",
+            build.display()
+        )),
+        "{}",
+        stored.line
+    );
+    assert!(
+        !stored.line.contains(token_route::DESCRIPTOR_ENV),
+        "a line after a stored login keeps its old shape: {}",
+        stored.line
+    );
+    assert!(matches!(
+        stored.command.and_then(|c| c.account_intent),
+        Some(crate::harness::accounts_pool::ExecutionIntent::Stored { .. })
+    ));
+
+    std::fs::remove_file(&build).expect("the build goes");
+    let unreadable = planned(&twin, TokenFact::InUse);
+    assert!(
+        !unreadable.line.contains("token-run"),
+        "{}",
+        unreadable.line
+    );
+    assert!(
+        unreadable.line.contains(&format!("'{}'", twin.display())),
+        "typed through the twin: {}",
+        unreadable.line
+    );
+}
+
+/// A ROUTE MOVE'S LINE AND A RESTORED TOKEN SESSION'S (DESIGN-claude-setup-token S10, §5.4, §5.5):
+/// a move onto the token serves it or has no plan (`route-unserved`), never a stored line in its
+/// name; a move back types the row's stored login, whatever the token's standing, with a stored
+/// intent; a session that ran on its token comes back (a restore, a crash) through the wrapper
+/// the one judgment types. No line assigns the descriptor variable or the marker, and a line after
+/// a token session unsets both. An account move judges its target from the stored login; any
+/// other restart keeps its route.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_route_move_serves_its_target_and_a_token_session_comes_back_through_the_wrapper() {
+    use crate::harness::accounts::{AuthRoute, TokenEntry};
+    use crate::harness::accounts_pool::ExecutionIntent;
+    use crate::harness::relaunch::{self, NoPlan, Serve, TOKEN_BUILDS, TOKEN_SEAM};
+    use crate::harness::token_route::{self, RouteTo, TokenFact};
+    fn keyer(_realm: &str, _email: &str) -> Option<String> {
+        Some("ac-fedcba9876543210".to_owned())
+    }
+    let entry = TokenEntry::parse("aterm-claude-token-ac-fedcba9876543210").expect("an entry");
+    let dir = scratch("line-route");
+    let opts = drive(&dir);
+    std::fs::create_dir_all(dir.join("config")).expect("config");
+    std::fs::write(
+        dir.join("config/accounts.toml"),
+        "[[account]]\nlabel = \"work\"\nclass = \"dedicated\"\nemail = \"person@example.com\"\n",
+    )
+    .expect("the roster");
+    std::fs::create_dir_all(opts.home.join(".claude")).expect("user dir");
+    let project = dir.join("proj");
+    std::fs::create_dir_all(&project).expect("project");
+    let cwd = project.to_str().expect("utf-8").to_owned();
+    let build = dir.join("store/claude/7/bin/claude");
+    std::fs::create_dir_all(build.parent().unwrap()).expect("the build's folder");
+    std::fs::write(&build, "a build").expect("the build");
+    let aterm = PathBuf::from("/Applications/aterm.app/Contents/MacOS/aterm");
+    let argv = vec!["claude".to_string(), "--chrome".to_string()];
+    let planned = |route: AuthRoute, serve: Serve, fact: TokenFact| {
+        TOKEN_SEAM.with(|seam| *seam.borrow_mut() = Some((aterm.clone(), fact)));
+        TOKEN_BUILDS.with(|seam| *seam.borrow_mut() = Some(dir.join("store/claude")));
+        let launch = relaunch::Launch {
+            auth_observed: true,
+            route,
+            launch_env: None,
+            billing: relaunch::ModelBilling::Keep,
+            serve,
+            session: SESSION,
+            resume: true,
+            cwd: &cwd,
+            agent: 0,
+            argv: &argv,
+            exe: &build,
+            model: None,
+            mode: None,
+            login: None,
+            home: None,
+            homedir: None,
+        };
+        let plan = crate::harness::journal::with_keyer(keyer, || {
+            relaunch::plan(&opts, &launch, 999_999, &[(999_999, 1, "zsh".into())])
+        });
+        TOKEN_SEAM.with(|seam| *seam.borrow_mut() = None);
+        TOKEN_BUILDS.with(|seam| *seam.borrow_mut() = None);
+        plan
+    };
+    let no_state = |line: &str| {
+        for name in token_route::TOKEN_STATE_ENV {
+            assert!(!line.contains(&format!("{name}=")), "{name}: {line}");
+        }
+    };
+    let served = format!(
+        "'{}' 'harness' 'accounts' 'token-run' 'work' '--' '{}' '--chrome' '--resume' '{SESSION}'",
+        aterm.display(),
+        build.display()
+    );
+    let token = AuthRoute::VaultToken { entry };
+
+    // Onto the token: served, or no plan.
+    let onto = planned(AuthRoute::Stored, Serve::Must, TokenFact::InUse)
+        .unwrap_or_else(|_| panic!("a plan"));
+    assert!(onto.line.contains(&served), "{}", onto.line);
+    no_state(&onto.line);
+    for fact in [TokenFact::Absent, TokenFact::Busy, TokenFact::Rejected] {
+        match planned(AuthRoute::Stored, Serve::Must, fact) {
+            Err(NoPlan::Refused { why, .. }) => assert_eq!(why, relaunch::ROUTE_UNSERVED),
+            Err(NoPlan::Wait(word)) => panic!("{fact:?}: waits on {word}"),
+            Ok(plan) => panic!("{fact:?}: {}", plan.line),
+        }
+    }
+
+    // Back onto the stored login, even while the token reads in use.
+    for fact in [TokenFact::Rejected, TokenFact::InUse] {
+        let back = planned(token, Serve::Never, fact).unwrap_or_else(|_| panic!("a plan"));
+        assert!(!back.line.contains("token-run"), "{fact:?}: {}", back.line);
+        assert!(
+            back.line.contains(&format!(
+                "'{}' '--chrome' '--resume' '{SESSION}'",
+                build.display()
+            )),
+            "{}",
+            back.line
+        );
+        no_state(&back.line);
+        let command = back.command.expect("a command");
+        // A line after a token session unsets the state its wrapper set (§5.4).
+        for name in token_route::TOKEN_STATE_ENV {
+            assert!(
+                command.unset.iter().flatten().any(|unset| unset == name),
+                "{fact:?}: {name}: {}",
+                back.line
+            );
+        }
+        assert!(
+            matches!(command.account_intent, Some(ExecutionIntent::Stored { .. })),
+            "{fact:?}"
+        );
+    }
+
+    // A session that ran on its token comes back through the wrapper.
+    let restored =
+        planned(token, Serve::Judge, TokenFact::InUse).unwrap_or_else(|_| panic!("a plan"));
+    assert!(restored.line.contains(&served), "{}", restored.line);
+    no_state(&restored.line);
+    let command = restored.command.expect("a command");
+    assert_eq!(
+        relaunch::PlannedCommand::expects(Some(&command), &build),
+        aterm.as_path(),
+        "a native restart's target is the wrapper, not the build"
+    );
+    assert!(matches!(
+        command.account_intent,
+        Some(ExecutionIntent::Token { .. })
+    ));
+
+    assert_eq!(relaunch::moved_route(true, token), AuthRoute::Stored);
+    assert_eq!(relaunch::moved_route(false, token), token);
+    assert_eq!(
+        relaunch::moved_route(true, AuthRoute::Outside),
+        AuthRoute::Outside
+    );
+    let route = |to| crate::supervise::policy::turn_end::Restart::Route { to };
+    assert_eq!(relaunch::serve_for(&route(RouteTo::Token)), Serve::Must);
+    assert_eq!(relaunch::serve_for(&route(RouteTo::Stored)), Serve::Never);
+    assert_eq!(
+        relaunch::serve_for(&crate::supervise::policy::turn_end::Restart::Memory),
+        Serve::Judge
+    );
+}
+
+/// THE PLAN AND THE WRAPPER JUDGE ONE BUILD ALIKE (DESIGN-claude-setup-token §5.3, §5.5): a
+/// build with a store build's shape outside atpkg's own store (a session left on a prefix the
+/// configuration no longer names) is one the wrapper never serves the token to, so no line types
+/// the wrapper for it: a move onto the token has no plan (`route-unserved`, which holds the move
+/// off for the window), never a relaunch the wrapper turns back into the stored login, and any
+/// other relaunch is the stored login's. CONTROL: the same build in the store is served.
+///
+/// NEGATIVE CONTROL (2026-11-06, restored with cp from a backup plus touch, confirmed with cmp):
+/// with `token_build` judging the build's shape alone (`token_route::store_build`), the move onto
+/// the token types the wrapper for the old prefix's build.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_store_shaped_build_outside_atpkgs_store_is_never_served_the_token() {
+    use crate::harness::accounts::AuthRoute;
+    use crate::harness::relaunch::{self, NoPlan, Serve, TOKEN_BUILDS, TOKEN_SEAM};
+    use crate::harness::token_route::TokenFact;
+    fn keyer(_realm: &str, _email: &str) -> Option<String> {
+        Some("ac-fedcba9876543210".to_owned())
+    }
+    let dir = scratch("line-outside-store");
+    let opts = drive(&dir);
+    std::fs::create_dir_all(dir.join("config")).expect("config");
+    std::fs::write(
+        dir.join("config/accounts.toml"),
+        "[[account]]\nlabel = \"work\"\nclass = \"dedicated\"\nemail = \"person@example.com\"\n",
+    )
+    .expect("the roster");
+    std::fs::create_dir_all(opts.home.join(".claude")).expect("user dir");
+    let project = dir.join("proj");
+    std::fs::create_dir_all(&project).expect("project");
+    let cwd = project.to_str().expect("utf-8").to_owned();
+    let (inside, outside) = (
+        dir.join("store/claude/7/bin/claude"),
+        dir.join("old/store/claude/7/bin/claude"),
+    );
+    for build in [&inside, &outside] {
+        std::fs::create_dir_all(build.parent().unwrap()).expect("the build's folder");
+        std::fs::write(build, "a build").expect("the build");
+    }
+    let aterm = PathBuf::from("/Applications/aterm.app/Contents/MacOS/aterm");
+    let argv = vec!["claude".to_string()];
+    let planned = |exe: &Path, serve: Serve| {
+        TOKEN_SEAM.with(|seam| *seam.borrow_mut() = Some((aterm.clone(), TokenFact::InUse)));
+        TOKEN_BUILDS.with(|seam| *seam.borrow_mut() = Some(dir.join("store/claude")));
+        let launch = relaunch::Launch {
+            auth_observed: true,
+            route: AuthRoute::Stored,
+            launch_env: None,
+            billing: relaunch::ModelBilling::Keep,
+            serve,
+            session: SESSION,
+            resume: true,
+            cwd: &cwd,
+            agent: 0,
+            argv: &argv,
+            exe,
+            model: None,
+            mode: None,
+            login: None,
+            home: None,
+            homedir: None,
+        };
+        let plan = crate::harness::journal::with_keyer(keyer, || {
+            relaunch::plan(&opts, &launch, 999_999, &[(999_999, 1, "zsh".into())])
+        });
+        TOKEN_SEAM.with(|seam| *seam.borrow_mut() = None);
+        TOKEN_BUILDS.with(|seam| *seam.borrow_mut() = None);
+        plan
+    };
+    match planned(&outside, Serve::Must) {
+        Err(NoPlan::Refused { why, .. }) => assert_eq!(why, relaunch::ROUTE_UNSERVED),
+        Err(NoPlan::Wait(word)) => panic!("waits on {word}"),
+        Ok(plan) => panic!("a move onto the token typed: {}", plan.line),
+    }
+    let judged = planned(&outside, Serve::Judge).unwrap_or_else(|_| panic!("a plan"));
+    assert!(!judged.line.contains("token-run"), "{}", judged.line);
+    let control = planned(&inside, Serve::Must).unwrap_or_else(|_| panic!("CONTROL: a plan"));
+    assert!(
+        control.line.contains("token-run"),
+        "CONTROL: {}",
+        control.line
     );
 }
 

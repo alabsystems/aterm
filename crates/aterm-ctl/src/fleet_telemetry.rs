@@ -13,13 +13,19 @@
 //! - `kind=task`, when a worker's board row closes and the board holds the worker's conclusion
 //!   as its Mac reported it ([`task_end`], from [`crate::board::Board::apply`], in whichever
 //!   process applied the close): the close is built from that Mac's last row and names a
-//!   conclusion its record came to (`task_state=` other than `working`, or `finished`), or the
-//!   Mac reported one while the row was open, which is then the row's end whatever the close
-//!   says. A close with neither writes nothing: the board's
+//!   conclusion its record came to (`task_state=` other than `working`, or `finished`), whose
+//!   words are the row's end; or else the Mac reported one while the row stood open (the last it
+//!   named, past a later live row that names none: a turn typed after it), which is the row's
+//!   end whatever words the close merged over it. A stall's `failed` stands only while the stall
+//!   does: a live row of it moving on, or the Mac's close at a later rev saying `working`, takes
+//!   it back. A close with neither writes nothing: the board's
 //!   `failed` there, and a Mac's own `conclusion=failed` for a tab closed while still `working`,
 //!   is the reading of whoever closed a gone tab, not an end its task came to. A worker writes
 //!   one, and another only where a close reversed and it came to another end: the board row keeps
-//!   the end its last row told (`told=`), so its last task row is its end. `outcome` is the
+//!   the end its last row told (`told=`), so its last task row is its end. A row the log's lock
+//!   (or its disk) refused is owed (`owed=`) under the board's lock, and written by a later apply
+//!   of its row or the keeper's settle at its own close's time and `wall_ms`, never also said
+//!   lost; one the board gives up is said lost once. `outcome` is the
 //!   conclusion (`finished` ok, `failed` fail), `stop` its `why=` (`exit` or `exit-status` exit, a
 //!   stall stalled, any other word unknown), `code` the record's `exit=` (none from an earlier
 //!   report), and `wall_ms` the time from its spawn to when this Mac's board took the close. A
@@ -96,18 +102,21 @@ pub fn spawn_outcome<T, E>(sid: Result<&Option<T>, E>) -> Outcome {
 }
 
 /// A fleet spawn's dial and exchange: `Err` where the dial failed (nothing was sent), else the
-/// exchange's result (its exit code and the sid its answer named; `Err` where it was lost).
+/// exchange's result (what it answered, before anything of it is printed, and the sid its answer
+/// named; `Err` where it was lost).
 pub(crate) type Dialled<C> = std::io::Result<std::io::Result<(C, Option<String>)>>;
 
-/// After a fleet spawn's dial and exchange: write the sender's row of the worker `args` asked
-/// for (`agent=`, `cwd=`), dialled at `began` to the node `on` and answered `exchanged`.
+/// After a fleet spawn's dial and exchange: write the sender's row of the worker `args` asked for
+/// (`agent=`, `cwd=`), dialled at `began` to the node `on` and answered `exchanged`, to the log in
+/// `dir`; with no `dir` (no state folder), none.
 pub(crate) fn spawned<C>(
+    dir: Option<std::path::PathBuf>,
     args: &[String],
     began: std::time::Instant,
     exchanged: &Dialled<C>,
     on: Option<&str>,
 ) {
-    let Some(dir) = aterm_telemetry::log::default_dir() else {
+    let Some(dir) = dir else {
         return;
     };
     let wall_ms = u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -212,19 +221,55 @@ pub(crate) fn task_row(
     }
 }
 
-/// The task row a board's close owes the log ([`task_end`]), and the end it tells.
+/// How long a board keeps a task row it owes its log ([`crate::board::Row::owed`]), from the
+/// close it is the row of: a write that fails once it is this old gives it up, said lost once.
+pub(crate) const OWED_KEPT: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// The most task rows one board row owes its log at once: a close past it gives up the oldest.
+pub(crate) const OWED_MAX: usize = 4;
+
+/// The task row a board's close owes the log ([`task_end`]).
 pub(crate) struct TaskEnd {
-    dir: std::path::PathBuf,
     row: Row,
-    /// `<outcome>.<stop>`: what the board keeps of it ([`crate::board::Row::told`]).
-    pub(crate) told: String,
 }
 
 impl TaskEnd {
-    /// Append the row to its log ([`aterm_telemetry::direct::write_now`]): whether it was written.
-    pub(crate) fn write(&self) -> bool {
-        aterm_telemetry::direct::write_now(self.dir.clone(), &self.row)
+    /// Owe the row on the board row `on` ([`crate::board::Row::owed`]), after any it owes
+    /// already, so its board writes it with them, its own close's time and `wall_ms` kept: how
+    /// many of the oldest it gave up to hold at most [`OWED_MAX`].
+    pub(crate) fn owe(&self, on: &mut crate::board::Row) -> u64 {
+        on.owed.push(self.row.line());
+        let over = on.owed.len().saturating_sub(OWED_MAX);
+        on.owed.drain(..over);
+        over as u64
     }
+}
+
+/// The task row an owed line holds ([`crate::board::Row::owed`]): `None` for a line that is no
+/// whole `kind=task` row.
+pub(crate) fn owed_row(line: &str) -> Option<Row> {
+    match aterm_telemetry::row::parse_line(line)? {
+        aterm_telemetry::row::Line::Row(row) if row.kind == Kind::Task => Some(row),
+        _ => None,
+    }
+}
+
+/// The end a task row tells, `<outcome>.<stop>`: what its board keeps of it
+/// ([`crate::board::Row::told`]).
+pub(crate) fn told_of(row: &Row) -> String {
+    format!("{}.{}", row.outcome.word(), row.stop.word())
+}
+
+/// The log of the state folder a board in `board_dir` sits in (`<state>/board`,
+/// [`crate::board::Board::in_state`]): `None` for a board elsewhere, which has no state of its
+/// own and writes no row.
+pub(crate) fn log_of(board_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let state = board_dir.parent().filter(|_| {
+        board_dir
+            .file_name()
+            .is_some_and(|n| n == crate::board::DIR)
+    })?;
+    Some(aterm_telemetry::log::dir_in(state))
 }
 
 /// The board in `board_dir` merged `seen` into `was`, changing it to `row`, at `now_ms`: where
@@ -234,27 +279,48 @@ impl TaskEnd {
 ///
 /// The conclusion is its Mac's where `seen` is a close built from that Mac's last row (`task_news=`
 /// at the board's rev or above: a row the Mac wrote, or a wait's `closed_row` of the last one it
-/// answered) and names a conclusion its record came to, or where `was` was open and held one (an
-/// open row's conclusion is only ever the last its Mac reported). That heard conclusion and its
-/// `why=` are then the row's end, never the words the close merged over them: so a close of a tab
-/// working again (a turn after it finished), from any Mac, and a recordless close, in either
-/// order, write the same end. A Mac's close says its record's
-/// own state (`task_state=`): `finished` is only ever a record's, but `failed` is also what a Mac
-/// answers for a tab closed on a task still `working`, which is that close's reading and no end
-/// its task came to. So a close's `failed` counts only beside a `task_state=` other than
-/// `working`, and a close from a Mac too old to say one counts only for `finished`. A close with
-/// neither writes none: the board's `failed` for a tab gone with no conclusion is the reading of
+/// answered) and names a conclusion its record came to: that record's words are the end. Without
+/// one, it is the conclusion `was` heard while it stood open: the one it holds (an open row's
+/// conclusion is only ever the last its Mac reported), or, where a later live row named none (a
+/// turn typed after it finished), the last one its Mac named ([`crate::board::Row::ended`]). A
+/// stall's `failed` is heard only while the stall stands: its record takes it back when the stall
+/// moves on, which a live row naming none or the Mac's close at a later rev saying `working`
+/// reports, and `ended` never keeps it. That heard conclusion and its `why=` are then the end,
+/// never the words the close merged over them: so a close of a tab working again, from any Mac, a
+/// recordless close, and a live row of the turn read before or after either, in any order, write
+/// the same end. A stall is the one end the board cannot see past where nothing it reads says the
+/// stall moved on: then it writes the stall it last heard, unless a live row of the stall moving
+/// on was read first (and then the end heard before the stall, if any). Such closes include a
+/// recordless close read before the Mac's close that says so, a wait's close built from the
+/// stalled row it last read (the Mac's aterm relaunched without the tab), and a `failed` close
+/// from a Mac too old to say `task_state=`, whose rev a move of a standing stall's ask raises too;
+/// that Mac's `finished` close is a record of its own. A Mac's close
+/// says its record's own state (`task_state=`): `finished` is only ever a record's, but `failed`
+/// is also what a Mac answers for a tab closed on a task still `working`, which is that close's
+/// reading and no end its task came to. So a close's `failed` counts only beside a `task_state=`
+/// other than `working`, and a close from a Mac too old to say one counts only for `finished`. A
+/// close with neither writes none: the board's `failed` for a tab gone with no conclusion is the reading of
 /// whoever closed it, never the Mac's.
 ///
 /// A close is the board's reading of a tab it no longer finds, which a later answer can reverse
 /// ([`crate::board::Row::merge`] reopens the row). So a worker writes a row again only where its
-/// end changed: none where the board row says it told the same outcome and stop
-/// ([`crate::board::Row::told`]), which the board keeps under its lock with the row, past every
-/// rotation of the log. A worker's last task row is its end. One that closed once, the usual flow,
-/// writes one; a record applied after the close that wrote, or a reopen at the close's rev and a
-/// second close, writes no second; a close that reversed and ended otherwise writes the end it
-/// came to. The board's lock holds the merge, the row's write and the board's, so of the processes
-/// that read one close (the window's keeper, a dispatcher's wait) only one writes.
+/// end changed: none where its outcome and stop are those of the newest row its board row owes
+/// ([`crate::board::Row::owed`]), or, owing none, of the row it last told
+/// ([`crate::board::Row::told`]), both of which the board keeps under its lock with the row, past
+/// every rotation of the log. A worker's
+/// last task row is its end. One that closed once, the usual flow, writes one; a record applied
+/// after the close that wrote, or a reopen at the close's rev and a second close, writes no
+/// second; a close that reversed and ended otherwise writes the end it came to. The board's lock
+/// holds the merge, the row's write and the board's, so of the processes that read one close
+/// (the window's keeper, a dispatcher's wait) only one writes.
+///
+/// The row is owed, not written here: the board writes it with every row it owes, and keeps
+/// those its log refused (its lock held past [`aterm_telemetry::direct::LOCK_WAIT`], a disk that
+/// filled) in the board row until a later write takes them, each at its own close's time and
+/// `wall_ms`, so the worker's last task row is still its end. A row written late is never also
+/// said lost; one the board gives up (its board row pruned or written over, past [`OWED_KEPT`],
+/// a line that holds no row, or past [`OWED_MAX`]) is said lost once
+/// ([`crate::board::BoundBoard::pay`]).
 pub(crate) fn task_end(
     board_dir: &std::path::Path,
     was: &crate::board::Row,
@@ -266,38 +332,56 @@ pub(crate) fn task_end(
         return None;
     }
     let record = macs_close(seen, was.rev).then_some(seen);
-    let heard = was.is_open() && was.conclusion.is_some();
-    if record.is_none() && !heard {
-        return None;
-    }
-    // Without a record, the end is what the board heard while the row was open: the close's own
-    // words (a closed tab's `failed`, an old Mac's or a new one's) are never its outcome or stop,
-    // so whichever close of the worker comes first, the row says the same end.
-    let ended = if record.is_some() {
-        row.clone()
+    // What the board heard while the row stood open: the conclusion it holds, unless that is a
+    // stall the Mac's close says moved on, else the last end its Mac named before a live row
+    // that named none.
+    let standing =
+        was.conclusion.is_some() && !(was.state == "stalled" && macs_moved_on(seen, was.rev));
+    let heard = if standing {
+        (&was.conclusion, &was.why)
     } else {
-        crate::board::Row {
-            conclusion: was.conclusion.clone(),
-            why: was.why.clone(),
-            ..row.clone()
-        }
+        (&was.ended, &was.ended_why)
     };
-    let state = board_dir.parent().filter(|_| {
-        board_dir
-            .file_name()
-            .is_some_and(|n| n == crate::board::DIR)
-    })?;
+    let heard = (was.is_open() && heard.0.is_some()).then_some(heard);
+    // Without a record, the end is what the board heard: the close's own words (a closed tab's
+    // `failed`, an old Mac's or a new one's) are never its outcome or stop, so whichever close of
+    // the worker comes first, the row says the same end.
+    let ended = match (record, heard) {
+        (Some(_), _) => row.clone(),
+        (None, Some((conclusion, why))) => crate::board::Row {
+            conclusion: conclusion.clone(),
+            why: why.clone(),
+            ..row.clone()
+        },
+        (None, None) => return None,
+    };
+    log_of(board_dir)?;
     let (facts, digest) = aterm_telemetry::direct::facts();
     let task = task_row(&ended, record, now_ms, &facts.host, *digest);
-    let told = format!("{}.{}", task.outcome.word(), task.stop.word());
-    if row.told.as_deref() == Some(told.as_str()) {
+    // The end the board last told or owes: a row it owes is the one its log will say last.
+    let last = row
+        .owed
+        .iter()
+        .rev()
+        .find_map(|line| owed_row(line))
+        .map(|owed| told_of(&owed))
+        .or_else(|| row.told.clone());
+    if last.as_deref() == Some(told_of(&task).as_str()) {
         return None;
     }
-    Some(TaskEnd {
-        dir: aterm_telemetry::log::dir_in(state),
-        row: task,
-        told,
-    })
+    Some(TaskEnd { row: task })
+}
+
+/// Whether `seen` is a close built from its Mac's last row at a rev above the board's `rev`
+/// (`task_news=`) whose record was `working`: a stall the board heard was taken back.
+fn macs_moved_on(seen: &str, rev: u64) -> bool {
+    let field = |key: &str| crate::await_task::row_field(seen, key);
+    field("state") == Some("closed")
+        && field("task_news").is_some()
+        && field("task_state") == Some("working")
+        && field("rev")
+            .and_then(|r| r.parse::<u64>().ok())
+            .is_some_and(|r| r > rev)
 }
 
 /// Whether `seen` is a close built from its Mac's last row, at or above the board's rev `rev`
@@ -465,12 +549,348 @@ mod tests {
         fn open(&self, sid: &str) -> bool {
             self.board.row(sid).expect("a row").is_open()
         }
+
+        /// The board row of `sid`: how many task rows it owes, and the end it told.
+        fn owes(&self, sid: &str) -> (usize, Option<String>) {
+            let row = self.board.row(sid).expect("a row");
+            (row.owed.len(), row.told)
+        }
+
+        /// Hold the log's lock, as another writer's long append does, until the guard drops.
+        fn hold_log(&self) -> std::fs::File {
+            std::fs::create_dir_all(&self.log).expect("the log's folder");
+            let held = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(self.log.join(".lock"))
+                .expect("lock file");
+            aterm_uds::file_lock::lock_exclusive_until(
+                &held,
+                std::time::Instant::now() + std::time::Duration::from_secs(60),
+                "the test holds the telemetry lock",
+            )
+            .expect("hold the lock");
+            held
+        }
+
+        /// The rows the log's gap lines say were lost.
+        fn dropped(&self) -> u64 {
+            aterm_telemetry::log::read(&self.log, 4, None).map_or(0, |read| read.dropped)
+        }
+
+        /// The loss records the log's folder holds, no append has said yet.
+        fn unsaid(&self) -> Vec<String> {
+            std::fs::read_dir(&self.log).map_or_else(
+                |_| Vec::new(),
+                |dir| {
+                    dir.flatten()
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .filter(|name| name.starts_with("lost-"))
+                        .collect()
+                },
+            )
+        }
+    }
+
+    /// A task row the log's lock refused (another writer held it past
+    /// [`aterm_telemetry::direct::LOCK_WAIT`]) is owed by its board row, not lost: a later apply
+    /// that reads the row, or the keeper's settle, writes it once the lock is free, with its own
+    /// close's time and `wall_ms`, and no gap line says it lost. A reversed end owed so is the
+    /// worker's last row. One settle writes what two rows owe, and each tells its end.
+    /// NEGATIVE CONTROL: once written, it is owed no more and written no second time.
+    #[test]
+    fn a_task_row_the_logs_lock_refused_is_written_later_as_it_was_and_never_said_lost() {
+        let at = Scratch::new(&["s-7a1", "s-7b2", "s-7c3"]);
+        let record = "@s-7a1 rev=3 state=closed task_state=exited agent=claude \
+                      conclusion=finished why=exit-status exit=0 task_news=1";
+        let held = at.hold_log();
+        at.apply(record, 61_000);
+        at.apply(
+            "@s-7c3 rev=2 state=closed task_state=failed agent=claude conclusion=failed \
+             why=could-not-finish task_news=1",
+            62_000,
+        );
+        assert!(!at.open("s-7a1"));
+        assert_eq!(at.owes("s-7a1"), (1, None), "the row its log refused");
+        assert_eq!(at.owes("s-7c3"), (1, None));
+        assert!(
+            at.unsaid().is_empty(),
+            "a row the board keeps is not counted lost"
+        );
+        drop(held);
+        // A later answer of the worker, which moves nothing, writes what its row owes.
+        at.apply(record, 70_000);
+        let rows = at.tasks("s-7a1");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(
+            (rows[0].at_ms, rows[0].wall_ms.clone()),
+            (at.t0 + 61_000, Fig::Known(61_000)),
+            "its own close's time and wall_ms"
+        );
+        assert_eq!(
+            (rows[0].outcome, rows[0].stop, rows[0].code),
+            (Outcome::Ok, Stop::Exit, Some(0))
+        );
+        assert_eq!(at.owes("s-7a1"), (0, Some("ok.exit".to_owned())));
+        assert_eq!(
+            at.dropped(),
+            0,
+            "a row written late is said lost by no gap line"
+        );
+        assert!(at.unsaid().is_empty());
+        at.apply(record, 80_000);
+        assert_eq!(at.tasks("s-7a1").len(), 1, "written once");
+
+        // A close that reversed and came to another end, its write refused: the keeper's settle
+        // writes it, the worker's last row, in the one append that writes `s-7c3`'s.
+        let done = "@s-7b2 rev=3 state=closed task_state=done agent=claude conclusion=finished \
+                    why=landed task_news=1";
+        at.apply(done, 1_000);
+        at.apply(
+            "@s-7b2 rev=3 state=done agent=claude conclusion=finished why=landed task_news=1",
+            2_000,
+        );
+        assert!(at.open("s-7b2"), "a row at the close's rev reopens it");
+        let held = at.hold_log();
+        at.apply(
+            "@s-7b2 rev=4 state=closed task_state=stalled agent=claude conclusion=failed \
+             why=held task_news=1",
+            3_000,
+        );
+        assert_eq!(at.owes("s-7b2"), (1, Some("ok.unknown".to_owned())));
+        drop(held);
+        at.board
+            .settle(&["s-7b2".to_owned(), "s-7c3".to_owned()], at.t0 + 9_000)
+            .expect("settled");
+        assert_eq!(
+            at.tasks("s-7b2")
+                .iter()
+                .map(|r| (r.outcome, r.stop, r.at_ms))
+                .collect::<Vec<_>>(),
+            [
+                (Outcome::Ok, Stop::Unknown, at.t0 + 1_000),
+                (Outcome::Fail, Stop::Stalled, at.t0 + 3_000)
+            ],
+            "its last row is the end it came to"
+        );
+        assert_eq!(at.owes("s-7b2"), (0, Some("fail.stalled".to_owned())));
+        assert_eq!(
+            at.tasks("s-7c3")
+                .iter()
+                .map(|r| (r.outcome, r.at_ms))
+                .collect::<Vec<_>>(),
+            [(Outcome::Fail, at.t0 + 62_000)]
+        );
+        assert_eq!(at.owes("s-7c3"), (0, Some("fail.unknown".to_owned())));
+        assert_eq!(at.dropped(), 0);
+    }
+
+    /// One apply that reads a sid twice (a close, then the row reopened) merges the second answer
+    /// into what the first left: the row its close owes stays owed, though the row stands open.
+    /// NEGATIVE CONTROL: the rows are read and written once, so the reopen is kept too.
+    #[test]
+    fn a_sid_answered_twice_in_one_apply_keeps_what_its_first_answer_owed() {
+        let at = Scratch::new(&["s-9a1"]);
+        let held = at.hold_log();
+        at.board
+            .apply(
+                &[
+                    "@s-9a1 rev=3 state=closed task_state=done agent=claude conclusion=finished \
+                     why=landed task_news=1"
+                        .to_owned(),
+                    "@s-9a1 rev=3 state=done agent=claude conclusion=finished why=landed \
+                     task_news=1"
+                        .to_owned(),
+                ],
+                at.t0 + 1_000,
+            )
+            .expect("applied");
+        assert!(at.open("s-9a1"), "the second answer reopened it");
+        assert_eq!(at.owes("s-9a1"), (1, None), "the first answer's row");
+        drop(held);
+        at.board
+            .settle(&["s-9a1".to_owned()], at.t0 + 2_000)
+            .expect("settled");
+        assert_eq!(at.tasks("s-9a1").len(), 1);
+    }
+
+    /// A board row file made immutable (`chflags uchg`) until the guard drops: it reads as it
+    /// did, and a rename over it is refused (`EPERM`), so one row's write fails and no other's.
+    #[cfg(target_os = "macos")]
+    struct Immutable(std::path::PathBuf);
+
+    #[cfg(target_os = "macos")]
+    impl Immutable {
+        fn set(path: std::path::PathBuf) -> Self {
+            let made = std::process::Command::new("/usr/bin/chflags")
+                .arg("uchg")
+                .arg(&path)
+                .status()
+                .expect("chflags ran");
+            assert!(made.success(), "chflags uchg {}", path.display());
+            Self(path)
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for Immutable {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("/usr/bin/chflags")
+                .arg("nouchg")
+                .arg(&self.0)
+                .status();
+        }
+    }
+
+    /// One board row's failed write leaves every other row the apply paid written: a row that
+    /// owed a task row the apply's append wrote no longer owes it, so no later write says it a
+    /// second time, and no give-up says lost a row the log holds. The apply answers the failure.
+    /// The row whose write failed keeps its file as it was, so the next apply tells its end
+    /// again: a second row of one end, never none. NEGATIVE CONTROL: the failed row is the
+    /// first the apply holds, so stopping at it writes no other.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn one_board_rows_failed_write_leaves_every_other_row_the_apply_paid_written() {
+        let at = Scratch::new(&["s-9b1", "s-9b2"]);
+        let close = |sid: &str| {
+            format!(
+                "@{sid} rev=3 state=closed task_state=exited agent=claude conclusion=finished \
+                 why=exit-status exit=0 task_news=1"
+            )
+        };
+        let held = at.hold_log();
+        at.apply(&close("s-9b2"), 1_000);
+        assert_eq!(at.owes("s-9b2"), (1, None), "refused by the log's lock");
+        drop(held);
+        let fixed = Immutable::set(at.board.dir().join("s-9b1"));
+        let answer = at
+            .board
+            .apply(&[close("s-9b1"), close("s-9b2")], at.t0 + 2_000);
+        assert!(answer.is_err(), "the failed write is the answer");
+        assert!(at.open("s-9b1"), "its file kept as it was");
+        assert_eq!(
+            at.owes("s-9b2"),
+            (0, Some("ok.exit".to_owned())),
+            "the row the append wrote is owed no more"
+        );
+        drop(fixed);
+        at.board
+            .settle(&["s-9b2".to_owned()], at.t0 + 3_000)
+            .expect("settled");
+        at.apply(&close("s-9b1"), 4_000);
+        assert!(!at.open("s-9b1"));
+        assert_eq!(at.tasks("s-9b2").len(), 1, "written once");
+        assert_eq!(at.tasks("s-9b1").len(), 2, "told again, never lost");
+        assert_eq!(at.dropped(), 0);
+        assert!(at.unsaid().is_empty());
+    }
+
+    /// A task row its board gives up is said lost exactly once: a write that fails
+    /// [`OWED_KEPT`] after its close (and not one a second before it), its board row pruned or
+    /// written over, a fifth row owed past [`OWED_MAX`] (the oldest), or a line that holds no
+    /// task row. NEGATIVE CONTROLS: the failed writes of other rows after each was given up, a
+    /// later prune and later appends say none of them again; the rows still owed are written, in
+    /// order.
+    #[test]
+    fn a_task_row_its_board_gives_up_is_said_lost_exactly_once() {
+        let at = Scratch::new(&["s-8a1", "s-8b2", "s-8c3", "s-8d4", "s-8e5", "s-8f6"]);
+        let record = |sid: &str| {
+            format!(
+                "@{sid} rev=3 state=closed task_state=done agent=claude conclusion=finished \
+                 why=landed task_news=1"
+            )
+        };
+        let kept = u64::try_from(OWED_KEPT.as_millis()).expect("ms");
+        let held = at.hold_log();
+        at.apply(&record("s-8a1"), 1_000);
+        at.apply(&record("s-8b2"), 1_000);
+        at.apply(&record("s-8a1"), kept);
+        assert_eq!(at.owes("s-8a1").0, 1, "a write that fails within its time");
+        at.apply(&record("s-8a1"), 1_000 + kept);
+        assert_eq!(at.owes("s-8a1"), (0, None), "retries exhausted: given up");
+        // Its board row written over (a row recorded again for its sid).
+        at.apply(&record("s-8e5"), 1_000);
+        assert_eq!(at.owes("s-8e5").0, 1);
+        at.board
+            .record(&worker("s-8e5", at.t0))
+            .expect("recorded over");
+        assert_eq!(at.owes("s-8e5"), (0, None));
+        // A line that holds no task row (a build's), given up at its first write.
+        let mut no_task = worker("s-8f6", at.t0);
+        let mut build = task_row(&no_task, None, at.t0, "m101", Digest::dir("/facts"));
+        build.kind = Kind::Build;
+        no_task.owed = vec![build.line()];
+        at.board.record(&no_task).expect("recorded");
+        // Its board row pruned, a week after it closed.
+        at.board.prune_at(at.t0 + 8 * 24 * 3_600_000);
+        assert!(at.board.row("s-8b2").is_none(), "pruned");
+        at.board.prune_at(at.t0 + 9 * 24 * 3_600_000);
+        // A worker whose closes reversed five times, each end owed: the oldest given up.
+        for n in 0..5u64 {
+            let rev = 4 + n;
+            let end = if n % 2 == 0 {
+                "task_state=done conclusion=finished why=landed"
+            } else {
+                "task_state=exited conclusion=failed why=exit-status exit=1"
+            };
+            at.apply(
+                &format!("@s-8c3 rev={rev} state=closed {end} agent=claude task_news=1"),
+                10_000 + 2 * n,
+            );
+            at.apply(
+                &format!("@s-8c3 rev={rev} state=working agent=claude task_news=1"),
+                10_001 + 2 * n,
+            );
+        }
+        assert_eq!(at.owes("s-8c3").0, OWED_MAX);
+        drop(held);
+        at.board
+            .settle(&["s-8c3".to_owned(), "s-8f6".to_owned()], at.t0 + 20_000)
+            .expect("settled");
+        assert_eq!(at.owes("s-8f6"), (0, None));
+        assert_eq!(
+            (at.dropped(), at.unsaid().len()),
+            (4, 1),
+            "each row given up before this settle said once by its append, and the line it gave \
+             up left for the next"
+        );
+        assert!(
+            ["s-8a1", "s-8b2", "s-8e5", "s-8f6"]
+                .iter()
+                .all(|sid| at.tasks(sid).is_empty())
+        );
+        assert_eq!(
+            at.tasks("s-8c3")
+                .iter()
+                .map(|r| (r.outcome, r.at_ms))
+                .collect::<Vec<_>>(),
+            [
+                (Outcome::Fail, at.t0 + 10_002),
+                (Outcome::Ok, at.t0 + 10_004),
+                (Outcome::Fail, at.t0 + 10_006),
+                (Outcome::Ok, at.t0 + 10_008)
+            ],
+            "the rows still owed, in order"
+        );
+        at.apply(&record("s-8a1"), 30_000);
+        at.apply(&record("s-8d4"), 40_000);
+        at.board.prune_at(at.t0 + 10 * 24 * 3_600_000);
+        assert_eq!(at.tasks("s-8d4").len(), 1);
+        assert_eq!(at.dropped(), 5, "said once");
+        assert!(
+            at.unsaid().is_empty(),
+            "and left unsaid by none: {:?}",
+            at.unsaid()
+        );
     }
 
     /// THE TASK ROW (Continuum TM-1): a worker writes its task row once its row is closed and
     /// the board holds the conclusion its Mac reported, whichever came first: a close built from
     /// the Mac's last row naming it, or the Mac's report while the row was open and then any
-    /// close. NEGATIVE CONTROLS: a close with no conclusion of its Mac's writes none, though the
+    /// close (a stall's only while it stands: `a_stall_its_record_took_back_is_no_end`).
+    /// NEGATIVE CONTROLS: a close with no conclusion of its Mac's writes none, though the
     /// board reads it `failed` and the close carries the Mac's rev; nothing writes a second row
     /// of the same end (the record arriving after a close that wrote, a reopen at the close's
     /// rev and a second close). A close that reversed and came to another end writes that end,
@@ -639,15 +1059,19 @@ mod tests {
         assert!(at.tasks("s-1e5").is_empty(), "{:?}", at.tasks("s-1e5"));
     }
 
-    /// A conclusion the board heard while the row was open is the worker's end whatever close
-    /// follows: the Mac's own close of a tab working again (a turn after it finished), an old
-    /// Mac's `failed` with no `task_state=`, or a close with no record of the Mac's (the
-    /// keeper's), in either order. The close's words, a closed tab's reading, are never its
-    /// outcome or stop. NEGATIVE CONTROL: a record close naming a concluding state is its end
-    /// (`s-1b2`).
+    /// A conclusion other than a stall's (`a_stall_its_record_took_back_is_no_end`) the board
+    /// heard while the row was open is the worker's end whatever close with no record of another
+    /// end follows: the Mac's own close of a tab working again (a turn
+    /// after it finished), an old Mac's `failed` with no `task_state=`, or a close with no record
+    /// of the Mac's (the keeper's), in either order, and a live row of the turn read before or
+    /// after either. The close's words, a closed tab's reading, are never its outcome or stop.
+    /// NEGATIVE CONTROL: a record close naming a concluding state is its end, though the board
+    /// heard another (`s-5e5`), and what a closed row heard is no later close's end (`s-5f6`).
     #[test]
     fn a_heard_conclusion_is_the_end_whatever_close_follows_and_in_either_order() {
-        let at = Scratch::new(&["s-4a1", "s-4b2", "s-4c3", "s-4d4", "s-4e5"]);
+        let at = Scratch::new(&[
+            "s-4a1", "s-4b2", "s-4c3", "s-4e5", "s-5a1", "s-5b2", "s-5e5", "s-5f6",
+        ]);
         let ends = |sid: &str| {
             at.tasks(sid)
                 .iter()
@@ -682,16 +1106,6 @@ mod tests {
             2_000,
         );
         assert_eq!(ends("s-4c3"), [(Outcome::Ok, Stop::Unknown)]);
-        // A stall heard, then the Mac's close of the tab working again with no conclusion.
-        at.apply(
-            "@s-4d4 rev=2 state=stalled agent=claude conclusion=failed why=startup task_news=1",
-            1_000,
-        );
-        at.apply(
-            "@s-4d4 rev=3 state=closed task_state=working agent=claude task_news=1",
-            2_000,
-        );
-        assert_eq!(ends("s-4d4"), [(Outcome::Fail, Stop::Stalled)]);
         // A wait's close built from a row older than the board's: the heard end stands.
         at.apply(
             "@s-4e5 rev=3 state=done agent=claude conclusion=finished why=landed task_news=1",
@@ -702,6 +1116,102 @@ mod tests {
             2_000,
         );
         assert_eq!(ends("s-4e5"), [(Outcome::Ok, Stop::Unknown)]);
+        // A live row of the turn typed after it (a wait's leg answered while it works), read
+        // before the Mac's close, and after it with the keeper's close next.
+        let turn = |sid: &str| format!("@{sid} rev=3 state=working agent=claude task_news=0");
+        at.apply(&finished("s-5a1"), 1_000);
+        at.apply(&turn("s-5a1"), 2_000);
+        at.apply(&macs("s-5a1"), 3_000);
+        at.apply(&finished("s-5b2"), 1_000);
+        at.apply(&macs("s-5b2"), 2_000);
+        at.apply(&turn("s-5b2"), 3_000);
+        assert!(at.open("s-5b2"), "a live row at the close's rev reopens it");
+        at.apply(&keepers("s-5b2"), 4_000);
+        assert_eq!(ends("s-5a1"), [(Outcome::Ok, Stop::Unknown)]);
+        assert_eq!(ends("s-5b2"), ends("s-5a1"), "either order, one end");
+        // NEGATIVE CONTROL: the Mac's record of another end is the end.
+        at.apply(&finished("s-5e5"), 1_000);
+        at.apply(
+            "@s-5e5 rev=3 state=closed task_state=stalled agent=claude conclusion=failed \
+             why=held task_news=1",
+            2_000,
+        );
+        assert_eq!(ends("s-5e5"), [(Outcome::Fail, Stop::Stalled)]);
+        // NEGATIVE CONTROL: a failure heard (an Autopilot set to off), a turn, then the Mac's
+        // record that it finished, then a turn after that closed while working: the failure is
+        // no end of the second close.
+        at.apply(
+            "@s-5f6 rev=2 state=failed agent=claude conclusion=failed why=off task_news=1",
+            1_000,
+        );
+        at.apply(&turn("s-5f6"), 2_000);
+        at.apply(
+            "@s-5f6 rev=4 state=closed task_state=done agent=claude conclusion=finished \
+             why=landed task_news=1",
+            3_000,
+        );
+        at.apply("@s-5f6 rev=5 state=working agent=claude task_news=0", 4_000);
+        assert!(at.open("s-5f6"), "the turn reopens it");
+        at.apply(
+            "@s-5f6 rev=5 state=closed task_state=working agent=claude task_news=1",
+            5_000,
+        );
+        assert_eq!(ends("s-5f6"), [(Outcome::Ok, Stop::Unknown)]);
+    }
+
+    /// A stall's `failed` stands only while the stall does: its record takes it back when the
+    /// stall moves on (the agent started after all, a held stall made progress), with no turn. A
+    /// stall the board heard and then read moving on, before the Mac's close of the tab working or
+    /// after it, is no end; an end heard before the stall still is. NEGATIVE CONTROL: a stall that
+    /// stood when a recordless close came is the end the board last heard (`s-6d4`).
+    #[test]
+    fn a_stall_its_record_took_back_is_no_end() {
+        let at = Scratch::new(&["s-6a1", "s-6b2", "s-6c3", "s-6d4"]);
+        let ends = |sid: &str| {
+            at.tasks(sid)
+                .iter()
+                .map(|r| (r.outcome, r.stop))
+                .collect::<Vec<_>>()
+        };
+        let stalled = |sid: &str, rev: u64| {
+            format!(
+                "@{sid} rev={rev} state=stalled agent=claude conclusion=failed why=startup \
+                 task_news=1"
+            )
+        };
+        let moved_on = |sid: &str, rev: u64| {
+            format!("@{sid} rev={rev} state=working agent=claude task_news=0")
+        };
+        let gone = |sid: &str, rev: u64| {
+            format!("@{sid} rev={rev} state=closed task_state=working agent=claude task_news=1")
+        };
+        let keepers = |sid: &str| format!("@{sid} rev=2 state=closed agent=-");
+        // The stall moving on read first, then the Mac's close of the tab working.
+        at.apply(&stalled("s-6a1", 2), 1_000);
+        at.apply(&moved_on("s-6a1", 3), 2_000);
+        at.apply(&gone("s-6a1", 3), 3_000);
+        assert!(ends("s-6a1").is_empty(), "{:?}", ends("s-6a1"));
+        // The Mac's close first, then the stall moving on and the keeper's close.
+        at.apply(&stalled("s-6b2", 2), 1_000);
+        at.apply(&gone("s-6b2", 3), 2_000);
+        at.apply(&moved_on("s-6b2", 3), 3_000);
+        at.apply(&keepers("s-6b2"), 4_000);
+        assert!(ends("s-6b2").is_empty(), "{:?}", ends("s-6b2"));
+        // It finished, was typed into, stalled and moved on, then closed while working: it
+        // finished.
+        at.apply(
+            "@s-6c3 rev=2 state=done agent=claude conclusion=finished why=landed task_news=1",
+            1_000,
+        );
+        at.apply(&moved_on("s-6c3", 3), 2_000);
+        at.apply(&stalled("s-6c3", 4), 3_000);
+        at.apply(&moved_on("s-6c3", 5), 4_000);
+        at.apply(&gone("s-6c3", 5), 5_000);
+        assert_eq!(ends("s-6c3"), [(Outcome::Ok, Stop::Unknown)]);
+        // NEGATIVE CONTROL: the stall stood as far as the board heard.
+        at.apply(&stalled("s-6d4", 2), 1_000);
+        at.apply(&keepers("s-6d4"), 2_000);
+        assert_eq!(ends("s-6d4"), [(Outcome::Fail, Stop::Stalled)]);
     }
 
     /// A record close that names no `why=` says no stop: the `why=held` the board kept from an

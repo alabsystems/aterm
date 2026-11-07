@@ -1729,10 +1729,88 @@ fn stale_apply_context_and_unsafe_files_never_supply_authenticated_bytes() {
     }
 }
 
+/// The fixture token of the class scenarios: inert, in the setup-token grammar.
+const CLASS_TOKEN: &[u8] = concat!("sk-ant-", "oat01-inert-conformance_fixture").as_bytes();
+
+/// The class scenarios of [`entry_transition`] (DESIGN-claude-setup-token §4.2): on a seated
+/// member (m7) of a log vault, `claude_token::write` stores a token, and the typed read
+/// (`ClaudeToken`, [`Reading::ClaudeToken`]) or a materialized reading
+/// (`ClaudeTokenMaterialized`, [`read_verified_entry`]) of its entry is made.
+fn claude_token_transition(
+    state: &aterm_spec::interp::State,
+    action: &str,
+) -> aterm_spec::interp::State {
+    let macs = crate::client::log_entries_tests::two_macs(&[]);
+    let m7 = &macs.m7;
+    let key = crate::claude_token::Key::parse("ac-0123456789abcdef").unwrap();
+    let meta = crate::claude_token::Meta {
+        email: "inert@example.invalid".into(),
+        account_id: "c-0123456789ab".into(),
+        minted_at: 1,
+        expires_at: u64::MAX / 2,
+        expiry_from: crate::claude_token::ExpiryFrom::Assumed,
+        minted_on: "m7".into(),
+        cli: "2.1.318".into(),
+        verified: None,
+    };
+    let soon = Instant::now() + Duration::from_secs(60);
+    assert_eq!(
+        crate::claude_token::write(
+            m7,
+            &key,
+            &SecretBytes::from(CLASS_TOKEN),
+            &meta,
+            OnBusy::Refuse(soon)
+        )
+        .unwrap(),
+        MemberWritten::Posted
+    );
+    let expected = config(m7).unwrap().unwrap();
+    let name = key.entry();
+    let tracked = [
+        m7.state_file(),
+        m7.cache_file(),
+        m7.home.join(".secrets").join(&name),
+    ];
+    let bytes = || {
+        tracked
+            .iter()
+            .map(|p| std::fs::read(p).ok())
+            .collect::<Vec<_>>()
+    };
+    let before = bytes();
+    let (scenario, accepted) = match action {
+        "ClaudeToken" => (
+            19,
+            read_entry(m7, &expected, &name, Reading::ClaudeToken)
+                .ok()
+                .flatten()
+                .is_some_and(|(entry, _)| entry.value().as_slice() == CLASS_TOKEN),
+        ),
+        "ClaudeTokenMaterialized" => (
+            20,
+            read_verified_entry(m7, &expected, &name)
+                .ok()
+                .flatten()
+                .is_some(),
+        ),
+        _ => panic!("unknown class scenario"),
+    };
+    let mut next = state.clone();
+    next.insert("scenario", scenario);
+    next.insert("accepted", i64::from(accepted));
+    next.insert("effects", i64::from(before != bytes()));
+    macs.server.stop();
+    next
+}
+
 pub(crate) fn entry_transition(
     state: &aterm_spec::interp::State,
     action: &str,
 ) -> aterm_spec::interp::State {
+    if action.starts_with("ClaudeToken") {
+        return claude_token_transition(state, action);
+    }
     let f = Fixture::new();
     let mut pin = f.read_token().unwrap().snapshot;
     let mut expected = config(&f.paths).unwrap().unwrap();
@@ -1921,7 +1999,14 @@ fn verified_entry_reads_conform_and_forged_files_or_rolled_back_pins_are_caught(
             }
         }
     }
-    for action in ["ForgedManifest", "Rollback", "Fork"] {
+    // NEGATIVE CONTROL: each of these readings accepting the bytes is no step of the model, and
+    // breaks its law; a materialized reading of a Claude Code token entry among them.
+    for action in [
+        "ForgedManifest",
+        "Rollback",
+        "Fork",
+        "ClaudeTokenMaterialized",
+    ] {
         let mut bad = entry_transition(&model.init_state(), action);
         bad.insert("accepted", 1);
         assert!(!model.check_invariant("OnlyBoundBytes", &bad));

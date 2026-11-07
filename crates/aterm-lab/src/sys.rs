@@ -3077,6 +3077,105 @@ pub mod tis {
     }
 }
 
+/// What one open descriptor of this process is, by `fstat`'s file type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FdKind {
+    /// A socket.
+    Socket,
+    /// A pipe or FIFO.
+    Pipe,
+    /// A regular file.
+    File,
+    /// A character device (a terminal, `/dev/null`).
+    Char,
+    /// A directory.
+    Dir,
+    /// Anything else `fstat` names.
+    Other,
+}
+
+impl FdKind {
+    /// Its word in a probe's report.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Socket => "sock",
+            Self::Pipe => "pipe",
+            Self::File => "file",
+            Self::Char => "chr",
+            Self::Dir => "dir",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// This process's open descriptors below `limit`, each with its kind: every number `fcntl(F_GETFD)`
+/// answers and `fstat` reads.
+#[must_use]
+pub fn open_fds(limit: RawFd) -> Vec<(RawFd, FdKind)> {
+    (0..limit)
+        .filter_map(|fd| {
+            // SAFETY: F_GETFD reads the descriptor's flags and changes nothing.
+            if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+                return None;
+            }
+            // SAFETY: `st` is a zeroed stat the call fills in; `fd` is only read.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: as above.
+            if unsafe { libc::fstat(fd, &raw mut st) } != 0 {
+                return None;
+            }
+            let kind = match st.st_mode & libc::S_IFMT {
+                libc::S_IFSOCK => FdKind::Socket,
+                libc::S_IFIFO => FdKind::Pipe,
+                libc::S_IFREG => FdKind::File,
+                libc::S_IFCHR => FdKind::Char,
+                libc::S_IFDIR => FdKind::Dir,
+                _ => FdKind::Other,
+            };
+            Some((fd, kind))
+        })
+        .collect()
+}
+
+/// What waits to be read on descriptor `fd` of kind `kind`, into `buf`, taking nothing from anyone
+/// else who holds it where the kind allows: a socket's bytes peeked (`MSG_PEEK | MSG_DONTWAIT`), a
+/// regular file's read from its start without moving its offset (`pread`), a pipe's read only once
+/// `poll` says bytes are there. Any other kind, and any failure, reads nothing.
+#[must_use]
+pub fn peek_fd(fd: RawFd, kind: FdKind, buf: &mut [u8]) -> usize {
+    let n = match kind {
+        // SAFETY: `buf` is writable for its length; `fd` is only read.
+        FdKind::Socket => unsafe {
+            libc::recv(
+                fd,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        },
+        // SAFETY: as above, at offset 0 of the file.
+        FdKind::File => unsafe { libc::pread(fd, buf.as_mut_ptr().cast(), buf.len(), 0) },
+        FdKind::Pipe => {
+            let mut p = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one pollfd, no wait.
+            let ready =
+                unsafe { libc::poll(&raw mut p, 1, 0) } == 1 && p.revents & libc::POLLIN != 0;
+            if !ready {
+                return 0;
+            }
+            // SAFETY: `buf` is writable for its length; `fd` is only read.
+            unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) }
+        }
+        FdKind::Char | FdKind::Dir | FdKind::Other => 0,
+    };
+    usize::try_from(n).unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

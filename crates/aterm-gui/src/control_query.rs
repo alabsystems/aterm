@@ -1594,12 +1594,36 @@ fn setup_status_over(rest: &str, read: &dyn Fn() -> Result<String, String>) -> S
 #[cfg(test)]
 #[test]
 fn background_setup_status_only_reads_and_rejects_action_words_before_posting() {
+    use aterm_types::macos_setup::{Observation, Plan, Selection, Setting, Subject};
+
+    let mut selected = Selection::none();
+    selected.set(Setting::CapsLock, true);
+    let mut unread = Observation::unknown(Subject::Setting(Setting::CapsLock));
+    unread.note = Some("private approval sentinel".into());
+    unread.detail = Some("private source sentinel".into());
+    unread.now = Some("private value sentinel".into());
+    unread.wanted = "private wanted sentinel".into();
+    let mut status = crate::SetupStatus {
+        plan: Some(Plan::from(selected)),
+        observed: vec![unread],
+        observed_generation: 7,
+        finished: true,
+        ..crate::SetupStatus::default()
+    };
     let reads = std::cell::Cell::new(0);
     let reply = setup_status_over("status", &|| {
         reads.set(reads.get() + 1);
-        Ok("setup=done;offered:lan verified=0".into())
+        Ok(crate::system_state_access::background_setup_fields(&status))
     });
-    assert_eq!(reply, "OK schema=2 setup=done;offered:lan verified=0\n");
+    assert_eq!(
+        reply,
+        "OK schema=2 setup=unknown:capslock verified=0 observed_generation=7 rows=capslock:unknown\n"
+    );
+    status.observed.clear();
+    assert_eq!(
+        crate::system_state_access::background_setup_fields(&status),
+        "setup=unknown:capslock verified=0 observed_generation=7 rows=capslock:unread"
+    );
     assert_eq!(reads.get(), 1);
     for rest in ["", "start", "on", "status now"] {
         assert!(

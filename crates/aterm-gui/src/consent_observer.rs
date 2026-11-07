@@ -62,7 +62,7 @@ pub(crate) enum ObserverMode {
     Off,
     /// Default sentinel stream (`AUTHREQ_PROMPTING`) feeding the access card.
     Sentinel,
-    /// `observer = true`: full `tccd` stream with tab mark and notification banner.
+    /// `observer = true`: full `tccd` stream with a tab mark for each pending dialog.
     Full,
 }
 
@@ -307,18 +307,6 @@ fn parse_yes_no(value: &str) -> bool {
     )
 }
 
-/// Formats the `blocked_on=` token for `service` by stripping `kTCCService`.
-pub(crate) fn blocked_on_token(service: &str) -> String {
-    let short = service
-        .trim()
-        .strip_prefix("kTCCService")
-        .unwrap_or(service.trim());
-    if short.is_empty() {
-        return "macos-permission:unknown".to_owned();
-    }
-    format!("macos-permission:{short}")
-}
-
 /// One in-flight `tccd` request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingEntry {
@@ -345,8 +333,6 @@ pub(crate) enum PidSource {
 pub(crate) struct PendingPrompt<'a> {
     /// Correlation `msgID`.
     pub(crate) msg_id: &'a str,
-    /// TCC service name.
-    pub(crate) service: &'a str,
     /// PID of the process parked in the syscall.
     pub(crate) accessing_pid: i32,
     /// Attribution block that provided [`Self::accessing_pid`].
@@ -358,16 +344,15 @@ pub(crate) struct PendingPrompt<'a> {
 }
 
 impl PendingEntry {
-    fn signature(&self) -> Option<(i32, PidSource, &str)> {
-        if self.preflight == Some(true) {
+    fn signature(&self) -> Option<(i32, PidSource)> {
+        if self.preflight == Some(true) || self.service.is_none() {
             return None;
         }
-        let (pid, source) = match (self.accessing_pid, self.requesting_pid) {
-            (Some(pid), _) => (pid, PidSource::Accessing),
-            (None, Some(pid)) => (pid, PidSource::Requesting),
-            (None, None) => return None,
-        };
-        Some((pid, source, self.service.as_deref()?))
+        match (self.accessing_pid, self.requesting_pid) {
+            (Some(pid), _) => Some((pid, PidSource::Accessing)),
+            (None, Some(pid)) => Some((pid, PidSource::Requesting)),
+            (None, None) => None,
+        }
     }
 }
 
@@ -465,10 +450,9 @@ impl PendingTable {
                 if age < threshold {
                     return None;
                 }
-                let (accessing_pid, pid_source, service) = entry.signature()?;
+                let (accessing_pid, pid_source) = entry.signature()?;
                 Some(PendingPrompt {
                     msg_id: &entry.msg_id,
-                    service,
                     accessing_pid,
                     pid_source,
                     subject: entry.subject.as_deref(),
@@ -999,7 +983,9 @@ pub(crate) struct ObserverState {
 struct AnnouncedPrompt {
     id: String,
     session: u64,
-    pending: Option<Arc<()>>,
+    /// Whether this prompt still marks its tab and is kept from eviction, from its announcement
+    /// until macOS's result or [`ObserverState::stop`] ends that.
+    pending: bool,
 }
 
 impl ObserverState {
@@ -1137,7 +1123,7 @@ impl ObserverState {
         self.requested = ObserverMode::Off;
         self.running = ObserverMode::Off;
         for prompt in &mut self.announced {
-            self.attention_dirty |= prompt.pending.take().is_some();
+            self.attention_dirty |= std::mem::take(&mut prompt.pending);
         }
         if self.availability.is_live() {
             self.availability = ObserverAvailability::Unavailable(UnavailableReason::StreamEnded);
@@ -1212,7 +1198,7 @@ impl ObserverState {
             ObserverEvent::Line(line) => {
                 if let TccEvent::Result { msg_id } = &line {
                     for prompt in &mut self.announced {
-                        if &prompt.id == msg_id && prompt.pending.take().is_some() {
+                        if &prompt.id == msg_id && std::mem::take(&mut prompt.pending) {
                             self.attention_dirty = true;
                         }
                     }
@@ -1260,7 +1246,7 @@ impl ObserverState {
     pub(crate) fn marks_session(&self, session: u64) -> bool {
         self.announced
             .iter()
-            .any(|p| p.session == session && p.pending.is_some())
+            .any(|p| p.session == session && p.pending)
     }
 
     pub(crate) fn take_attention_changed(&mut self) -> bool {
@@ -1279,7 +1265,7 @@ impl ObserverState {
         now: Instant,
         roster: u64,
         sessions: impl FnOnce() -> Vec<(u64, i32)>,
-    ) -> Vec<ObservedPrompt> {
+    ) -> Vec<u64> {
         let pgid_of = self.probe.pgid_of;
         self.take_new_verdicts(now, roster, sessions, pgid_of)
     }
@@ -1296,14 +1282,15 @@ impl ObserverState {
             .collect()
     }
 
-    /// Returns newly observed pending prompts attributed to `sessions`, marking them announced.
+    /// Returns the session of each newly observed pending prompt attributed to `sessions`, marking
+    /// the prompt announced.
     pub(crate) fn take_new_verdicts(
         &mut self,
         now: Instant,
         roster: u64,
         sessions: impl FnOnce() -> Vec<(u64, i32)>,
         pgid_of: impl Fn(i32) -> Option<i32>,
-    ) -> Vec<ObservedPrompt> {
+    ) -> Vec<u64> {
         let due = self.verdicts_dirty
             || self.judged_roster != Some(roster)
             || self.verdict_due.is_some_and(|due| now >= due);
@@ -1327,32 +1314,25 @@ impl ObserverState {
             return Vec::new();
         }
         let sessions = sessions();
-        let mut fresh: Vec<ObservedPrompt> = Vec::new();
+        let mut fresh: Vec<u64> = Vec::new();
         for prompt in open {
             let pgid = pgid_of(prompt.accessing_pid);
             let Some(session) = owning_session(prompt.accessing_pid, pgid, &sessions) else {
                 continue;
             };
             if self.announced.len() >= ANNOUNCED_CAP {
-                let Some(done) = self.announced.iter().position(|p| p.pending.is_none()) else {
+                let Some(done) = self.announced.iter().position(|p| !p.pending) else {
                     continue;
                 };
                 self.announced.remove(done);
             }
-            let owner = Arc::new(());
-            let validity = crate::notify::NoticeValidity::new(&owner);
             self.announced.push_back(AnnouncedPrompt {
                 id: prompt.msg_id.to_owned(),
                 session,
-                pending: Some(owner),
+                pending: true,
             });
             self.attention_dirty = true;
-            fresh.push(ObservedPrompt {
-                session,
-                blocked_on: blocked_on_token(prompt.service),
-                service: prompt.service.to_owned(),
-                validity,
-            });
+            fresh.push(session);
         }
         fresh
     }
@@ -1373,7 +1353,6 @@ pub(crate) fn short_service(service: &str) -> &str {
 pub(crate) fn service_words(short: &str) -> Option<&'static str> {
     use aterm_containment::consent::Folder;
     match Folder::ALL.iter().find(|f| f.tcc_service() == short) {
-        Some(Folder::AppData) => Some("other applications' data"),
         Some(folder) => Some(folder.label()),
         None => match short {
             "SystemPolicyNetworkVolumes" => Some("network drives"),
@@ -1393,36 +1372,6 @@ pub(crate) fn service_words(short: &str) -> Option<&'static str> {
             "AppleEvents" => Some("another app"),
             _ => None,
         },
-    }
-}
-
-/// Newly observed pending prompt attributed to a session.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ObservedPrompt {
-    /// Session ID whose process is parked.
-    pub(crate) session: u64,
-    /// Rendered `blocked_on=` token.
-    pub(crate) blocked_on: String,
-    /// Raw TCC service name.
-    pub(crate) service: String,
-    /// Permission borrowed from the still-pending announced request.
-    pub(crate) validity: crate::notify::NoticeValidity,
-}
-
-impl ObservedPrompt {
-    /// Builds the [`AttentionNotice`] for this prompt.
-    pub(crate) fn notice(&self) -> AttentionNotice {
-        let asked = service_words(short_service(&self.service)).map_or_else(
-            || "macOS is asking for a permission.".to_string(),
-            |what| format!("macOS is asking for access to {what}."),
-        );
-        AttentionNotice {
-            session: self.session,
-            title: PROMPT_TITLE,
-            body: format!("{asked} The program that asked waits until you answer."),
-            validity: self.validity.clone(),
-            decided: (),
-        }
     }
 }
 
@@ -1585,29 +1534,11 @@ pub(crate) enum AttentionEvent {
     ProtectedEperm { session: Option<u64> },
 }
 
-/// Native notification payload produced by an [`AttentionEvent`] or [`ObservedPrompt`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct AttentionNotice {
-    /// Originating session ID (`u64::MAX` when instance-wide).
-    pub(crate) session: u64,
-    /// Notification title.
-    pub(crate) title: &'static str,
-    /// Notification body.
-    pub(crate) body: String,
-    /// Permission borrowed from the condition that still needs an answer.
-    pub(crate) validity: crate::notify::NoticeValidity,
-    /// Private: only this module's gate and prompts build a notice, so
-    /// [`crate::notify::NotifyMsg::consent`] posts nothing they did not decide.
-    decided: (),
-}
-
 /// Host actions decided by [`AttentionGate::note`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AttentionOutcome {
     /// Session whose tab attention mark should be raised, if any.
     pub(crate) raise_tab: Option<u64>,
-    /// Native notification to post, if any.
-    pub(crate) notice: Option<AttentionNotice>,
     /// Whether the status-bar menu glance needs refreshing.
     pub(crate) refresh_status_item: bool,
 }
@@ -1620,29 +1551,23 @@ impl AttentionOutcome {
         } else {
             Self {
                 raise_tab: None,
-                notice: None,
                 refresh_status_item: self.refresh_status_item,
             }
         }
     }
 }
 
-const DENIED_TITLE: &str = "aterm · file access denied";
-
-const PROMPT_TITLE: &str = "aterm · permission waiting";
-
-/// Per-instance rate limiter and session tracker for `EPERM` attention events.
+/// Per-instance first-refusal latch and session tracker for `EPERM` attention events.
 #[derive(Debug, Default)]
 pub(crate) struct AttentionGate {
-    /// Whether the one notification has been spent.
-    spent: bool,
+    /// Whether a refusal has been seen: only the first refreshes the menu-bar glance, so a storm
+    /// of refusals rebuilds nothing.
+    first_refusal_seen: bool,
     /// Live sessions whose own protected read was refused. This contribution
     /// ends on a verified grant or session retirement, not on a dismissal.
     denied_sessions: Vec<DeniedSession>,
     /// A refusal not attributed to a session still needs the same grant.
     unattributed_at: Option<Instant>,
-    /// Only the gate owns the one notice's lifetime; queued copies borrow it.
-    notice_owner: Option<Arc<()>>,
 }
 
 #[derive(Debug)]
@@ -1656,10 +1581,9 @@ impl AttentionGate {
     /// Creates a fresh, armed [`AttentionGate`].
     pub(crate) const fn new() -> Self {
         Self {
-            spent: false,
+            first_refusal_seen: false,
             denied_sessions: Vec::new(),
             unattributed_at: None,
-            notice_owner: None,
         }
     }
 
@@ -1697,25 +1621,17 @@ impl AttentionGate {
         if unattributed_ended {
             self.unattributed_at = None;
         }
-        self.revoke_ended_notice();
         self.denied_sessions.len() != before || unattributed_ended
     }
 
     pub(crate) fn retire_session(&mut self, session: u64) {
         self.denied_sessions.retain(|denied| denied.id != session);
-        self.revoke_ended_notice();
     }
 
-    fn revoke_ended_notice(&mut self) {
-        if !self.has_denials() {
-            self.notice_owner = None;
-        }
-    }
-
-    /// Whether the per-instance notification has already been sent.
+    /// Whether this instance has seen a refusal.
     #[cfg(all(test, unix))]
-    pub(crate) const fn is_spent(&self) -> bool {
-        self.spent
+    pub(crate) const fn first_refusal_seen(&self) -> bool {
+        self.first_refusal_seen
     }
 
     /// Records `event` and returns the resulting [`AttentionOutcome`].
@@ -1747,32 +1663,9 @@ impl AttentionGate {
         } else {
             self.unattributed_at = Some(now);
         }
-        if self.spent {
-            return AttentionOutcome {
-                raise_tab: session,
-                notice: None,
-                refresh_status_item: false,
-            };
-        }
-        self.spent = true;
-        let owner = Arc::new(());
-        let validity = crate::notify::NoticeValidity::new(&owner);
-        self.notice_owner = Some(owner);
         AttentionOutcome {
             raise_tab: session,
-            notice: Some(AttentionNotice {
-                session: session.unwrap_or(u64::MAX),
-                title: DENIED_TITLE,
-                body: format!(
-                    "Turn on aterm in {} (+ adds a missing app).",
-                    crate::menu::privacy_settings_path_words(
-                        crate::menu::PrivacyPane::FullDiskAccess
-                    )
-                ),
-                validity,
-                decided: (),
-            }),
-            refresh_status_item: true,
+            refresh_status_item: !std::mem::replace(&mut self.first_refusal_seen, true),
         }
     }
 }
@@ -1988,7 +1881,6 @@ mod tests {
         assert_eq!(prompts.len(), 1, "exactly one open request");
         assert_eq!(prompts[0].accessing_pid, 18584);
         assert_eq!(prompts[0].pid_source, PidSource::Accessing);
-        assert_eq!(prompts[0].service, "kTCCServiceSystemPolicyDocumentsFolder");
         assert_eq!(prompts[0].subject, Some("/usr/bin/mdfind"));
     }
 
@@ -2018,6 +1910,25 @@ mod tests {
             table
                 .pending_prompts(later, PENDING_PROMPT_THRESHOLD)
                 .is_empty()
+        );
+        assert_eq!(table.len(), 1, "still tracked, just not a verdict");
+    }
+
+    #[test]
+    fn a_request_with_no_known_service_is_never_a_prompt() {
+        let t0 = Instant::now();
+        let mut table = PendingTable::new();
+        feed(&mut table, REC_ATTRIBUTION, t0);
+        let later = t0 + PENDING_PROMPT_THRESHOLD + Duration::from_secs(1);
+        assert!(
+            table
+                .pending_prompts(later, PENDING_PROMPT_THRESHOLD)
+                .is_empty()
+        );
+        assert_eq!(
+            table.next_crossing(t0, PENDING_PROMPT_THRESHOLD),
+            None,
+            "and it arms no deadline"
         );
         assert_eq!(table.len(), 1, "still tracked, just not a verdict");
     }
@@ -2104,22 +2015,19 @@ mod tests {
     }
 
     #[test]
-    fn the_blocked_on_token_is_the_short_service_name() {
+    fn the_short_service_name_drops_the_prefix() {
         let cases: &[(&str, &str)] = &[
             (
                 "kTCCServiceSystemPolicyDocumentsFolder",
-                "macos-permission:SystemPolicyDocumentsFolder",
+                "SystemPolicyDocumentsFolder",
             ),
-            (
-                "SystemPolicyAllFiles",
-                "macos-permission:SystemPolicyAllFiles",
-            ),
-            ("  kTCCServiceCamera ", "macos-permission:Camera"),
-            ("kTCCService", "macos-permission:unknown"),
-            ("", "macos-permission:unknown"),
+            ("SystemPolicyAllFiles", "SystemPolicyAllFiles"),
+            ("  kTCCServiceCamera ", "Camera"),
+            ("kTCCService", ""),
+            ("", ""),
         ];
         for (service, expected) in cases {
-            assert_eq!(blocked_on_token(service), *expected);
+            assert_eq!(short_service(service), *expected);
         }
     }
 
@@ -2330,12 +2238,11 @@ mod tests {
         );
         assert_eq!(observer.session_for_pid(9999, sessions), None, "unrelated");
         let fresh = observer.take_new_verdicts_for_instance(later, 2, || sessions.to_vec());
-        assert_eq!(fresh.len(), 1);
-        assert_eq!(fresh[0].session, 4);
+        assert_eq!(fresh, [4]);
     }
 
     #[test]
-    fn one_observed_prompt_pages_once_and_a_second_dialog_pages_again() {
+    fn one_observed_prompt_is_announced_once_and_a_second_dialog_again() {
         let t0 = Instant::now();
         let mut observer = ObserverState::inert();
         observer.feed_for_test(ObserverEvent::Started, t0);
@@ -2348,27 +2255,13 @@ mod tests {
         let pgid = |pid: i32| (pid == 18584).then_some(4711);
 
         let first = observer.take_new_verdicts(later, 1, sessions, pgid);
-        assert_eq!(first.len(), 1, "the observed dialog pages");
-        assert_eq!(first[0].session, 4);
-        assert_eq!(
-            first[0].blocked_on,
-            "macos-permission:SystemPolicyDocumentsFolder"
-        );
-        assert_eq!(first[0].notice().session, 4);
-        let unknown_owner = Arc::new(());
-        let unknown = ObservedPrompt {
-            session: 4,
-            blocked_on: blocked_on_token("kTCCServiceSomethingNew"),
-            service: "kTCCServiceSomethingNew".to_owned(),
-            validity: crate::notify::NoticeValidity::new(&unknown_owner),
-        };
-        assert!(!unknown.notice().body.contains("kTCCService"));
+        assert_eq!(first, [4], "the observed dialog is announced");
 
         assert!(
             observer
                 .take_new_verdicts(later, 2, sessions, pgid)
                 .is_empty(),
-            "the same dialog never pages twice"
+            "the same dialog is never announced twice"
         );
 
         for line in [
@@ -2382,10 +2275,82 @@ mod tests {
         }
         let later2 = later + PENDING_PROMPT_THRESHOLD + Duration::from_secs(1);
         let second = observer.take_new_verdicts(later2, 2, sessions, pgid);
-        assert_eq!(second.len(), 1, "a distinct dialog is distinct news");
+        assert_eq!(second, [4], "a distinct dialog is distinct news");
+    }
+
+    #[test]
+    fn a_stopped_stream_leaves_no_prompt_marking_its_tab() {
+        let t0 = Instant::now();
+        let mut observer = ObserverState::inert();
+        observer.feed_for_test(ObserverEvent::Started, t0);
+        for line in [REC_CTX, REC_ATTRIBUTION] {
+            let event = parse_line(line).expect("recorded line parses");
+            observer.feed_for_test(ObserverEvent::Line(event), t0);
+        }
+        let later = t0 + PENDING_PROMPT_THRESHOLD + Duration::from_secs(1);
+        let first = observer.take_new_verdicts(
+            later,
+            1,
+            || vec![(4, 4711)],
+            |pid| (pid == 18584).then_some(4711),
+        );
+        assert_eq!(first, [4]);
+        assert!(observer.marks_session(4));
+        assert!(observer.take_attention_changed());
+        observer.stop();
+        assert!(!observer.marks_session(4), "no stream is left to answer it");
+        assert!(
+            observer.take_attention_changed(),
+            "and the host hears that the mark moved"
+        );
+    }
+
+    #[test]
+    fn a_full_ring_of_announced_prompts_evicts_only_an_answered_one() {
+        let t0 = Instant::now();
+        let mut observer = ObserverState::inert();
+        observer.feed_for_test(ObserverEvent::Started, t0);
+        let shells: Vec<(u64, i32)> = (0u64..).zip(5000i32..).take(ANNOUNCED_CAP + 1).collect();
+        for (session, shell) in &shells {
+            for line in [
+                format!(
+                    "tccd: AUTHREQ_CTX: msgID=5.{session}, service=kTCCServiceCamera, preflight=no"
+                ),
+                format!(
+                    "tccd: AUTHREQ_ATTRIBUTION: msgID=5.{session}, attribution={{accessing=\
+                     {{TCCDProcess: identifier=x, pid={shell}}}}}"
+                ),
+            ] {
+                let event = parse_line(&line).expect("line parses");
+                observer.feed_for_test(ObserverEvent::Line(event), t0);
+            }
+        }
+        let later = t0 + PENDING_PROMPT_THRESHOLD + Duration::from_secs(1);
+        let sessions = || shells.clone();
+        let last = shells[ANNOUNCED_CAP].0;
+
+        let first = observer.take_new_verdicts(later, 1, sessions, |_| None);
+        assert_eq!(first.len(), ANNOUNCED_CAP, "the ring takes what it holds");
+        assert!(!first.contains(&last), "the prompt past it waits");
+        assert!(
+            (0..last).all(|session| observer.marks_session(session)),
+            "and no pending prompt is evicted for it"
+        );
+
+        let answered = TccEvent::Result {
+            msg_id: "5.3".to_owned(),
+        };
+        observer.feed_for_test(ObserverEvent::Line(answered), later);
         assert_eq!(
-            second[0].blocked_on,
-            "macos-permission:SystemPolicyDesktopFolder"
+            observer.take_new_verdicts(later, 1, sessions, |_| None),
+            [last],
+            "an answered entry makes room"
+        );
+        assert!(
+            (0..=last)
+                .filter(|session| *session != 3)
+                .all(|session| observer.marks_session(session)),
+            "and only it goes"
         );
     }
 
@@ -2411,7 +2376,7 @@ mod tests {
             || vec![(4, 4711)],
             |pid| (pid == 18584).then_some(4711),
         );
-        assert_eq!(ours.len(), 1, "and once it IS ours, it pages");
+        assert_eq!(ours.len(), 1, "and once it IS ours, it is announced");
     }
 
     #[test]
@@ -2494,10 +2459,9 @@ mod tests {
             "nothing is judged before the crossing"
         );
         assert_eq!(asked.get(), 1, "and the OS is not asked");
-        let paged = observer.take_new_verdicts(crossing, 1, sessions, pgid);
+        let fresh = observer.take_new_verdicts(crossing, 1, sessions, pgid);
         assert_eq!(asked.get(), 3, "the crossing judges both requests");
-        assert_eq!(paged.len(), 1, "the crossing pages on its own");
-        assert_eq!(paged[0].session, 4);
+        assert_eq!(fresh, [4], "the crossing announces on its own");
         assert_eq!(observer.verdict_deadline(), None, "nothing left to cross");
     }
 
@@ -2525,7 +2489,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unavailable_observer_pages_nobody() {
+    fn an_unavailable_observer_announces_nothing() {
         let t0 = Instant::now();
         let mut observer = ObserverState::inert();
         observer.feed_for_test(ObserverEvent::Started, t0);
@@ -2611,12 +2575,11 @@ mod tests {
     }
 
     #[test]
-    fn an_eperm_storm_posts_exactly_one_notification() {
+    fn an_eperm_storm_refreshes_the_status_item_once() {
         let mut gate = AttentionGate::new();
         let first = gate.note(AttentionEvent::ProtectedEperm { session: Some(3) });
         assert_eq!(first.raise_tab, Some(3));
-        assert!(first.notice.is_some(), "the first denial is news");
-        assert!(first.refresh_status_item);
+        assert!(first.refresh_status_item, "the first denial is news");
         for _ in 0..50 {
             let again = gate.note(AttentionEvent::ProtectedEperm { session: Some(3) });
             assert_eq!(
@@ -2624,20 +2587,18 @@ mod tests {
                 Some(3),
                 "the tab mark is per-tab and cheap"
             );
-            assert!(again.notice.is_none(), "and the notification is spent");
-            assert!(!again.refresh_status_item);
+            assert!(!again.refresh_status_item, "and the glance stays as it is");
         }
     }
 
     #[test]
-    fn a_sentinel_instance_posts_no_banner_and_a_full_instance_still_does() {
+    fn a_sentinel_instance_marks_no_tab_and_a_full_instance_does() {
         for mode in [ObserverMode::Sentinel, ObserverMode::Off] {
             let mut gate = AttentionGate::new();
             let outcome = gate
                 .note(AttentionEvent::ProtectedEperm { session: Some(3) })
                 .for_mode(mode);
             assert_eq!(outcome.raise_tab, None, "{mode:?}: no tab mark");
-            assert!(outcome.notice.is_none(), "{mode:?}: no banner");
             assert!(
                 outcome.refresh_status_item,
                 "{mode:?}: the glance refreshes"
@@ -2648,20 +2609,15 @@ mod tests {
             .note(AttentionEvent::ProtectedEperm { session: Some(3) })
             .for_mode(ObserverMode::Full);
         assert_eq!(outcome.raise_tab, Some(3));
-        assert!(outcome.notice.is_some());
     }
 
     #[test]
-    fn an_instance_level_eperm_marks_no_tab_but_still_notifies() {
+    fn an_instance_level_eperm_marks_no_tab() {
         let mut gate = AttentionGate::new();
         let outcome = gate.note(AttentionEvent::ProtectedEperm { session: None });
         assert_eq!(outcome.raise_tab, None);
-        let notice = outcome.notice.expect("instance denials still notify");
-        assert_eq!(
-            notice.session,
-            u64::MAX,
-            "an instance-level notice names no session, so focus suppresses nothing"
-        );
+        assert!(outcome.refresh_status_item, "the first denial is news");
+        assert!(gate.has_denials(), "and it waits for the same grant");
     }
 
     const REC_PROMPTING_WINDOW: &str = "2026-09-28 17:28:00.090411-0700 0x20dffbe  Default     \

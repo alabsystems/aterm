@@ -256,9 +256,29 @@ impl Document {
         Document { lines, model }
     }
 
-    /// The text, with every edit applied (LF line ends, a final LF).
+    /// The text, with every edit applied (LF line ends, a final LF), and without a Claude Code
+    /// token entry ([`crate::entry_class::claude_token`]), which no vault text holds: one a text
+    /// an older build wrote still carries is left out, so no admin text, edit draft or locker
+    /// this build writes holds it (DESIGN-claude-setup-token §4.4).
     pub fn render(&self) -> SecretBytes {
-        render_lines(self.lines.iter().map(String::as_str))
+        let left_out = self.claude_token_lines();
+        render_lines(
+            self.lines
+                .iter()
+                .enumerate()
+                .filter(|(n, _)| !left_out.iter().any(|lines| lines.contains(n)))
+                .map(|(_, line)| line.as_str()),
+        )
+    }
+
+    /// The lines of each Claude Code token entry this text holds ([`Document::render`]).
+    fn claude_token_lines(&self) -> Vec<std::ops::RangeInclusive<usize>> {
+        self.model
+            .entries
+            .iter()
+            .filter(|located| crate::entry_class::claude_token(&located.entry.name))
+            .map(|located| located.first..=located.last)
+            .collect()
     }
 
     /// The machines, in file order.
@@ -503,16 +523,33 @@ impl Document {
             .collect()
     }
 
-    /// Why this text cannot be published over `base`: an entry it adds names an AI CLI's login
-    /// file ([`cli_login_refusal`]). One `base` already holds is kept, so the vault still opens;
-    /// no machine writes its file.
-    pub fn added_cli_login(&self, base: &Document) -> Option<String> {
-        self.model
+    /// Why this text cannot be published over `base`: an entry it adds or changes is one no
+    /// vault text writes ([`crate::entry_class::text_refusal`]: an AI CLI's login file, another
+    /// name set apart, a Claude Code token), or shares its fold with another entry's name, which
+    /// a Mac's disk makes one file ([`crate::entry_class::folded_pairs`]). One `base` holds as it
+    /// is stays, so a vault an older build wrote still opens; no machine writes its file.
+    pub fn added_refusal(&self, base: &Document) -> Option<String> {
+        let entries: Vec<&Entry> = self
+            .model
             .entries
             .iter()
             .map(|located| &located.entry)
-            .filter(|entry| base.entry(&entry.audience, &entry.name).is_none())
-            .find_map(|entry| cli_login_refusal(&entry.name))
+            .collect();
+        let changed = |entry: &&&Entry| base.entry(&entry.audience, &entry.name) != Some(**entry);
+        if let Some(why) = entries
+            .iter()
+            .filter(changed)
+            .find_map(|entry| crate::entry_class::text_refusal(&entry.name))
+        {
+            return Some(why);
+        }
+        let pairs =
+            crate::entry_class::folded_pairs(entries.iter().map(|entry| entry.name.as_str()));
+        entries.iter().filter(changed).find_map(|entry| {
+            pairs
+                .get(entry.name.as_str())
+                .map(|other| crate::entry_class::folded_pair_refusal(&entry.name, other))
+        })
     }
 
     /// The entry `name` of the sections for `audience`, if there is one.
@@ -565,11 +602,15 @@ impl Document {
                 continue;
             }
             let header = audience.header();
+            // No locker holds a Claude Code token entry ([`Document::render`]).
             let body = self
                 .model
                 .entries
                 .iter()
-                .filter(|located| located.entry.audience == *audience)
+                .filter(|located| {
+                    located.entry.audience == *audience
+                        && !crate::entry_class::claude_token(&located.entry.name)
+                })
                 .flat_map(|located| {
                     self.lines[located.first..=located.last]
                         .iter()
@@ -768,6 +809,9 @@ impl Document {
         }
         if let Some(why) = cli_login_refusal(name) {
             return Err(whole(why));
+        }
+        if crate::entry_class::claude_token(name) {
+            return Err(whole(crate::entry_class::claude_token_refusal(name)));
         }
         if value.len() > MAX_VALUE {
             return Err(whole(format!("the value is larger than {MAX_VALUE} bytes")));
@@ -2483,23 +2527,75 @@ mod tests {
                 "{name} is a CLI's login, no entry"
             );
         }
+        let empty = document.clone();
         document
             .set_entry(
                 &Audience::Everyone,
                 "~/.codex/config.toml",
                 b"model = \"x\"",
             )
-            .expect("a CLI's settings are an entry");
+            .expect("a document holds a CLI's settings path");
+        assert!(
+            document.added_refusal(&empty).is_some(),
+            "a home path aterm does not name: no vault text adds it"
+        );
         let held = Document::parse(&base("[everyone]\n~/.codex/auth.json={}\n"))
             .expect("a vault an older admin wrote one into still parses");
+        assert!(held.added_refusal(&held).is_none(), "one it holds is kept");
         assert!(
-            held.added_cli_login(&held).is_none(),
-            "one it holds is kept"
-        );
-        assert!(
-            held.added_cli_login(&document).is_some(),
+            held.added_refusal(&document).is_some(),
             "one an edit adds is refused"
         );
+    }
+
+    /// No vault text adds or changes a name set apart or a Claude Code token, or makes two names
+    /// one file on a Mac's disk (DESIGN-claude-setup-token §3.1, §4.4); one a text an older build
+    /// wrote holds as it is stays, so its vault still opens. A token entry such a text holds is
+    /// in no text this build renders, no locker included.
+    #[test]
+    fn a_text_adds_no_name_set_apart_no_token_and_no_folded_pair() {
+        const TOKEN: &str = "aterm-claude-token-ac-0123456789abcdef";
+        let older = Document::parse(&base(&format!(
+            "[everyone]\nfoo=1\nGH_ACCESS_TOKEN_ALABSYSTEMS=x\n{TOKEN}=inert-fixture\nbar=2\n"
+        )))
+        .expect("a text an older build wrote parses");
+        assert!(older.added_refusal(&older).is_none(), "what it holds stays");
+        let rendered = String::from_utf8(older.render().as_slice().to_vec()).unwrap();
+        assert!(
+            !rendered.contains(TOKEN) && !rendered.contains("inert-fixture"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("foo=1") && rendered.contains("bar=2"),
+            "{rendered}"
+        );
+        for plan in older.lockers() {
+            let text = String::from_utf8(plan.text.as_slice().to_vec()).unwrap();
+            assert!(!text.contains(TOKEN), "{text}");
+        }
+        let refused = |change: &dyn Fn(&mut Document)| {
+            let mut next = older.clone();
+            change(&mut next);
+            next.added_refusal(&older)
+        };
+        let set = |name: &'static str| {
+            move |doc: &mut Document| doc.set_entry(&Audience::Everyone, name, b"v").unwrap()
+        };
+        let why = refused(&set("Foo")).expect("a folded pair");
+        assert!(why.contains("`Foo` and `foo`"), "{why}");
+        for name in ["~/.zshrc", "Release-Notary", "GH_ACCESS_TOKEN_ALABSYSTEMS"] {
+            assert!(refused(&set(name)).is_some(), "{name}");
+        }
+        assert!(refused(&set("baz")).is_none(), "CONTROL: a shared name");
+        assert!(
+            refused(&set("gh_access_token_alabsystems")).is_none(),
+            "the admin route keeps Held names"
+        );
+        let mut next = older.clone();
+        assert!(next.set_entry(&Audience::Everyone, TOKEN, b"v").is_err());
+        let typed = Document::parse(&base(&format!("[everyone]\n{TOKEN}=typed\n"))).unwrap();
+        let why = typed.added_refusal(&older).expect("typed in");
+        assert!(why.contains("Claude Code token"), "{why}");
     }
 
     #[test]

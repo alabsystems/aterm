@@ -2222,7 +2222,7 @@ fn the_status_record_keeps_one_field_set_on_both_arms_body() {
              needs needs_n needs_told hold_by typed_by typed_ms path program agent agent_detail agent_rev \
              agent_since_ms agent_gen agent_fp wait wait_gib wait_ahead program_state \
              program_state_ms \
-             last_act os_appearance theme_side reported_scheme scheme_from bg_dark \
+             last_act auth token os_appearance theme_side reported_scheme scheme_from bg_dark \
              session_theme theme_origin{conpty} integration input input_bytes input_wait_ms fg_rss_mb \
              disk disk_free_mb disk_room_mb disk_age_ms job job_quiet_ms program_check left syspolicyd \
              syspolicyd_workers syspolicyd_full_ms service_mem service_mem_top occupancy \

@@ -132,8 +132,7 @@ pub mod machine_footprint;
 pub mod overrun;
 pub mod reading;
 pub mod room;
-/// Each admission's `kind=admission` row in this Mac's telemetry log (Continuum TM-0).
-mod telemetry;
+pub mod telemetry;
 pub mod tree_meter;
 #[cfg(unix)]
 pub mod user_namespace;

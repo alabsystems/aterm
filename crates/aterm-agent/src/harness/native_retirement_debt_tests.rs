@@ -29,6 +29,7 @@ fn pending() -> St {
         cwd: None,
         heal: None,
         dialect: super::super::upgrade::Dialect::Zsh,
+        settles: None,
         account_intent: Some(Box::new(
             super::super::accounts_pool::ExecutionIntent::external(),
         )),

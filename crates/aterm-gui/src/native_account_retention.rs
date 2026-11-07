@@ -163,6 +163,14 @@ impl Operations {
     /// Transfer only after acknowledged successor publication. The journal
     /// remains authoritative for the old receipt; a missing operation never
     /// recreates its proof. Return owners for destruction outside the table lock.
+    #[cfg_attr(
+        all(unix, any(test, debug_assertions)),
+        aterm_spec_anchor::refines(
+            machine = "AccountFence",
+            action = "Reclaim",
+            project = "native_act::tests::account_continuation_tests::fence_transaction::fence_transition"
+        )
+    )]
     pub(super) fn compact_account_lineages(&mut self) -> Vec<Arc<Mutex<Operation>>> {
         let mut retired = Vec::new();
         let frontiers = self
@@ -200,7 +208,7 @@ impl Operations {
                 continue;
             };
             let Some(candidate) = self.account_lineages.entries.get(&id).cloned().flatten() else {
-                if !proof.available() {
+                if !proof.keeps_account_frontier() {
                     self.account_lineages.entries.remove(&id);
                 }
                 continue;

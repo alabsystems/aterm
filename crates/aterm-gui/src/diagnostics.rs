@@ -573,7 +573,7 @@ pub(crate) fn config_semantic_warnings(
                 warnings.push(ConfigSemanticWarning {
                     key: "privacy.notice",
                     message: "privacy.notice = true has no effect while privacy.enabled = false; \
-                              the consent notice can never fire"
+                              System State's access steps never run"
                         .to_string(),
                 });
             }

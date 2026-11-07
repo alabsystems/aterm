@@ -962,54 +962,46 @@ fn a_workers_task_follows_only_the_servers_go() {
     };
     let go: &'static str = aterm_types::control_verbs::task_frame_go(task.len()).leak();
     let srv = serve(vec![go].leak(), listener);
-    let spawned = std::cell::RefCell::new(None);
-    let code = worker_exchange(
-        &path,
-        TargetOrigin::Pinned,
-        (&head, task),
-        deadline,
-        &spawned,
-    )
-    .expect("run");
-    assert_eq!(code, ExitCode::SUCCESS);
+    let ((answered, told), printed) = stdout_lines_of(false, || {
+        stderr_lines_of(|| {
+            worker_exchange(&path, TargetOrigin::Pinned, (&head, task), deadline).expect("run")
+        })
+    });
     assert_eq!(
-        spawned.take().as_deref(),
-        Some("s-0e1"),
-        "the sid the instance answered, for the board"
+        answered,
+        WorkerAnswer::Task("OK s-0e1".to_owned(), Some("s-0e1".to_owned())),
+        "the answer, unprinted, and the sid the instance answered, for the board"
+    );
+    assert!(
+        printed.is_empty() && told.is_empty(),
+        "the exchange prints no answer to the task: {printed:?} {told:?}"
     );
     let (listener, first, rest) = srv.join().expect("server");
     assert_eq!(first, format!("{head}\n"));
     assert_eq!(rest, task, "the task, after the GO");
 
     let srv = serve(vec![go, go].leak(), listener);
-    let code = worker_exchange(
-        &path,
-        TargetOrigin::Pinned,
-        (&head, task),
-        deadline,
-        &spawned,
-    )
-    .expect("run");
-    assert_eq!(code, ExitCode::SUCCESS, "a second GO is read past");
+    let answered =
+        worker_exchange(&path, TargetOrigin::Pinned, (&head, task), deadline).expect("run");
+    assert_eq!(
+        answered,
+        WorkerAnswer::Task("OK s-0e1".to_owned(), Some("s-0e1".to_owned())),
+        "a second GO is read past"
+    );
     let (listener, _, rest) = srv.join().expect("server");
     assert_eq!(rest, task);
 
     let old = "ERR usage: spawn [window=<id>] [raise=<t|f>] [cwd=<path>]";
     let srv = serve(vec![format!("{old}\n").leak() as &str].leak(), listener);
-    spawned.take();
-    let (code, said) = stderr_lines_of(|| {
-        worker_exchange(
-            &path,
-            TargetOrigin::Pinned,
-            (&head, task),
-            deadline,
-            &spawned,
-        )
-        .expect("run")
+    let (answered, said) = stderr_lines_of(|| {
+        worker_exchange(&path, TargetOrigin::Pinned, (&head, task), deadline).expect("run")
     });
-    assert_eq!(code, ExitCode::FAILURE);
+    assert_eq!(
+        answered,
+        WorkerAnswer::Said(ExitCode::FAILURE),
+        "a refused spawn started no worker"
+    );
     assert_eq!(said, [old, PREDATES_WORKERS]);
-    assert_eq!(spawned.take(), None, "a refused spawn started no worker");
     let (mut listener, first, rest) = srv.join().expect("server");
     assert_eq!(first, format!("{head}\n"));
     assert!(rest.is_empty(), "not a byte of the task: {rest:?}");
@@ -1024,29 +1016,111 @@ fn a_workers_task_follows_only_the_servers_go() {
         grammar.to_string(),
     ] {
         let srv = serve(vec![format!("{current}\n").leak() as &str].leak(), listener);
-        let (code, said) = stderr_lines_of(|| {
-            worker_exchange(
-                &path,
-                TargetOrigin::Pinned,
-                (&head, task),
-                deadline,
-                &spawned,
-            )
-            .expect("run")
+        let (answered, said) = stderr_lines_of(|| {
+            worker_exchange(&path, TargetOrigin::Pinned, (&head, task), deadline).expect("run")
         });
-        assert_eq!(code, ExitCode::FAILURE);
+        assert_eq!(
+            answered,
+            WorkerAnswer::Said(ExitCode::FAILURE),
+            "a refused spawn started no worker"
+        );
         assert_eq!(
             said,
             [current.as_str()],
             "a current instance's refusal, alone"
         );
-        assert_eq!(spawned.take(), None, "a refused spawn started no worker");
         let (back, first, rest) = srv.join().expect("server");
         listener = back;
         assert_eq!(first, format!("{head}\n"));
         assert!(rest.is_empty(), "not a byte of the task: {rest:?}");
     }
     drop(listener);
+}
+
+/// A WORKER ON THIS MAC IS RECORDED FROM ITS ANSWER, NOT FROM ITS PRINT: a spawn whose answer
+/// cannot be printed (stdout closed: `aterm ctl spawn agent=claude - < task | head -0`, here
+/// this thread's stdout seam) started its worker all the same, so the board holds it, in the
+/// folder its head resolved; the closed stdout is the call's own error alone, which exits 0
+/// (`exit_for`). The answer is printed once, after the board's record.
+/// NEGATIVE CONTROL: the same spawn with stdout open records the same row, and prints `OK` once.
+#[cfg(unix)]
+#[test]
+fn a_spawn_whose_answer_cannot_be_printed_still_records_its_worker() {
+    use std::io::{BufRead, Read};
+    use std::os::unix::net::UnixListener;
+
+    let scratch = test_scratch_dir("unprinted");
+    let sock = scratch.path().join("worker.sock");
+    let listener = UnixListener::bind(&sock).expect("bind mock socket");
+    let path = sock.to_str().expect("utf8 path").to_string();
+    let task = b"go on";
+    let go = aterm_types::control_verbs::task_frame_go(task.len());
+    let srv = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let (conn, _) = listener.accept().expect("accept");
+            let mut w = conn.try_clone().expect("clone");
+            let mut r = std::io::BufReader::new(conn);
+            let mut first = String::new();
+            r.read_line(&mut first).expect("request line");
+            std::io::Write::write_all(&mut w, go.as_bytes()).expect("GO");
+            let mut body = vec![0u8; task.len()];
+            r.read_exact(&mut body).expect("the task");
+            std::io::Write::write_all(&mut w, b"OK s-0e1 task_rev=1\n").expect("answer");
+            let _ = r.read_to_end(&mut Vec::new());
+        }
+    });
+    let targets = Targets {
+        hosting: Vec::new(),
+        last: LastTarget::Sock(path),
+    };
+    for (n, closed) in [true, false].into_iter().enumerate() {
+        let dir = scratch.path().join(format!("board-{n}"));
+        let _here = board::HereGuard::at(&dir);
+        let worker = HereWorker {
+            head: "spawn agent=claude cwd=/Users//me/work/w from=s-5e1",
+            task,
+            args: ["agent=claude", "cwd=w", "-"].map(str::to_owned).into(),
+            label: Some("dx".to_owned()),
+            starter: Some("s-5e1"),
+            pwd: Some(Path::new("/Users//me/work")),
+        };
+        let (ended, printed) = stdout_lines_of(closed, || {
+            spawn_worker_here(&targets, worker, Some(std::time::Duration::from_secs(60)))
+        });
+        if closed {
+            let e = ended.expect_err("stdout closed");
+            assert!(is_stdout_closed(&e), "{e}");
+            assert_eq!(exit_for(&e), ExitCode::SUCCESS, "a closed stdout");
+        } else {
+            assert_eq!(ended.expect("printed"), ExitCode::SUCCESS);
+        }
+        assert_eq!(
+            printed,
+            ["OK s-0e1 task_rev=1"],
+            "the answer, printed once (closed stdout: {closed})"
+        );
+        let row = board::Board::at(&dir)
+            .row("s-0e1")
+            .unwrap_or_else(|| panic!("the board holds the worker (closed stdout: {closed})"));
+        assert_eq!(
+            (
+                row.node,
+                row.host,
+                row.label.as_deref(),
+                row.cwd.as_deref(),
+                row.from.as_deref()
+            ),
+            (
+                None,
+                board::host_name(),
+                Some("dx"),
+                Some("/Users//me/work/w"),
+                Some("s-5e1")
+            ),
+            "closed stdout: {closed}"
+        );
+    }
+    srv.join().expect("server");
 }
 
 #[test]

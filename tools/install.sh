@@ -5850,6 +5850,18 @@ zsh_rc_fold_home() { # <output-variable> <home>
 	fi
 }
 
+# Add a distinct normalized input to zsh_rc_dir's invocation-local home/root
+# arrays. Reuse only identical input bytes, even when two inputs fold alike.
+zsh_rc_add_home_root() { # <normalized-home>; caller owns zrc_home_inputs/zrc_roots
+	local zahr_seen zahr_folded
+	for zahr_seen in ${zrc_home_inputs[@]+"${zrc_home_inputs[@]}"}; do
+		[ "$zahr_seen" = "$1" ] && return 0
+	done
+	zsh_rc_fold_home zahr_folded "$1" || return 1
+	zrc_home_inputs+=("$1")
+	zrc_roots+=("$zahr_folded")
+}
+
 # The same consent roots as atpkg/protected.rs. Call before querying a candidate,
 # including a link's target text; a lexical prefix must never request consent.
 # macOS conservatively reserves case/canonical aliases on case-sensitive volumes
@@ -5984,26 +5996,23 @@ zsh_ask_secs() { # <output-variable>
 # before metadata, and a fresh nonce plus byte count binds the binary reply.
 zsh_rc_dir() { # <output-variable>
 	printf -v "$1" '%s' ''
-	local zrc_uid zrc_named zrc_home zrc_kind zrc_account zrc_physical zrc_own=0 zrc_root
-	local zrc_roots=() zrc_accounts=() zrc_file zrc_seen=0 zrc_zsh="" zrc_dir="" zrc_confine=""
+	local zrc_uid zrc_named zrc_home zrc_kind zrc_account zrc_physical zrc_own=0
+	local zrc_roots=() zrc_home_inputs=() zrc_accounts=() zrc_file zrc_seen=0 zrc_zsh="" zrc_dir="" zrc_confine=""
 	local zrc_tmp zrc_nonce zrc_begin zrc_end zrc_field zrc_count zrc_finish zrc_status=0 zrc_wait
 	zrc_uid="$(installer_uid)"
 	[[ "$zrc_uid" != 0 ]] || return 0
 	# zrc_roots holds each home folded once (zsh_rc_fold_home), as every walk
 	# compares against it; a home whose fold fails refuses before any query.
 	zsh_rc_lexical zrc_named "$HOME" || return 0
-	zsh_rc_fold_home zrc_root "$zrc_named" || return 0
-	zrc_roots+=("$zrc_root")
+	zsh_rc_add_home_root "$zrc_named" || return 0
 	while IFS= read -r zrc_account; do
 		zsh_rc_lexical zrc_account "$zrc_account" || continue
-		zsh_rc_fold_home zrc_root "$zrc_account" || return 0
-		zrc_roots+=("$zrc_root")
+		zsh_rc_add_home_root "$zrc_account" || return 0
 		zrc_accounts+=("$zrc_account")
 	done <<<"$(account_homes "$zrc_uid")"
 	zsh_rc_walk zrc_home zrc_kind "$HOME" "" "${zrc_roots[@]}" || return 0
 	[[ "$zrc_kind" == dir || "$zrc_kind" == missing ]] || return 0
-	zsh_rc_fold_home zrc_root "$zrc_home" || return 0
-	zrc_roots+=("$zrc_root")
+	zsh_rc_add_home_root "$zrc_home" || return 0
 	for zrc_account in ${zrc_accounts[@]+"${zrc_accounts[@]}"}; do
 		if [[ "$zrc_account" == "$zrc_named" ]] ||
 			{ zsh_rc_walk zrc_physical zrc_kind "$zrc_account" "" "${zrc_roots[@]}" && [[ "$zrc_physical" == "$zrc_home" ]]; }; then

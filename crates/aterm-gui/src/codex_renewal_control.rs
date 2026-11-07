@@ -362,6 +362,7 @@ fn make_prepare(
         env.push(("CODEX_AUTH_PATH".into(), path.clone()));
     }
     let rollback = RestartCommand {
+        settles: None,
         account_intent: None,
         image: process.image.clone(),
         program: program.clone(),
@@ -375,6 +376,7 @@ fn make_prepare(
     env.retain(|(name, _)| name != "CODEX_AUTH_PATH");
     env.push(("CODEX_AUTH_PATH".into(), next.new_auth.to_str()?.into()));
     let forward = RestartCommand {
+        settles: None,
         account_intent: None,
         env,
         ..rollback.clone()
@@ -613,7 +615,7 @@ pub(super) fn ready_native_no_go(ctx: &crate::SessionCtx, id: &str) -> bool {
         .native
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    if table.reservations.contains(id) || table.renewal_seals.contains_key(id) {
+    if table.reservations.contains_key(id) || table.renewal_seals.contains_key(id) {
         return false;
     }
     let Some(operation) = table.by_id.get(id).cloned() else {
@@ -1424,6 +1426,7 @@ mod tests {
             image: image.clone(),
         };
         let command = RestartCommand {
+            settles: None,
             account_intent: None,
             image: image.clone(),
             program: "/fixture-image".into(),
@@ -1692,7 +1695,7 @@ mod tests {
                 login: None,
                 home: None,
                 auth_observed: false,
-                stored_login: true,
+                route: aterm_agent::harness::accounts::AuthRoute::Stored,
                 conversation: Some("captured-conversation".into()),
                 profile: None,
                 mode: aterm_agent::harness::accounts::Mode::Wall,

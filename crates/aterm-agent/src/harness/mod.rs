@@ -22,6 +22,15 @@ pub mod accounts_overlay;
 pub mod accounts_pool;
 pub mod accounts_step;
 pub mod accounts_sync;
+/// `aterm harness accounts token-run`: the token wrapper
+/// (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.3).
+pub mod accounts_token_run;
+/// The vault token state every surface shows, and the quiet offer
+/// (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.9, §5.10).
+#[cfg(unix)]
+pub mod accounts_token_view;
+#[cfg(unix)]
+pub mod accounts_tokens;
 pub mod acts;
 pub mod agent_image;
 pub mod agents;
@@ -144,6 +153,10 @@ pub mod resume;
 mod safari_window;
 pub mod self_claimed;
 pub mod session_usage;
+/// The setup-token capture: Claude Code's `setup-token` on a private terminal, its token taken
+/// and nothing else of it kept (`docs/DESIGN-claude-setup-token-2026-11-05.md` §4.5).
+#[cfg(unix)]
+pub mod setup_token;
 pub(crate) mod sign_in_ladder;
 pub mod source;
 pub mod spend;
@@ -153,6 +166,9 @@ pub mod steps;
 pub mod tap;
 /// The harness's clock: every bounded wait of the live upgrade and the relaunch, as one value ([`Timings`]).
 pub mod timings;
+/// The one judgment of whether a Claude Code launch starts on its vault token
+/// (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.3).
+pub mod token_route;
 pub use timings::Timings;
 pub(crate) mod transcript;
 pub use transcript::{claude_reads, codex_reads};

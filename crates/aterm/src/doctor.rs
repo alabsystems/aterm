@@ -1540,10 +1540,18 @@ fn ai_accounts_due(env: &aterm_agent::harness::cli::Env) -> Option<String> {
 /// CLI's whose roster this machine keeps after it (`other CLIs: codex 1, kimi 1`), then the
 /// vault sheet's rows that conflict for an address this machine's pools skip
 /// (`accounts_sync::sheet_conflicts`: each CLI and its rows, never the address), so `aterm init`
-/// and `aterm doctor` say it on a Mac with no window. A machine with Claude Code's alone reads
-/// as it always did.
+/// and `aterm doctor` say it on a Mac with no window; last, the vault tokens' words
+/// ([`ai_accounts_token_words`]), which keep the row's standing. A machine with Claude Code's
+/// alone reads as it always did before those words.
 #[cfg(unix)]
 fn ai_accounts_probe(env: &aterm_agent::harness::cli::Env) -> aterm_converge::Probe {
+    with_token_words(ai_accounts_rows_probe(env), ai_accounts_token_words(env))
+}
+
+/// [`ai_accounts_probe`] before its vault token words: the swarm's and the sync's switches, the
+/// pools and the sheet's conflicts.
+#[cfg(unix)]
+fn ai_accounts_rows_probe(env: &aterm_agent::harness::cli::Env) -> aterm_converge::Probe {
     use aterm_agent::harness::accounts_sync::{
         ACCOUNTS_SYNC_OFF, accounts_sync_off, sheet_conflicts, sheet_conflicts_words,
     };
@@ -1588,6 +1596,45 @@ fn ai_accounts_probe(env: &aterm_agent::harness::cli::Env) -> aterm_converge::Pr
         },
         other => other,
     }
+}
+
+/// `probe` with the vault token `words` after what it says (or will say), its standing kept:
+/// they report, and ask nothing of the row.
+#[cfg(unix)]
+fn with_token_words(probe: aterm_converge::Probe, words: Option<String>) -> aterm_converge::Probe {
+    use aterm_converge::Probe;
+    let Some(words) = words else {
+        return probe;
+    };
+    match probe {
+        Probe::Ok { now } => Probe::Ok {
+            now: format!("{now}; {words}"),
+        },
+        Probe::NotApplicable { why } => Probe::NotApplicable {
+            why: format!("{why}; {words}"),
+        },
+        Probe::Change { from, to } => Probe::Change {
+            from,
+            to: format!("{to}; {words}"),
+        },
+        other => other,
+    }
+}
+
+/// The accounts row's vault token words (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.10):
+/// how many of this Mac's Claude Code accounts' tokens are active, soon, unverified, not yet in
+/// vault and rejected, read value-free; `unknown (vault not read)` where the vault's read failed;
+/// nothing where no home is known or no vault is configured.
+#[cfg(unix)]
+fn ai_accounts_token_words(env: &aterm_agent::harness::cli::Env) -> Option<String> {
+    use aterm_agent::harness::accounts_token_view as view;
+    view::view_here(
+        &env.state,
+        env.config.as_deref(),
+        env.home.as_deref(),
+        env.now,
+    )
+    .map(|accounts| view::doctor_words(&accounts))
 }
 
 /// [`ai_accounts_probe`] before the sheet's conflicts: Claude Code's pool, the pools due a sync,

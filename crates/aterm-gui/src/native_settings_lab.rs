@@ -13,6 +13,20 @@ use aterm_types::network_state::{ServiceAvailability, ServiceState};
 pub(super) const LAB_ACTION_PREFIX: &str = "lab/";
 pub(super) const LAB_ACCOUNTS_REFRESH: &str = "lab/accounts/refresh";
 
+/// The action of account row `index`'s vault token offer (`lab/account/<index>/token`).
+pub(super) fn token_action(index: usize) -> String {
+    format!("lab/account/{index}/token")
+}
+
+/// The account row a [`token_action`] names.
+fn token_index(action: &str) -> Option<usize> {
+    action
+        .strip_prefix("lab/account/")?
+        .strip_suffix("/token")?
+        .parse()
+        .ok()
+}
+
 pub(super) fn lab_commands(lab: &LabState) -> Vec<Command> {
     vec![Command {
         id: ActionId::new(LAB_ACCOUNTS_REFRESH),
@@ -32,6 +46,17 @@ impl SettingsApp {
         if action == LAB_ACCOUNTS_REFRESH {
             if !self.harness.lab.collecting {
                 cx.harness(HarnessRequest::LabAccountsRefresh);
+            }
+        } else if let Some(index) = token_index(action) {
+            if self
+                .harness
+                .lab
+                .accounts
+                .rows
+                .get(index)
+                .is_some_and(|row| row.offer.is_some())
+            {
+                cx.harness(HarnessRequest::LabToken { index });
             }
         } else {
             return EventResult::Bubble;
@@ -210,11 +235,30 @@ pub(super) fn lab_page(
     for (index, account) in lab.accounts.rows.iter().enumerate() {
         let mut rows = vec![("Account".into(), account.label.clone())];
         rows.extend(account.facts.iter().cloned());
-        cards.extend(facts(
+        let mut group = facts(
             &format!("lab/account/{index}"),
             ("CLAUDE ACCOUNT", "CLAUDE ACCOUNT"),
             &rows,
-        ));
+        );
+        // The quiet offer's one step: a tab beside the person's that runs the verb (§5.9).
+        if let (Some(offer), Some((card, height))) = (&account.offer, group.last_mut()) {
+            let action = token_action(index);
+            let (step, step_height) = button(
+                &action,
+                if offer.replace {
+                    "Replace vault token"
+                } else {
+                    "Make vault token"
+                },
+                ActionId::new(action.as_str()),
+                inner,
+                true,
+            );
+            card.children.push(step);
+            *height += step_height + 4.0;
+            card.layout.height = Length::Fixed(*height);
+        }
+        cards.extend(group);
     }
 
     for session in &lab.sessions {

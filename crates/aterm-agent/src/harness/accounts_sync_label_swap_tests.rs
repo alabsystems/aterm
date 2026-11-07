@@ -1887,7 +1887,7 @@ fn a_departing_accounts_provider_key_preserves_its_record_before_label_reuse() {
                             who: &accounts::ProcessLogin {
                                 login: old_row.dir.clone(),
                                 default_home: false,
-                                stored_login: true,
+                                route: crate::harness::accounts::AuthRoute::Stored,
                             },
                         },
                         |_, _| {

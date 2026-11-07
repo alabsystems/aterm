@@ -194,7 +194,10 @@ fn activity_contexts_fence_process_birth_conversation_and_authentication() {
                 2 => kept.snapshot.as_mut().unwrap().session = Some("another-conversation".into()),
                 3 => kept.snapshot.as_mut().unwrap().login = Some("/synthetic/other-login".into()),
                 4 => kept.snapshot.as_mut().unwrap().home = Some("/synthetic/other-home".into()),
-                5 => kept.snapshot.as_mut().unwrap().stored_login = true,
+                5 => {
+                    kept.snapshot.as_mut().unwrap().route =
+                        aterm_agent::harness::accounts::AuthRoute::Stored
+                }
                 6 => kept.account.landing = Arc::new(Mutex::new(())),
                 7 => kept.account.activity_context = None,
                 _ => unreachable!(),
@@ -231,7 +234,7 @@ fn set_work(kept: &mut Kept, row: &accounts::Row, kind: i32) {
                 who: accounts::ProcessLogin {
                     login: None,
                     default_home: true,
-                    stored_login: true,
+                    route: aterm_agent::harness::accounts::AuthRoute::Stored,
                 },
                 roster: "/synthetic/roster".into(),
                 state: "/synthetic/state".into(),

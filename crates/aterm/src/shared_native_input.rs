@@ -23,7 +23,7 @@ pub(super) fn entry(scope: &aterm_db::table::Scope, key: &str, provider: Provide
     hash.update([0]);
     hash.update(key.as_bytes());
     let mut out = String::with_capacity(63);
-    out.push_str("native-api-key-");
+    out.push_str(aterm_secrets::entry_class::NATIVE_API_KEY_PREFIX);
     aterm_codec::hex::push_lower(&mut out, &hash.finalize()[..24]);
     out
 }

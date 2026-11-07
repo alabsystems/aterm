@@ -3,7 +3,8 @@
 
 //! THE WRITER: rows go to a thread of their own through a bounded queue, so no session waits
 //! on the disk. [`Sink::emit`] never blocks: a row that finds the queue full is counted, and the
-//! writer says how many it lost in a `kind=gap` line before its next batch.
+//! writer says how many it lost in a `kind=gap` line before its next batch, a write of its own
+//! ([`Log::append_saying`]), so a batch that fails after it never has the line's rows said again.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError};
@@ -11,7 +12,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use crate::log::Log;
-use crate::row::{Row, gap_line};
+use crate::row::Row;
 
 /// How many rows the queue holds before [`Sink::emit`] drops one.
 pub const QUEUE: usize = 1024;
@@ -89,14 +90,11 @@ impl Sink {
 fn run(log: &Log, rx: &Receiver<Msg>, counts: &Counts) {
     let mut told = 0u64;
     let mut flushes = Vec::new();
-    let mut lines = Vec::with_capacity(BATCH + 1);
+    let mut lines = Vec::with_capacity(BATCH);
     while let Ok(first) = rx.recv() {
         lines.clear();
         let mut rows = 0usize;
         let lost = counts.dropped.load(Ordering::Relaxed);
-        if lost > told {
-            lines.push(gap_line(crate::now_ms(), lost - told));
-        }
         let mut take = |msg: Msg, lines: &mut Vec<String>, rows: &mut usize| match msg {
             Msg::Row(row) => {
                 lines.push(row.line());
@@ -111,13 +109,17 @@ fn run(log: &Log, rx: &Receiver<Msg>, counts: &Counts) {
                 Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
             }
         }
-        if !lines.is_empty() {
-            match log.append(&lines) {
+        let said = lost.saturating_sub(told);
+        if !lines.is_empty() || said > 0 {
+            match log.append_saying(said, &lines) {
                 Ok(_) => {
                     told = lost;
                     counts.written.fetch_add(rows as u64, Ordering::Relaxed);
                 }
-                Err(_) => {
+                Err((_, gap_written)) => {
+                    if gap_written {
+                        told = lost;
+                    }
                     counts.dropped.fetch_add(rows as u64, Ordering::Relaxed);
                 }
             }

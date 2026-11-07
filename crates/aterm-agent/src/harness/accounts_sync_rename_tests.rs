@@ -632,7 +632,7 @@ fn renamed_accounts_refuse_stale_completions_for_the_reused_label() {
     let who = accounts::ProcessLogin {
         login: old_row.dir.clone(),
         default_home: true,
-        stored_login: true,
+        route: crate::harness::accounts::AuthRoute::Stored,
     };
     bed.sync().unwrap();
     let roster = Roster::load(&bed.path).unwrap();

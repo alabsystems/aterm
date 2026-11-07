@@ -74,6 +74,10 @@ fn account_usage_of(
 #[path = "harness_host_agent_gate_tests.rs"]
 mod agent_gate_tests;
 
+#[cfg(unix)]
+#[path = "harness_host_token_tests.rs"]
+mod token_tests;
+
 #[path = "harness_host_landed_restart_tests.rs"]
 mod landed_restart_tests;
 
@@ -1200,7 +1204,7 @@ fn restored(sid: &str, place: &str) -> RestoredAgent {
         snap: Snapshot {
             launch_env: None,
             auth_observed: true,
-            stored_login: false,
+            route: aterm_agent::harness::accounts::AuthRoute::Outside,
             profile: None,
             tab: sid.to_string(),
             pid: 4242,
@@ -2915,7 +2919,7 @@ fn the_disk_watch_searches_where_the_agents_work_and_the_shared_roots() {
         started: None,
         cwd: Some(home.join("work")),
         profile: None,
-        stored_login: true,
+        route: aterm_agent::harness::accounts::AuthRoute::Stored,
     };
     let running = aterm_agent::harness::disk::discover::Running {
         claudes: vec![claude.clone()],
@@ -7096,7 +7100,7 @@ fn snap(sid: &str) -> Snapshot {
     Snapshot {
         launch_env: None,
         auth_observed: true,
-        stored_login: false,
+        route: aterm_agent::harness::accounts::AuthRoute::Outside,
         profile: None,
         tab: sid.to_string(),
         pid: 4242,
@@ -9179,7 +9183,7 @@ fn a_landed_agent_missed_is_read_again_a_production_pause_later() {
     let snap = |pid: u32| Snapshot {
         launch_env: None,
         auth_observed: true,
-        stored_login: false,
+        route: aterm_agent::harness::accounts::AuthRoute::Outside,
         profile: None,
         tab: SID.to_string(),
         pid,
@@ -9851,8 +9855,8 @@ fn the_live_recorder_reads_a_stand_ins_environment_and_its_transcripts_wall() {
             argv,
             login: args.env_var(accounts::LOGIN_ENV).map(str::to_owned),
             home: args.env_var(accounts::HOME_ENV).map(str::to_owned),
-            stored_login: accounts::ProcessLogin::of_exec_env(&args.env)
-                .is_some_and(|who| who.stored_login),
+            route: accounts::ProcessLogin::of_exec_env(&args.env)
+                .map_or(accounts::AuthRoute::Outside, |who| who.route),
             session: Some(TALK.to_string()),
             ..snap("s-live")
         }
@@ -10299,7 +10303,7 @@ impl Accts {
         }
         self.procs.lock().unwrap().insert(pid, env);
         let snap = Snapshot {
-            stored_login: true,
+            route: aterm_agent::harness::accounts::AuthRoute::Stored,
             pid,
             start: aterm_agent::harness::footer::lstart_utc(u64::try_from(started).unwrap()),
             session: Some(talk.to_string()),
@@ -11142,7 +11146,7 @@ fn codex_pool_advice_records_thread_rollout_sample_and_plans_at_measured_wall() 
     snap.program = aterm_agent::harness::codex_alab::lay_package(&a.tmp.path().join("store"), true);
     snap.argv = vec![snap.program.display().to_string()];
     snap.login = None;
-    snap.stored_login = false;
+    snap.route = aterm_agent::harness::accounts::AuthRoute::Outside;
     snap.run = relaunch::AgentRun::Codex(relaunch::CodexRun {
         home: codex_home.clone(),
         home_env: None,
@@ -12514,7 +12518,7 @@ fn the_probe_is_claimed_once_under_the_lock_for_the_process_that_asked() {
             who: accounts::ProcessLogin {
                 login: None,
                 default_home: true,
-                stored_login: true
+                route: accounts::AuthRoute::Stored
             },
             roster: a.roster_path(),
             state: a.state_root(),
@@ -18488,7 +18492,7 @@ fn the_tabs_on_one_login_share_its_one_sign_in() {
         idle.login_latches = Arc::clone(&host.shared.login_latches);
         idle.kept.lock().unwrap().snapshot = Some(Snapshot {
             pid,
-            stored_login: pid != 8,
+            route: aterm_agent::harness::accounts::AuthRoute::Stored.unless(pid == 8),
             home: (pid == 3).then(|| "/work/b".to_string()),
             ..snap(sid)
         });
@@ -33055,7 +33059,7 @@ fn the_normal_roster_read_recovers_lifecycle_records_and_preserves_conflicts() {
         let who = accounts::ProcessLogin {
             login: Some(login),
             default_home: true,
-            stored_login: true,
+            route: aterm_agent::harness::accounts::AuthRoute::Stored,
         };
         let witness = store.logins_witness_file();
         let retained = witness.with_extension("retained");
@@ -33558,7 +33562,7 @@ impl TapWorld {
         }
         let idle = idle_host(TAP_SID, Program::Claude, switched(cfg), hooks);
         idle.kept.lock().unwrap().snapshot = Some(Snapshot {
-            stored_login: stored,
+            route: aterm_agent::harness::accounts::AuthRoute::Stored.unless(!stored),
             profile: None,
             pid: TAP_PID,
             argv,
@@ -35836,6 +35840,55 @@ fn a_hung_install_counts_only_its_own_quiet() {
         &hooks,
     );
     assert_eq!(w.marks(), [stalled("s-a", installing_hold())]);
+}
+
+#[test]
+fn an_installs_quiet_clock_restarts_after_a_protected_wait() {
+    for state in [StartupState::Working, StartupState::Reopened] {
+        for (panel, claim_held) in [(false, false), (true, false), (false, true)] {
+            let w = Arc::new(StartupWorld::default());
+            let hooks = w.hooks();
+            let none = OffSessions::default();
+            let t0 = Instant::now();
+            let worker = Startup {
+                installing: true,
+                ..startup("s-a", state, t0, StartupSeen::Holds(installing_hold()))
+            };
+            w.set(vec![worker.clone()]);
+            let mut books = Startups::default();
+            look_at_startups(&mut books, t0, true, &none, &hooks);
+            let held = t0 + INSTALL_QUIET_LIMIT;
+            if claim_held {
+                w.set(vec![Startup {
+                    seen: StartupSeen::CannotClaim,
+                    ..worker.clone()
+                }]);
+            } else if panel {
+                books.waits.own_panel.insert("s-a".to_string(), held);
+            } else {
+                books.waits.relaunching.insert("s-a".to_string());
+            }
+            look_at_startups(&mut books, held, true, &none, &hooks);
+            assert!(w.marks().is_empty());
+            books.waits = HarnessWaits::default();
+            w.set(vec![worker]);
+            let back = held + Duration::from_secs(1);
+            look_at_startups(&mut books, back, true, &none, &hooks);
+            look_at_startups(
+                &mut books,
+                back + INSTALL_QUIET_LIMIT - Duration::from_secs(1),
+                true,
+                &none,
+                &hooks,
+            );
+            assert!(
+                w.marks().is_empty(),
+                "state={state:?}, panel={panel}, claim_held={claim_held}"
+            );
+            look_at_startups(&mut books, back + INSTALL_QUIET_LIMIT, true, &none, &hooks);
+            assert_eq!(w.marks(), [stalled("s-a", installing_hold())]);
+        }
+    }
 }
 
 /// A HUNG INSTALL HIDES NO AGENT. The install is what holds a worker only where its screen shows a
@@ -45703,7 +45756,7 @@ fn worker_idle_agent_resumed_refreshes_an_uncaptured_foreground_snapshot() {
             login: None,
             home: None,
             claude_dir: None,
-            stored_login: true,
+            route: aterm_agent::harness::accounts::AuthRoute::Stored,
             profile: None,
         };
         let mut h = hooks(&world, parking_body(&world));

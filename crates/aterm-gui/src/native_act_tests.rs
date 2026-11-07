@@ -100,6 +100,12 @@ struct Facts {
     historical_pin_probe: Option<(std::sync::Weak<crate::SessionCtx>, Arc<AtomicBool>)>,
     receipt_history: Mutex<Vec<(Prepare, Binding)>>,
     receipt_gate: Option<PublicationGate>,
+    #[cfg(unix)]
+    fence_allowed: AtomicBool,
+    #[cfg(unix)]
+    fence_ack: AtomicBool,
+    #[cfg(unix)]
+    fence_gate: Option<PublicationGate>,
     processes: Arc<Mutex<BTreeMap<u32, Process>>>,
     foreground: AtomicU32,
     signals: AtomicU32,
@@ -242,6 +248,12 @@ impl Facts {
             historical_pin_probe: None,
             receipt_history: Mutex::new(Vec::new()),
             receipt_gate: None,
+            #[cfg(unix)]
+            fence_allowed: AtomicBool::new(true),
+            #[cfg(unix)]
+            fence_ack: AtomicBool::new(true),
+            #[cfg(unix)]
+            fence_gate: None,
             processes: Arc::new(Mutex::new(BTreeMap::from([
                 (actor.pid, actor),
                 (child.pid, child),
@@ -275,6 +287,52 @@ impl Facts {
 }
 
 impl Kernel for Facts {
+    fn fence_account_claim(
+        &self,
+        relation: &aterm_agent::harness::native_account_wire::Relation,
+    ) -> Option<account_fence::FenceRecord> {
+        #[cfg(unix)]
+        {
+            if !self.fence_allowed.load(Ordering::SeqCst) {
+                return None;
+            }
+            let record = self
+                .native_journal
+                .as_ref()?
+                .fence_account(aterm_agent::harness::native_receipts::AccountRelation {
+                    predecessor: relation.predecessor().prepare(),
+                    predecessor_binding: relation.predecessor().binding(),
+                    phase: relation.phase(),
+                    candidate: relation.candidate(),
+                })
+                .ok()?;
+            if let Some((entered, proceed)) = &self.fence_gate {
+                entered.send(()).unwrap();
+                let (lock, ready) = &**proceed;
+                let (guard, waited) = ready
+                    .wait_timeout_while(lock.lock().unwrap(), PATIENCE, |go| !*go)
+                    .unwrap();
+                assert!(
+                    *guard && !waited.timed_out(),
+                    "fence worker was not released"
+                );
+            }
+            if !self.fence_ack.load(Ordering::SeqCst)
+                || record.outcome != aterm_agent::harness::native_receipts::AccountOutcome::Fenced
+            {
+                return None;
+            }
+            Some(account_fence::FenceRecord {
+                sequence: record.sequence,
+                recorded_ms: record.recorded_ms,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = relation;
+            None
+        }
+    }
     fn record_account_closure(
         &self,
         prepare: &Prepare,
@@ -618,6 +676,10 @@ impl Kernel for Facts {
         if !self.receipt_readable.load(Ordering::SeqCst) {
             return Err(());
         }
+        #[cfg(unix)]
+        if let Some(journal) = &self.native_journal {
+            return journal.contains_operation(id).map_err(|_| ());
+        }
         Ok(self
             .prepared_history
             .lock()
@@ -842,6 +904,7 @@ fn image(inode: u64) -> Image {
 
 fn restart_command(inode: u64) -> RestartCommand {
     RestartCommand {
+        settles: None,
         account_intent: None,
         image: image(inode),
         program: format!("/image-{inode}"),
@@ -989,7 +1052,7 @@ fn sealed_cold_restart_admission_requires_builtin_relaunch_without_rollback() {
             login: None,
             home: None,
             auth_observed: false,
-            stored_login: true,
+            route: aterm_agent::harness::accounts::AuthRoute::Stored,
             conversation: Some("captured-conversation".into()),
             profile: None,
             mode: aterm_agent::harness::accounts::Mode::Wall,
@@ -2080,7 +2143,7 @@ fn codex_renewal_ready_retirement_requires_a_closed_native_capability() {
         .lock()
         .unwrap()
         .reservations
-        .insert(id.clone());
+        .insert(id.clone(), None);
     assert!(!renewal::ready_native_no_go(ctx, &id));
     ctx.fenced_writes
         .native

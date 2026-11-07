@@ -14,6 +14,7 @@ use crate::init_observe::{LastReading, Reading, Wait};
 use crate::items::{Ctx, Item};
 use crate::model::{ItemReport, Mode, Probe, User};
 use crate::port::{GithubError, GithubFailure, Secret, System};
+use crate::sync::repository_refresh::{Admission, Execution, RepositoryPass, Ticket};
 use aterm_converge::{Class, Layer, Remedy, Requires};
 use aterm_secrets::converge::RepositoryWork;
 use aterm_types::macos_setup::FailureKind;
@@ -116,11 +117,13 @@ pub(super) fn item(
     after: Option<String>,
     unasked: bool,
     work: RepositoryWork,
+    execution: Option<Execution>,
 ) -> Box<dyn Item> {
     Box::new(NativeRepositories {
         after,
         unasked,
         work,
+        execution,
         ..NativeRepositories::new(user.clone(), None)
     })
 }
@@ -172,6 +175,9 @@ struct NativeRepositories {
     user: User,
     /// The caller's scheduling intent; it grants no authority over the captured source.
     work: RepositoryWork,
+    execution: Option<Execution>,
+    refresh: Mutex<Option<ActiveRefresh>>,
+    lease: Mutex<Option<Arc<RepositoryPass>>>,
     /// How many repositories the last probe found and whether it signed in, for
     /// System State.
     reading: LastReading,
@@ -209,6 +215,12 @@ pub struct InitialRepositoryInputs {
     local: Result<LocalInputs, Block>,
     source: Option<super::source::Stamp>,
     authority: InputAuthority,
+    execution: Option<Execution>,
+}
+
+struct ActiveRefresh {
+    pass: Arc<RepositoryPass>,
+    ticket: Ticket,
 }
 
 #[derive(Clone)]
@@ -236,6 +248,36 @@ struct Captured {
 }
 
 impl InitialRepositoryInputs {
+    /// The same opaque scheduling identity used by the local-input observer.
+    /// It grants no permission over the captured files or a later Git effect.
+    /// # Errors
+    /// The account, default source or local scheduling inputs cannot be admitted.
+    pub fn refresh_scope(
+        &self,
+        sys: &dyn System,
+    ) -> Result<aterm_secrets::converge::RefreshScope, String> {
+        if self.user.uid != sys.euid() || self.user.uid == 0 {
+            return Err("repository refresh belongs to this login alone".into());
+        }
+        let local = self.local.as_ref().map_err(|block| block.why.clone())?;
+        if local.configured.is_some() {
+            return Err("explicit repository profiles use their own apply policy".into());
+        }
+        super::source::refresh_scope(
+            sys,
+            &self.user,
+            self.source
+                .as_ref()
+                .ok_or("repository input source is not ready")?,
+        )
+    }
+    /// Reuse the enclosing pass's one alignment lease. This supplies scheduling
+    /// intent alone; all captured-input and effect admission remains unchanged.
+    #[must_use]
+    pub fn with_repository_execution(mut self, execution: Option<Execution>) -> Self {
+        self.execution = execution;
+        self
+    }
     /// Read only local admitted profile/token files, for a caller holding its
     /// vault's ready materialization against writers. A blocked local reading is
     /// kept for the item's probe to report without reading those files again.
@@ -281,6 +323,7 @@ impl InitialRepositoryInputs {
             local,
             source,
             authority: InputAuthority::Caller,
+            execution: None,
         }
     }
 
@@ -290,6 +333,7 @@ impl InitialRepositoryInputs {
             local: Err(why.into()),
             source: None,
             authority: InputAuthority::Caller,
+            execution: None,
         };
         let table = match super::profile(sys, user) {
             Ok(profile) => profile.and_then(|profile| profile.github),
@@ -474,10 +518,25 @@ impl InitialRepositoryInputs {
 }
 
 impl NativeRepositories {
+    /// Capture this item's ready generation lazily, including a direct apply.
+    /// Blocked observations remain retryable rather than filling the ready slot.
+    fn prepared_inputs(&self, sys: &dyn System) -> InitialRepositoryInputs {
+        self.prepared.get().cloned().unwrap_or_else(|| {
+            let inputs = InitialRepositoryInputs::ready(sys, &self.user);
+            if inputs.local.is_ok() {
+                let _ = self.prepared.set(inputs.clone());
+            }
+            inputs
+        })
+    }
+
     fn new(user: User, captured: Option<Captured>) -> Self {
         Self {
             user,
             work: RepositoryWork::Refresh,
+            execution: None,
+            refresh: Mutex::new(None),
+            lease: Mutex::new(None),
             reading: LastReading::default(),
             captured,
             prepared: OnceLock::new(),
@@ -629,7 +688,11 @@ impl Item for NativeRepositories {
             self.carry(Carried::Probed(plan, standing));
             probe
         })();
-        repos::with_hooks(read, &hooks)
+        let read = repos::with_hooks(read, &hooks);
+        if let Err(why) = self.finish_refresh(sys, matches!(read, Probe::Ok { .. })) {
+            return Probe::Blocked { why };
+        }
+        read
     }
 
     fn apply(&self, sys: &dyn System, ctx: &Ctx) -> Result<(), String> {
@@ -666,8 +729,31 @@ impl Item for NativeRepositories {
     fn apply_guarded(
         &self,
         sys: &dyn System,
+        ctx: &Ctx,
+        authorized: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Result<(), String> {
+        authorized()?;
+        self.ensure_current(sys)?;
+        let work = self.begin_refresh(sys)?;
+        let result = self.apply_batch(sys, ctx, authorized, work);
+        if result.is_err() {
+            self.finish_refresh(sys, false)?;
+        }
+        result
+    }
+
+    fn detail(&self, _sys: &dyn System, _ctx: &Ctx) -> Option<String> {
+        self.reading.detail()
+    }
+}
+
+impl NativeRepositories {
+    fn apply_batch(
+        &self,
+        sys: &dyn System,
         _ctx: &Ctx,
         authorized: &(dyn Fn() -> Result<(), String> + Sync),
+        work: RepositoryWork,
     ) -> Result<(), String> {
         authorized()?;
         self.ensure_current(sys)?;
@@ -691,7 +777,7 @@ impl Item for NativeRepositories {
             }
         };
         let recorded =
-            if self.work == RepositoryWork::Refresh && configuration(sys, &self.user)?.is_none() {
+            if work == RepositoryWork::Refresh && configuration(sys, &self.user)?.is_none() {
                 Some(super::develop_checkouts(sys, &self.user)?)
             } else {
                 None
@@ -795,8 +881,97 @@ impl Item for NativeRepositories {
         }
     }
 
-    fn detail(&self, _sys: &dyn System, _ctx: &Ctx) -> Option<String> {
-        self.reading.detail()
+    fn refresh_scope(
+        &self,
+        sys: &dyn System,
+    ) -> Result<aterm_secrets::converge::RefreshScope, String> {
+        match &self.captured {
+            Some(captured) => captured.inputs.refresh_scope(sys),
+            None => self.prepared_inputs(sys).refresh_scope(sys),
+        }
+    }
+
+    fn begin_refresh(&self, sys: &dyn System) -> Result<RepositoryWork, String> {
+        use aterm_secrets::converge::{RefreshRequest, RepositoryRequest};
+        if self.work != RepositoryWork::Refresh || configuration(sys, &self.user)?.is_some() {
+            return Ok(self.work);
+        }
+        let scope = self.refresh_scope(sys)?;
+        let execution = self.execution.clone().or_else(|| {
+            self.captured
+                .as_ref()
+                .and_then(|captured| captured.inputs.execution.clone())
+        });
+        let execution = match execution {
+            Some(execution) => execution,
+            None => {
+                let access = sys.repository_pass()?;
+                Execution {
+                    request: RepositoryRequest::Refresh(RefreshRequest::after(
+                        Some(scope),
+                        access.observed.version,
+                    )),
+                    pass: access
+                        .pass
+                        .ok_or("another repository/converge pass holds align.lock")?,
+                }
+            }
+        };
+        let RepositoryRequest::Refresh(request) = execution.request else {
+            return Ok(RepositoryWork::Repair);
+        };
+        let (work, ticket) =
+            match execution
+                .pass
+                .admit(request, scope, sys.now().saturating_mul(1000))?
+            {
+                Admission::Refresh(ticket) => (RepositoryWork::Refresh, Some(ticket)),
+                Admission::Fulfilled => (RepositoryWork::Repair, None),
+                Admission::Waiting => {
+                    return Err("repository refresh is waiting for its shared retry".into());
+                }
+            };
+        *self.lease.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some(Arc::clone(&execution.pass));
+        *self.refresh.lock().unwrap_or_else(PoisonError::into_inner) =
+            ticket.map(|ticket| ActiveRefresh {
+                pass: execution.pass,
+                ticket,
+            });
+        Ok(work)
+    }
+
+    fn finish_refresh(&self, sys: &dyn System, complete: bool) -> Result<(), String> {
+        let _lease = self
+            .lease
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let active = self
+            .refresh
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let Some(active) = active else {
+            return Ok(());
+        };
+        let current = if complete {
+            self.ensure_current(sys).and_then(|()| {
+                if self.refresh_scope(sys)? == active.ticket.scope() {
+                    Ok(())
+                } else {
+                    Err("repository refresh scope changed before completion".into())
+                }
+            })
+        } else {
+            Ok(())
+        };
+        active.pass.finish(
+            active.ticket,
+            complete && current.is_ok(),
+            sys.now().saturating_mul(1000),
+        )?;
+        current
     }
 }
 
@@ -930,16 +1105,7 @@ impl NativeRepositories {
                 // No token and no configured source yet: git and the home need not be read.
                 return Err(Block::of(Wait::Token)(String::new()));
             }
-            None => {
-                let inputs = self.prepared.get().cloned().unwrap_or_else(|| {
-                    let inputs = InitialRepositoryInputs::ready(sys, &self.user);
-                    if inputs.local.is_ok() {
-                        let _ = self.prepared.set(inputs.clone());
-                    }
-                    inputs
-                });
-                inputs.local?
-            }
+            None => self.prepared_inputs(sys).local?,
         };
         let LocalInputs {
             configured,
@@ -1088,6 +1254,18 @@ pub(super) mod tests {
         let mut sys = Fake::root();
         sys.euid = 501;
         let item = NativeRepositories::new(user("alice", 501), None);
+        // Child publication must not invent the account's already-existing
+        // ancestry and thereby change the captured source's prefix policy.
+        for path in ["/", "/Users"] {
+            sys.stat_of(
+                path,
+                Stat {
+                    uid: 0,
+                    gid: 0,
+                    ..stat(true, 0o755)
+                },
+            );
+        }
         sys.stat_of(&item.user.home, stat(true, 0o700));
         (sys, item)
     }
@@ -1182,7 +1360,7 @@ pub(super) mod tests {
     }
 
     fn metadata(sys: &Fake, user: &User, repositories: aterm_json::Value) {
-        let path = Path::new(&user.home).join(super::super::inventory::FILE);
+        let path = super::super::inventory::file(&user.home);
         let bytes = aterm_json::to_vec(&aterm_json::json!({
             "schema":2,"account":user.name,"repositories":repositories
         }))
@@ -2158,7 +2336,7 @@ pub(super) mod tests {
         assert_eq!(blocked.wait, Some(Wait::RepositoryInventory));
         assert!(!sys.calls().iter().any(|call| call.contains(" agh GET ")));
 
-        let path = Path::new(&item.user.home).join(super::super::inventory::FILE);
+        let path = super::super::inventory::file(&item.user.home);
         sys.file(path.to_str().unwrap(), b"not JSON")
             .stat_of(path.to_str().unwrap(), stat(false, 0o600));
         assert_eq!(
@@ -2385,9 +2563,9 @@ pub(super) mod tests {
                                 .collect::<Vec<_>>()
                                 .join("\n"),
                             "incomplete" => {
-                                std::fs::create_dir_all(syncing.home.join(".tool/blocked"))
+                                std::fs::create_dir_all(syncing.home.join(".config/gh/hosts.yml"))
                                     .unwrap();
-                                format!("{source_text}~/.tool/blocked=cannot-materialize\n")
+                                format!("{source_text}~/.config/gh/hosts.yml=cannot-materialize\n")
                             }
                             _ => unreachable!(),
                         };
@@ -3576,7 +3754,7 @@ pub(super) mod tests {
             script::alike(&sys, &repos.who);
             let paths = works.clone();
             let bare = repos.origin.clone();
-            let inventory = Path::new(&repos.who.home).join(super::super::inventory::FILE);
+            let inventory = super::super::inventory::file(&repos.who.home);
             let profile = Path::new(&repos.who.home).join(".config/aterm/init.toml");
             let (uid, gid) = (repos.who.uid, repos.who.gid);
             let who = repos.who.clone();
@@ -3824,6 +4002,463 @@ pub(super) mod tests {
                 assert!(repos.status(&repos.work).is_empty());
             }
         }
+    }
+
+    #[test]
+    fn node_and_subscriber_share_a_source_refresh_wave_using_the_alignment_record() {
+        use super::super::RepositoryRefreshCursor;
+        use crate::port::Live;
+        use crate::sync::repository_refresh::{Execution, RepositoryPass, observe};
+        use aterm_secrets::converge::{RefreshRequest, RepositoryRequest};
+
+        let live = Live::new();
+        let repos = crate::checkout::tests::Repos::new(&live, "native-shared-refresh");
+        let first = repos.head(&repos.work);
+        repos.g(
+            &repos.work,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                &format!("https://github.com/{}/work.git", repos.who.name),
+            ],
+        );
+        let second = repos.advance("second.txt", "source two\n");
+        assert_eq!(repos.head(&repos.work), first);
+        assert_eq!(
+            repos.g(&repos.work, &["rev-parse", "refs/remotes/origin/main"]),
+            first
+        );
+
+        let mut sys = Fake::root();
+        sys.euid = repos.who.uid;
+        sys.logged_in(&repos.who)
+            .stat_of(
+                &repos.who.home,
+                Stat {
+                    uid: repos.who.uid,
+                    gid: repos.who.gid,
+                    ..stat(true, 0o700)
+                },
+            )
+            .file(crate::items::github::CLT_GIT, b"selected fixture git")
+            .stat_of(
+                repos.work.to_str().unwrap(),
+                Stat {
+                    uid: repos.who.uid,
+                    gid: repos.who.gid,
+                    ..stat(true, 0o700)
+                },
+            );
+        for path in [repos.work.join(".git"), repos.work.join(".git/objects")] {
+            sys.stat_of(path.to_str().unwrap(), live.stat(&path).unwrap());
+        }
+        script::launcher(&sys, &repos.who);
+        source(
+            &sys,
+            Path::new(&repos.who.home)
+                .join(super::super::TOKEN_FILE)
+                .to_str()
+                .unwrap(),
+        );
+        metadata(
+            &sys,
+            &repos.who,
+            aterm_json::json!([repository(&repos.who.name, "work", 1)]),
+        );
+        script::lookups_hold(&sys, &repos.who, GITHUB, &repos.who.name, TOKEN);
+        script::alike(&sys, &repos.who);
+        let work = repos.work.clone();
+        let bare = repos.origin.clone();
+        sys.simulate(move |_, command| {
+            if !command.args.iter().any(|arg| arg == work.as_os_str()) {
+                return None;
+            }
+            let mut command = command.clone();
+            let fetching = command.args.iter().any(|arg| arg == "fetch");
+            if fetching || command.args.iter().any(|arg| arg == "--symref") {
+                for arg in &mut command.args {
+                    if arg == "origin" {
+                        *arg = bare.as_os_str().to_owned();
+                    }
+                }
+                if fetching {
+                    command
+                        .args
+                        .push("+refs/heads/*:refs/remotes/origin/*".into());
+                }
+            }
+            Some(Live::new().run_complete_stdout(&command).unwrap())
+        });
+
+        let state = aterm_tempfile::tempdir().unwrap();
+        let now = sys.now().saturating_mul(1_000);
+        assert!(crate::sync::read_record(state.path()).is_none());
+        // Receipt samples precede both producers' initial actual source readings.
+        let node_before = observe(state.path(), now);
+        let subscriber_before = observe(state.path(), now);
+        let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&repos.who));
+        let inputs = InitialRepositoryInputs::capture(&sys, &ctx).unwrap();
+        let scope = inputs.refresh_scope(&sys).unwrap();
+        let initial_mark = super::super::repository_input_mark(&sys).unwrap();
+        assert_eq!(
+            initial_mark.refresh_scope(),
+            Some(scope),
+            "the producer and the effect runner derive the same production scope"
+        );
+        let mut node_cursor = RepositoryRefreshCursor::new(node_before, Some(&initial_mark));
+        let mut subscriber_cursor =
+            RepositoryRefreshCursor::new(subscriber_before, Some(&initial_mark));
+        let Some(RepositoryRequest::Refresh(node)) =
+            node_cursor.observe(Some(&initial_mark), node_before, None)
+        else {
+            panic!("the node's first actual source ensures freshness");
+        };
+        let Some(RepositoryRequest::Refresh(subscriber)) =
+            subscriber_cursor.observe(Some(&initial_mark), subscriber_before, None)
+        else {
+            panic!("the subscriber's first actual source ensures freshness");
+        };
+        let apply = |inputs: InitialRepositoryInputs, request: RefreshRequest| {
+            let access = RepositoryPass::open(state.path(), now).unwrap();
+            let pass = access
+                .pass
+                .expect("the prior owner released the file lease");
+            let rows = run_captured(
+                &sys,
+                &ctx,
+                Mode::Apply,
+                RepositoryWork::Refresh,
+                inputs.with_repository_execution(Some(Execution {
+                    request: RepositoryRequest::Refresh(request),
+                    pass: Arc::clone(&pass),
+                })),
+                Box::new(|| Ok(true)),
+            )
+            .unwrap();
+            (rows, pass.record())
+        };
+        let network = || {
+            let calls = sys.calls();
+            (
+                calls
+                    .iter()
+                    .filter(|call| call.contains("--symref"))
+                    .count(),
+                calls.iter().filter(|call| call.contains(" fetch ")).count(),
+            )
+        };
+        let (rows, empty) = apply(inputs.clone(), node);
+        assert_eq!(stage(&rows).outcome, crate::model::Outcome::Ok, "{rows:?}");
+        assert_eq!(repos.head(&repos.work), second);
+        assert_eq!(network(), (1, 1));
+        assert_eq!(empty.build, "");
+        assert_eq!(empty.spec, 0);
+        assert_eq!(empty.attempted_ms, 0);
+        assert_eq!(empty.converged_ms, None);
+        assert!(empty.builds.is_empty() && empty.routes.is_empty() && empty.rows.is_empty());
+        assert_eq!(empty.base, None);
+        assert_eq!(
+            crate::sync::due(Some(&empty), "future-build", &[], now),
+            crate::sync::Due::NewBuild
+        );
+
+        // Repository-only completion cannot stamp the generic pass's build, routes or base.
+        let expected = {
+            let pass = RepositoryPass::open(state.path(), now)
+                .unwrap()
+                .pass
+                .unwrap();
+            let generic = crate::sync::Record {
+                build: "kept-build".into(),
+                spec: crate::sync::SPEC,
+                builds: vec!["earlier-build".into()],
+                attempted_ms: now - 1_000,
+                converged_ms: Some(now - 500),
+                routes: vec!["192.0.2.1".into()],
+                rows: vec![crate::sync::RecordRow {
+                    id: "kept-row".into(),
+                    outcome: crate::model::Outcome::Ok,
+                    why: Some("kept result".into()),
+                }],
+                base: Some(crate::sync::BaseRecord {
+                    build: "kept-base".into(),
+                    pending: vec!["kept-item".into()],
+                }),
+                repositories: None,
+            };
+            pass.record_pass(generic).unwrap();
+            pass.record()
+        };
+        let (rows, shared) = apply(inputs.clone(), subscriber);
+        assert_eq!(stage(&rows).outcome, crate::model::Outcome::Ok, "{rows:?}");
+        assert_eq!(repos.head(&repos.work), second);
+        assert_eq!(
+            network(),
+            (1, 1),
+            "the follower performs no second remote wave"
+        );
+        assert_eq!(shared, expected);
+
+        let latest = observe(state.path(), now);
+        assert!(
+            node_cursor
+                .observe(Some(&initial_mark), latest, None)
+                .is_none()
+        );
+        assert!(
+            subscriber_cursor
+                .observe(Some(&initial_mark), latest, None)
+                .is_none()
+        );
+        let forced = RefreshRequest::after(Some(scope), latest.version);
+        let third = repos.advance("third.txt", "source three\n");
+        let (rows, refreshed) = apply(inputs.clone(), forced);
+        assert_eq!(stage(&rows).outcome, crate::model::Outcome::Ok, "{rows:?}");
+        assert_eq!(repos.head(&repos.work), third);
+        assert_eq!(
+            network(),
+            (2, 2),
+            "a later explicit boundary refreshes the same source again"
+        );
+        let generic = |mut record: crate::sync::Record| {
+            record.repositories = None;
+            record
+        };
+        assert_eq!(generic(refreshed.clone()), generic(expected.clone()));
+        assert_eq!(
+            super::super::repository_input_mark(&sys)
+                .unwrap()
+                .refresh_scope(),
+            Some(scope)
+        );
+
+        let before_change = observe(state.path(), now);
+        metadata(
+            &sys,
+            &repos.who,
+            aterm_json::json!([repository(&repos.who.name, "work", 2)]),
+        );
+        let changed = InitialRepositoryInputs::capture(&sys, &ctx).unwrap();
+        let changed_scope = changed.refresh_scope(&sys).unwrap();
+        assert_ne!(changed_scope, scope);
+        let changed_mark = super::super::repository_input_mark(&sys).unwrap();
+        assert_eq!(changed_mark.refresh_scope(), Some(changed_scope));
+        let fourth = repos.advance("fourth.txt", "source four\n");
+        let (rows, refused) = apply(changed.clone(), forced);
+        assert_eq!(
+            stage(&rows).outcome,
+            crate::model::Outcome::Failed,
+            "{rows:?}"
+        );
+        assert_eq!(repos.head(&repos.work), third);
+        assert_eq!(
+            network(),
+            (2, 2),
+            "an old request cannot refresh a new admitted source"
+        );
+        assert_eq!(refused, refreshed);
+        let Some(RepositoryRequest::Refresh(changed_request)) = node_cursor.observe(
+            Some(&changed_mark),
+            before_change,
+            Some(RepositoryWork::Refresh),
+        ) else {
+            panic!("the node observes the actual source transition");
+        };
+        // A→B→A before any admission still owes a new generation when its bytes return.
+        metadata(
+            &sys,
+            &repos.who,
+            aterm_json::json!([repository(&repos.who.name, "work", 1)]),
+        );
+        let returned_mark = super::super::repository_input_mark(&sys).unwrap();
+        let Some(RepositoryRequest::Refresh(returned)) = node_cursor.observe(
+            Some(&returned_mark),
+            before_change,
+            Some(RepositoryWork::Refresh),
+        ) else {
+            panic!("returning to the earlier bytes retains the transition");
+        };
+        let unadmitted = changed_request.merge(returned);
+        assert_eq!(unadmitted.scope, Some(scope));
+        assert!(
+            !before_change.fulfills(unadmitted),
+            "ABA cannot inherit the old A fulfillment"
+        );
+        metadata(
+            &sys,
+            &repos.who,
+            aterm_json::json!([repository(&repos.who.name, "work", 2)]),
+        );
+        let final_mark = super::super::repository_input_mark(&sys).unwrap();
+        let Some(RepositoryRequest::Refresh(final_request)) = node_cursor.observe(
+            Some(&final_mark),
+            before_change,
+            Some(RepositoryWork::Refresh),
+        ) else {
+            panic!("the final B source is the desired generation");
+        };
+        let changed_request = unadmitted.merge(final_request);
+        let (rows, changed_record) = apply(changed.clone(), changed_request);
+        assert_eq!(stage(&rows).outcome, crate::model::Outcome::Ok, "{rows:?}");
+        assert_eq!(repos.head(&repos.work), fourth);
+        assert_eq!(network(), (3, 3));
+        assert!(observe(state.path(), now).fulfills(changed_request));
+
+        // This producer sees B only after the node already fulfilled B. Its old actual
+        // source's epoch must bind the request, not the just-read B receipt's newer epoch.
+        let after_change = observe(state.path(), now);
+        let Some(RepositoryRequest::Refresh(delayed)) = subscriber_cursor.observe(
+            Some(&final_mark),
+            after_change,
+            Some(RepositoryWork::Refresh),
+        ) else {
+            panic!("the delayed subscriber also observes the actual transition");
+        };
+        assert_eq!(delayed, changed_request);
+        assert!(delayed.base_input < after_change.version.input);
+        let (rows, delayed_record) = apply(changed, delayed);
+        assert_eq!(stage(&rows).outcome, crate::model::Outcome::Ok, "{rows:?}");
+        assert_eq!(repos.head(&repos.work), fourth);
+        assert_eq!(
+            network(),
+            (3, 3),
+            "the delayed actual source observer shares the completed B wave"
+        );
+        assert_eq!(delayed_record, changed_record);
+        assert_eq!(generic(changed_record), generic(expected.clone()));
+
+        // A semantic develop selection can move A→B→A while this observer's actual
+        // source stays A. A successful A sample against B's newer receipt owes A now
+        // and raises the floor for a subsequent B transition.
+        let profile = Path::new(&repos.who.home).join(".config/aterm/init.toml");
+        let set_develop = |checkouts: &str| {
+            let bytes = format!("[develop]\ncheckouts={checkouts}\n");
+            sys.file(profile.to_str().unwrap(), bytes.as_bytes())
+                .stat_of(
+                    profile.to_str().unwrap(),
+                    Stat {
+                        uid: repos.who.uid,
+                        gid: repos.who.gid,
+                        len: bytes.len() as u64,
+                        ..stat(false, 0o600)
+                    },
+                );
+        };
+        let before_semantic = observe(state.path(), now);
+        set_develop("[]");
+        let semantic_a = super::super::repository_input_mark(&sys).unwrap();
+        assert_eq!(semantic_a.refresh_scope(), Some(changed_scope));
+        let mut late = RepositoryRefreshCursor::new(before_semantic, Some(&semantic_a));
+        let Some(RepositoryRequest::Refresh(initial)) =
+            late.observe(Some(&semantic_a), before_semantic, None)
+        else {
+            panic!("the late actor first ensures the actual A generation");
+        };
+        assert!(before_semantic.fulfills(initial));
+        assert!(
+            node_cursor
+                .observe(Some(&semantic_a), before_semantic, None)
+                .is_none()
+        );
+
+        set_develop("['~/parked']");
+        let semantic_b = super::super::repository_input_mark(&sys).unwrap();
+        let semantic_inputs = InitialRepositoryInputs::capture(&sys, &ctx).unwrap();
+        assert_eq!(
+            semantic_b.refresh_scope(),
+            Some(semantic_inputs.refresh_scope(&sys).unwrap())
+        );
+        assert_ne!(semantic_b.refresh_scope(), semantic_a.refresh_scope());
+        let Some(RepositoryRequest::Refresh(winner)) = node_cursor.observe(
+            Some(&semantic_b),
+            before_semantic,
+            Some(RepositoryWork::Refresh),
+        ) else {
+            panic!("the node refreshes the new semantic selection");
+        };
+        let before_network = network();
+        let (rows, _) = apply(semantic_inputs.clone(), winner);
+        assert_eq!(stage(&rows).outcome, crate::model::Outcome::Ok, "{rows:?}");
+        assert_eq!(network().0, before_network.0 + 1);
+        let winner_receipt = observe(state.path(), now);
+        assert!(winner_receipt.fulfills(winner));
+
+        set_develop("[]");
+        let still_a = super::super::repository_input_mark(&sys).unwrap();
+        assert_eq!(still_a.refresh_scope(), semantic_a.refresh_scope());
+        let Some(RepositoryRequest::Refresh(missed_a)) =
+            late.observe(Some(&still_a), winner_receipt, None)
+        else {
+            panic!("unchanged actual A against a newer foreign B receipt owes A immediately");
+        };
+        assert_eq!(missed_a.scope, semantic_a.refresh_scope());
+        assert_eq!(missed_a.base_input, winner_receipt.version.input);
+        set_develop("['~/parked']");
+        let back_to_b = super::super::repository_input_mark(&sys).unwrap();
+        let Some(RepositoryRequest::Refresh(new_b)) = late.observe(
+            Some(&back_to_b),
+            winner_receipt,
+            Some(RepositoryWork::Refresh),
+        ) else {
+            panic!("the later B transition retains the newer receipt floor");
+        };
+        let requested = missed_a.merge(new_b);
+        assert!(
+            !winner_receipt.fulfills(requested),
+            "the previous B wave cannot acknowledge a later A→B transition"
+        );
+        let before_network = network();
+        let (rows, semantic_record) = apply(semantic_inputs.clone(), requested);
+        assert_eq!(stage(&rows).outcome, crate::model::Outcome::Ok, "{rows:?}");
+        assert_eq!(network().0, before_network.0 + 1);
+        assert!(observe(state.path(), now).fulfills(requested));
+        assert_eq!(generic(semantic_record), generic(expected));
+
+        // An owned record reset cannot make a retained input/attempt fence require
+        // repeated remote waves merely to count back up to its old epochs.
+        let before_reset = observe(state.path(), now);
+        let retained_scope = semantic_inputs.refresh_scope(&sys).unwrap();
+        let retained = RefreshRequest::inputs(retained_scope, before_reset.version).merge(
+            RefreshRequest::after(Some(retained_scope), before_reset.version),
+        );
+        {
+            let _fence = RepositoryPass::open(state.path(), now)
+                .unwrap()
+                .pass
+                .unwrap();
+            std::fs::remove_file(
+                state
+                    .path()
+                    .join(aterm_converge::FileJournal::DIR)
+                    .join(crate::sync::RECORD),
+            )
+            .unwrap();
+        }
+        assert!(crate::sync::read_record(state.path()).is_none());
+        let fifth = repos.advance("fifth.txt", "source five\n");
+        let before_network = network();
+        let (rows, reset_record) = apply(semantic_inputs.clone(), retained);
+        assert_eq!(stage(&rows).outcome, crate::model::Outcome::Ok, "{rows:?}");
+        assert_eq!(repos.head(&repos.work), fifth);
+        assert_eq!(network(), (before_network.0 + 1, before_network.1 + 1));
+        let reset_receipt = observe(state.path(), now);
+        assert!(
+            reset_receipt.fulfills(retained),
+            "one wave exceeds both retained epoch fences after reset"
+        );
+        assert!(reset_receipt.version.input > retained.base_input);
+        assert!(reset_receipt.version.attempt > retained.after_attempt.unwrap());
+        assert_eq!(generic(reset_record.clone()), generic(empty));
+        assert_eq!(
+            crate::sync::due(Some(&reset_record), "kept-build", &[], now),
+            crate::sync::Due::NewBuild
+        );
+        let before_network = network();
+        let (rows, reset_follower) = apply(semantic_inputs, retained);
+        assert_eq!(stage(&rows).outcome, crate::model::Outcome::Ok, "{rows:?}");
+        assert_eq!(network(), before_network);
+        assert_eq!(reset_follower, reset_record);
     }
 
     #[test]
@@ -4306,7 +4941,7 @@ pub(super) mod tests {
     fn init_s_default_stage_without_a_token_is_not_applicable_and_asks_nothing() {
         let (sys, bare) = bare();
         let context = crate::items::defaults::tests::ctx(std::slice::from_ref(&bare.user));
-        match item(&bare.user, None, true, RepositoryWork::Refresh).probe(&sys, &context) {
+        match item(&bare.user, None, true, RepositoryWork::Refresh, None).probe(&sys, &context) {
             Probe::NotApplicable { why } => {
                 assert!(why.contains("~/.secrets/gh_access_token"), "{why}");
                 assert!(why.contains("on this Mac yet"), "{why}");
@@ -4322,20 +4957,20 @@ pub(super) mod tests {
             sys.calls()
         );
         assert!(matches!(
-            item(&bare.user, None, false, RepositoryWork::Refresh).probe(&sys, &context),
+            item(&bare.user, None, false, RepositoryWork::Refresh, None).probe(&sys, &context),
             Probe::Blocked { .. }
         ));
         // On Linux the row names the machine, not a Mac.
         let (mut linux, _) = self::bare();
         linux.linux = true;
-        match item(&bare.user, None, true, RepositoryWork::Refresh).probe(&linux, &context) {
+        match item(&bare.user, None, true, RepositoryWork::Refresh, None).probe(&linux, &context) {
             Probe::NotApplicable { why } => assert!(why.contains("on this machine yet"), "{why}"),
             other => panic!("{other:?}"),
         }
         // So does an init.toml `[github]` account's step, whose token file is not there yet
         // (with the distribution's git there, so the step reaches the token).
         linux.file(crate::items::github::SYSTEM_GIT, b"synthetic git");
-        match item(&bare.user, None, false, RepositoryWork::Refresh).probe(&linux, &context) {
+        match item(&bare.user, None, false, RepositoryWork::Refresh, None).probe(&linux, &context) {
             Probe::Person { how, .. } => {
                 assert!(how.contains("is not on this machine yet"), "{how}");
             }

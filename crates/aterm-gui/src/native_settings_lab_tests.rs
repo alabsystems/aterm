@@ -74,6 +74,7 @@ fn fixture() -> LabState {
                     ),
                     ("Next step".into(), "Browser sign-in needed".into()),
                 ],
+                offer: None,
             }],
         },
         sessions: vec![LabSession {
@@ -267,6 +268,48 @@ fn lab_route_shows_independent_cache_quota_and_recovery_observations() {
     assert!(show.effects.iter().any(|effect| matches!(
         effect,
         AppEffect::Harness(HarnessRequest::Show { session: 7 })
+    )));
+}
+
+/// An account row whose vault token offer stands carries its one step, whose press asks the
+/// host for that row's step tab; a row with none carries no step
+/// (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.9).
+#[test]
+fn an_accounts_token_offer_is_one_step_that_asks_for_its_tab() {
+    let mut lab = fixture();
+    let (mut runtime, instance, view) = controller(lab.clone());
+    let drawn = pages(&mut runtime, instance, view, 1200.0, 820.0);
+    assert!(
+        drawn
+            .iter()
+            .all(|page| page.semantic(&UiKey::new("lab/account/0/token")).is_none()),
+        "no offer, no step"
+    );
+    lab.accounts.rows[0].offer = Some(crate::token_shown::TokenOffer {
+        line: "a vault token would keep fixture-account signed in: make one".into(),
+        label: "fixture-account".into(),
+        replace: false,
+    });
+    publish(&mut runtime, instance, view, lab, 2);
+    let drawn = pages(&mut runtime, instance, view, 1200.0, 820.0);
+    let step = drawn
+        .iter()
+        .find_map(|page| page.semantic(&UiKey::new("lab/account/0/token")))
+        .expect("the offer's step");
+    assert_eq!(step.parent, Some(UiKey::new("lab/account/0")));
+    let pressed = runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: step.action.clone().expect("the step is actionable"),
+                value: None,
+            }),
+        )
+        .unwrap();
+    assert!(pressed.effects.iter().any(|effect| matches!(
+        effect,
+        AppEffect::Harness(HarnessRequest::LabToken { index: 0 })
     )));
 }
 

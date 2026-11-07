@@ -18,7 +18,9 @@
 //! checks, and runs them after any wait.
 //!
 //! A test makes a registry of its own ([`Boundary::new`]) and hands it to the item through the
-//! item's port, so tests that latch a handoff never hold up another test's items.
+//! item's port, so tests that latch a handoff never hold up another test's items. An item no port
+//! reaches holds this process's, and aterm-gui's tests read another for their handoffs, which keeps
+//! that item and those handoffs apart the same way.
 
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::ThreadId;
@@ -159,8 +161,8 @@ impl Boundary {
         }
     }
 
-    /// This process's registry: the one the update handoff reads, and every item's outside a
-    /// test.
+    /// This process's registry: the one every item holds and, in a running aterm, the one the
+    /// update handoff reads.
     #[must_use]
     pub fn process() -> &'static Self {
         &PROCESS
@@ -310,35 +312,6 @@ impl Drop for HandoffLatch<'_> {
         drop(registry);
         self.boundary.released.notify_all();
     }
-}
-
-/// This process's [`Boundary::any_held`].
-#[must_use]
-pub fn any_held() -> Option<GuardedItem> {
-    Boundary::process().any_held()
-}
-
-/// This process's [`Boundary::is_held`].
-#[must_use]
-pub fn is_held(item: GuardedItem) -> bool {
-    Boundary::process().is_held(item)
-}
-
-/// This process's [`Boundary::latch_handoff`].
-pub fn latch_handoff(bound: Duration) -> HandoffLatch<'static> {
-    Boundary::process().latch_handoff(bound)
-}
-
-/// This process's [`Boundary::handoff_pending`].
-#[must_use]
-pub fn handoff_pending() -> bool {
-    Boundary::process().handoff_pending()
-}
-
-/// This process's [`Boundary::waiting`].
-#[must_use]
-pub fn waiting() -> u32 {
-    Boundary::process().waiting()
 }
 
 #[cfg(test)]

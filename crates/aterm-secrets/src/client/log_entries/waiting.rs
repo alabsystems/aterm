@@ -420,7 +420,7 @@ thread_local! {
 ///
 /// # Errors
 /// The lock cannot be opened.
-fn pass_claim(paths: &Paths) -> crate::Result<Option<DraftClaim>> {
+pub(in super::super) fn pass_claim(paths: &Paths) -> crate::Result<Option<DraftClaim>> {
     let path = claim_file(paths);
     fsx::ensure_private_dir(&paths.dir)?;
     let file = fsx::open_lock(&path)?;
@@ -1024,7 +1024,9 @@ pub(in super::super) fn view_waiting(
     )
 }
 
-/// Overlay `waiting` onto `doc`'s `[everyone]`: each name as its write leaves it.
+/// Overlay `waiting` onto `doc`'s `[everyone]`: each name as its write leaves it, but a Claude
+/// Code token's, which no text holds (DESIGN-claude-setup-token §4.4): its write waits for the
+/// vault pass, never for an edit.
 ///
 /// # Errors
 /// The text refuses an entry.
@@ -1034,7 +1036,11 @@ pub(in super::super) fn overlay_waiting_onto_document(
 ) -> crate::Result<()> {
     // Unanchored entries first, so an anchor exists before an entry names it.
     for anchored in [false, true] {
-        for (name, write) in &waiting.0 {
+        for (name, write) in waiting
+            .0
+            .iter()
+            .filter(|(name, _)| !crate::entry_class::claude_token(name))
+        {
             match &write.to {
                 Some(entry) if entry.anchor.is_some() == anchored => doc
                     .set_entry_with(
@@ -1095,6 +1101,10 @@ pub(in super::super) struct EveryoneEdit {
 /// write, signed after the view or the draft read it, nor a pass racing the draft reads the newer
 /// edit as overtaken, and a write over the text's value, where this Mac opens none of the newest
 /// epochs and reads that text as the log's, still stands over the value its earlier write did.
+///
+/// A Claude Code token's name is none of the edit's ([`crate::entry_class::claude_token`]): no
+/// text holds one, its waiting write is the vault pass's to sign, and the draft keeps the log's
+/// as it stands.
 /// They also hold `held`, what this Mac's own earlier publishes whose records are held and not
 /// kept leave at the name ([`held_values`]): such a publish's version may be on a server already,
 /// its records entering the log only once it keeps them, after this draft read the log, and its
@@ -1111,10 +1121,12 @@ pub(in super::super) fn everyone_edit(
     let log = log.unwrap_or(&none);
     let unseen = Waiting::default();
     let shown = view.unwrap_or(&unseen);
+    let ours = |name: &&String| !crate::entry_class::claude_token(name);
     let mut entries = doc.cloned().unwrap_or_default();
+    entries.retain(|name, _| ours(&name));
     // The write each name left as the view showed it takes its value from.
     let mut kept: BTreeMap<&String, &WaitingWrite> = BTreeMap::new();
-    for (name, was) in &shown.0 {
+    for (name, was) in shown.0.iter().filter(|(name, _)| ours(name)) {
         let left = match (entries.get(name), &was.to) {
             (Some(have), Some(to)) => same_entry(have, to),
             (None, None) => true,
@@ -1147,8 +1159,8 @@ pub(in super::super) fn everyone_edit(
     } else {
         entries
             .keys()
-            .chain(shown.0.keys())
-            .chain(now.0.keys())
+            .chain(shown.0.keys().filter(ours))
+            .chain(now.0.keys().filter(ours))
             .collect()
     };
     for name in names {
@@ -1197,6 +1209,141 @@ pub(in super::super) fn everyone_edit(
         settles: Waiting(settles),
         shows,
     }
+}
+
+impl WaitingWrite {
+    /// A member's `set` of `entry` (`member::member_set`) over `read`, the log's value its draft
+    /// read there. It settles a conflict only where that draft read one (`conflicted`), as a
+    /// person's save does: a first `set` signs no `Delete` ahead of its `Put`.
+    pub(super) fn member(entry: Entry, read: Option<&Entry>, conflicted: bool) -> Self {
+        Self {
+            to: Some(entry),
+            bases: BTreeSet::from([read.map(entry_digest)]),
+            resolve: conflicted,
+        }
+    }
+
+    /// What the name becomes: an entry, or `None` for a take-back.
+    pub(super) const fn entry(&self) -> Option<&Entry> {
+        self.to.as_ref()
+    }
+}
+
+/// Whether a write of this Mac's of `name` waits: in [`waiting_file`], or in a pending set
+/// ([`pending_dir`]). Where either does not read, it may hold any name, and so it holds this one.
+pub(super) fn waits_here(paths: &Paths, identity: &Identity, name: &str) -> bool {
+    read_waiting(paths, identity).map_or(true, |held| held.0.contains_key(name))
+        || pending_names(paths, identity).is_none_or(|names| names.contains(name))
+}
+
+/// Land a member's `write` of `name` (`member::member_set`) in [`waiting_file`] for the next
+/// vault pass, under the state lock taken by `deadline` where one is given. It replaces this
+/// Mac's earlier writes of the name, the one waiting there and each a pending set holds, and is
+/// signed over each value they would have left ([`WaitingWrite::bases`]): the person's later write
+/// is the one that stands, so their earlier one is neither signed after it nor read as a change
+/// that overtook it. Each pending set loses the name, which would otherwise land over this write
+/// once its version lands ([`land_sets`]). Returns the write as it waits.
+///
+/// # Errors
+/// The state lock is not taken by `deadline`, the waiting or pending writes cannot be read
+/// (a pending set that does not open included, [`read_pending`]), sealed or written, or this
+/// Mac's held drafts do not read ([`held_values`]).
+pub(super) fn land_member_write(
+    paths: &Paths,
+    identity: &Identity,
+    name: &str,
+    mut write: WaitingWrite,
+    deadline: Option<std::time::Instant>,
+) -> crate::Result<WaitingWrite> {
+    let _lock = waiting_lock(paths, deadline)?;
+    let mut held = read_waiting(paths, identity)?;
+    let mut sets = if waiting_pending(paths) {
+        read_pending(paths, identity)?
+    } else {
+        Vec::new()
+    };
+    let earlier = held
+        .0
+        .get(name)
+        .into_iter()
+        .chain(sets.iter().filter_map(|set| set.writes.0.get(name)));
+    for was in earlier {
+        write.bases.insert(was.to.as_ref().map(entry_digest));
+        write.bases.extend(was.bases.iter().copied());
+    }
+    // What this Mac's held drafts leave at the name is its own earlier edit in flight, which the
+    // person's later write replaces whichever reaches the log first (one-mesh P3), as an edit's
+    // waiting write is signed over it ([`everyone_edit`]).
+    if let Some(store) = super::super::remove::trusted_store(paths)?
+        && let Some(held) = held_values(paths, &store, identity)?.remove(name)
+    {
+        write.bases.extend(held);
+    }
+    for set in &mut sets {
+        if set.writes.0.remove(name).is_some() {
+            write_pending(paths, identity, set)?;
+        }
+    }
+    held.0.insert(name.to_owned(), write.clone());
+    write_waiting(paths, identity, &held)?;
+    Ok(write)
+}
+
+/// Take back this Mac's own writes of `name` that are still to be signed (`member::member_unset`,
+/// DESIGN-claude-setup-token §3.6), under the state lock taken by `deadline` where one is given:
+/// the one waiting in [`waiting_file`], and the name in each pending set ([`pending_dir`]). A
+/// first `set` that waits is signed over an absent value ([`WaitingWrite::bases`] holds `None`),
+/// so left there, the pass after the rotation would sign it over the absence the unset leaves,
+/// and the value would come back. Returns whether one was there.
+///
+/// # Errors
+/// The state lock is not taken by `deadline`, or the waiting or pending writes cannot be read
+/// (a pending set that does not open included, [`read_pending`]), sealed or written.
+pub(super) fn take_back_member_write(
+    paths: &Paths,
+    identity: &Identity,
+    name: &str,
+    deadline: Option<std::time::Instant>,
+) -> crate::Result<bool> {
+    let _lock = waiting_lock(paths, deadline)?;
+    let mut held = read_waiting(paths, identity)?;
+    let mut sets = if waiting_pending(paths) {
+        read_pending(paths, identity)?
+    } else {
+        Vec::new()
+    };
+    let mut took = held.0.remove(name).is_some();
+    if took {
+        write_waiting(paths, identity, &held)?;
+    }
+    for set in &mut sets {
+        if set.writes.0.remove(name).is_some() {
+            write_pending(paths, identity, set)?;
+            took = true;
+        }
+    }
+    Ok(took)
+}
+
+/// Whether `write` still waits at `name` as [`land_member_write`] left it.
+pub(super) fn still_waits(
+    paths: &Paths,
+    identity: &Identity,
+    name: &str,
+    write: &WaitingWrite,
+) -> bool {
+    read_waiting(paths, identity)
+        .is_ok_and(|held| held.0.get(name).is_some_and(|kept| kept.same(write)))
+}
+
+/// The latest record of this Mac's journal of overtaken writes ([`overtaken_file`]) of `name`
+/// that a pass dropped at `since_ms` or later.
+pub(super) fn overtaken_since(paths: &Paths, name: &str, since_ms: u64) -> Option<Overtaken> {
+    read_overtaken(paths)
+        .ok()?
+        .into_iter()
+        .rev()
+        .find(|record| record.name == name && record.dropped_ms >= since_ms)
 }
 
 /// What this Mac's held drafts leave at each `[everyone]` name they change ([`held_values`]): the
@@ -1284,6 +1431,24 @@ fn held_changes(paths: &Paths, store: &Store, identity: &Identity) -> crate::Res
     Ok(values)
 }
 
+/// Whether a member's write of `names` (`member::member_set`) waits for this Mac's held drafts, as
+/// a vault pass defers the names they change: one of them changes a name, or one does not read
+/// and so may change any (one-mesh P3, W3).
+pub(super) fn held_defers(
+    paths: &Paths,
+    store: &Store,
+    identity: &Identity,
+    names: &[&str],
+) -> bool {
+    if held_undeferred() {
+        return false;
+    }
+    match held_changes(paths, store, identity) {
+        Ok(held) => names.iter().any(|name| held.contains_key(*name)),
+        Err(_) => !unread_as_none(),
+    }
+}
+
 /// What a draft whose writes wait reads of this Mac's held drafts ([`held_values`]): what each
 /// leaves at each name, or none and why they do not read. A hold that does not read is never
 /// read as leaving nothing (one-mesh W3): the draft refuses over it ([`nle::draft_refuses`]), as
@@ -1309,6 +1474,169 @@ fn settle(held: &mut Waiting, done: &Waiting) {
     }
 }
 
+/// How a writer outside an edit seals its `[everyone]` writes now: a vault pass signing what
+/// waits ([`sign_waiting_writes_by`]), and a member's `set` signing its own (`member::member_set`).
+pub(super) enum EveryoneSeal {
+    /// Under this epoch, the one a writer seals under ([`sealing_epoch`]), with its key.
+    Reuse(RecordId, zeroize::Zeroizing<[u8; 32]>),
+    /// Under a fresh epoch wrapped to these recipients: a newest epoch was minted by, or wraps, a
+    /// Mac the log or roster denies, a departure that is no removal.
+    Fresh(BTreeSet<Recipient>),
+}
+
+/// How the Mac of `identity` seals its next `[everyone]` writes as `opened` reads `log`
+/// ([`EveryoneSeal`]). Where a newest epoch was minted by, or wraps, a Mac the log or roster
+/// denies, a fresh epoch, wrapped to the Macs the newest epochs wrap and to the current seats
+/// (each seat a batch still arriving may wrap among them), less each one the log removed or the
+/// log or roster denies, so neither concurrent heads nor a batch still arriving hold it.
+/// Otherwise the epoch a writer seals under ([`sealing_epoch`]). `None` where there is none:
+/// newest epochs concurrent with distinct recipient sets (the tender coalesces them), or a batch
+/// still arriving that may wrap a Mac outside the current seats and outside those only that batch
+/// can decide; or where this Mac holds no key of the epoch it would reuse.
+pub(super) fn everyone_seal(
+    log: &Log,
+    opened: &crate::membership_log::entries::OpenedAudienceEntries,
+    identity: &Identity,
+) -> Option<EveryoneSeal> {
+    let newest = opened
+        .maximal_epochs
+        .get(&EpochAudience::Everyone)
+        .cloned()
+        .unwrap_or_default();
+    let roster = roster_from_doc_or_opened(None, Some(opened), Some(log));
+    let denied = |r: &Recipient| recipient_denied_by_roster_or_log(roster.as_ref(), log, r);
+    let membership = log.membership();
+    let departed = newest.iter().any(|epoch| {
+        log.get(epoch).is_some_and(|record| {
+            membership.removal(record.actor()).is_some()
+                || membership
+                    .get(record.actor())
+                    .is_some_and(|minter| denied(&minter.binding.recipient()))
+        }) || opened
+            .wrapped_recipients
+            .get(epoch)
+            .is_some_and(|wrapped| wrapped.iter().any(&denied))
+    });
+    if departed {
+        return Some(EveryoneSeal::Fresh(everyone_fresh_to(log, opened)));
+    }
+    let current = log.current_recipients_where(&EpochAudience::Everyone, |seat| {
+        roster
+            .as_ref()
+            .is_some_and(|r| member_denied_by_roster(r, seat))
+    });
+    let flight = Flight::of_reader(log, &identity.recipient());
+    let epoch = sealing_epoch(
+        log,
+        opened,
+        &newest,
+        identity,
+        &current,
+        flight.undecided(&EpochAudience::Everyone),
+    )?;
+    let key = opened.unwrapped_keys.get(&epoch)?;
+    Some(EveryoneSeal::Reuse(epoch, zeroize::Zeroizing::new(**key)))
+}
+
+/// Whom a fresh `[everyone]` epoch a writer outside an edit mints is wrapped to, as `opened` reads
+/// `log` ([`EveryoneSeal::Fresh`], and a member's unset, `member::member_unset`): the Macs the
+/// newest epochs wrap and the current seats (each seat a batch still arriving may wrap among
+/// them), less each one the log removed or the log or roster denies, so neither concurrent heads
+/// nor a batch still arriving hold it.
+pub(super) fn everyone_fresh_to(
+    log: &Log,
+    opened: &crate::membership_log::entries::OpenedAudienceEntries,
+) -> BTreeSet<Recipient> {
+    let roster = roster_from_doc_or_opened(None, Some(opened), Some(log));
+    let current = log.current_recipients_where(&EpochAudience::Everyone, |seat| {
+        roster
+            .as_ref()
+            .is_some_and(|r| member_denied_by_roster(r, seat))
+    });
+    opened
+        .maximal_epochs
+        .get(&EpochAudience::Everyone)
+        .into_iter()
+        .flatten()
+        .filter_map(|epoch| opened.wrapped_recipients.get(epoch))
+        .flatten()
+        .chain(&current)
+        .filter(|r| {
+            !log.recipient_is_removed(r)
+                && !recipient_denied_by_roster_or_log(roster.as_ref(), log, r)
+        })
+        .copied()
+        .collect()
+}
+
+/// Sign `deletes`, then `puts`, of `[everyone]` into `log` under `seal`, as the member `signer`
+/// (its actor, device key and incarnation) at `authored_ms`: a fresh epoch and its wraps first
+/// where `seal` mints one, and a `Delete` before its `Put`, so a person's save replaces every
+/// sibling. Returns what it signed, in order, already in `log`; nothing where there is nothing to
+/// write.
+///
+/// # Errors
+/// A record fails to draft, sign or go into `log`.
+pub(super) fn sign_everyone(
+    log: &mut Log,
+    opened: &crate::membership_log::entries::OpenedAudienceEntries,
+    signer: (&MemberId, &Device, [u8; 16]),
+    authored_ms: u64,
+    seal: EveryoneSeal,
+    deletes: &[&String],
+    puts: &[&Entry],
+) -> crate::Result<Vec<Record>> {
+    let (actor, device, incarnation) = signer;
+    let mut minted = Vec::new();
+    if puts.is_empty() && deletes.is_empty() {
+        return Ok(minted);
+    }
+    device.with_seed(|writer_seed| -> crate::Result<()> {
+        let (epoch, key) = match seal {
+            EveryoneSeal::Reuse(epoch, key) => (epoch, key),
+            EveryoneSeal::Fresh(fresh_to) => {
+                let generation = opened
+                    .max_generation
+                    .get(&EpochAudience::Everyone)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(1)
+                    .max(1);
+                let (draft, key) =
+                    log.draft_epoch(actor, authored_ms, EpochAudience::Everyone, generation)?;
+                let record = draft.sign(writer_seed, incarnation)?;
+                let epoch = *record.id();
+                let _ = log.insert(record.clone())?;
+                minted.push(record);
+                for recipient in fresh_to {
+                    let record = log
+                        .draft_wrap(actor, authored_ms, epoch, &key, recipient)?
+                        .sign(writer_seed, incarnation)?;
+                    let _ = log.insert(record.clone())?;
+                    minted.push(record);
+                }
+                (epoch, key)
+            }
+        };
+        for name in deletes {
+            let record = log
+                .draft_delete(actor, authored_ms, epoch, &key, name)?
+                .sign(writer_seed, incarnation)?;
+            let _ = log.insert(record.clone())?;
+            minted.push(record);
+        }
+        for entry in puts {
+            let record = log
+                .draft_put(actor, authored_ms, epoch, &key, entry)?
+                .sign(writer_seed, incarnation)?;
+            let _ = log.insert(record.clone())?;
+            minted.push(record);
+        }
+        Ok(())
+    })?;
+    Ok(minted)
+}
+
 /// One vault pass's waiting writes ([`Waiting`]): once no newest `[everyone]` epoch wraps a Mac
 /// the log removed, sign each `[everyone]` write waiting here, as the edit would have signed it,
 /// under the epoch a writer seals under ([`sealing_epoch`]), and forget it. A write whose name
@@ -1318,9 +1646,10 @@ fn settle(held: &mut Waiting, done: &Waiting) {
 /// or a new fleet code), is dropped, so a value the edit never saw stands: signed now, after it,
 /// it would revert it. A take-back (a `keep`) that finds the name held, by any write, is dropped
 /// too: a pass signs no `Delete`, since a name that leaves `[everyone]` takes a fresh epoch that
-/// reseals what stays (F15), which only an edit's draft mints, and the person's next edit removes
-/// it that way. A publish's claim ([`claim_draft`]) keeps this Mac's own earlier write from being
-/// signed between the draft of a take-back and its pending set. Each dropped write leaves a record
+/// reseals what stays (F15), which only an edit's draft or a member's unset mints
+/// (`member::member_unset`), and the person's next edit or unset removes it that way. A
+/// publish's claim ([`claim_draft`]) keeps this Mac's own earlier write from being signed between
+/// the draft of a take-back and its pending set. Each dropped write leaves a record
 /// in this Mac's journal of overtaken writes ([`overtaken_file`]): the entry, the op that holds it
 /// now and when the write was dropped, which the admin view shows once. A record, never an alert.
 /// A write whose name a pending set of this Mac writes ([`pending_names`]) is left as it is: that
@@ -1430,56 +1759,8 @@ pub(in super::super) fn sign_waiting_writes_by(
                 Err(_) => return none(),
             }
         }
-        let roster = roster_from_doc_or_opened(None, Some(&opened), Some(&log));
-        let denied = |r: &Recipient| recipient_denied_by_roster_or_log(roster.as_ref(), &log, r);
-        let membership = log.membership();
-        let departed = newest.iter().any(|epoch| {
-            log.get(epoch).is_some_and(|record| {
-                membership.removal(record.actor()).is_some()
-                    || membership
-                        .get(record.actor())
-                        .is_some_and(|minter| denied(&minter.binding.recipient()))
-            }) || opened
-                .wrapped_recipients
-                .get(epoch)
-                .is_some_and(|wrapped| wrapped.iter().any(&denied))
-        });
-        let current = log.current_recipients_where(&EpochAudience::Everyone, |seat| {
-            roster
-                .as_ref()
-                .is_some_and(|r| member_denied_by_roster(r, seat))
-        });
-        let flight = Flight::of_reader(&log, &identity.recipient());
-        // A departure that is no removal: a fresh epoch for the rest, as a writer's.
-        let fresh_to: BTreeSet<Recipient> = if departed {
-            newest
-                .iter()
-                .filter_map(|epoch| opened.wrapped_recipients.get(epoch))
-                .flatten()
-                .chain(&current)
-                .filter(|r| !log.recipient_is_removed(r) && !denied(r))
-                .copied()
-                .collect()
-        } else {
-            BTreeSet::new()
-        };
-        let reuse = if departed {
-            None
-        } else {
-            let Some(epoch) = sealing_epoch(
-                &log,
-                &opened,
-                &newest,
-                &identity,
-                &current,
-                flight.undecided(&EpochAudience::Everyone),
-            ) else {
-                return none();
-            };
-            let Some(key) = opened.unwrapped_keys.get(&epoch) else {
-                return none();
-            };
-            Some((epoch, zeroize::Zeroizing::new(**key)))
+        let Some(seal) = everyone_seal(&log, &opened, &identity) else {
+            return none();
         };
         let view = opened.by_audience.get(&Audience::Everyone);
         let mut settled = Waiting::default();
@@ -1519,55 +1800,15 @@ pub(in super::super) fn sign_waiting_writes_by(
                 _ => {}
             }
         }
-        let authored_ms = now_ms;
-        let mut minted = Vec::new();
-        device.with_seed(|writer_seed| -> crate::Result<()> {
-            if puts.is_empty() && deletes.is_empty() {
-                return Ok(());
-            }
-            let (epoch, key) = match reuse {
-                Some(reused) => reused,
-                None => {
-                    let generation = opened
-                        .max_generation
-                        .get(&EpochAudience::Everyone)
-                        .copied()
-                        .unwrap_or(0)
-                        .saturating_add(1)
-                        .max(1);
-                    let (draft, key) =
-                        log.draft_epoch(&actor, authored_ms, EpochAudience::Everyone, generation)?;
-                    let record = draft.sign(writer_seed, incarnation)?;
-                    let epoch = *record.id();
-                    let _ = log.insert(record.clone())?;
-                    minted.push(record);
-                    for &recipient in &fresh_to {
-                        let record = log
-                            .draft_wrap(&actor, authored_ms, epoch, &key, recipient)?
-                            .sign(writer_seed, incarnation)?;
-                        let _ = log.insert(record.clone())?;
-                        minted.push(record);
-                    }
-                    (epoch, key)
-                }
-            };
-            // A `Delete` before its `Put`: a person's save replaces every sibling.
-            for name in &deletes {
-                let record = log
-                    .draft_delete(&actor, authored_ms, epoch, &key, name)?
-                    .sign(writer_seed, incarnation)?;
-                let _ = log.insert(record.clone())?;
-                minted.push(record);
-            }
-            for entry in &puts {
-                let record = log
-                    .draft_put(&actor, authored_ms, epoch, &key, entry)?
-                    .sign(writer_seed, incarnation)?;
-                let _ = log.insert(record.clone())?;
-                minted.push(record);
-            }
-            Ok(())
-        })?;
+        let minted = sign_everyone(
+            &mut log,
+            &opened,
+            (&actor, &device, incarnation),
+            now_ms,
+            seal,
+            &deletes,
+            &puts,
+        )?;
         Ok((minted, (settled, overtaken)))
     };
     let authored = match deadline {
@@ -1612,7 +1853,7 @@ pub(in super::super) fn sign_waiting_writes_by(
 
 /// The op that holds `name` in `[everyone]` now, as `opened` reads `log`: its winning `Put`, or the
 /// `Delete` that removed it; `None` where the log names neither.
-fn overtaker(
+pub(super) fn overtaker(
     log: &Log,
     opened: &crate::membership_log::entries::OpenedAudienceEntries,
     name: &str,

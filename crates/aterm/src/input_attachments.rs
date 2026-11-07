@@ -355,13 +355,17 @@ impl Keeper {
     }
 }
 
-/// Constructed only by the validated subscriber runtime. Its existing local-input
-/// lane maintains the keeper even when sharing holds repository observation.
-pub(super) fn subscriber_inputs(
+/// Only the subscriber's local-input lane maintains the keeper. The node service
+/// already owns its maintenance worker for its full runtime.
+pub(super) fn convergence_inputs(
     paths: &aterm_secrets::client::Paths,
-) -> aterm_secrets::client::SubscriberInputs {
+    role: aterm_secrets::client::ConvergenceRole,
+) -> aterm_secrets::client::ConvergenceInputs {
+    let inputs = super::converge_inputs::observe(paths, role);
+    if role == aterm_secrets::client::ConvergenceRole::Node {
+        return inputs;
+    }
     let maintenance = spawn_background();
-    let inputs = super::converge_inputs::observe(paths);
     match maintenance {
         Some(maintain) => inputs.with_maintenance(Box::new(move || maintain())),
         None => inputs,

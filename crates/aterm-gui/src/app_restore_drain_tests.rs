@@ -527,7 +527,7 @@ fn a_system_quit_inside_the_drain_keeps_each_owed_tabs_own_agent_and_hold() {
     let published = aterm_agent::harness::relaunch::Snapshot {
         launch_env: None,
         auth_observed: true,
-        stored_login: false,
+        route: aterm_agent::harness::accounts::AuthRoute::Outside,
         profile: None,
         tab: sid.clone(),
         pid: 5151,

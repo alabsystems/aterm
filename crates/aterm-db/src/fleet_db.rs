@@ -1673,7 +1673,8 @@ fn default_webmail_url(provider: &str) -> &'static str {
 /// legacy CSV files in `secrets_dir` and enrich with the live fleet roster. A key the database
 /// has already used is left alone, so running it again changes nothing: edits and deletions stand.
 pub fn bootstrap_from_secrets(db: &mut Database, secrets_dir: &Path) -> Result<Value> {
-    let phones_bytes = crate::import::read_bounded(&secrets_dir.join("alab-phones.csv"))?;
+    let phones_bytes =
+        crate::import::read_bounded(&secrets_dir.join(aterm_secrets::entry_class::ALAB_PHONES))?;
     let phones_records = crate::import::parse(&phones_bytes)?;
     let mut phones_map: BTreeMap<String, Map> = BTreeMap::new();
     let mut digits_to_phone: BTreeMap<String, String> = BTreeMap::new();
@@ -1704,7 +1705,8 @@ pub fn bootstrap_from_secrets(db: &mut Database, secrets_dir: &Path) -> Result<V
         phones_map.insert(phone, obj);
     }
 
-    let comp_bytes = crate::import::read_bounded(&secrets_dir.join("alab-computers.csv"))?;
+    let comp_bytes =
+        crate::import::read_bounded(&secrets_dir.join(aterm_secrets::entry_class::ALAB_COMPUTERS))?;
     let comp_records = crate::import::parse(&comp_bytes)?;
     let mut roster_by_label: BTreeMap<String, (Option<String>, Option<String>)> = BTreeMap::new();
     if let Ok(paths) = aterm_secrets::client::Paths::live()
@@ -1824,7 +1826,8 @@ pub fn bootstrap_from_secrets(db: &mut Database, secrets_dir: &Path) -> Result<V
 
     let (xlsx_passwords, unread_workbooks) = read_xlsx_email_passwords(secrets_dir);
     let no_passwords = xlsx_passwords.is_empty();
-    let emails_bytes = crate::import::read_bounded(&secrets_dir.join("alab-emails.csv"))?;
+    let emails_bytes =
+        crate::import::read_bounded(&secrets_dir.join(aterm_secrets::entry_class::ALAB_EMAILS))?;
     let emails_records = crate::import::parse(&emails_bytes)?;
     let mut emails_map: BTreeMap<String, Map> = BTreeMap::new();
     for row in emails_records.iter().skip(1) {
@@ -1894,7 +1897,9 @@ pub fn bootstrap_from_secrets(db: &mut Database, secrets_dir: &Path) -> Result<V
         emails_map.insert(email, obj);
     }
 
-    let acc_bytes = crate::import::read_bounded(&secrets_dir.join("ai-accounts.csv"))?;
+    let acc_bytes = crate::import::read_bounded(
+        &secrets_dir.join(aterm_secrets::entry_class::AI_ACCOUNTS_CSV),
+    )?;
     let acc_records = crate::import::parse(&acc_bytes)?;
     let mut ai_accounts_map: BTreeMap<String, Map> = BTreeMap::new();
     let mut comp_accounts: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();

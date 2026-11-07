@@ -148,6 +148,16 @@ fn step_of(line: &str) -> Result<Step, String> {
         ["aterm", "harness", "accounts", "browser", label] => {
             Step::Browser(cli, (*label).to_owned())
         }
+        ["aterm", "harness", "accounts", "token", label] if cli == Cli::Claude => Step::Token {
+            label: (*label).to_owned(),
+            replace: false,
+        },
+        ["aterm", "harness", "accounts", "token", label, "--replace"] if cli == Cli::Claude => {
+            Step::Token {
+                label: (*label).to_owned(),
+                replace: true,
+            }
+        }
         ["aterm", "harness", "accounts", "add", "<label>"] => Step::Add { cli, email: None },
         [
             "aterm",
@@ -820,6 +830,8 @@ fn every_step_a_surface_names_can_be_taken() {
             .collect::<Vec<_>>()
             .join("\n")
     );
+    #[cfg(unix)]
+    claude_token_worlds(&mut seen, &mut wrong);
     for floor in [
         "aterm harness accounts --cli",
         "aterm harness accounts sync",
@@ -828,7 +840,173 @@ fn every_step_a_surface_names_can_be_taken() {
         "aterm pkg install codex",
         "aterm ai login codex",
         "codex login",
+        #[cfg(unix)]
+        "aterm harness accounts token",
     ] {
         assert!(seen.contains(floor), "no surface named `{floor}`: {seen:?}");
+    }
+}
+
+/// The token worlds of a Claude Code build, with a person at the terminal (DESIGN-claude-setup-
+/// token §5.9, slice S12): `work` has an email and a session here is logged into it, and its
+/// token is `none`, `soon`, `exposed` or `rejected`. Each world's report (text and JSON) names the
+/// offer's step; each step parses into a [`Step`] and, through the real parser and the real entry
+/// in a fresh copy of the world, gets past the verb's preflight to the setup-token program (a
+/// stand-in that answers none). A world whose report names no step fails, as does a step refused.
+#[cfg(unix)]
+fn claude_token_worlds(seen: &mut BTreeSet<String>, wrong: &mut Vec<String>) {
+    use crate::harness::accounts_tokens::tests as token;
+    use crate::harness::accounts_tokens::{
+        InVault, SessionLogin, TokenRow, UsedOn, Verification, update_table,
+    };
+    use aterm_secrets::claude_token::Check;
+    let soon = || token::standing(Check::Readable, token::NOW + 86_400, true, false, &[]);
+    let worlds: [(&str, token::Answer, bool); 4] = [
+        ("none", token::Answer::Absent, false),
+        ("soon", soon(), false),
+        (
+            "exposed",
+            token::standing(
+                Check::Readable,
+                token::NOW + token::A_YEAR,
+                true,
+                false,
+                &["m9"],
+            ),
+            false,
+        ),
+        (
+            "rejected",
+            token::standing(
+                Check::Readable,
+                token::NOW + token::A_YEAR,
+                true,
+                false,
+                &[],
+            ),
+            true,
+        ),
+    ];
+    for (name, found, rejected) in worlds {
+        let scratch = token::Scratch::new(&format!("law-{name}"));
+        let lay = || {
+            let store = scratch.store();
+            update_table(&store, |table| {
+                table.rows.clear();
+                table.offers.clear();
+                if rejected {
+                    table.rows.insert(
+                        token::KEY.to_owned(),
+                        TokenRow {
+                            key: token::KEY.to_owned(),
+                            email: token::EMAIL.to_owned(),
+                            account_id: None,
+                            label: Some("work".to_owned()),
+                            entry: token::key().entry(),
+                            minted_at: Some(token::NOW - 86_400),
+                            expires_at: Some(token::NOW + token::A_YEAR),
+                            expiry_from: Some("printed".to_owned()),
+                            minted_on: Some("m7".to_owned()),
+                            signer: Some("m7".to_owned()),
+                            used_on: UsedOn::default(),
+                            vault: InVault::InVault,
+                            verified: Some(token::NOW - 3_600),
+                            verification: Verification::default(),
+                            rejected_at: Some(token::NOW - 60),
+                            removed_at: None,
+                        },
+                    );
+                }
+            })
+            .expect("the table");
+        };
+        let host = || {
+            let mut host =
+                token::Host::new(token::VaultOf::Fake(token::FakeVault::new(found.clone())));
+            host.logins = vec![SessionLogin {
+                email: token::EMAIL.to_owned(),
+                account_id: None,
+                default: true,
+            }];
+            host
+        };
+        let run = |host: &token::Host, line: &str| -> Result<(ExitCode, String, String), String> {
+            let words: Vec<String> = line.split_whitespace().map(str::to_owned).collect();
+            let (cmd, _) = crate::harness::cli::parse(&words)
+                .map_err(|why| format!("the parser refused: {why}"))?;
+            let Cmd::Accounts(form) = cmd else {
+                return Err("the parser read another command".to_owned());
+            };
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = crate::harness::journal::with_keyer(token::keyer, || {
+                run_accounts(&form, &scratch.env(), host, &mut out, &mut err)
+            });
+            Ok((
+                code,
+                String::from_utf8(out).expect("utf-8"),
+                String::from_utf8(err).expect("utf-8"),
+            ))
+        };
+        let mut named = 0;
+        for json in [false, true] {
+            lay();
+            let report = if json { "accounts --json" } else { "accounts" };
+            let said = match run(&host(), report) {
+                Ok((_, out, _)) => out,
+                Err(why) => {
+                    wrong.push(format!("Claude {name}: the report: {why}"));
+                    continue;
+                }
+            };
+            // The JSON names its step as a value (`tokens.accounts[].offer.step`).
+            let lines: Vec<String> = if json {
+                let value: aterm_json::Value =
+                    aterm_json::from_str(said.trim()).unwrap_or_default();
+                value["tokens"]["accounts"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|account| account["offer"]["step"].as_str().map(str::to_owned))
+                    .collect()
+            } else {
+                named_commands(&said)
+                    .into_iter()
+                    .map(|named| named.line)
+                    .collect()
+            };
+            for line in lines {
+                let step = match step_of(&line) {
+                    Ok(step) => step,
+                    Err(why) => {
+                        wrong.push(format!("Claude {name}: the report: {why}"));
+                        continue;
+                    }
+                };
+                if !matches!(step, Step::Token { .. }) {
+                    continue;
+                }
+                named += 1;
+                seen.insert(
+                    line.split_whitespace()
+                        .take(4)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
+                lay();
+                let taker = host();
+                match run(&taker, &command_line(&step)) {
+                    Ok(_) if taker.asked_program.get() => {}
+                    Ok((code, out, err)) => wrong.push(format!(
+                        "Claude {name}: the report names `{line}`, refused ({code:?}): {out}{err}"
+                    )),
+                    Err(why) => wrong.push(format!("Claude {name}: `{line}`: {why}")),
+                }
+            }
+        }
+        if named < 2 {
+            wrong.push(format!(
+                "Claude {name}: the report's text and JSON name no token step"
+            ));
+        }
     }
 }

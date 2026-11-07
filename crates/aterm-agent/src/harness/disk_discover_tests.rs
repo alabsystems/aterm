@@ -1393,7 +1393,7 @@ fn each_running_claude_code_names_the_home_it_runs_in() {
             argv: vec![exe.to_owned()],
             config: config.map(str::to_owned),
             home: Some("/u".to_owned()),
-            stored_login: true,
+            route: crate::harness::accounts::AuthRoute::Stored,
         }),
         cwd: cwd.map(PathBuf::from),
         started: None,
@@ -1573,7 +1573,7 @@ fn a_session_is_gone_only_when_nothing_names_it_and_nothing_of_it_was_written() 
                 argv: argv.iter().map(|a| (*a).to_owned()).collect(),
                 config: None,
                 home: text(&home),
-                stored_login: true,
+                route: crate::harness::accounts::AuthRoute::Stored,
             }),
             cwd: cwd.map(PathBuf::from),
             started: Some(started.to_owned()),
@@ -1754,7 +1754,7 @@ fn a_session_is_gone_only_when_nothing_names_it_and_nothing_of_it_was_written() 
             argv: vec!["cc-work".to_owned()],
             config: text(&alt.join(".claude")),
             home: text(&home),
-            stored_login: true,
+            route: crate::harness::accounts::AuthRoute::Stored,
         }),
         ..Process::default()
     };
@@ -1771,7 +1771,7 @@ fn a_session_is_gone_only_when_nothing_names_it_and_nothing_of_it_was_written() 
             argv: vec!["cc-work".to_owned()],
             config: text(&home.join("Library/Work/.claude")),
             home: text(&home),
-            stored_login: true,
+            route: crate::harness::accounts::AuthRoute::Stored,
         }),
         cwd: Some(PathBuf::from("/proj")),
         ..Process::default()
@@ -3294,7 +3294,8 @@ fn the_census_reads_whether_a_claude_code_is_on_its_stored_login() {
             env: env.iter().map(|kv| (*kv).to_owned()).collect(),
         })
         .expect("an exec record")
-        .stored_login
+        .route
+        .is_stored()
     };
     assert!(stored(&["HOME=/u", "TERM=xterm"]));
     for env in [

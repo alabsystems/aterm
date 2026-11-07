@@ -202,6 +202,8 @@ impl PageStore {
         PageSlice {
             ptr,
             len,
+            touched_lo: 0,
+            touched_hi: len,
             #[cfg(any(test, debug_assertions))]
             page_id,
             #[cfg(test)]

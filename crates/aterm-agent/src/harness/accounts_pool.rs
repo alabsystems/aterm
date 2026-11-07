@@ -2889,10 +2889,12 @@ pub fn cold_launch_admitted(
         let effective = match row {
             Some(row) => {
                 let (_, login) = accounts::login_env_for(cli, row);
+                // The picked row's stored login: the plan that serves a row's vault token
+                // decides that route itself (§5.3).
                 accounts::ProcessLogin {
                     login,
                     default_home: true,
-                    stored_login: true,
+                    route: accounts::AuthRoute::Stored,
                 }
             }
             None => input.clone(),
@@ -2955,7 +2957,13 @@ fn cold_launch_who_capturing(
         current
     };
     let Some(label) = accounts::judged_label(&snapshot.roster, &who) else {
-        if who.default_home && who.stored_login {
+        // A process on a login's own credential, stored or a vault token's, never reuses a
+        // login retained without a binding.
+        let own = match who.route {
+            accounts::AuthRoute::Stored | accounts::AuthRoute::VaultToken { .. } => true,
+            accounts::AuthRoute::Outside => false,
+        };
+        if who.default_home && own {
             let default = seat.home.join(cli.accounts().default_home);
             let directory = who.login.as_deref().map(Path::new).unwrap_or(&default);
             let directory = directory
@@ -4073,7 +4081,7 @@ pub fn native_quota_target(
         account: Some(&from.label),
         left: None,
         default_home: true,
-        stored_login: true,
+        route: accounts::AuthRoute::Stored,
     };
     let point = Point::Wall {
         window: window.to_owned(),
@@ -4145,7 +4153,10 @@ fn session_plan_with<T, R>(
     };
     let who = accounts::ProcessLogin::of_env_for(s.cli, s.env.iter().copied());
     let me = who.me(&roster);
-    if let Some(label) = me.label().filter(|_| me.default_home && me.stored_login) {
+    if let Some(label) = me
+        .label()
+        .filter(|_| me.default_home && me.route.on_account())
+    {
         let recorded = roster
             .row(label)
             .ok_or_else(|| "observed row is missing".into())
@@ -4706,7 +4717,8 @@ fn record_session<R>(
         |raw, state, logins| {
             let current = accounts::bound(raw, logins);
             let me = who.me(&current);
-            if !me.default_home || !me.stored_login || me.label() != Some(row.label.as_str()) {
+            if !me.default_home || !me.route.on_account() || me.label() != Some(row.label.as_str())
+            {
                 return Err("session login changed; usage attribution is unknown".into());
             }
             let mut observed = current

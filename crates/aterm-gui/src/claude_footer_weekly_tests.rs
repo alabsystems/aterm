@@ -132,7 +132,7 @@ fn asks(args: fn(i32) -> Option<atpkg::caller_shell::ProcArgs>, seat: fn() -> Ta
         args,
         roster: || Some(accounts::Roster::default()),
         home: || Some(root()),
-        stored_login: |_, _, _| true,
+        route: |_, _, _| aterm_agent::harness::accounts::AuthRoute::Stored,
         tap: TapAsks {
             seat,
             settings: |_, _| true,
@@ -329,7 +329,7 @@ fn unread(dir: &Path) -> Identity {
         argv: Vec::new(),
         task: None,
         login_checked_for: None,
-        stored_login: false,
+        route: aterm_agent::harness::accounts::AuthRoute::Outside,
         unoffered: None,
         env_stamp: None,
     }
@@ -490,7 +490,7 @@ fn the_footer_shows_its_own_taps_week_for_its_own_login_under_the_age_rule() {
 
     reading(pid, NOW - 60, (380, RESET), None, None);
     let refused = Asks {
-        stored_login: |_, _, _| false,
+        route: |_, _, _| aterm_agent::harness::accounts::AuthRoute::Outside,
         ..tap_on
     };
     assert_eq!(
@@ -995,7 +995,7 @@ fn the_resolver_reads_the_stores_week_under_the_same_rule() {
     );
     save(Some(NOW - 60), true);
     let refused = Asks {
-        stored_login: |_, _, _| false,
+        route: |_, _, _| aterm_agent::harness::accounts::AuthRoute::Outside,
         ..asks(tapped, stored)
     };
     assert_eq!(

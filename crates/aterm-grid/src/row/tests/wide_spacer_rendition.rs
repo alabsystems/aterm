@@ -86,9 +86,8 @@ fn write_wide_char_no_fixup_matches_the_checked_path() {
     let colors = Cell::convert_colors(PackedColor::DEFAULT_FG, PackedColor::DEFAULT_BG);
 
     checked.write_wide_char_packed(0, '\u{6F22}', colors, EVERY_RENDITION);
-    // SAFETY: col 0 with col+1 = 1 < 10 cells, on a wide boundary, into a fresh
-    // row with no pre-existing wide pair to conflict with (invariants a/b/c).
-    unsafe { fast.write_wide_char_packed_no_fixup(0, '\u{6F22}', colors, EVERY_RENDITION) };
+    // On a wide boundary, into a fresh row with no wide pair to conflict with.
+    fast.write_wide_run_packed_no_fixup(0, &['\u{6F22}'], colors, |_| EVERY_RENDITION);
 
     assert_eq!(
         fast.get(1).unwrap().flags(),

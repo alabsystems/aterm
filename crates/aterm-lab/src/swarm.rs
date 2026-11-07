@@ -134,7 +134,7 @@ pub fn simulate_tap_wall_step(
             let me = accounts::Me {
                 account: Some(from_label),
                 default_home: true,
-                stored_login: true,
+                route: aterm_agent::harness::accounts::AuthRoute::Stored,
                 left: None,
             };
             accounts::advise_past_probe(

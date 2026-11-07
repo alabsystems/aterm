@@ -1839,10 +1839,6 @@ impl Ports for Live {
         })
     }
 
-    fn holds_fleet_key(&self) -> bool {
-        aterm_types::dirs::state_dir().is_none_or(|state| aterm_net::fleet::holds_fleet_key(&state))
-    }
-
     fn sync_fleet(&self) -> Result<FleetDone, String> {
         match aterm_agent::try_sync_from_cache() {
             Ok(aterm_agent::FleetSync::Blocked(why)) => Ok(FleetDone::Blocked(why)),
@@ -2114,7 +2110,11 @@ impl Ports for Live {
         }
     }
 
-    fn clone_owed(&self, work: aterm_secrets::converge::RepositoryWork) -> Result<String, String> {
+    fn clone_owed(
+        &self,
+        work: aterm_secrets::converge::RepositoryWork,
+        execution: Option<aterm_machines::sync::repository_refresh::Execution>,
+    ) -> Result<String, String> {
         let state = self
             .state_dir()
             .ok_or("no state directory holds the clone aterm init owes")?;
@@ -2122,26 +2122,32 @@ impl Ports for Live {
         let ctx = repository_context(&sys)?;
         let paths = vault_paths()?;
         let Some(config) = repository_vault(&paths, &sys, &ctx)? else {
-            return aterm_machines::init::clone_owed(&sys, &state, work);
+            return aterm_machines::init::clone_owed_in_pass(&sys, &state, work, execution);
         };
         let captured =
             repository_inputs(&paths, &config, &sys, &ctx)?.ok_or(REPOSITORIES_SYNCING)?;
-        aterm_machines::init::clone_owed_captured(&sys, &state, work, captured.inputs, move || {
-            // A first clone may take a long time. The person's Stop, repository switch or
-            // profile change must hold every later effect, not just the next sync pass.
-            if setup_holds().holds(aterm_types::macos_setup::Setting::Repositories)
-                || !aterm_machines::init_github::uses_vault_inventory(
-                    &aterm_machines::port::Live::new(),
-                    &ctx,
-                )?
-            {
-                return Ok(false);
-            }
-            captured
-                .snapshot
-                .is_current_now(&paths)
-                .map_err(|why| why.to_string())
-        })
+        aterm_machines::init::clone_owed_captured(
+            &sys,
+            &state,
+            work,
+            captured.inputs.with_repository_execution(execution),
+            move || {
+                // A first clone may take a long time. The person's Stop, repository switch or
+                // profile change must hold every later effect, not just the next sync pass.
+                if setup_holds().holds(aterm_types::macos_setup::Setting::Repositories)
+                    || !aterm_machines::init_github::uses_vault_inventory(
+                        &aterm_machines::port::Live::new(),
+                        &ctx,
+                    )?
+                {
+                    return Ok(false);
+                }
+                captured
+                    .snapshot
+                    .is_current_now(&paths)
+                    .map_err(|why| why.to_string())
+            },
+        )
     }
 
     fn forget_owed_clone(&self) -> Result<(), String> {

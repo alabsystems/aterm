@@ -24,7 +24,7 @@ fn snapshot() -> Snapshot {
         login: None,
         home: None,
         claude_dir: None,
-        stored_login: true,
+        route: crate::harness::accounts::AuthRoute::Stored,
         profile: None,
     }
 }
@@ -169,9 +169,9 @@ fn transcript_environment_reads_the_live_kernel_identity() {
             .expect("normalized own command");
     snap.login = args.env_var(accounts::LOGIN_ENV).map(str::to_owned);
     snap.home = args.env_var(accounts::HOME_ENV).map(str::to_owned);
-    snap.stored_login = accounts::ProcessLogin::of_exec_env(&args.env)
+    snap.route = accounts::ProcessLogin::of_exec_env(&args.env)
         .expect("own nonempty environment")
-        .stored_login;
+        .route;
     assert!(
         snapshot_login_env(&snap).is_some(),
         "the live snapshot must agree"
@@ -188,7 +188,7 @@ fn codex_snapshot_login_env_verifies_codex_home_and_self_claimed_auth_path() {
     let mut snap = snapshot();
     snap.program = at!("/synthetic/codex").into();
     snap.argv = vec![at!("/synthetic/codex").into()];
-    snap.stored_login = false;
+    snap.route = crate::harness::accounts::AuthRoute::Outside;
     snap.run = AgentRun::Codex(crate::harness::relaunch::CodexRun {
         home: "/synthetic/.codex".into(),
         home_env: Some("/synthetic/.codex".into()),

@@ -87,7 +87,7 @@ fn observe_case(state: &ModelState, legacy: bool, capture_late: bool) -> [(&'sta
             Some(directory.display().to_string())
         },
         default_home: true,
-        stored_login: true,
+        route: crate::harness::accounts::AuthRoute::Stored,
     };
     let mut s = session(provider, Supervisor::Aterm, Mode::Early, &world.exe);
     if state["point"] == 1 {
@@ -283,7 +283,7 @@ fn an_observation_uses_the_identity_policy_current_inside_the_writer() {
     let who = accounts::ProcessLogin {
         login: Some(directory.display().to_string()),
         default_home: true,
-        stored_login: true,
+        route: crate::harness::accounts::AuthRoute::Stored,
     };
     let s = session(provider, Supervisor::Aterm, Mode::Early, &world.exe);
     assert!(super::super::record_session(&world.seat(), &s, &who, &captured).is_err());

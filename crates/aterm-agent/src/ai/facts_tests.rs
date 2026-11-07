@@ -491,7 +491,7 @@ fn claude_accounts_surfaces_next_sign_in_and_prefers_ready_enrolled_row() {
     let who = accounts::ProcessLogin {
         login: None,
         default_home: true,
-        stored_login: true,
+        route: crate::harness::accounts::AuthRoute::Stored,
     };
     let _ = accounts::record_wall(&store, &roster, "s-test", &who, &wall, now - 60, now);
 

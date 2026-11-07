@@ -76,7 +76,23 @@ fn spawn_pass<'scope>(
             stop,
             held: &|| held(),
             may_post: &|| true,
-            start_converge: &|| None,
+            routes: &|| [None; 3],
+            make_inputs: &|| {
+                assert!(!held(), "held work does not construct an observer");
+                assert!(
+                    !crate::service::subscriber_turned_off(&paths.home),
+                    "Off work does not construct an observer"
+                );
+                ConvergenceInputs::new(Box::new(|_| None))
+            },
+            start_converge: &|_| {
+                assert!(!held(), "held work does not start convergence");
+                assert!(
+                    !crate::service::subscriber_turned_off(&paths.home),
+                    "Off work does not start convergence"
+                );
+                None
+            },
             now_ms: &|| clock.load(Ordering::Acquire),
             log: &|_| {},
             pace: QUICK,
@@ -190,6 +206,25 @@ fn a_person_who_turned_the_agent_off_holds_the_pass() {
     });
     assert!(!wrapped(m22, &m40));
     assert_eq!(node_pass_receipt(m22), None);
+}
+
+#[test]
+fn a_stopped_node_does_not_make_inputs_or_start_convergence() {
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
+    let stop = AtomicBool::new(true);
+    run_node_pass(&NodePassHost {
+        paths: &macs.m7,
+        stop: &stop,
+        held: &|| panic!("a stopped loop reads no admission inputs"),
+        may_post: &|| panic!("a stopped loop starts no vault work"),
+        routes: &|| panic!("a stopped loop reads no routes"),
+        make_inputs: &|| panic!("a stopped loop constructs no observer"),
+        start_converge: &|_| panic!("a stopped loop starts no converge job"),
+        now_ms: &|| panic!("a stopped loop reads no clock"),
+        log: &|_| {},
+        pace: QUICK,
+    });
+    assert_eq!(node_pass_receipt(&macs.m7), None);
 }
 
 #[test]
@@ -309,13 +344,13 @@ fn a_failed_apply_is_tried_again_with_no_new_record() {
     let (m22, m7) = (&macs.m22, &macs.m7);
     let now = aterm_time::unix_millis().unwrap();
     let mut pass = NodePass::default();
-    let parent = m7.home.join(".config/tool");
+    let parent = m7.home.join(".config/gh");
     std::fs::create_dir_all(&parent).unwrap();
     let mode = |bits| {
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(bits)).unwrap();
     };
     mode(0o500);
-    test_put_everyone(m22, "~/.config/tool/token", b"token-v1").unwrap();
+    test_put_everyone(m22, "~/.config/gh/hosts.yml", b"token-v1").unwrap();
     save_records(m7, &load_records(m22).unwrap().encode()).unwrap();
     let (receipt, _) = pass.once(m7, now, QUICK.lock_wait, &|| false).unwrap();
     assert_eq!(receipt.said, NodePassSaid::Failed);
@@ -329,7 +364,10 @@ fn a_failed_apply_is_tried_again_with_no_new_record() {
     mode(0o700);
     let (receipt, error) = pass.once(m7, now, QUICK.lock_wait, &|| false).unwrap();
     assert_eq!(receipt.said, NodePassSaid::Done, "{error:?}");
-    assert_eq!(std::fs::read(parent.join("token")).unwrap(), b"token-v1");
+    assert_eq!(
+        std::fs::read(parent.join("hosts.yml")).unwrap(),
+        b"token-v1"
+    );
 }
 
 /// A Mac that holds its vault as a log alone keeps the rule too, with no envelope to read.
@@ -420,7 +458,9 @@ fn a_busy_pass_in_the_loop_runs_again_soon_and_backs_off() {
                 stop: &stop,
                 held: &|| false,
                 may_post: &|| false,
-                start_converge: &|| None,
+                routes: &|| [None; 3],
+                make_inputs: &|| ConvergenceInputs::new(Box::new(|_| None)),
+                start_converge: &|_| None,
                 now_ms: &|| clock.load(Ordering::Acquire),
                 log: &|_| {},
                 pace: NodePassPace {
@@ -456,8 +496,8 @@ fn a_busy_pass_in_the_loop_runs_again_soon_and_backs_off() {
     assert_eq!(wait(u32::MAX), Duration::from_secs(60));
 }
 
-/// A version the pass applied starts one converge runner, once the LAN allows, and a pass that
-/// applied none starts none: the subscriber beside it finds that version unchanged.
+/// A version the pass applied starts one repair once the LAN allows. A subsequent relevant
+/// local-input change owes a refresh even when the signed records and wall clock stay fixed.
 #[test]
 fn a_version_the_pass_applied_owes_one_converge_runner_once_the_lan_allows() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
@@ -467,9 +507,13 @@ fn a_version_the_pass_applied_owes_one_converge_runner_once_the_lan_allows() {
     let stop = AtomicBool::new(false);
     let lan = AtomicBool::new(false);
     let runners = AtomicUsize::new(0);
+    let work = std::sync::Mutex::new(Vec::new());
     let looked = AtomicUsize::new(0);
+    let source = std::sync::Arc::new(AtomicUsize::new(0));
+    let made_inputs = AtomicUsize::new(0);
     let successful = converge_program(macs.root.path(), "converge-success", "exit 0");
     std::thread::scope(|scope| {
+        let _running = Running { stop: &stop };
         scope.spawn(|| {
             run_node_pass(&NodePassHost {
                 paths: m7,
@@ -479,7 +523,38 @@ fn a_version_the_pass_applied_owes_one_converge_runner_once_the_lan_allows() {
                     false
                 },
                 may_post: &|| lan.load(Ordering::Acquire),
-                start_converge: &|| {
+                routes: &|| [None; 3],
+                make_inputs: &|| {
+                    made_inputs.fetch_add(1, Ordering::AcqRel);
+                    let source = std::sync::Arc::clone(&source);
+                    let mut seen = source.load(Ordering::Acquire);
+                    ConvergenceInputs::new(Box::new(move |refresh| {
+                        let current = source.load(Ordering::Acquire);
+                        if current == seen {
+                            None
+                        } else {
+                            seen = current;
+                            Some(crate::converge::RepositoryRequest::Refresh(
+                                crate::converge::RefreshRequest::inputs(
+                                    crate::converge::RefreshScope::new([1; 32]),
+                                    refresh.version,
+                                ),
+                            ))
+                        }
+                    }))
+                    .with_refresh(Box::new(|| {
+                        crate::converge::RefreshObservation {
+                            version: crate::converge::RefreshVersion {
+                                input: 7,
+                                attempt: 9,
+                                ..crate::converge::RefreshVersion::default()
+                            },
+                            ..crate::converge::RefreshObservation::default()
+                        }
+                    }))
+                },
+                start_converge: &|requested| {
+                    work.lock().unwrap().push(requested);
                     runners.fetch_add(1, Ordering::AcqRel);
                     Some(ended_runner(&successful))
                 },
@@ -497,11 +572,14 @@ fn a_version_the_pass_applied_owes_one_converge_runner_once_the_lan_allows() {
         };
         looks_past(5);
         lan.store(true, Ordering::Release);
+        aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "initial refresh", || {
+            (runners.load(Ordering::Acquire) == 1).then_some(())
+        });
         looks_past(5);
         assert_eq!(
             runners.load(Ordering::Acquire),
-            0,
-            "nothing was applied yet"
+            1,
+            "startup ensures freshness once without an applied version"
         );
 
         lan.store(false, Ordering::Release);
@@ -512,18 +590,57 @@ fn a_version_the_pass_applied_owes_one_converge_runner_once_the_lan_allows() {
             std::fs::read(&later).ok().map(|_| ())
         });
         looks_past(5);
-        assert_eq!(runners.load(Ordering::Acquire), 0, "the LAN is closed");
+        assert_eq!(runners.load(Ordering::Acquire), 1, "the LAN is closed");
         lan.store(true, Ordering::Release);
         aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the owed runner", || {
-            (runners.load(Ordering::Acquire) >= 1).then_some(())
+            (runners.load(Ordering::Acquire) >= 2).then_some(())
         });
         looks_past(5);
         assert_eq!(
             runners.load(Ordering::Acquire),
-            1,
-            "one version, one runner"
+            2,
+            "the unrelated applied version owes one repair"
         );
+        let records = load_records(m7).unwrap().encode();
+        source.store(1, Ordering::Release);
+        looks_past(10);
         stop.store(true, Ordering::Release);
+        assert_eq!(made_inputs.load(Ordering::Acquire), 1);
+        assert_eq!(load_records(m7).unwrap().encode(), records);
+        assert_eq!(clock.load(Ordering::Acquire), start);
+        let requests = work.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.work())
+                .collect::<Vec<_>>(),
+            vec![
+                crate::converge::RepositoryWork::Refresh,
+                crate::converge::RepositoryWork::Repair,
+                crate::converge::RepositoryWork::Refresh,
+            ],
+            "a relevant local source change refreshes without another signed record"
+        );
+        let version = crate::converge::RefreshVersion {
+            input: 7,
+            attempt: 9,
+            ..crate::converge::RefreshVersion::default()
+        };
+        assert_eq!(
+            requests[0],
+            crate::converge::RepositoryRequest::Refresh(crate::converge::RefreshRequest::ensure(
+                None, version
+            )),
+            "startup shares an existing generation without inventing a later fence"
+        );
+        assert_eq!(
+            requests[2],
+            crate::converge::RepositoryRequest::Refresh(crate::converge::RefreshRequest::inputs(
+                crate::converge::RefreshScope::new([1; 32]),
+                version,
+            )),
+            "the local transition retains its sampled input epoch and expected scope"
+        );
     });
 }
 
@@ -559,7 +676,7 @@ fn node_convergence_retries_unfinished_or_failed_runners_and_honors_the_lan_hold
         );
         let success = converge_program(root.path(), "success", "exit 0");
         let calls = std::cell::Cell::new(0);
-        let start = || {
+        let start = |_: crate::converge::RepositoryRequest| {
             calls.set(calls.get() + 1);
             Some(ended_runner(match calls.get() {
                 1 | 4 => &failed,
@@ -567,49 +684,60 @@ fn node_convergence_retries_unfinished_or_failed_runners_and_honors_the_lan_hold
                 _ => &success,
             }))
         };
-        let mut converge = NodeConverge {
-            owed: true,
-            ..NodeConverge::default()
-        };
-        converge.tend_at(0, &|| false, &start);
+        let mut converge = NodeConverge::default();
+        converge.tend_at(0, [None; 3], &|| false, &start);
         assert_eq!(calls.get(), 0, "an owed version still honors the LAN hold");
-        converge.tend_at(1, &|| true, &start);
-        converge.tend_at(2, &|| true, &start);
+        converge.tend_at(1, [None; 3], &|| true, &start);
+        converge.tend_at(2, [None; 3], &|| true, &start);
         for at in [3, 4_000, 5_001] {
-            converge.tend_at(at, &|| true, &start);
+            converge.tend_at(at, [None; 3], &|| true, &start);
         }
         assert_eq!(
             calls.get(),
             1,
             "one failure is consumed once, without a hot loop"
         );
-        converge.tend_at(5_002, &|| false, &start);
+        converge.tend_at(5_002, [None; 3], &|| false, &start);
         assert_eq!(calls.get(), 1, "a due retry cannot bypass the LAN hold");
-        converge.tend_at(6_000, &|| true, &start);
+        converge.tend_at(6_000, [None; 3], &|| true, &start);
         assert_eq!(
             calls.get(),
             2,
             "unchanged records do not strand the failure"
         );
-        converge.tend_at(6_001, &|| true, &start);
-        assert_eq!(calls.get(), 3, "the held pass stays owed");
-        converge.tend_at(6_002, &|| true, &start);
-        converge.tend_at(30_000, &|| true, &start);
+        converge.tend_at(6_001, [None; 3], &|| true, &start);
+        assert_eq!(
+            calls.get(),
+            2,
+            "a held pass waits for the shared five-second retry"
+        );
+        converge.tend_at(11_000, [None; 3], &|| true, &start);
+        assert_eq!(calls.get(), 2);
+        converge.tend_at(11_001, [None; 3], &|| true, &start);
+        assert_eq!(
+            calls.get(),
+            3,
+            "the held pass stays owed at its retry boundary"
+        );
+        converge.tend_at(11_002, [None; 3], &|| true, &start);
+        converge.tend_at(30_000, [None; 3], &|| true, &start);
         assert_eq!(calls.get(), 3, "success ends the retry streak");
 
-        converge.owed = true;
-        converge.tend_at(30_001, &|| true, &start);
-        converge.tend_at(30_002, &|| true, &start);
-        converge.tend_at(35_001, &|| true, &start);
+        converge
+            .due
+            .request(crate::converge::RepositoryRequest::Repair);
+        converge.tend_at(30_001, [None; 3], &|| true, &start);
+        converge.tend_at(30_002, [None; 3], &|| true, &start);
+        converge.tend_at(35_001, [None; 3], &|| true, &start);
         assert_eq!(calls.get(), 4);
-        converge.tend_at(35_002, &|| true, &start);
+        converge.tend_at(35_002, [None; 3], &|| true, &start);
         assert_eq!(
             calls.get(),
             5,
             "success reset the next failure to five seconds"
         );
-        converge.tend_at(35_003, &|| true, &start);
-        converge.tend_at(60_000, &|| true, &start);
+        converge.tend_at(35_003, [None; 3], &|| true, &start);
+        converge.tend_at(60_000, [None; 3], &|| true, &start);
         assert_eq!(calls.get(), 5);
     }
 }
@@ -625,7 +753,7 @@ fn node_convergence_coalesces_new_versions_while_a_runner_still_runs() {
     );
     let success = converge_program(root.path(), "success", "exit 0");
     let calls = std::cell::Cell::new(0);
-    let start = || {
+    let start = |_: crate::converge::RepositoryRequest| {
         calls.set(calls.get() + 1);
         Some(if calls.get() == 1 {
             crate::converge::start(
@@ -638,31 +766,30 @@ fn node_convergence_coalesces_new_versions_while_a_runner_still_runs() {
             ended_runner(&success)
         })
     };
-    let mut converge = NodeConverge {
-        owed: true,
-        ..NodeConverge::default()
-    };
-    converge.tend_at(0, &|| true, &start);
-    converge.owed = true;
+    let mut converge = NodeConverge::default();
+    converge.tend_at(0, [None; 3], &|| true, &start);
+    converge
+        .due
+        .request(crate::converge::RepositoryRequest::Repair);
     for at in [1, 2, 3] {
-        converge.tend_at(at, &|| true, &start);
+        converge.tend_at(at, [None; 3], &|| true, &start);
     }
     assert_eq!(calls.get(), 1, "new work cannot start a concurrent runner");
     let child = converge.runner.as_mut().unwrap();
     child.kill().unwrap();
     child.wait().unwrap();
-    converge.tend_at(4, &|| true, &start);
+    converge.tend_at(4, [None; 3], &|| true, &start);
     assert_eq!(
         calls.get(),
         2,
         "new work remains owed after the failed runner"
     );
-    converge.tend_at(5, &|| true, &start);
-    converge.tend_at(60_000, &|| true, &start);
+    converge.tend_at(5, [None; 3], &|| true, &start);
+    converge.tend_at(60_000, [None; 3], &|| true, &start);
     assert_eq!(
         calls.get(),
-        2,
-        "the coalesced successful pass ends the debt"
+        3,
+        "a successful local repair preserves the failed refresh's original retry"
     );
 }
 

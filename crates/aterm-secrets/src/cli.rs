@@ -38,8 +38,11 @@ aterm secrets: one credentials file for every machine (aterm help secrets).
                                          to a mirror
   aterm secrets ls [--describe | --json]  the names this machine holds; descriptions and
                                          file pointers with --describe, metadata JSON
-                                         with --json; neither prints secret values
-  aterm secrets get <name>               print one value to stdout
+                                         with --json; neither prints secret values. A
+                                         Claude Code token has no file: its row says its
+                                         state, where it was minted and when it ends
+  aterm secrets get <name>               print one value to stdout (never a Claude Code
+                                         token, which aterm hands only to Claude Code)
   aterm secrets keep <name>...           make each file the vault wrote here this Mac's own
                                          (confirmed by digest), so the removal of its entry
                                          leaves the file; prints kept, or why not, per
@@ -57,6 +60,31 @@ aterm secrets: one credentials file for every machine (aterm help secrets).
   aterm secrets git-setup [--apply]    plan a local migration of known vault/native Git helpers
                                          to this protected development executable; --apply keeps
                                          exact private rollback files and refuses custom helpers
+member (a Mac seated in the vault's membership log; status says vault writes: member):
+  aterm secrets set <name> [--file <path>]
+        [--if-absent [--with <name> | --no-with]] [--fleet-reads-anchors]
+                                         sign the value from stdin or the file into the
+                                         vault's log for every member, with no admin key;
+                                         shared names only (release material, fleet
+                                         configuration, git's config and control records
+                                         are refused); with no server answering, it is
+                                         signed here, and while a removal's new key is due,
+                                         it waits: not yet in vault until this Mac's vault
+                                         pass posts or signs it; --if-absent:
+                                         only where the machine has no file of its own;
+                                         --with: and only where that if-absent entry is
+                                         not the machine's own (set again, an entry keeps
+                                         its anchor unless --no-with); the vault's first
+                                         anchored entry needs --fleet-reads-anchors
+  aterm secrets unset <name>             remove a shared name from the vault's log for every
+                                         member, with no admin key, under a new vault key
+                                         that seals every entry left again, so no Mac let
+                                         in later reads the removed value; this Mac's own
+                                         write of it that still waits is taken back; it
+                                         never waits, and needs a Mac that opens every
+                                         entry; with no server answering, it is signed
+                                         here: not yet in vault until this Mac's vault pass
+                                         posts it
 admin (a machine in [admins]):
   aterm secrets create <url>|<path> [--import <dir>] [--name <host>]
         [--no-agent] [--serve]           a new open vault (at a <url> a machine is let in by
@@ -71,15 +99,16 @@ admin (a machine in [admins]):
                                          machine's server on the <url>'s port
   aterm secrets edit                     the vault text in $VISUAL or $EDITOR (else vi);
                                          saving publishes it
-  aterm secrets set <name> [--for <host|code>...] [--file <path>]
-        [--if-absent [--with <name> | --no-with]] [--fleet-reads-anchors]
-                                         the value from stdin or the file; --if-absent: only
-                                         where the machine has no file of its own; --with:
-                                         and only where that if-absent entry is not the
-                                         machine's own (set again, an entry keeps its anchor
-                                         unless --no-with); the vault's first anchored entry
-                                         needs --fleet-reads-anchors
-  aterm secrets unset <name> [--for <host|code>...]
+  aterm secrets set <name> --for <host|code>... [set's flags]
+                                         the value for those machines only (B13 removes
+                                         --for); a plain set on a vault with no membership
+                                         log, and of release material, fleet configuration,
+                                         git's config or a control record, is an admin's too
+  aterm secrets unset <name> --for <host|code>...
+                                         remove it for those machines only (B13 removes
+                                         --for); a plain unset on a vault with no membership
+                                         log, and of release material, fleet configuration,
+                                         git's config or a control record, is an admin's too
   aterm secrets password [show|set|new|open|off] [--no-agent]
                                          the join password: show (the default), set (typed
                                          or piped), new (generated), open (none: a
@@ -337,6 +366,251 @@ struct Fill {
     /// `--fleet-reads-anchors`: every machine and admin runs an aterm that reads anchors, so
     /// the vault's first anchored entry may be published.
     fleet_reads_anchors: bool,
+}
+
+/// Whether a `set` or `unset` of `name` for `hosts` (none: `[everyone]`) is a member's write or an
+/// admin's on a vault this Mac writes by `route` (DESIGN-claude-setup-token §3.4): a plain one of
+/// a shared name on a vault with a membership log is a member's, whatever the seat (one that has
+/// none, or a busy state, is told so and never falls back to the admin locker); `--for`, a
+/// vault with no log, and every name a member may not write, are an admin's.
+#[cfg(unix)]
+fn by_member(name: &str, hosts: &[String], route: crate::client::WriteRoute) -> bool {
+    hosts.is_empty()
+        && route != crate::client::WriteRoute::NoLog
+        && crate::entry_class::of(name) == crate::entry_class::EntryClass::Shared
+}
+
+#[cfg(unix)]
+impl Command {
+    /// Whether this command needs the admin locker on a vault this Mac writes by `route`: what
+    /// `aterm secrets status` names on its `admin key:` line ([`admin_verbs`]), read from each
+    /// verb's own route. `revoke` removes through the membership log where this Mac is seated
+    /// there, as `aterm members remove`.
+    fn admin_route(&self, route: crate::client::WriteRoute) -> bool {
+        match self {
+            Self::Set { name, hosts, .. } | Self::Unset { name, hosts } => {
+                !by_member(name, hosts, route)
+            }
+            Self::Revoke { .. } => route != crate::client::WriteRoute::Seated,
+            Self::Edit
+            | Self::Password { .. }
+            | Self::Approve { .. }
+            | Self::Retire(_)
+            | Self::Admins { .. }
+            | Self::RotateKey
+            | Self::CommonsInit
+            | Self::CommonsRestore { .. }
+            | Self::Genesis(_) => true,
+            _ => false,
+        }
+    }
+}
+
+/// Each verb that may need the admin locker, as `aterm secrets status` names it, with one command
+/// line of it ([`Command::admin_route`]).
+#[cfg(unix)]
+fn admin_verb_lines() -> Vec<(&'static str, Command)> {
+    let set = |name: &str, hosts: &[&str]| Command::Set {
+        name: name.to_owned(),
+        hosts: hosts.iter().map(|host| (*host).to_owned()).collect(),
+        file: None,
+        fill: Fill::default(),
+    };
+    let unset = |name: &str, hosts: &[&str]| Command::Unset {
+        name: name.to_owned(),
+        hosts: hosts.iter().map(|host| (*host).to_owned()).collect(),
+    };
+    vec![
+        ("edit", Command::Edit),
+        ("set", set("gh_access_token", &[])),
+        (
+            "set of a held name",
+            set(crate::entry_class::RELEASE_GH_TOKEN, &[]),
+        ),
+        ("set --for", set("gh_access_token", &["m3"])),
+        ("unset", unset("gh_access_token", &[])),
+        (
+            "unset of a held name",
+            unset(crate::entry_class::RELEASE_GH_TOKEN, &[]),
+        ),
+        ("unset --for", unset("gh_access_token", &["m3"])),
+        (
+            "password",
+            Command::Password {
+                action: Password::Show,
+                agent: false,
+            },
+        ),
+        (
+            "approve",
+            Command::Approve {
+                which: Vec::new(),
+                all: true,
+                name: None,
+            },
+        ),
+        (
+            "revoke",
+            Command::Revoke {
+                host: "m3".to_owned(),
+                drop_sections: false,
+                stolen: false,
+            },
+        ),
+        ("retire", Command::Retire(vec!["m3".to_owned()])),
+        (
+            "admins",
+            Command::Admins {
+                add: true,
+                host: "m3".to_owned(),
+            },
+        ),
+        ("rotate-key", Command::RotateKey),
+        ("commons init", Command::CommonsInit),
+        (
+            "commons restore",
+            Command::CommonsRestore { expected: None },
+        ),
+        ("genesis", Command::Genesis("alab.genesis".to_owned())),
+    ]
+}
+
+/// The verbs that need the admin locker on a vault this Mac writes by `route`
+/// ([`Command::admin_route`]).
+#[cfg(unix)]
+#[must_use]
+pub fn admin_verbs(route: crate::client::WriteRoute) -> Vec<&'static str> {
+    admin_verb_lines()
+        .into_iter()
+        .filter(|(_, command)| command.admin_route(route))
+        .map(|(verb, _)| verb)
+        .collect()
+}
+
+/// Who writes this Mac's vault, as `aterm secrets status` says it (`vault writes:`).
+#[cfg(unix)]
+#[must_use]
+pub fn vault_writes(route: crate::client::WriteRoute) -> &'static str {
+    match route {
+        crate::client::WriteRoute::Seated => "member",
+        crate::client::WriteRoute::NotSeated => "none (not seated in the vault's log yet)",
+        crate::client::WriteRoute::NoLog => "admin (a vault with no log)",
+        crate::client::WriteRoute::Busy => "unknown (this Mac's vault state is busy)",
+    }
+}
+
+/// What a member's `set` of `name` printed, by its outcome (DESIGN-claude-setup-token §3.5):
+/// `Ok` a line on stdout, `Err` the refusal. A write signed here, or one that waits, is not yet
+/// in vault.
+#[cfg(unix)]
+fn member_words(name: &str, written: &crate::client::MemberWritten) -> Result<String, String> {
+    use crate::client::{MemberWritten, WaitFor};
+    let pass = "this Mac's vault pass signs it";
+    Ok(match written {
+        MemberWritten::Posted => format!(
+            "set `{name}` for every member; a per-host copy, where one exists, still wins on its \
+             Mac (an admin's `set --for` changes those until B13)"
+        ),
+        MemberWritten::SignedHere => format!(
+            "set `{name}` here; not yet in vault: no server answered, and this Mac's vault pass \
+             posts it"
+        ),
+        MemberWritten::Waiting(why) => {
+            let waits = match why {
+                WaitFor::RotationDue => "waits for the vault's new key after a removal".to_owned(),
+                WaitFor::NewestUnopened => {
+                    "waits until this Mac holds the vault's newest key".to_owned()
+                }
+                WaitFor::KeysUnsettled => {
+                    "waits for the vault's newest keys to settle into one".to_owned()
+                }
+                WaitFor::PendingOfThisMac => {
+                    format!("replaces this Mac's earlier write of `{name}`, which still waited")
+                }
+                WaitFor::LockDeadline => "this Mac's vault state was busy".to_owned(),
+            };
+            format!("not yet in vault: {waits}; {pass}")
+        }
+        MemberWritten::Overtaken(by) => {
+            let who = by.as_ref().map_or_else(
+                || "another write".to_owned(),
+                |by| {
+                    format!(
+                        "{}'s {}",
+                        by.label,
+                        if by.deleted { "removal" } else { "write" }
+                    )
+                },
+            );
+            return Err(format!(
+                "`{name}` is not set: {who} took it first and stands (set it again to replace it)"
+            ));
+        }
+        MemberWritten::Refused(why) => return Err(why.clone()),
+        MemberWritten::Busy => return Err("the vault is busy; try again".to_owned()),
+        MemberWritten::NotSeated => {
+            return Err(
+                "this Mac is not seated in the vault's log yet, so it writes nothing there \
+                 (aterm secrets status says vault writes:)"
+                    .to_owned(),
+            );
+        }
+        MemberWritten::NoLog => {
+            return Err(
+                "this Mac's vault has no membership log: an admin's `aterm secrets set` writes it"
+                    .to_owned(),
+            );
+        }
+    })
+}
+
+/// What a member's `unset` of `name` printed, by its outcome (DESIGN-claude-setup-token §3.6):
+/// `Ok` a line on stdout, `Err` the refusal. A removal signed here is not yet in vault.
+#[cfg(unix)]
+fn member_unset_words(name: &str, unset: &crate::client::MemberUnset) -> Result<String, String> {
+    use crate::client::MemberUnset;
+    Ok(match unset {
+        MemberUnset::Posted => format!(
+            "removed `{name}` for every member, under a new vault key, so no Mac let in later \
+             reads the removed value; a per-host copy, where one exists, still wins on its Mac \
+             (an admin's `unset --for` removes those until B13)"
+        ),
+        MemberUnset::SignedHere => format!(
+            "removed `{name}` here; not yet in vault: no server answered, and this Mac's vault \
+             pass posts it"
+        ),
+        MemberUnset::TookBack => format!(
+            "took back this Mac's write of `{name}`, which still waited to be signed; the vault \
+             never held it"
+        ),
+        MemberUnset::Absent => return Err(format!("no entry {name} in [everyone]")),
+        MemberUnset::Overtaken(by) => {
+            let who = by.as_ref().map_or_else(
+                || "another write".to_owned(),
+                |by| format!("{}'s write", by.label),
+            );
+            return Err(format!(
+                "`{name}` is set again: {who} put it back after the removal and stands (unset it \
+                 again to remove it)"
+            ));
+        }
+        MemberUnset::Refused(why) => return Err(why.clone()),
+        MemberUnset::Busy => return Err("the vault is busy; try again".to_owned()),
+        MemberUnset::NotSeated => {
+            return Err(
+                "this Mac is not seated in the vault's log yet, so it removes nothing there \
+                 (aterm secrets status says vault writes:)"
+                    .to_owned(),
+            );
+        }
+        MemberUnset::NoLog => {
+            return Err(
+                "this Mac's vault has no membership log: an admin's `aterm secrets unset` writes \
+                 it"
+                .to_owned(),
+            );
+        }
+    })
 }
 
 /// Pull `--flag <value>` pairs and bare switches out of `args`; the rest are operands.
@@ -1375,7 +1649,21 @@ mod unix {
             Command::Mirrors { change, urls } => mirrors(&paths, change, &urls),
             Command::Ls { describe, json } => {
                 let names = client::registered_names(&paths)?;
-                print!("{}", super::inventory::listing(&names, describe, json)?);
+                // The vault's Claude Code tokens, value-free: best effort, so a vault that cannot
+                // be read just now still lists what the registry names.
+                let tokens = match crate::claude_token::listed(&paths) {
+                    Ok(crate::claude_token::Lookup::Found(standings)) => {
+                        super::inventory::token_rows(
+                            &standings,
+                            aterm_time::unix_secs().unwrap_or(0),
+                        )
+                    }
+                    _ => Vec::new(),
+                };
+                print!(
+                    "{}",
+                    super::inventory::listing(&names, &tokens, describe, json)?
+                );
                 Ok(ExitCode::SUCCESS)
             }
             Command::Get(name) => get(&paths, &name),
@@ -1401,23 +1689,7 @@ mod unix {
                 file,
                 fill,
             } => set(&paths, &name, &hosts, file, &fill),
-            Command::Unset { name, hosts } => {
-                let admin = client::admin_open(&paths)?;
-                view_notes(&paths, &admin);
-                let mut doc = admin.doc.clone();
-                let hosts = machines_named_in_vault(&paths, &admin, &hosts)?;
-                if !doc
-                    .unset_entry(&audience(&hosts), &name)
-                    .map_err(text_error)?
-                {
-                    return Err(Error::new(format!(
-                        "no entry {name} in {}",
-                        audience(&hosts).header()
-                    )));
-                }
-                let done = client::admin_publish(&paths, &admin, &doc)?;
-                Ok(published(&format!("removed {name}"), &done))
-            }
+            Command::Unset { name, hosts } => unset(&paths, &name, &hosts),
             Command::Password { action, agent } => password(&paths, action, agent, &subscriber),
             Command::Requests { json } => requests(&paths, json),
             Command::Approve { which, all, name } => approve(&paths, &which, all, name),
@@ -2346,6 +2618,36 @@ mod unix {
         (rows, complete)
     }
 
+    /// Who writes this Mac's vault, as `status` says it (DESIGN-claude-setup-token §3.9): `vault
+    /// writes:` by this Mac's route ([`client::write_route`], read at once: a busy state is
+    /// unknown), `admin key:` with the verbs that need the admin locker on this vault
+    /// ([`super::admin_verbs`]), and on a host Mac its per-host copies that shadow `[everyone]`,
+    /// counted, which only a host can see.
+    pub(super) fn writes_lines(paths: &Paths) -> Vec<String> {
+        let mut lines = Vec::new();
+        let route = client::write_route(paths, std::time::Instant::now());
+        lines.push(match &route {
+            Ok(route) => format!("vault writes: {}", super::vault_writes(*route)),
+            Err(error) => format!("vault writes: unknown ({error})"),
+        });
+        let verbs = route.as_ref().ok().map(|route| super::admin_verbs(*route));
+        let opens = verbs
+            .filter(|verbs| !verbs.is_empty())
+            .map(|verbs| format!(" (on this vault it opens for: {})", verbs.join(", ")))
+            .unwrap_or_default();
+        lines.push(match client::can_administer(paths) {
+            Ok(true) => format!("admin key: yes{opens}"),
+            Ok(false) => format!("admin key: no{opens}"),
+            Err(error) => format!("admin key: unknown ({error})"),
+        });
+        match client::per_host_shadows(paths) {
+            Ok(0) => {}
+            Ok(shadows) => lines.push(format!("per-host copies: {shadows} shadow [everyone]")),
+            Err(error) => lines.push(format!("per-host copies: unknown ({error})")),
+        }
+        lines
+    }
+
     fn status(paths: &Paths, subscriber: &Subscriber<'_>) -> crate::Result<ExitCode> {
         let status = client::status(paths)?;
         match &status.config {
@@ -2423,9 +2725,10 @@ mod unix {
                 status.names.join(", ")
             );
         }
-        match client::can_administer(paths) {
-            Ok(admin) => println!("vault admin: {admin}"),
-            Err(error) => println!("vault admin: unknown ({error})"),
+        if status.config.is_some() {
+            for line in writes_lines(paths) {
+                println!("{line}");
+            }
         }
         match client::swarm_lease_holder(paths) {
             Ok(Some(holder)) => println!("vault steward: {holder}"),
@@ -2445,11 +2748,23 @@ mod unix {
             ),
         }
         match client::conflicts(paths) {
-            Ok(conflicts) if !conflicts.is_empty() => println!(
-                "conflict: {} (saved with different values while apart; every Mac writes the same one, and aterm secrets set <name> picks it)",
-                conflicts.join(", ")
-            ),
-            Ok(_) => {}
+            Ok(conflicts) => {
+                let (plain, tokens) = client::Conflict::split(&conflicts);
+                if !plain.is_empty() {
+                    println!(
+                        "conflict: {} (saved with different values while apart; every Mac writes the same one, and {})",
+                        plain.join(", "),
+                        client::CONFLICT_PICK
+                    );
+                }
+                if !tokens.is_empty() {
+                    println!(
+                        "conflict: {} (saved with different values while apart; every Mac reads the same one, and {})",
+                        tokens.join(", "),
+                        client::TOKEN_CONFLICT_PICK
+                    );
+                }
+            }
             Err(error) => println!("conflict: unreadable ({error})"),
         }
         match client::reseal_waits(paths) {
@@ -2872,6 +3187,9 @@ mod unix {
     }
 
     pub(super) fn get_value(paths: &Paths, name: &str) -> crate::Result<crate::SecretBytes> {
+        if crate::entry_class::claude_token(&name.to_ascii_lowercase()) {
+            return Err(Error::new(format!("{name}: {CLAUDE_TOKEN_GET}")));
+        }
         let expected = client::config(paths)?
             .ok_or_else(|| Error::new("no vault configured; run aterm secrets join"))?;
         if expected.signer.is_some() {
@@ -2903,6 +3221,9 @@ mod unix {
         })?;
         Ok(value)
     }
+
+    /// Why `secrets get` refuses a Claude Code token entry (DESIGN-claude-setup-token §4.2).
+    pub(super) const CLAUDE_TOKEN_GET: &str = "a Claude Code token, which aterm hands only to Claude Code and never prints; aterm secrets ls --describe shows its state";
 
     const DEV_TOKEN_FILE: &str = ".secrets/gh_access_token";
     const RELEASE_TOKEN_FILE: &str = ".secrets/gh_access_token_alabsystems";
@@ -3600,7 +3921,7 @@ mod unix {
                 None => Err(Error::new("the file is not UTF-8")),
             };
             let confirmed = parsed.and_then(|mut doc| {
-                if let Some(why) = doc.added_cli_login(&admin.doc) {
+                if let Some(why) = doc.added_refusal(&admin.doc) {
                     return Err(Error::new(why));
                 }
                 let kept = client::keep_admitted(&base, &admin.doc, &mut doc)?;
@@ -3650,9 +3971,7 @@ mod unix {
         }
     }
 
-    /// Why the vault's first anchored entry waits for the fleet: no machine tells the vault
-    /// which aterm it runs, so the admin says it.
-    const FIRST_ANCHOR: &str = "this is the vault's first anchored entry (if-absent=<anchor>), and an aterm older than anchors refuses every version that holds one: a machine on it applies nothing until it updates, and an admin on it cannot open the vault. Update every machine and admin first (there `aterm secrets --help` names --with)";
+    use client::FIRST_ANCHOR;
 
     /// `doc` with entry `name` set for `audience` as `set` sets it, and the anchor the entry got.
     pub(super) fn set_in(
@@ -3704,7 +4023,7 @@ mod unix {
         }
     }
 
-    fn set(
+    pub(super) fn set(
         paths: &Paths,
         name: &str,
         hosts: &[String],
@@ -3716,7 +4035,7 @@ mod unix {
                 "{name:?} is not a valid name (letters, digits, . _ -; or ~/a/b)"
             )));
         }
-        if let Some(why) = text::cli_login_refusal(name) {
+        if let Some(why) = crate::entry_class::text_refusal(name) {
             return Err(Error::new(why));
         }
         let value = match file {
@@ -3751,10 +4070,26 @@ mod unix {
                 "the value is empty; aterm secrets unset {name} removes an entry"
             )));
         }
+        let route = client::write_route(paths, std::time::Instant::now() + PERSON_WAIT)?;
+        if super::by_member(name, hosts, route) {
+            return member_set(paths, name, value, fill);
+        }
+        // A seated Mac without the admin key is told why a member may not write the name, never
+        // that a plain `set` needs an admin.
+        if hosts.is_empty()
+            && route != client::WriteRoute::NoLog
+            && matches!(client::can_administer(paths), Ok(false))
+            && let Some(why) = crate::entry_class::member_refusal(name)
+        {
+            return Err(Error::new(why));
+        }
         let mut admin = client::admin_open(paths)?;
         view_notes(paths, &admin);
         let hosts = &machines_named_in_vault(paths, &admin, hosts)?;
         let (doc, anchor) = set_in(&admin.doc, &audience(hosts), name, value.as_slice(), fill)?;
+        if let Some(why) = doc.added_refusal(&admin.doc) {
+            return Err(Error::new(why));
+        }
         // A person's save settles a conflict the log holds for this entry.
         admin.resolving(&audience(hosts), name);
         let done = client::admin_publish(paths, &admin, &doc)?;
@@ -3769,6 +4104,113 @@ mod unix {
             &format!("set {name} for {}{gaps}", audience(hosts).header()),
             &done,
         ))
+    }
+
+    /// How long a person's write waits for this Mac's vault pass to let go of the state before it
+    /// says the vault is busy.
+    const PERSON_WAIT: Duration = Duration::from_secs(60);
+
+    /// A member's `set` of `name` (DESIGN-claude-setup-token §3.5): signed into the vault's log
+    /// with no admin key, or waiting for this Mac's vault pass, said in one line. A write a
+    /// server took is then applied here ([`apply_member_write`]).
+    fn member_set(
+        paths: &Paths,
+        name: &str,
+        value: SecretBytes,
+        fill: &Fill,
+    ) -> crate::Result<ExitCode> {
+        let anchor = match (&fill.with, fill.no_with) {
+            (Some(anchor), _) => client::Anchor::To(anchor.clone()),
+            (None, true) => client::Anchor::Drop,
+            (None, false) => client::Anchor::Keep,
+        };
+        let entry = client::MemberEntry {
+            name: name.to_owned(),
+            value,
+            if_absent: fill.if_absent,
+            anchor,
+            fleet_reads_anchors: fill.fleet_reads_anchors,
+        };
+        let by = std::time::Instant::now() + PERSON_WAIT;
+        let written = client::member_set(paths, &entry, client::OnBusy::Refuse(by))?;
+        let line = super::member_words(name, &written).map_err(Error::new)?;
+        let gaps = if fill.if_absent {
+            " (written only where the machine has no file of its own)"
+        } else {
+            ""
+        };
+        println!("{line}{gaps}");
+        if written == client::MemberWritten::Posted {
+            apply_member_write(paths);
+        }
+        Ok(ExitCode::SUCCESS)
+    }
+
+    /// `unset <name> [--for ...]`: a plain unset of a shared name on a vault with a membership log
+    /// is a member's ([`member_unset`]); a seated Mac without the admin key is told why a member
+    /// may not remove any other name, never that a plain `unset` needs an admin; `--for`, a vault
+    /// with no log, and the names a member may not write, are an admin's.
+    pub(super) fn unset(paths: &Paths, name: &str, hosts: &[String]) -> crate::Result<ExitCode> {
+        if crate::entry_class::claude_token(name) {
+            return Err(Error::new(crate::entry_class::claude_token_refusal(name)));
+        }
+        let by = std::time::Instant::now() + PERSON_WAIT;
+        let route = client::write_route(paths, by)?;
+        if super::by_member(name, hosts, route) {
+            return member_unset(paths, name, by);
+        }
+        if hosts.is_empty()
+            && route != client::WriteRoute::NoLog
+            && matches!(client::can_administer(paths), Ok(false))
+            && let Some(why) = crate::entry_class::member_refusal(name)
+        {
+            return Err(Error::new(why));
+        }
+        let admin = client::admin_open(paths)?;
+        view_notes(paths, &admin);
+        let mut doc = admin.doc.clone();
+        let hosts = machines_named_in_vault(paths, &admin, hosts)?;
+        if !doc
+            .unset_entry(&audience(&hosts), name)
+            .map_err(text_error)?
+        {
+            return Err(Error::new(format!(
+                "no entry {name} in {}",
+                audience(&hosts).header()
+            )));
+        }
+        let done = client::admin_publish(paths, &admin, &doc)?;
+        Ok(published(&format!("removed {name}"), &done))
+    }
+
+    /// A member's `unset` of `name` (DESIGN-claude-setup-token §3.6): its `Delete` signed into the
+    /// vault's log under a fresh `[everyone]` key, with no admin key, said in one line, and a
+    /// removal a server took applied here ([`apply_member_write`]).
+    fn member_unset(paths: &Paths, name: &str, by: std::time::Instant) -> crate::Result<ExitCode> {
+        let unset = client::member_unset(paths, name, by)?;
+        let line = super::member_unset_words(name, &unset).map_err(Error::new)?;
+        println!("{line}");
+        if unset == client::MemberUnset::Posted {
+            apply_member_write(paths);
+        }
+        Ok(ExitCode::SUCCESS)
+    }
+
+    /// Apply a member write a server took to this Mac: an admin of the vault 0.145 Macs read
+    /// mirrors the log into it, as a member's removal does, and any other Mac syncs. A failure is
+    /// a warning: this Mac's next vault pass does it again.
+    fn apply_member_write(paths: &Paths) {
+        if client::admin_cached(paths).is_ok() {
+            if let Err(error) = client::admin_mirror_log(paths, &[]) {
+                eprintln!(
+                    "warning: the vault 0.145 Macs read is not in step with it yet ({error}): this Mac's next vault pass mirrors it again"
+                );
+            }
+        } else if let Err(error) = client::sync(paths, None) {
+            eprintln!(
+                "warning: this Mac's own copy is not updated yet ({error}); aterm secrets sync retries"
+            );
+        }
     }
 
     /// `password <action>`: show the join password, set or generate one, open the vault, or
@@ -4524,6 +4966,290 @@ mod unix {
 
 #[cfg(test)]
 mod tests {
+    /// A plain `set` or `unset` of a shared name is a member's on every vault with a membership
+    /// log, whatever the seat (a seatless or busy Mac is told so, never sent to the admin locker);
+    /// `--for`, a vault with no log, and a name a member may not write are an admin's. The
+    /// `admin key:` line's verbs are read from each verb's route: on a seated log vault neither a
+    /// plain `set`, a plain `unset` nor `revoke` needs the admin key.
+    #[cfg(unix)]
+    #[test]
+    fn a_plain_set_of_a_shared_name_is_a_members_and_for_is_an_admins() {
+        use super::{admin_verbs, by_member};
+        use crate::client::WriteRoute;
+        for route in [WriteRoute::Seated, WriteRoute::NotSeated, WriteRoute::Busy] {
+            assert!(by_member("gh_access_token", &[], route), "{route:?}");
+        }
+        assert!(!by_member("gh_access_token", &[], WriteRoute::NoLog));
+        assert!(
+            !by_member("gh_access_token", &["m3".to_owned()], WriteRoute::Seated),
+            "--for is an admin's"
+        );
+        for held in [
+            crate::entry_class::RELEASE_GH_TOKEN,
+            crate::entry_class::FLEET_ACCOUNTS,
+            crate::entry_class::GIT_CONFIG,
+            crate::entry_class::FLEET_CODE,
+        ] {
+            assert!(!by_member(held, &[], WriteRoute::Seated), "{held}");
+        }
+        let seated = admin_verbs(WriteRoute::Seated);
+        for absent in ["set", "unset", "revoke"] {
+            assert!(!seated.contains(&absent), "{absent}: {seated:?}");
+        }
+        for present in [
+            "set --for",
+            "set of a held name",
+            "unset --for",
+            "unset of a held name",
+            "edit",
+        ] {
+            assert!(seated.contains(&present), "{present}: {seated:?}");
+        }
+        let no_log = admin_verbs(WriteRoute::NoLog);
+        for present in ["set", "set --for", "unset", "revoke"] {
+            assert!(no_log.contains(&present), "{present}: {no_log:?}");
+        }
+    }
+
+    /// The line each member write's outcome prints: a write signed here, or one that waits, is
+    /// "not yet in vault"; a posted one says a per-host copy still wins where one exists; a busy
+    /// state and a missing seat are refusals that name no admin.
+    #[cfg(unix)]
+    #[test]
+    fn each_member_outcome_says_where_the_write_stands() {
+        use super::member_words;
+        use crate::client::{MemberWritten, WaitFor};
+        let posted = member_words("t", &MemberWritten::Posted).unwrap();
+        assert!(
+            posted.contains("for every member")
+                && posted.contains("a per-host copy, where one exists, still wins on its Mac"),
+            "{posted}"
+        );
+        let mut later = vec![MemberWritten::SignedHere];
+        later.extend(
+            [
+                WaitFor::RotationDue,
+                WaitFor::NewestUnopened,
+                WaitFor::KeysUnsettled,
+                WaitFor::PendingOfThisMac,
+                WaitFor::LockDeadline,
+            ]
+            .map(MemberWritten::Waiting),
+        );
+        for written in &later {
+            let line = member_words("t", written).unwrap();
+            assert!(line.contains("not yet in vault"), "{written:?}: {line}");
+        }
+        assert_eq!(
+            member_words("t", &MemberWritten::Waiting(WaitFor::RotationDue)).unwrap(),
+            "not yet in vault: waits for the vault's new key after a removal; this Mac's vault pass signs it"
+        );
+        assert_eq!(
+            member_words("t", &MemberWritten::Busy).unwrap_err(),
+            "the vault is busy; try again"
+        );
+        for refused in [
+            MemberWritten::Busy,
+            MemberWritten::NotSeated,
+            MemberWritten::Overtaken(None),
+        ] {
+            let why = member_words("t", &refused).unwrap_err();
+            assert!(!why.contains("admin"), "{why}");
+        }
+    }
+
+    /// On a fixture seated Mac with no admin key, `status` says `vault writes: member` and an
+    /// `admin key:` line whose verbs are those whose route needs the admin locker there (no
+    /// `revoke`, no plain `set`), and a plain `set` of a shared name writes the vault with no
+    /// admin: another Mac reads it after a sync. A held name is refused in a member's words,
+    /// never "not an admin"; `--for` still takes the admin route.
+    #[cfg(unix)]
+    #[test]
+    fn a_seated_mac_sets_with_no_admin_and_status_says_so() {
+        use super::{Fill, admin_verbs, unix};
+        use crate::client::WriteRoute;
+        let macs = crate::client::two_log_macs_for_test(&[]);
+        let (m22, m7) = (&macs.m22, &macs.m7);
+        let lines = unix::writes_lines(m7);
+        assert_eq!(lines[0], "vault writes: member");
+        let verbs = admin_verbs(WriteRoute::Seated);
+        assert_eq!(
+            lines[1],
+            format!(
+                "admin key: no (on this vault it opens for: {})",
+                verbs.join(", ")
+            )
+        );
+        assert!(!lines[1].contains("revoke"), "{}", lines[1]);
+        assert!(unix::writes_lines(m22)[1].starts_with("admin key: yes ("));
+
+        let value = macs.root.path().join("value");
+        std::fs::write(&value, b"token-v9").unwrap();
+        let file = || Some(value.to_str().unwrap().to_owned());
+        let code = unix::set(m7, "gh_access_token", &[], file(), &Fill::default())
+            .expect("a member's set");
+        assert_eq!(code, std::process::ExitCode::SUCCESS);
+        crate::client::sync(m22, None).expect("m22 syncs");
+        assert_eq!(
+            std::fs::read(m22.home.join(".secrets/gh_access_token")).unwrap(),
+            b"token-v9"
+        );
+
+        let held = crate::entry_class::RELEASE_GH_TOKEN;
+        let error = unix::set(m7, held, &[], file(), &Fill::default()).expect_err("held");
+        assert_eq!(
+            Some(error.0.clone()),
+            crate::entry_class::member_refusal(held),
+            "{error}"
+        );
+        let error = unix::set(
+            m7,
+            "gh_access_token",
+            &["m7".to_owned()],
+            file(),
+            &Fill::default(),
+        )
+        .expect_err("--for is an admin's");
+        assert!(error.0.contains("is not an admin of"), "{error}");
+    }
+
+    /// On the same fixture seated Mac with no admin key, a plain `unset` of a shared name removes
+    /// it with no admin: another Mac takes its file back after a sync. A held name is refused in
+    /// a member's words, never "not an admin", and its file stays on the Mac that holds it;
+    /// `--for` still takes the admin route.
+    #[cfg(unix)]
+    #[test]
+    fn a_seated_mac_unsets_with_no_admin() {
+        use super::unix;
+        let macs = crate::client::two_log_macs_for_test(&[]);
+        let (m22, m7) = (&macs.m22, &macs.m7);
+        let held = crate::entry_class::RELEASE_GH_TOKEN;
+        for name in ["gh_access_token", held] {
+            crate::client::test_put_everyone(m22, name, b"token-v1").expect("m22 puts it");
+        }
+        crate::client::sync(m22, None).expect("m22 syncs");
+        crate::client::sync(m7, None).expect("m7 syncs");
+        assert!(
+            m22.home.join(".secrets/gh_access_token").exists(),
+            "CONTROL"
+        );
+
+        let code = unix::unset(m7, "gh_access_token", &[]).expect("a member's unset");
+        assert_eq!(code, std::process::ExitCode::SUCCESS);
+        crate::client::sync(m22, None).expect("m22 syncs");
+        assert!(
+            !m22.home.join(".secrets/gh_access_token").exists(),
+            "m22 takes its file back"
+        );
+        let error = unix::unset(m7, "gh_access_token", &[]).expect_err("absent");
+        assert_eq!(error.0, "no entry gh_access_token in [everyone]");
+
+        let error = unix::unset(m7, held, &[]).expect_err("held");
+        assert_eq!(
+            Some(error.0.clone()),
+            crate::entry_class::member_refusal(held),
+            "{error}"
+        );
+        crate::client::sync(m22, None).expect("m22 syncs");
+        assert_eq!(
+            std::fs::read(m22.home.join(format!(".secrets/{held}"))).unwrap(),
+            b"token-v1",
+            "the held file stays"
+        );
+        let error = unix::unset(m7, "gh_access_token", &["m7".to_owned()])
+            .expect_err("--for is an admin's");
+        assert!(error.0.contains("is not an admin of"), "{error}");
+    }
+
+    /// The line each member unset's outcome prints: one signed here is "not yet in vault", a
+    /// posted one says a per-host copy still wins where one exists, and the refusals name no
+    /// admin, but for a vault with no log, which only an admin writes.
+    #[cfg(unix)]
+    #[test]
+    fn each_member_unset_outcome_says_where_the_removal_stands() {
+        use super::member_unset_words;
+        use crate::client::MemberUnset;
+        let posted = member_unset_words("t", &MemberUnset::Posted).unwrap();
+        assert!(
+            posted.contains("for every member")
+                && posted.contains("a per-host copy, where one exists, still wins on its Mac"),
+            "{posted}"
+        );
+        let here = member_unset_words("t", &MemberUnset::SignedHere).unwrap();
+        assert!(here.contains("not yet in vault"), "{here}");
+        let back = member_unset_words("t", &MemberUnset::TookBack).unwrap();
+        assert!(back.contains("the vault never held it"), "{back}");
+        assert_eq!(
+            member_unset_words("t", &MemberUnset::Absent).unwrap_err(),
+            "no entry t in [everyone]"
+        );
+        for refused in [
+            MemberUnset::Busy,
+            MemberUnset::NotSeated,
+            MemberUnset::Overtaken(None),
+            MemberUnset::Refused(crate::client::RESEAL_REFUSAL.to_owned()),
+        ] {
+            let why = member_unset_words("t", &refused).unwrap_err();
+            assert!(!why.contains("admin"), "{why}");
+        }
+    }
+
+    /// A vault at a path has no membership log a member writes: its admin writes it, and `status`
+    /// says so, naming a plain `set` and `revoke` among the verbs that need the admin key there.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_vault_is_written_by_its_admin() {
+        use super::{admin_verbs, unix};
+        use crate::client::WriteRoute;
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let admin = admin_of_a_path_vault(root.path());
+        let soon = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        assert_eq!(
+            crate::client::write_route(&admin, soon).unwrap(),
+            WriteRoute::NoLog
+        );
+        let lines = unix::writes_lines(&admin);
+        assert_eq!(lines[0], "vault writes: admin (a vault with no log)");
+        assert_eq!(
+            lines[1],
+            format!(
+                "admin key: yes (on this vault it opens for: {})",
+                admin_verbs(WriteRoute::NoLog).join(", ")
+            )
+        );
+        for verb in ["set", "revoke"] {
+            assert!(admin_verbs(WriteRoute::NoLog).contains(&verb), "{verb}");
+        }
+    }
+
+    /// A host Mac's `status` counts the per-host copy that shadows an `[everyone]` entry, which
+    /// only a host can see; another Mac prints no such line.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_macs_status_counts_its_shadowing_copy() {
+        use super::unix;
+        use crate::text::Audience;
+        let macs = crate::client::two_log_macs_with_for_test(
+            &[
+                (Audience::Everyone, "hosted", b"e1".as_slice()),
+                (Audience::Hosts(vec!["m7".to_owned()]), "hosted", b"h1"),
+            ],
+            false,
+        );
+        let lines = unix::writes_lines(&macs.m7);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "per-host copies: 1 shadow [everyone]"),
+            "{lines:?}"
+        );
+        assert!(
+            !unix::writes_lines(&macs.m22)
+                .iter()
+                .any(|line| line.starts_with("per-host copies:")),
+        );
+    }
+
     #[test]
     fn secret_listing_accepts_metadata_flags_without_operands() {
         use super::{Command, parse};
@@ -6811,6 +7537,136 @@ mod tests {
             began,
             "nothing published"
         );
+    }
+
+    /// An edit's draft holds no Claude Code token the vault's log holds, so no plaintext copy of
+    /// one is written to disk (DESIGN-claude-setup-token §4.4). The editor is a stand-in that
+    /// copies the draft into the test's scratch directory and fails, so nothing is published.
+    /// CONTROL: a shared entry put the same way, with the same value, is in the draft.
+    #[cfg(unix)]
+    #[test]
+    fn an_edit_draft_holds_no_claude_token() {
+        const TOKEN: &str = "aterm-claude-token-ac-0123456789abcdef";
+        const FIXTURE: &[u8] = b"inert-claude-fixture-value";
+        let macs = crate::client::two_log_macs_for_test(&[]);
+        let m22 = &macs.m22;
+        crate::client::test_put_everyone(m22, TOKEN, FIXTURE).expect("m22 puts the token");
+        crate::client::test_put_everyone(m22, "shared-control", b"control-value")
+            .expect("m22 puts a shared entry");
+        let copy = macs.root.path().join("draft-copy");
+        let nothing_asked = |_: &str| -> Option<String> { panic!("nothing to ask") };
+        let error = unix::edit_with(
+            m22,
+            &mut |file: &std::path::Path| {
+                std::fs::copy(file, &copy).expect("copy the draft");
+                Ok(false)
+            },
+            &nothing_asked,
+        )
+        .expect_err("the stand-in editor fails");
+        assert!(error.0.contains("nothing published"), "{error}");
+        let draft = std::fs::read(&copy).expect("the copy");
+        let holds = |value: &[u8]| draft.windows(value.len()).any(|w| w == value);
+        assert!(
+            holds(b"control-value"),
+            "CONTROL: the draft holds the log's entries"
+        );
+        assert!(!holds(FIXTURE), "no token value in the draft");
+        assert!(!holds(TOKEN.as_bytes()), "no token name in the draft");
+    }
+
+    /// `secrets get` refuses a Claude Code token entry, in any spelling, and prints nothing; `ls
+    /// --describe` lists the token and its meta with no file pointer, the token's row with its
+    /// account and state, and no byte of the value (DESIGN-claude-setup-token §4.2, §5.10).
+    /// CONTROL: a shared entry reads through `get`.
+    #[cfg(unix)]
+    #[test]
+    fn get_refuses_a_claude_token_and_ls_describe_names_no_file() {
+        const VALUE: &[u8] = concat!("sk-ant-", "oat01-inert_cli-fixture-token").as_bytes();
+        let macs = crate::client::two_log_macs_for_test(&[]);
+        let m7 = &macs.m7;
+        let key = crate::claude_token::Key::parse("ac-0123456789abcdef").unwrap();
+        let meta = crate::claude_token::Meta {
+            email: "inert@example.invalid".into(),
+            account_id: "c-0123456789ab".into(),
+            minted_at: 1,
+            expires_at: 4_102_444_800,
+            expiry_from: crate::claude_token::ExpiryFrom::Assumed,
+            minted_on: "m7".into(),
+            cli: "2.1.318".into(),
+            verified: None,
+        };
+        let soon = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        assert_eq!(
+            crate::claude_token::write(
+                m7,
+                &key,
+                &crate::SecretBytes::from(VALUE),
+                &meta,
+                crate::client::OnBusy::Refuse(soon),
+            )
+            .unwrap(),
+            crate::client::MemberWritten::Posted
+        );
+        crate::client::test_put_everyone(m7, "shared-control", b"control-value").unwrap();
+        crate::client::sync(m7, None).unwrap();
+        for name in [
+            key.entry(),
+            key.meta_entry(),
+            key.entry().to_ascii_uppercase(),
+        ] {
+            let Err(error) = unix::get_value(m7, &name) else {
+                panic!("{name}: get returned a value");
+            };
+            assert!(error.0.contains(unix::CLAUDE_TOKEN_GET), "{name}: {error}");
+        }
+        assert_eq!(
+            unix::get_value(m7, "shared-control").unwrap().as_slice(),
+            b"control-value",
+            "CONTROL"
+        );
+        let crate::claude_token::Lookup::Found(standings) =
+            crate::claude_token::listed(m7).unwrap()
+        else {
+            panic!("the vault reads");
+        };
+        let rows = super::inventory::token_rows(&standings, 0);
+        let names = crate::client::registered_names(m7).unwrap();
+        let text = super::inventory::listing(&names, &rows, true, false).unwrap();
+        let holds = |text: &str, value: &[u8]| {
+            text.as_bytes()
+                .windows(8)
+                .any(|w| value.windows(8).any(|v| v == w))
+        };
+        assert!(text.contains(&format!(
+            "{}\tno file\tClaude Code token for inert@example.invalid",
+            key.entry()
+        )));
+        assert!(text.contains("unverified"), "the row says its state");
+        assert!(text.contains("ends 2100-01-01"), "and when it ends");
+        assert!(text.contains(&format!(
+            "{}\tno file\tmetadata for that token (no secret)",
+            key.meta_entry()
+        )));
+        assert!(
+            !text.contains("~/.secrets/aterm-claude-token"),
+            "no pointer"
+        );
+        assert!(!holds(&text, VALUE), "no byte of the value");
+        let json = super::inventory::listing(&names, &rows, false, true).unwrap();
+        let parsed: aterm_json::Value = aterm_json::from_str(&json).unwrap();
+        let aterm_json::Value::Array(entries) = &parsed["entries"] else {
+            panic!("entries");
+        };
+        let token = entries
+            .iter()
+            .find(|row| row["name"].as_str() == Some(key.entry().as_str()))
+            .expect("the token's row");
+        assert_eq!(token["pointer"], aterm_json::Value::Null);
+        assert!(!holds(&json, VALUE));
+        let plain = super::inventory::listing(&names, &rows, false, false).unwrap();
+        assert!(plain.lines().any(|line| line == key.entry()));
+        macs.server.stop();
     }
 
     /// Run an edit where a concurrent publish forces a reopen, then quit unchanged and answer

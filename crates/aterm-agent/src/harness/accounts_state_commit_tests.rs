@@ -12,7 +12,7 @@ fn observe(store: &Store, usage: bool) -> Recorded {
     let who = ProcessLogin {
         login: None,
         default_home: true,
-        stored_login: true,
+        route: crate::harness::accounts::AuthRoute::Stored,
     };
     if usage {
         record_usage(

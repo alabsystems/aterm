@@ -13,12 +13,16 @@ pub mod grant;
 #[cfg(test)]
 mod grant_conformance_tests;
 mod run;
+#[cfg(unix)]
+mod source_config;
 
 pub use fetch::{FetchBatch, FetchRow};
 pub use run::{GitOp, GitOut, GitRun, HelperCommand};
 // `run` stays a private module; its runner is re-exported to the crate alone, so
 // `Github::run_git` (client.rs) calls it as `crate::git::run(self, run)`. The function and
 // the module share the name in different namespaces.
+#[cfg(unix)]
+pub(crate) use run::project_config_names;
 pub(crate) use run::run;
 
 /// The username the helper answers: GitHub ignores it for a token, and a fixed one keeps

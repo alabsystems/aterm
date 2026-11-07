@@ -189,9 +189,8 @@ impl Unfinished {
         }
     }
 
-    /// The tab's last line for this class:
-    /// `Mac Setup did not finish: <reason>. Running aterm init in a terminal tries again.`,
-    /// except where another try would only say the same: Low Data Mode says how to lift it
+    /// The tab's last line for this class, naming the reason without prescribing another
+    /// install attempt. Low Data Mode says how to lift it
     /// ([`TAB_LOW_DATA`]), and an account that is no administrator's who must install them
     /// ([`TAB_NOT_ADMIN`]).
     #[must_use]
@@ -200,10 +199,9 @@ impl Unfinished {
             Self::LowData => TAB_LOW_DATA.to_owned(),
             Self::NotAdmin => TAB_NOT_ADMIN.to_owned(),
             _ => format!(
-                "{}: {}. {}",
+                "{}: {}.",
                 aterm_types::macos_setup::COMMAND_LINE_TOOLS_NOT_FINISHED,
-                self.reason(),
-                aterm_types::macos_setup::COMMAND_LINE_TOOLS_TRY_AGAIN
+                self.reason()
             ),
         }
     }

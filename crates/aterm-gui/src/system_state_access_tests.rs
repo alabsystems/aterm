@@ -107,6 +107,19 @@ fn background_workstation_scope_comes_from_selected_current_verified_rows() {
         scope(&off).is_empty(),
         "an unmanaged reading is outside the coordinator's scope"
     );
+    let off_unknown = SetupStatus {
+        finished: true,
+        ..fully_observed_setup(
+            Selection::none(),
+            vec![observed(
+                Subject::Setting(Setting::CapsLock),
+                Standing::Unknown,
+                None,
+            )],
+        )
+    };
+    assert_eq!(setup_field(&off_unknown), "done");
+    assert!(scope(&off_unknown).is_empty());
 
     let caps = Subject::Setting(Setting::CapsLock);
     let dock = Subject::Setting(Setting::Dock);
@@ -155,6 +168,19 @@ fn background_workstation_scope_comes_from_selected_current_verified_rows() {
         !scope(&after_login).contains(Setting::TrackpadScrolling),
         "a saved-only value awaiting login is not a verified current preference"
     );
+    for (mut mixed, not_verified) in [
+        (personal, Setting::Dock),
+        (after_login, Setting::TrackpadScrolling),
+    ] {
+        *mixed
+            .observed
+            .iter_mut()
+            .find(|row| row.subject == Subject::Setting(Setting::Widgets))
+            .unwrap() = observed(Subject::Setting(Setting::Widgets), Standing::Unknown, None);
+        assert_eq!(setup_field(&mixed), "unknown:widgets");
+        assert!(scope(&mixed).contains(Setting::CapsLock));
+        assert!(!scope(&mixed).contains(not_verified));
+    }
     let not_needed = fully_observed_setup(
         Selection::all(),
         vec![observed(caps, Standing::NotNeeded, None)],
@@ -261,11 +287,21 @@ fn setup_field_requires_current_evidence_after_the_plan_finishes() {
             .iter_mut()
             .find(|row| row.subject == fda)
             .unwrap() = observed(fda, Standing::Unknown, note);
-        assert_eq!(setup_field(&unread), "pending:fda", "{note:?}");
+        assert_eq!(setup_field(&unread), "unknown:fda", "{note:?}");
+        for active in 0..4 {
+            let mut active_unread = unread.clone();
+            match active {
+                0 => active_unread.busy = true,
+                1 => active_unread.changing = true,
+                2 => active_unread.queued = true,
+                _ => active_unread.running = vec![Setting::Repositories],
+            }
+            assert_eq!(setup_field(&active_unread), "pending;unknown:fda");
+        }
     }
     let mut absent = complete();
     absent.observed.retain(|row| row.subject != fda);
-    assert_eq!(setup_field(&absent), "pending:fda");
+    assert_eq!(setup_field(&absent), "unknown:fda");
 
     let mut missing = complete();
     let row = missing
@@ -277,6 +313,12 @@ fn setup_field_requires_current_evidence_after_the_plan_finishes() {
     row.now = Some("0 of 53".into());
     row.wanted = "All 53".into();
     assert_eq!(setup_field(&missing), "pending:repos");
+    *missing
+        .observed
+        .iter_mut()
+        .find(|row| row.subject == fda)
+        .unwrap() = observed(fda, Standing::Unknown, None);
+    assert_eq!(setup_field(&missing), "pending:repos;unknown:fda");
 }
 
 #[test]

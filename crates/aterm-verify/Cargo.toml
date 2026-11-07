@@ -27,6 +27,10 @@ path = "src/lib.rs"
 name = "contract"
 path = "tests/contract.rs"
 
+[[bench]]
+name = "journal_push_admission"
+harness = false
+
 # First-party crates (and the workspace's libc, which is crates/aterm-libc),
 # each serving a check the CLI runs in-process. Every one is also a workspace
 # member that `lint` and `test` compile, so a compile break in any of them
@@ -121,6 +125,9 @@ aterm-update-core = { workspace = true }
 aterm-vz = { workspace = true }
 
 [dev-dependencies]
+# Manual journal-store admission measurement; all network and identities are fixtures.
+agh = { workspace = true }
+agh-fake = { workspace = true }
 # Tier-1 of `EndByProof` (tests/conformance_end_by_proof.rs): the model and the interpreter
 # that drives it against the real `aterm_uds::process::end_proven`.
 aterm-models-misc = { workspace = true }

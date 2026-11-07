@@ -1361,8 +1361,12 @@ pub struct NodeMesh {
     pub pass_now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
     /// The vault pass's pace.
     pub pass_pace: aterm_secrets::client::NodePassPace,
-    /// Starts the converge pass's runner after a version the vault pass applied.
-    pub pass_converge: Arc<dyn Fn() -> Option<aterm_uds::spawnfd::Child> + Send + Sync>,
+    /// Starts the converge pass's retained request after local progress or a refresh boundary.
+    pub pass_converge: Arc<
+        dyn Fn(aterm_secrets::converge::RepositoryRequest) -> Option<aterm_uds::spawnfd::Child>
+            + Send
+            + Sync,
+    >,
 }
 
 impl NodeMesh {
@@ -1384,12 +1388,12 @@ impl NodeMesh {
             bus: live_bus(),
             pass_now_ms: Arc::new(|| aterm_time::unix_millis().unwrap_or(0)),
             pass_pace: aterm_secrets::client::NodePassPace::LIVE,
-            pass_converge: Arc::new(|| {
+            pass_converge: Arc::new(|request| {
                 let exe = std::env::current_exe().ok()?;
-                aterm_secrets::converge::start(
+                aterm_secrets::converge::start_requested(
                     &exe,
                     aterm_secrets::converge::SUBSCRIBER,
-                    aterm_secrets::converge::RepositoryWork::Repair,
+                    request,
                 )
                 .map_err(|error| {
                     aterm_log::warn!("node: could not start the converge pass: {error}");
@@ -1412,7 +1416,7 @@ impl NodeMesh {
             bus: None,
             pass_now_ms: Arc::new(|| aterm_time::unix_millis().unwrap_or(0)),
             pass_pace: aterm_secrets::client::NodePassPace::LIVE,
-            pass_converge: Arc::new(|| None),
+            pass_converge: Arc::new(|_| None),
         }
     }
 }
@@ -2520,6 +2524,13 @@ fn spawn_node_vault_pass(cfg: &NodeServeConfig) -> Option<std::thread::JoinHandl
                 stop: &stop,
                 held: &|| sharing_held(&state_dir, config_path.as_deref()),
                 may_post: &|| lan_unavailable().is_none(),
+                routes: &aterm_secrets::server::route_sources,
+                make_inputs: &|| {
+                    aterm_secrets::client::convergence_inputs(
+                        &paths,
+                        aterm_secrets::client::ConvergenceRole::Node,
+                    )
+                },
                 start_converge: &*start_converge,
                 now_ms: &*now_ms,
                 log: &|line| aterm_log::info!("node: {line}"),

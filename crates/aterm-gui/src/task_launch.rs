@@ -2512,7 +2512,13 @@ fn pooled_starter_reading(
         .map(|(n, v)| (n.as_str(), v.as_str()))
         .collect();
     let who = accounts::ProcessLogin::of_env_for(pool, pairs.iter().copied());
-    if !who.default_home || !who.stored_login {
+    // Only Claude Code has a token route; another CLI reads one as outside.
+    let own = match who.route {
+        accounts::AuthRoute::Stored => true,
+        accounts::AuthRoute::VaultToken { .. } => pool == accounts::Cli::Claude,
+        accounts::AuthRoute::Outside => false,
+    };
+    if !who.default_home || !own {
         return Ok(starter);
     }
     let var = pool.accounts().seam.var();

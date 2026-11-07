@@ -59,7 +59,9 @@ mod open_migration;
 mod own_head;
 mod peer_candidates;
 mod projection;
-pub use projection::{SubscriberInputs, on_subscriber_inputs};
+pub use projection::{
+    ConvergenceInputs, ConvergenceRole, convergence_inputs, on_convergence_inputs,
+};
 mod readmit;
 mod reads;
 mod records_cache;
@@ -98,6 +100,7 @@ pub use entry::{
 };
 #[path = "client/mailbox_index.rs"]
 mod mailbox_index;
+pub(crate) use entry::read_claude_token_until;
 #[cfg(any(test, debug_assertions))]
 pub use fleet::test_without_roster_wait;
 pub use fleet::{
@@ -131,12 +134,19 @@ pub use ledger_publish::{
 };
 pub(crate) use log_entries::local_swarm_roster_for_log_held;
 pub use log_entries::{
+    Anchor, FIRST_ANCHOR, MemberEntry, MemberUnset, MemberWritten, OnBusy, RESEAL_REFUSAL, WaitFor,
+    WriteRoute, member_set, member_unset, per_host_shadows, write_route,
+};
+pub use log_entries::{
     CommonsLog, GAP_STEP_MS, Overtaken, Overtaker, REMOVER_GRACE_MS, SETTLE_GRACE_MS,
     acknowledged_commons_log, admin_mirror_log, admit_member_in_log, applied_version_names_log,
     check_log_commons_enrollment, configure_log_member, enroll_commons_member_in_log,
     keyed_epochs_environment, local_swarm_roster_for_log, member_denied_by_roster,
     publish_local_node_key, remove_member_in_log, trusted_commons_log,
 };
+#[cfg(any(test, debug_assertions))]
+pub use log_entries::{TestPassClaim, test_hold_pass_claim};
+pub(crate) use log_entries::{member_unset_names, member_waits_here, member_write};
 pub use mailbox_index::{
     mailbox_component_held, read_mailbox_component, refresh_mailbox_component_index,
 };
@@ -163,8 +173,9 @@ pub use remove::{
     removes_by_log, reseal_waits, revoke_by_log, run_node_pass, tend_epochs, tend_epochs_at,
     undo_offers, undo_removals, vault_admin_named, vault_pass_at,
 };
+pub(crate) use remove::{recipient_label, seat_label};
 #[cfg(any(test, debug_assertions))]
-pub use remove::{test_put_everyone, test_remove_unposted};
+pub use remove::{test_put_everyone, test_put_everyone_draft, test_remove_unposted};
 #[cfg(any(test, debug_assertions))]
 pub use retained_history::{
     RetainedHistoryReadCounts, RetainedHistoryReadOutcomes, test_retained_history_read_counts,
@@ -215,6 +226,10 @@ mod join_tests;
 #[cfg(test)]
 mod log_entries_tests;
 #[cfg(test)]
+pub(crate) use log_entries_tests::two_macs as two_log_macs_for_test;
+#[cfg(test)]
+pub(crate) use log_entries_tests::two_macs_with as two_log_macs_with_for_test;
+#[cfg(test)]
 mod own_head_tests;
 #[cfg(test)]
 mod parent_history_tests;
@@ -226,6 +241,8 @@ mod peer_selection_tests;
 
 #[cfg(test)]
 mod cold_read_tests;
+#[cfg(test)]
+mod entry_class_tests;
 #[cfg(test)]
 mod envelope_denial_tests;
 #[cfg(test)]
@@ -2428,15 +2445,50 @@ fn registry_names(state: &State) -> Vec<String> {
         .collect()
 }
 
+/// One entry whose register holds concurrent values ([`conflicts`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Conflict {
+    /// Its section header and name (`[everyone] gh-token`), never a value.
+    pub entry: String,
+    /// Whether it is a Claude Code token or its record ([`crate::entry_class::claude_token`]),
+    /// which no `aterm secrets set` writes: the token call's own write picks one
+    /// ([`TOKEN_CONFLICT_PICK`]).
+    pub token: bool,
+}
+
+/// What picks one value of a conflicted entry other than a Claude Code token's.
+pub const CONFLICT_PICK: &str = "aterm secrets set <name> picks it";
+
+/// What picks one value of a conflicted Claude Code token: the token call's write, which deletes
+/// the concurrent values ahead of its own (DESIGN-claude-setup-token §3.5).
+pub const TOKEN_CONFLICT_PICK: &str = "`aterm harness accounts token <label|email> --replace` picks a Claude Code token's, for the account `aterm harness accounts` shows it under";
+
+impl Conflict {
+    /// The entries of `conflicts`, in two lists: those [`CONFLICT_PICK`] picks, then the Claude
+    /// Code tokens [`TOKEN_CONFLICT_PICK`] picks.
+    #[must_use]
+    pub fn split(conflicts: &[Self]) -> (Vec<&str>, Vec<&str>) {
+        let named = |token: bool| {
+            conflicts
+                .iter()
+                .filter(|conflict| conflict.token == token)
+                .map(|conflict| conflict.entry.as_str())
+                .collect()
+        };
+        (named(false), named(true))
+    }
+}
+
 /// The entries this Mac reads from the membership log whose register holds concurrent values
 /// (`docs/DESIGN-fluid-swarm-2026-10-28.md` §3.5.3): two Macs saved different values while apart.
 /// Every Mac writes the same one, and the other stays a candidate until a person saves or removes
-/// the entry. Each is its section header and name (`[everyone] gh-token`), never a value. Empty
-/// where this Mac reads its entries from the envelope.
+/// the entry ([`CONFLICT_PICK`]), or, for a Claude Code token, until the token call writes it
+/// again ([`TOKEN_CONFLICT_PICK`]). Each is named by its section header and name, never a value.
+/// Empty where this Mac reads its entries from the envelope.
 /// # Errors
 /// The local state, identity or records cannot be read, or a record addressed to this Mac does
 /// not open.
-pub fn conflicts(paths: &Paths) -> crate::Result<Vec<String>> {
+pub fn conflicts(paths: &Paths) -> crate::Result<Vec<Conflict>> {
     if load_state(paths)?.records_digest.is_none() {
         return Ok(Vec::new());
     }
@@ -2459,7 +2511,10 @@ pub fn conflicts(paths: &Paths) -> crate::Result<Vec<String>> {
     Ok(opened
         .conflicts
         .into_iter()
-        .map(|(audience, name)| format!("{} {name}", audience.header()))
+        .map(|(audience, name)| Conflict {
+            entry: format!("{} {name}", audience.header()),
+            token: crate::entry_class::claude_token(&name),
+        })
         .collect())
 }
 
@@ -4015,8 +4070,8 @@ fn gaps(paths: &Paths, state: &State) -> BTreeSet<String> {
 
 /// The files `state`'s manifest names that are not as the vault wrote them (changed, missing or
 /// unreadable); one behind a link is left out, as the vault never writes through one, and so is
-/// an AI CLI's login a build that did not refuse it wrote, the CLI's own file now
-/// ([`materialize::Report::refused`]).
+/// a name set apart that a build that did not refuse it wrote (an AI CLI's login, a home path
+/// aterm does not name), the Mac's own file now ([`materialize::Report::refused`]).
 fn changed_files(paths: &Paths, state: &State) -> BTreeSet<String> {
     state
         .manifest
@@ -4024,7 +4079,10 @@ fn changed_files(paths: &Paths, state: &State) -> BTreeSet<String> {
         .iter()
         .filter(|(name, digest)| {
             !materialize::behind_a_link(&paths.home, name)
-                && text::cli_login(name).is_none()
+                && !matches!(
+                    crate::entry_class::of(name),
+                    crate::entry_class::EntryClass::SetApart(_)
+                )
                 && materialize::target_path(&paths.home, name)
                     .ok()
                     .and_then(|path| fsx::read_private(&path, text::MAX_VALUE).ok().flatten())
@@ -7298,7 +7356,7 @@ fn refused_words(report: &Report) -> String {
         .map(|(name, _)| name.as_str())
         .collect();
     format!(
-        "; not written, as no vault carries an AI CLI's login: {}",
+        "; not written, as no Mac writes these names as files (an AI CLI's login, a home path aterm does not name, another spelling of a held or consumed name, or two spellings of one file): {}",
         names.join(", ")
     )
 }
@@ -7447,17 +7505,17 @@ fn put_back_due(
     due
 }
 
-/// Start the converge pass's runner for the subscriber (`crate::converge::start`, `--trigger
+/// Start the converge pass's runner for the subscriber (`crate::converge::start_requested`, `--trigger
 /// subscriber`) without waiting for it: the pass runs `aterm fleet sync`'s work among its items,
 /// and a dial of the fleet's issuer must never hold up this long-poll (or, on an admin Mac, the
 /// approver beside it).
 #[cfg(not(test))]
 fn start_converge(
     exe: &Path,
-    work: crate::converge::RepositoryWork,
+    request: crate::converge::RepositoryRequest,
     log: &dyn Fn(&str),
 ) -> Option<aterm_uds::spawnfd::Child> {
-    crate::converge::start(exe, crate::converge::SUBSCRIBER, work)
+    crate::converge::start_requested(exe, crate::converge::SUBSCRIBER, request)
         .map_err(|error| log(&format!("could not start the converge pass: {error}")))
         .ok()
 }
@@ -7467,7 +7525,7 @@ fn start_converge(
 #[cfg(test)]
 fn start_converge(
     _exe: &Path,
-    _work: crate::converge::RepositoryWork,
+    _request: crate::converge::RepositoryRequest,
     _log: &dyn Fn(&str),
 ) -> Option<aterm_uds::spawnfd::Child> {
     None
@@ -7479,7 +7537,7 @@ fn start_converge(
 struct Converging<'a> {
     /// Start the runner of the program at this path, without waiting for it.
     start: &'a (
-            dyn Fn(&Path, crate::converge::RepositoryWork) -> Option<aterm_uds::spawnfd::Child>
+            dyn Fn(&Path, crate::converge::RepositoryRequest) -> Option<aterm_uds::spawnfd::Child>
                 + Sync
         ),
     /// This Mac's routes.
@@ -7687,7 +7745,7 @@ fn ask_members_if_due_with_native(
 }
 
 fn subscriber_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<()> {
-    let start = |exe: &Path, work| start_converge(exe, work, log);
+    let start = |exe: &Path, request| start_converge(exe, request, log);
     let converging = Converging {
         start: &start,
         routes: &crate::server::route_sources,
@@ -7717,7 +7775,10 @@ fn subscriber_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<
         hold: &hold,
         away: &away,
     };
-    let projection = projection::Projection::observing(&converging, projection::inputs(paths));
+    let projection = projection::Projection::observing(
+        &converging,
+        convergence_inputs(paths, ConvergenceRole::Subscriber),
+    );
     let run = |maintain: &mut dyn FnMut() -> member_routes::Status| {
         subscriber_loop_projecting(paths, log, &|| false, &hearing, &projection, maintain)
     };
@@ -13611,6 +13672,7 @@ fn prepare_initial(
     }
     .map_err(|e| Error::new(e.to_string()))?;
     let mut imported = Vec::new();
+    let empty = doc.clone();
     if let Some(dir) = import {
         let mut names: Vec<(String, PathBuf)> = std::fs::read_dir(dir)
             .map_err(|e| Error::new(format!("{}: {e}", dir.display())))?
@@ -13633,6 +13695,10 @@ fn prepare_initial(
             doc.set_entry(&Audience::Everyone, &name, value.as_slice())
                 .map_err(|e| Error::new(format!("{name}: {e}")))?;
             imported.push(name);
+        }
+        // A name no vault text writes, or two spellings of one file, refuse the import whole.
+        if let Some(why) = doc.added_refusal(&empty) {
+            return Err(Error::new(format!("{}: {why}", dir.display())));
         }
     }
     let mut seed = zeroize::Zeroizing::new([0u8; 32]);
@@ -15517,9 +15583,9 @@ mod tests {
         let before = pinned(&admin);
         assert!(before.signer.is_some());
         // Someone who can write the file puts plain text in the vault's place.
-        fsx::write_atomic(&source, b"~/.tool/planted=inert-planted\n", 0o600).unwrap();
+        fsx::write_atomic(&source, b"~/.config/gh/hosts.yml=inert-planted\n", 0o600).unwrap();
         let planted = |paths: &Paths| {
-            materialize::target_path(&paths.home, "~/.tool/planted")
+            materialize::target_path(&paths.home, "~/.config/gh/hosts.yml")
                 .unwrap()
                 .exists()
         };
@@ -15850,7 +15916,7 @@ mod tests {
             .unwrap();
         doc.set_entry_with(
             &Audience::Everyone,
-            "~/.config/tool/config",
+            "~/.config/git/config",
             b"[tool]\n",
             true,
             None,
@@ -15862,7 +15928,7 @@ mod tests {
         let mut repaired = None;
         assert!(!repair_due(&admin, &mut repaired), "nothing to repair");
 
-        let config = materialize::target_path(&admin.home, "~/.config/tool/config").unwrap();
+        let config = materialize::target_path(&admin.home, "~/.config/git/config").unwrap();
         fsx::write_atomic(&config, b"[tool]\nhelper = local\n", 0o600).unwrap();
         let token = materialize::target_path(&admin.home, "token").unwrap();
         std::fs::remove_file(&token).unwrap();
@@ -16128,14 +16194,15 @@ mod tests {
         let source = root.path().join("team.secrets");
         fsx::write_atomic(
             &source,
-            b"token=inert-token\n~/.tool/token=inert-value\n",
+            b"token=inert-token\n~/.config/gh/hosts.yml=inert-value\n",
             0o600,
         )
         .expect("plain vault");
         let reader = Paths::for_home(&root.path().join("reader"));
         assert!(!materialization_ready(&reader).expect("unconfigured"));
         assert!(!reader.dir.exists(), "a readiness check creates no state");
-        let blocked = materialize::target_path(&reader.home, "~/.tool/token").expect("target");
+        let blocked =
+            materialize::target_path(&reader.home, "~/.config/gh/hosts.yml").expect("target");
         std::fs::create_dir_all(&blocked).expect("directory blocks the file");
         assert!(matches!(
             join_pinned(&reader, source.to_str().expect("utf-8"), "reader"),
@@ -16937,7 +17004,11 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let root = aterm_tempfile::tempdir().expect("tempdir");
         let paths = Paths::for_home(root.path());
-        let (anchor, gap, changed) = ("~/.config/gh/hosts.yml", "~/.gitconfig", "~/.gitnotes");
+        let (anchor, gap, changed) = (
+            "~/.config/gh/hosts.yml",
+            "~/.config/git/config",
+            "~/.config/git/credentials",
+        );
         let entry = |name: &str, anchor: Option<&str>| Entry {
             name: name.to_string(),
             value: SecretBytes::from(&b"vault-value"[..]),
@@ -17192,7 +17263,7 @@ mod tests {
             save_state(&paths, &state).expect("saved");
             load_state(&paths).expect("state")
         };
-        let (anchor, gap) = ("~/.config/gh/hosts.yml", "~/.gitconfig");
+        let (anchor, gap) = ("~/.config/gh/hosts.yml", "~/.config/git/config");
         private(gap, b"vault-value");
         private(anchor, b"the machine's own");
         let mut state = resume(&[(gap, b"vault-value")], &[]);
@@ -17223,8 +17294,8 @@ mod tests {
         assert!(state.manifest.files.is_empty(), "{:?}", state.manifest);
         let elsewhere = root.path().join("elsewhere");
         std::fs::create_dir_all(&elsewhere).expect("dir");
-        std::os::unix::fs::symlink(&elsewhere, root.path().join(".tool")).expect("linked");
-        let linked = "~/.tool/token";
+        std::os::unix::fs::symlink(&elsewhere, root.path().join(".aterm/roster")).expect("linked");
+        let linked = "~/.aterm/roster/aterm-machines.toml";
         private(linked, b"vault-value");
         let resumed: materialize::Pending =
             [(linked.to_string(), materialize::digest_hex(b"vault-value"))].into();
@@ -17245,16 +17316,26 @@ mod tests {
         assert!(pending.is_empty(), "{pending:?}");
         assert!(resumed_held.files.is_empty(), "{resumed_held:?}");
         assert!(manifest.files.is_empty(), "{manifest:?}");
-        private("~/.netrc", b"the machine's own");
-        let own_anchor = "~/.config/tool/own";
+        private("~/.aterm/apple/devid-netrc.key", b"the machine's own");
+        let own_anchor = "~/.aterm/apple/devid-own.key";
         private(own_anchor, b"the machine's own");
         let entries = [
             entry("plain_gap", b"vault-value", false, None),
-            entry("~/.netrc", b"vault-value", false, None),
-            entry("~/.config/tool/filled", b"vault-value", true, None),
+            entry(
+                "~/.aterm/apple/devid-netrc.key",
+                b"vault-value",
+                false,
+                None,
+            ),
+            entry(
+                "~/.aterm/apple/devid-filled.key",
+                b"vault-value",
+                true,
+                None,
+            ),
             entry(own_anchor, b"vault-value", true, None),
             entry(
-                "~/.config/tool/kept",
+                "~/.aterm/apple/devid-kept.key",
                 b"vault-value",
                 true,
                 Some(own_anchor),
@@ -17278,7 +17359,10 @@ mod tests {
         for name in &report.written {
             assert!(told.contains_key(name), "{name} written unpended: {told:?}");
         }
-        assert!(!told.contains_key("~/.config/tool/kept"), "{told:?}");
+        assert!(
+            !told.contains_key("~/.aterm/apple/devid-kept.key"),
+            "{told:?}"
+        );
         assert!(!told.contains_key(linked), "{told:?}");
     }
 
@@ -17298,7 +17382,7 @@ mod tests {
             .expect("a key")
             .0
             .to_bech32();
-        let (token, gap) = ("token", "~/.gitconfig");
+        let (token, gap) = ("token", "~/.config/git/config");
         {
             let opened = admin_open(&admin).expect("open");
             let mut doc = opened.doc.clone();
@@ -17310,6 +17394,7 @@ mod tests {
             admin_publish(&admin, &opened, &doc).expect("publish");
         }
         let at = materialize::target_path(&reader.home, gap).expect("valid");
+        std::fs::create_dir_all(at.parent().expect("parent")).expect("dir");
         std::fs::write(&at, b"the machine's own\n").expect("written");
         let first = sync(&reader, None).expect("sync");
         assert!(matches!(first, SyncOutcome::Applied { .. }), "{first:?}");
@@ -17333,7 +17418,7 @@ mod tests {
     #[test]
     fn a_target_that_changed_since_the_look_is_not_written_unannounced() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
-        let name = "~/.tool/token";
+        let name = "~/.config/gh/hosts.yml";
         let at = materialize::target_path(root.path(), name).expect("valid");
         std::fs::create_dir_all(&at).expect("a directory in the way");
         let entries = [Entry {
@@ -19409,10 +19494,10 @@ mod tests {
         let target = |name: &str| materialize::target_path(&admin.home, name).expect("target");
         let (adopted, hosts) = (target("adopted"), target("~/.config/gh/hosts.yml"));
         let (anchor, anchored) = (
-            target("~/.config/tool/config"),
-            target("~/.config/tool/key"),
+            target("~/.config/git/config"),
+            target("~/.config/git/credentials"),
         );
-        let paired = target("~/.config/pair/b");
+        let paired = target("~/.aterm/apple/devid-pair.key");
         fsx::ensure_private_dir(&admin.home.join(".secrets")).expect("~/.secrets");
         fsx::write_atomic(&adopted, b"inert-adopted", 0o600).expect("this Mac's value");
         std::fs::create_dir_all(hosts.parent().expect("parent")).expect("dir");
@@ -19427,14 +19512,18 @@ mod tests {
             .expect("set");
         for (name, value, anchored_to) in [
             ("~/.config/gh/hosts.yml", &b"github.com: {}\n"[..], None),
-            ("~/.config/tool/config", b"[tool]\n", None),
+            ("~/.config/git/config", b"[tool]\n", None),
             (
-                "~/.config/tool/key",
+                "~/.config/git/credentials",
                 b"inert-key",
-                Some("~/.config/tool/config"),
+                Some("~/.config/git/config"),
             ),
-            ("~/.config/pair/a", b"inert-a", None),
-            ("~/.config/pair/b", b"inert-b", Some("~/.config/pair/a")),
+            ("~/.aterm/apple/devid-pair.cer", b"inert-a", None),
+            (
+                "~/.aterm/apple/devid-pair.key",
+                b"inert-b",
+                Some("~/.aterm/apple/devid-pair.cer"),
+            ),
         ] {
             doc.set_entry_with(&Audience::Everyone, name, value, true, anchored_to)
                 .expect("set");
@@ -19447,8 +19536,8 @@ mod tests {
             [
                 "adopted",
                 "~/.config/gh/hosts.yml",
-                "~/.config/pair/b",
-                "~/.config/tool/config"
+                "~/.aterm/apple/devid-pair.key",
+                "~/.config/git/config"
             ]
             .map(String::from)
             .into(),
@@ -19474,7 +19563,12 @@ mod tests {
         };
         assert_eq!(
             report.written,
-            ["adopted", "~/.config/gh/hosts.yml", "~/.config/pair/b"].map(String::from)
+            [
+                "adopted",
+                "~/.aterm/apple/devid-pair.key",
+                "~/.config/gh/hosts.yml"
+            ]
+            .map(String::from)
         );
         assert_eq!(std::fs::read(&adopted).expect("filled"), b"inert-adopted");
         assert_eq!(std::fs::read(&paired).expect("filled"), b"inert-b");
@@ -19486,7 +19580,7 @@ mod tests {
         );
         assert_eq!(
             state.own.expect("recorded"),
-            ["~/.config/tool/config".to_string()].into()
+            ["~/.config/git/config".to_string()].into()
         );
         assert!(materialization_ready(&admin).expect("ready"));
         assert_eq!(
@@ -19522,7 +19616,8 @@ mod tests {
         let source = root.path().join("team.vault");
         let admin = Paths::for_home(&root.path().join("admin"));
         create(&admin, source.to_str().expect("utf-8"), None, Some("admin")).expect("create");
-        let token = materialize::target_path(&admin.home, "~/.config/tool/token").expect("target");
+        let token =
+            materialize::target_path(&admin.home, "~/.config/gh/hosts.yml").expect("target");
         let dir = token.parent().expect("parent").to_path_buf();
         std::fs::create_dir_all(&dir).expect("dir");
         let mode = |mode| {
@@ -19532,10 +19627,14 @@ mod tests {
             let opened = admin_open(&admin).expect("open");
             let mut doc = opened.doc.clone();
             if set {
-                doc.set_entry(&Audience::Everyone, "~/.config/tool/token", b"inert-token")
-                    .expect("set");
+                doc.set_entry(
+                    &Audience::Everyone,
+                    "~/.config/gh/hosts.yml",
+                    b"inert-token",
+                )
+                .expect("set");
             } else {
-                doc.unset_entry(&Audience::Everyone, "~/.config/tool/token")
+                doc.unset_entry(&Audience::Everyone, "~/.config/gh/hosts.yml")
                     .expect("unset");
             }
             admin_publish(&admin, &opened, &doc).expect("publish");
@@ -19553,7 +19652,7 @@ mod tests {
         let state = load_state(&admin).expect("state");
         assert!(!state.failed);
         assert!(
-            !state.manifest.files.contains_key("~/.config/tool/token"),
+            !state.manifest.files.contains_key("~/.config/gh/hosts.yml"),
             "adopted"
         );
         publish(false);

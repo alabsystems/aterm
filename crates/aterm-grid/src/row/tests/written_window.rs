@@ -92,20 +92,10 @@ fn every_row_write_stays_inside_the_written_window() {
                     if pairs > 0 {
                         let end = col + 2 * pairs;
                         let blanked = row.fixup_wide_chars_in_range(col, 2 * pairs, fill);
-                        for at in (col..end).step_by(2) {
-                            // SAFETY: `at + 1` is below `end`, which is at most the row's width,
-                            // so both cells of the pair exist; the run steps by two from `col` over
-                            // the span the fixup above just cleared, so each pair starts on a cell
-                            // boundary and none overlaps another.
-                            unsafe {
-                                row.write_wide_char_packed_no_fixup(
-                                    at,
-                                    '中',
-                                    colors,
-                                    CellFlags::empty(),
-                                );
-                            }
-                        }
+                        let glyphs = vec!['中'; usize::from(pairs)];
+                        row.write_wide_run_packed_no_fixup(col, &glyphs, colors, |_| {
+                            CellFlags::empty()
+                        });
                         row.settle_len_after_wide_run(col, end, blanked);
                         row.mark_has_wide_chars();
                     }

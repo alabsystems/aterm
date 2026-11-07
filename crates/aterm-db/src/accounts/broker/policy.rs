@@ -4,7 +4,7 @@
 use super::*;
 use std::collections::BTreeMap;
 
-pub const ENTRY: &str = "ai-broker.toml";
+pub const ENTRY: &str = aterm_secrets::entry_class::AI_BROKER;
 pub(super) const MAX_BYTES: usize = 128 * 1024;
 pub(super) const MAX_LEASE: Duration = Duration::from_secs(3600);
 

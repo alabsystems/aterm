@@ -495,7 +495,7 @@ fn retained_account_attribution_round_trips_but_legacy_or_missing_namespace_is_n
         &accounts::ProcessLogin {
             login: None,
             default_home: true,
-            stored_login: true,
+            route: crate::harness::accounts::AuthRoute::Stored,
         },
     )
     .unwrap();
@@ -739,7 +739,7 @@ fn exit_input(world: &Path, st: &St) -> (Snapshot, Plan) {
     let snap = Snapshot {
         launch_env: None,
         auth_observed: true,
-        stored_login: false,
+        route: crate::harness::accounts::AuthRoute::Outside,
         profile: None,
         tab: TAB.into(),
         pid: std::process::id(),
@@ -763,6 +763,7 @@ fn exit_input(world: &Path, st: &St) -> (Snapshot, Plan) {
         dialect: Dialect::Zsh,
         line: st.line.clone(),
         tap_dropped: None,
+        token_dropped: None,
         line_dir: None,
         command: None,
         cold: None,
@@ -886,7 +887,7 @@ fn live_admitted_login_reaches_the_saved_plan_before_a_held_execution() {
     snap.shell = shell.id();
     snap.argv = vec!["claude".into()];
     snap.login = Some(world.path().join("previous-login").display().to_string());
-    snap.stored_login = true;
+    snap.route = crate::harness::accounts::AuthRoute::Stored;
     snap.profile = Some(super::super::profile::Context {
         plain: opts.home.join(".claude.json"),
         records: opts.home.join(".claude"),
@@ -1077,7 +1078,7 @@ fn a_cold_intent_for_an_agent_of_an_earlier_host_waits_on_a_witness_it_cannot_ha
         login: None,
         home: None,
         auth_observed: true,
-        stored_login: true,
+        route: super::super::accounts::AuthRoute::Stored,
         conversation: Some(SESSION.into()),
         profile: None,
         mode: super::super::accounts::Mode::Wall,
@@ -1589,7 +1590,8 @@ fn a_cold_line_past_the_twin_commands_the_build_it_types() {
         home: None,
         homedir: None,
         login: None,
-        stored_login: true,
+        route: super::super::accounts::AuthRoute::Stored,
+        serve: Serve::Judge,
         auth_observed: true,
         launch_env: None,
         billing: ModelBilling::Keep,
@@ -1598,7 +1600,7 @@ fn a_cold_line_past_the_twin_commands_the_build_it_types() {
         login: None,
         home: None,
         auth_observed: true,
-        stored_login: true,
+        route: super::super::accounts::AuthRoute::Stored,
         conversation: Some(SESSION.into()),
         profile: None,
         mode: super::super::accounts::Mode::Wall,

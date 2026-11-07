@@ -450,7 +450,7 @@ mod tests {
                 account: Some("current"),
                 left: None,
                 default_home: true,
-                stored_login: true,
+                route: crate::harness::accounts::AuthRoute::Stored,
             },
             Some(&Point::Wall {
                 window: "seven_day".into(),
@@ -499,7 +499,7 @@ mod tests {
             account: Some("current"),
             left: None,
             default_home: true,
-            stored_login: true,
+            route: crate::harness::accounts::AuthRoute::Stored,
         };
         let generic = "synthetic supervisor reason";
         for (phase, judged, alternate_ready, prefer) in [
@@ -631,7 +631,7 @@ mod tests {
                     account: Some("current"),
                     left: None,
                     default_home: true,
-                    stored_login: true,
+                    route: crate::harness::accounts::AuthRoute::Stored,
                 },
                 Some(&Point::Wall {
                     window: "seven_day".into(),
@@ -673,7 +673,7 @@ mod tests {
             account: Some("current"),
             left: None,
             default_home: true,
-            stored_login: true,
+            route: crate::harness::accounts::AuthRoute::Stored,
         };
         let point = Point::Wall {
             window: "seven_day".into(),
@@ -776,7 +776,7 @@ mod tests {
                 account: Some("current"),
                 left: None,
                 default_home: true,
-                stored_login: true,
+                route: crate::harness::accounts::AuthRoute::Stored,
             },
             Some(&Point::Wall {
                 window: "seven_day".into(),
@@ -808,7 +808,7 @@ mod tests {
                 account: Some("current"),
                 left: None,
                 default_home: true,
-                stored_login: true,
+                route: crate::harness::accounts::AuthRoute::Stored,
             },
             None,
         );
@@ -853,7 +853,7 @@ mod tests {
             account: Some("pool-a"),
             left: None,
             default_home: true,
-            stored_login: true,
+            route: crate::harness::accounts::AuthRoute::Stored,
         };
         let mut unclaimed = State {
             machine: "0a0b".into(),

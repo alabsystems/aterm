@@ -189,6 +189,7 @@ fn reading(
         program: aterm_phase::Program::Claude,
         seat: Default::default(),
         account: None,
+        route: None,
         autopilot: aterm_agent::supervise::Autopilot::Cruise,
         login_label: None,
         autopilot_by_person: false,

@@ -2936,3 +2936,40 @@ fn a_seats_fresh_activity_row_is_its_activity_on_the_copy() {
         "{texts:?}"
     );
 }
+
+/// A need a person decides makes an agent wait whatever its own word, as `aterm ctl survey`
+/// classes it: an idle agent that ended its turn on a question is waiting, not quiet (the live
+/// fleet of 2026-11-06 held two such and four busy ones a harness reported). A stuck need keeps
+/// the agent's own word, and `needs=-` keeps a prompt at work.
+#[test]
+fn a_decided_need_waits_whatever_the_agent_says() {
+    for need in ["ask", "approval", "question"] {
+        for word in ["idle", "busy", "prompt", "unknown"] {
+            assert_eq!(
+                AgentWord::of(Some(word), Some(need)),
+                AgentWord::Waiting,
+                "{word} with {need}"
+            );
+        }
+    }
+    assert_eq!(
+        AgentWord::of(Some("idle"), Some("-")),
+        AgentWord::Idle,
+        "control"
+    );
+    assert_eq!(
+        AgentWord::of(Some("busy"), Some("-")),
+        AgentWord::Busy,
+        "control"
+    );
+    assert_eq!(AgentWord::of(Some("prompt"), Some("-")), AgentWord::Busy);
+    assert_eq!(
+        AgentWord::of(Some("wall:auth"), Some("login")),
+        AgentWord::Walled("auth".into()),
+        "a stuck need is no decision"
+    );
+    assert_eq!(
+        AgentWord::of(Some("unknown"), Some("stalled")),
+        AgentWord::Unknown
+    );
+}

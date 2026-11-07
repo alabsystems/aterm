@@ -72,6 +72,12 @@ fn post(snapshot: Option<Arc<AccountsSnapshot>>) {
     {
         SNAPSHOT.with(|s| *s.borrow_mut() = snapshot);
     }
+    wake_card();
+}
+
+/// Wake the open Accounts card's session, whose footer handler refreshes the card: a new
+/// snapshot, or new token facts ([`crate::token_shown::refresh`]).
+pub(crate) fn wake_card() {
     if let Some(session) = card_with(|card| card.session) {
         crate::claude_footer::post_changed(session);
     }

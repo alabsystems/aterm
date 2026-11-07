@@ -25,7 +25,6 @@ fn native_cohort_is_bound_before_the_supervisor_waits() {
     let status = supervise_with(
         Some(held),
         &mut command,
-        &|| 0,
         &mut |_| {},
         || None,
         |child, _| {
@@ -58,7 +57,6 @@ fn native_cohort_missing_target_cancels_its_actual_unused_arm() {
     let error = supervise(
         Some(held),
         &mut spawnfd::command(dir.path().join("missing")),
-        &|| 0,
         &mut |_| {},
     )
     .unwrap_err();
@@ -130,7 +128,6 @@ fn native_cohort_supervises_a_real_targo_compile_and_emitted_program() {
     let status = supervise_with(
         Some(*held),
         &mut command,
-        &|| 0,
         &mut |_| {},
         || None,
         |child, _| {
@@ -180,7 +177,6 @@ fn native_cohort_normal_root_exit_keeps_a_live_descendants_entire_budget() {
     let status = supervise_with(
         Some(held),
         &mut command,
-        &|| 1,
         &mut |line| said.push(line.to_owned()),
         || None,
         |child, _| {
@@ -292,7 +288,6 @@ fn native_cohort_controller_actor_if_requested() {
     let status = supervise_with(
         Some(held),
         &mut command,
-        &|| 0,
         &mut |_| {},
         || None,
         |child, _| std::fs::write(world.join("bound"), child.id().to_string()).unwrap(),

@@ -2867,6 +2867,10 @@ fn a_need_sized_again_after_its_relief_re_enters_the_wait_with_it() {
         "counted from when it first entered: {:?}",
         claim.waited()
     );
+    assert!(
+        claim.asked_ms() < claim.record().start_ms,
+        "its ask is its first entry's, not the entry its relief made again"
+    );
     assert_eq!(
         needs,
         [2 * GIB, 12 * GIB],
@@ -2879,7 +2883,31 @@ fn a_need_sized_again_after_its_relief_re_enters_the_wait_with_it() {
         1,
         "the first entry left the queue: {listed:?}"
     );
-    drop(claim);
+    // Its admission row's wait, by the wall clock, is counted from its first entry too, the one
+    // its build row reads (one stamp to the next: a millisecond's truncation apart from the
+    // monotonic wait at most).
+    let mut rows = Vec::new();
+    crate::telemetry::Asked::of(&Need::new("verify").disk(2 * GIB, "/vol")).decided_in(
+        &s.ledger,
+        s.ledger.dir(),
+        "m14",
+        aterm_telemetry::Digest::of("test", &[b"facts"]),
+        &Ok(claim),
+        |row| {
+            rows.push(row.clone());
+            true
+        },
+    );
+    let [row] = &rows[..] else {
+        panic!("one admission row: {rows:?}");
+    };
+    let aterm_telemetry::Fig::Known(waited_ms) = row.wait_ms else {
+        panic!("a known wall-clock wait: {row:?}");
+    };
+    assert!(
+        u128::from(waited_ms) + 1 >= FIRST.as_millis(),
+        "its row's wait from when it first entered: {waited_ms} ms"
+    );
 
     let (got, needs, _) = run(&[14], &[Some(200 * GIB)]);
     match got {

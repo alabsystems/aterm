@@ -258,12 +258,13 @@ fn a_waiting_keeper_takes_the_board_when_the_first_lets_go() {
     drop(second);
 }
 
-/// A keeper with nothing to ask is due at its next prune, a closed row's next ask, or a Mac's
-/// backoff's end, whichever is first, and at nothing sooner: an idle board wakes it hourly.
-/// A backoff already over is no deadline: a Mac whose rows are all out of asking does not keep
-/// the keeper due in the past.
+/// A keeper with nothing to ask is due at its next prune, a closed row's next ask, a Mac's
+/// backoff's end, or its next settle of the task rows its board owes its log, whichever is
+/// first, and at nothing sooner: an idle board wakes it hourly. A backoff already over is no
+/// deadline: a Mac whose rows are all out of asking does not keep the keeper due in the past.
 /// NEGATIVE CONTROL: `next_due` as `at + KEEP_IDLE` (the read every 5 s) fails "an idle board
-/// is due at its prune"; without its `> at` filter it fails "a backoff over is no deadline".
+/// is due at its prune"; without its `> at` filter it fails "a backoff over is no deadline";
+/// without the settle it fails "a board that owes its log is due at its next settle".
 #[cfg(unix)]
 #[test]
 fn an_idle_keeper_is_due_at_its_next_prune_ask_or_backoff() {
@@ -271,28 +272,81 @@ fn an_idle_keeper_is_due_at_its_next_prune_ask_or_backoff() {
     let mut closed_asked = std::collections::HashMap::new();
     let mut backoff = Backoff::default();
     assert_eq!(
-        next_due(at, Some(at), &closed_asked, &backoff),
+        next_due(at, Some(at), &closed_asked, &backoff, None),
         at + KEEP_PRUNE_EVERY,
         "an idle board is due at its prune"
     );
     closed_asked.insert("s-0b1".to_owned(), at + CLOSED_ASKED_EVERY);
     assert_eq!(
-        next_due(at, Some(at), &closed_asked, &backoff),
+        next_due(at, Some(at), &closed_asked, &backoff, None),
         at + CLOSED_ASKED_EVERY
     );
     let wait = backoff.unanswered("m1".to_owned(), at);
     assert!(wait < CLOSED_ASKED_EVERY, "PRECONDITION: {wait:?}");
-    assert_eq!(next_due(at, Some(at), &closed_asked, &backoff), at + wait);
     assert_eq!(
-        next_due(at, None, &closed_asked, &backoff),
+        next_due(at, Some(at), &closed_asked, &backoff, None),
+        at + wait
+    );
+    assert_eq!(
+        next_due(at, None, &closed_asked, &backoff, None),
         at,
         "never pruned"
     );
     let later = at + wait + Duration::from_secs(1);
     assert_eq!(
-        next_due(later, Some(at), &std::collections::HashMap::new(), &backoff),
+        next_due(
+            later,
+            Some(at),
+            &std::collections::HashMap::new(),
+            &backoff,
+            None
+        ),
         at + KEEP_PRUNE_EVERY,
         "a backoff over is no deadline"
+    );
+    let settle = at + OWED_SETTLED_EVERY;
+    assert_eq!(
+        next_due(
+            at,
+            Some(at),
+            &std::collections::HashMap::new(),
+            &Backoff::default(),
+            Some(settle)
+        ),
+        settle,
+        "a board that owes its log is due at its next settle"
+    );
+}
+
+/// A keeper settles what its board owes its log a period after it finds it owing, and every
+/// period after while it owes, never sooner: a settle's own write to the board wakes the keeper,
+/// which settles nothing then. A board that owes nothing has no settle due.
+/// NEGATIVE CONTROL: settling as soon as a row is found owing fails "found owing", and settling
+/// whenever the keeper wakes fails "not yet".
+#[cfg(unix)]
+#[test]
+fn a_keeper_settles_what_its_board_owes_a_period_after_and_every_period_after() {
+    let at = std::time::Instant::now();
+    let due = at + OWED_SETTLED_EVERY;
+    assert_eq!(
+        settle_step(false, Some(due), due),
+        (false, None),
+        "nothing owed"
+    );
+    assert_eq!(
+        settle_step(true, None, at),
+        (false, Some(due)),
+        "found owing"
+    );
+    assert_eq!(
+        settle_step(true, Some(due), at + Duration::from_secs(1)),
+        (false, Some(due)),
+        "not yet"
+    );
+    assert_eq!(
+        settle_step(true, Some(due), due),
+        (true, Some(due + OWED_SETTLED_EVERY)),
+        "due: it settles, and is due a period on"
     );
 }
 

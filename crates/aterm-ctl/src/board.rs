@@ -56,7 +56,7 @@ const HEARD_WRITTEN_EVERY: Duration = Duration::from_secs(300);
 const WORD_MAX: usize = 64;
 
 /// The row's keys, in the order a row is written.
-const KEYS: [&str; 26] = [
+const KEYS: [&str; 29] = [
     "sid",
     "label",
     "node",
@@ -83,6 +83,9 @@ const KEYS: [&str; 26] = [
     "after",
     "area",
     "told",
+    "ended",
+    "ended_why",
+    "owed",
 ];
 
 /// One worker this Mac started.
@@ -143,6 +146,21 @@ pub struct Row {
     /// [`crate::fleet_telemetry::task_end`]): a close that comes to the same end writes no second
     /// row. Kept under the board's lock with the row, so no read of the log decides it.
     pub told: Option<String>,
+    /// The last end its Mac reported while the row stood open: a conclusion of any state but
+    /// `stalled` (a stall's `failed` stands only while the stall does, and its record takes it
+    /// back when the stall moves on). Kept past a later live row that names none (a turn typed
+    /// after it) until the row closes: the end a close that is no record of the Mac's tells
+    /// ([`crate::fleet_telemetry::task_end`]).
+    pub ended: Option<String>,
+    /// That conclusion's `why=`, as its Mac reported it.
+    pub ended_why: Option<String>,
+    /// The `kind=task` telemetry rows the board owes its log, oldest first, each the line
+    /// [`aterm_telemetry::Row::line`] wrote: a close whose row the log's lock (or its disk)
+    /// refused. Kept under the board's lock with the row, so it outlives the process, until a
+    /// write takes them, at their own close's time and `wall_ms` (the board's `pay`), or the
+    /// board gives them up, which counts each lost once
+    /// ([`crate::fleet_telemetry::task_end`]).
+    pub owed: Vec<String>,
     /// Words of keys this aterm does not know (a later aterm's), as read: written back unchanged.
     pub extra: Vec<(String, String)>,
 }
@@ -189,7 +207,7 @@ impl Row {
         let num = |n: u64| n.to_string();
         let opt_num = |n: Option<u64>| n.map_or_else(|| "-".to_owned(), |n| n.to_string());
         let word = |s: &Option<String>| s.as_deref().map_or_else(|| "-".to_owned(), encode);
-        let values: [String; 26] = [
+        let values: [String; 29] = [
             encode(&self.sid),
             word(&self.label),
             word(&self.node),
@@ -216,6 +234,13 @@ impl Row {
             word(&self.after),
             word(&self.area),
             word(&self.told),
+            word(&self.ended),
+            word(&self.ended_why),
+            if self.owed.is_empty() {
+                "-".to_owned()
+            } else {
+                encode(&self.owed.concat())
+            },
         ];
         KEYS.iter()
             .zip(values)
@@ -288,6 +313,13 @@ impl Row {
                 "after" => row.after = text(),
                 "area" => row.area = text(),
                 "told" => row.told = text(),
+                "ended" => row.ended = text(),
+                "ended_why" => row.ended_why = text(),
+                "owed" => {
+                    row.owed = text().map_or_else(Vec::new, |lines| {
+                        lines.split_inclusive('\n').map(str::to_owned).collect()
+                    });
+                }
                 // Kept in the board's own encoding, so no byte a peer sent reaches a terminal.
                 _ => row.extra.push((key.to_owned(), encode(&decode(value)))),
             }
@@ -354,7 +386,9 @@ impl Row {
     /// a close, at a lower rev, never reopens it. A close a wait makes with no row of the Mac's
     /// read carries the asker's edge and no `task_news=`, and leaves the board's `rev`, so the
     /// worker's own answer at a rev at least the board's reopens it. `landed` is kept once read:
-    /// a worker that landed a commit landed it still.
+    /// a worker that landed a commit landed it still. A live row's conclusion and `why=` are also
+    /// kept as `ended`, a stall's excepted: a later live row that names none leaves it, and a
+    /// close clears it.
     pub fn merge(&mut self, seen: &str, now_ms: u64) -> bool {
         let field = |key: &str| crate::await_task::row_field(seen, key).map(decode);
         let given = |key: &str| field(key).filter(|v| !v.is_empty() && v != "-");
@@ -384,6 +418,10 @@ impl Row {
             self.why = word("why").or_else(|| self.why.take());
             self.checked = word("checked").or_else(|| self.checked.take());
             self.attention = None;
+            // What the row heard open is the end of the close that ends it, which reads it from
+            // the row as it was (`fleet_telemetry::task_end`), and of no later one.
+            self.ended = None;
+            self.ended_why = None;
         } else {
             let Some(rev) = rev.filter(|&rev| rev >= self.rev) else {
                 return false;
@@ -394,6 +432,10 @@ impl Row {
             self.why = given("why");
             self.checked = given("checked");
             self.attention = given("attention");
+            if self.conclusion.is_some() && self.state != "stalled" {
+                self.ended.clone_from(&self.conclusion);
+                self.ended_why.clone_from(&self.why);
+            }
         }
         if let Some(head) = self.checked.as_deref().and_then(landed_head) {
             self.landed = Some(head.to_owned());
@@ -542,6 +584,20 @@ impl Board {
         if let Ok(board) = self.bind(true) {
             board.prune();
         }
+    }
+
+    /// [`Board::prune`] as of `now_ms`.
+    #[cfg(test)]
+    pub(crate) fn prune_at(&self, now_ms: u64) {
+        let board = self.bind(true).expect("the board");
+        let _lock = board.lock().expect("the board's lock");
+        board.prune_locked(now_ms);
+    }
+
+    /// The keeper's settle of what the rows of `sids` owe the log ([`BoundBoard::settle`]).
+    #[cfg(test)]
+    pub(crate) fn settle(&self, sids: &[String], now_ms: u64) -> io::Result<()> {
+        self.bind(false)?.settle(sids, now_ms)
     }
 
     fn bind(&self, ensure: bool) -> io::Result<BoundBoard> {
@@ -705,7 +761,15 @@ impl BoundBoard {
     /// fails.
     pub fn record(&self, row: &Row) -> io::Result<()> {
         let _lock = self.lock()?;
+        // A row of its sid written over drops what that row owed its log: given up.
+        let replaced = self.row(&row.sid).map_or(0, |was| {
+            was.owed
+                .iter()
+                .filter(|line| !row.owed.contains(line))
+                .count()
+        });
         self.write(row)?;
+        self.give_up(replaced as u64);
         self.prune_locked(now_ms());
         Ok(())
     }
@@ -725,34 +789,159 @@ impl BoundBoard {
         }
         let _lock = self.lock()?;
         let mut changed = 0;
+        // Each row read, as this apply moved it: a sid answered twice merges into the row its
+        // first answer left.
+        let mut held: Vec<Held> = Vec::new();
         for (sid, seen) in sids {
-            let Some(mut row) = self.row(sid) else {
-                continue;
+            let mut h = match held.iter().position(|h| h.row.sid == sid) {
+                Some(i) => held.swap_remove(i),
+                None => match self.row(sid) {
+                    Some(row) => Held::of(row),
+                    None => continue,
+                },
             };
+            let row = &mut h.row;
             let heard = row.heard_ms;
             let was = row.clone();
             if row.merge(seen, now_ms) {
                 changed += 1;
-                // A close's task row goes to the log before the board keeps the end it told: an
-                // exit between the two leaves the close unkept, which the next answer merges and
-                // tells again (a second row of one end, never none). Only a board still at its
-                // path names the state folder whose log it is.
+                h.write = true;
+                // A close's task row is owed, and goes to the log with every row this apply's
+                // rows owe ([`Self::pay`]) before the board keeps the close: an exit between the
+                // two leaves the close unkept, which the next answer merges and tells again (a
+                // second row of one end, never none). Only a board still at its path names the
+                // state folder whose log it is.
                 if self.is_current()
                     && let Some(end) =
-                        crate::fleet_telemetry::task_end(&self.dir, &was, &row, seen, now_ms)
-                    && end.write()
+                        crate::fleet_telemetry::task_end(&self.dir, &was, row, seen, now_ms)
                 {
-                    row.told = Some(end.told);
+                    h.given_up += end.owe(row);
                 }
-                self.write(&row)?;
             } else if row.heard_ms != heard
                 && heard
                     .is_none_or(|heard| now_ms.saturating_sub(heard) >= millis(HEARD_WRITTEN_EVERY))
             {
-                self.write(&row)?;
+                h.write = true;
+            }
+            held.push(h);
+        }
+        self.keep_held(held, now_ms)?;
+        Ok(changed)
+    }
+
+    /// Write the task rows the rows of `sids` owe the board's log ([`Self::pay`]), under the
+    /// board's lock, at `now_ms`: the keeper's retry of a row no answer moves again ([`keep`]).
+    /// # Errors
+    /// As [`Board::record`].
+    #[cfg(any(unix, test))]
+    fn settle(&self, sids: &[String], now_ms: u64) -> io::Result<()> {
+        let _lock = self.lock()?;
+        let held = sids
+            .iter()
+            .filter_map(|sid| self.row(sid))
+            .filter(|row| !row.owed.is_empty())
+            .map(Held::of)
+            .collect();
+        self.keep_held(held, now_ms)
+    }
+
+    /// With the board's lock held: pay what `held` owe the log ([`Self::pay`]), write each row
+    /// that moved, and only then say lost what it gave up of each: an exit between the two
+    /// leaves those rows unsaid, missing and never said twice. A row whose write fails keeps its
+    /// file as it was, and says nothing; every other row is still written, so one row's failure
+    /// leaves no other row owing what the log already holds. The first failure is the answer.
+    fn keep_held(&self, mut held: Vec<Held>, now_ms: u64) -> io::Result<()> {
+        self.pay(&mut held, now_ms);
+        let mut failed = None;
+        for h in held.iter().filter(|h| h.write) {
+            match self.write(&h.row) {
+                Ok(()) => self.give_up(h.given_up),
+                Err(e) => {
+                    failed.get_or_insert(e);
+                }
             }
         }
-        Ok(changed)
+        failed.map_or(Ok(()), Err)
+    }
+
+    /// Write the task rows `held` owe the board's log ([`Row::owed`]), oldest first, in one
+    /// append: one wait of at most [`aterm_telemetry::direct::LOCK_WAIT`] for the log's lock,
+    /// however many rows owe. Each row it wrote is the end its row's last told (`told=`), and
+    /// its row owes none; none of them is counted lost ([`aterm_telemetry::direct::write_kept`]).
+    /// Where the append fails, the rows owed since a close
+    /// [`crate::fleet_telemetry::OWED_KEPT`] or more before `now_ms` are given up, and a line
+    /// that holds no task row is given up at once: each counted in its row's `given_up`, said
+    /// lost once the board no longer holds it ([`Self::keep_held`]). A board no longer at its
+    /// path writes none: its state folder's log is no longer its own.
+    fn pay(&self, held: &mut [Held], now_ms: u64) {
+        use crate::fleet_telemetry::{OWED_KEPT, owed_row, told_of};
+        if held.iter().all(|h| h.row.owed.is_empty()) {
+            return;
+        }
+        let Some(log) = self.log() else {
+            return;
+        };
+        let mut lines = Vec::new();
+        for h in held.iter_mut().filter(|h| !h.row.owed.is_empty()) {
+            let rows: Vec<aterm_telemetry::Row> = h
+                .row
+                .owed
+                .iter()
+                .filter_map(|line| owed_row(line))
+                .collect();
+            let bad = h.row.owed.len() - rows.len();
+            if bad > 0 {
+                h.given_up += bad as u64;
+                h.write = true;
+            }
+            h.row.owed = rows.iter().map(aterm_telemetry::Row::line).collect();
+            lines.extend(h.row.owed.iter().cloned());
+        }
+        if lines.is_empty() {
+            return;
+        }
+        if aterm_telemetry::direct::write_kept(log, &lines) {
+            for h in held.iter_mut().filter(|h| !h.row.owed.is_empty()) {
+                h.row.told = h
+                    .row
+                    .owed
+                    .last()
+                    .and_then(|line| owed_row(line))
+                    .map(|row| told_of(&row));
+                h.row.owed.clear();
+                h.write = true;
+            }
+            return;
+        }
+        for h in held.iter_mut() {
+            let owed = h.row.owed.len();
+            h.row.owed.retain(|line| {
+                owed_row(line)
+                    .is_some_and(|row| now_ms.saturating_sub(row.at_ms) < millis(OWED_KEPT))
+            });
+            let exhausted = owed - h.row.owed.len();
+            if exhausted > 0 {
+                h.given_up += exhausted as u64;
+                h.write = true;
+            }
+        }
+    }
+
+    /// The log of the state folder this board sits in, where it is still at its path.
+    fn log(&self) -> Option<PathBuf> {
+        if !self.is_current() {
+            return None;
+        }
+        crate::fleet_telemetry::log_of(&self.dir)
+    }
+
+    /// Say lost `rows` task rows this board owed its log and gave up ([`Row::owed`]).
+    fn give_up(&self, rows: u64) {
+        if rows > 0
+            && let Some(log) = self.log()
+        {
+            aterm_telemetry::direct::give_up(&log, rows);
+        }
     }
 
     /// Record `word`, what the dispatcher observed of the package's accept test, on the row
@@ -812,21 +1001,25 @@ impl BoundBoard {
                 .max(row.started_ms)
                 .max(row.accept_ms.unwrap_or(0));
             let age = now_ms.saturating_sub(last);
-            if (!row.is_open() && age >= millis(CLOSED_KEPT)) || age >= millis(UNHEARD_KEPT) {
-                self.remove(&row.sid);
+            if ((!row.is_open() && age >= millis(CLOSED_KEPT)) || age >= millis(UNHEARD_KEPT))
+                && self.remove(&row.sid)
+            {
+                // What it owed its log goes with it: given up.
+                self.give_up(row.owed.len() as u64);
             }
         }
     }
 
+    /// Remove the row of `sid`: whether it was removed.
     #[cfg(unix)]
-    fn remove(&self, sid: &str) {
-        if let Ok(view) = self.root.view() {
-            let _ = view.remove(sid);
-        }
+    fn remove(&self, sid: &str) -> bool {
+        self.root.view().and_then(|view| view.remove(sid)).is_ok()
     }
 
     #[cfg(not(unix))]
-    fn remove(&self, _sid: &str) {}
+    fn remove(&self, _sid: &str) -> bool {
+        false
+    }
 
     #[cfg(unix)]
     fn lock(&self) -> io::Result<aterm_uds::private_file::PrivateLock> {
@@ -852,6 +1045,25 @@ impl BoundBoard {
     #[cfg(not(unix))]
     fn write(&self, _row: &Row) -> io::Result<()> {
         self.lock()
+    }
+}
+
+/// A row an apply or a keeper's settle holds under the board's lock: whether it is to be
+/// written, and how many task rows it owed the board gave up, said lost once it is written
+/// ([`BoundBoard::keep_held`]).
+struct Held {
+    row: Row,
+    write: bool,
+    given_up: u64,
+}
+
+impl Held {
+    const fn of(row: Row) -> Self {
+        Self {
+            row,
+            write: false,
+            given_up: 0,
+        }
     }
 }
 
@@ -931,8 +1143,9 @@ impl Rest {
 }
 
 /// When a keeper with nothing to ask has its next thing to do, its board unchanged, as of `at`:
-/// its next prune (`pruned`, the last), the next ask after each closed row (`closed_asked`), and
-/// the end of each Mac's backoff still ahead of `at`. A backoff already over is no deadline: its
+/// its next prune (`pruned`, the last), the next ask after each closed row (`closed_asked`), the
+/// end of each Mac's backoff still ahead of `at`, and its next settle of the task rows its board
+/// owes its log (`settle`, [`OWED_SETTLED_EVERY`]). A backoff already over is no deadline: its
 /// Mac is asked again with its next row, and a Mac whose rows are all out of asking would
 /// otherwise keep the keeper due in the past, reading the board with no rest. Nothing else comes due on a clock: a row unheard past
 /// [`UNHEARD_ASKED`] or closed past [`CLOSED_ASKED`] only ages further out of asking, and any
@@ -943,14 +1156,34 @@ fn next_due(
     pruned: Option<std::time::Instant>,
     closed_asked: &std::collections::HashMap<String, std::time::Instant>,
     backoff: &Backoff,
+    settle: Option<std::time::Instant>,
 ) -> std::time::Instant {
     let prune = pruned.map_or(at, |pruned| pruned + KEEP_PRUNE_EVERY);
     closed_asked
         .values()
         .chain(backoff.0.values().map(|(_, until)| until))
+        .chain(settle.as_ref())
         .copied()
         .filter(|due| *due > at)
         .fold(prune, std::cmp::Ord::min)
+}
+
+/// A keeper's settle of the task rows its board owes its log, at `at`, its next one due `due`
+/// ([`keep`]): whether it settles now, and when it next does. A board that owes nothing has
+/// none due; one found owing settles a period ([`OWED_SETTLED_EVERY`]) after, then every period
+/// while it owes, so a settle's own write to the board, which wakes the keeper, settles nothing.
+#[cfg(unix)]
+fn settle_step(
+    owing: bool,
+    due: Option<std::time::Instant>,
+    at: std::time::Instant,
+) -> (bool, Option<std::time::Instant>) {
+    match due {
+        _ if !owing => (false, None),
+        Some(due) if due > at => (false, Some(due)),
+        Some(_) => (true, Some(at + OWED_SETTLED_EVERY)),
+        None => (false, Some(at + OWED_SETTLED_EVERY)),
+    }
 }
 
 /// The wait one leg of the keeper asks a Mac for ([`keep`]).
@@ -982,6 +1215,13 @@ const CLOSED_ASKED: Duration = Duration::from_secs(24 * 3600);
 /// How often the keeper asks after a closed row ([`CLOSED_ASKED`]).
 #[cfg(unix)]
 const CLOSED_ASKED_EVERY: Duration = Duration::from_secs(600);
+
+/// How often a keeper whose board owes its log task rows writes them again
+/// ([`BoundBoard::settle`]): one append for them all, waiting at most
+/// [`aterm_telemetry::direct::LOCK_WAIT`] for the log's lock, the first a period after it found
+/// them owed. Over [`crate::fleet_telemetry::OWED_KEPT`] that is at most 60 settles.
+#[cfg(unix)]
+const OWED_SETTLED_EVERY: Duration = Duration::from_secs(60);
 
 /// What a keeper needs of the aterm it runs in ([`keep`]).
 pub struct Keeper<'a> {
@@ -1061,6 +1301,7 @@ pub fn keep(state: &Path, keeper: &Keeper<'_>) {
             let mut edges: HashMap<String, u64> = HashMap::new();
             let mut closed_asked: HashMap<String, Instant> = HashMap::new();
             let mut pruned: Option<Instant> = None;
+            let mut settle: Option<Instant> = None;
             let board = &held.board;
             while board.is_current() {
                 if pruned.is_none_or(|at| at.elapsed() >= KEEP_PRUNE_EVERY) {
@@ -1071,6 +1312,18 @@ pub fn keep(state: &Path, keeper: &Keeper<'_>) {
                 let at = Instant::now();
                 closed_asked.retain(|_, next| *next > at);
                 let rows = board.scan().rows;
+                // The task rows its board owes its log: written again once a period after they
+                // were found owed, and every period after, until none is owed.
+                let owing: Vec<String> = rows
+                    .iter()
+                    .filter(|row| !row.owed.is_empty())
+                    .map(|row| row.sid.clone())
+                    .collect();
+                let (settle_now, due) = settle_step(!owing.is_empty(), settle, at);
+                if settle_now {
+                    let _ = board.settle(&owing, now_ms());
+                }
+                settle = due;
                 edges.retain(|sid, _| rows.iter().any(|row| row.sid == *sid));
                 backoff.keep(|node| rows.iter().any(|row| row.node.as_deref() == Some(node)));
                 let mut asked: Vec<Row> = rows
@@ -1094,7 +1347,7 @@ pub fn keep(state: &Path, keeper: &Keeper<'_>) {
                     if !board.is_current() {
                         break;
                     }
-                    rest.until(next_due(at, pruned, &closed_asked, &backoff));
+                    rest.until(next_due(at, pruned, &closed_asked, &backoff, settle));
                     continue;
                 }
                 for row in &mut asked {

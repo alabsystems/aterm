@@ -1867,6 +1867,7 @@ mod tests {
             image: launcher.clone(),
         };
         let command = RestartCommand {
+            settles: None,
             account_intent: None,
             image: target.clone(),
             program: "/codex".into(),

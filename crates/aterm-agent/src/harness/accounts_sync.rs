@@ -43,8 +43,9 @@ pub const NO_SOURCE: &str = "no accounts source is configured, so nothing was fe
 /// Development seam enabling live window upkeep under a scratch state root in tests.
 pub const UPKEEP_SEAM: &str = "ATERM_DEBUG_ACCOUNTS_UPKEEP";
 
-/// Shared fleet config file written beside `accounts.toml`.
-pub const FLEET_ROSTER_FILE: &str = "fleet-accounts.toml";
+/// Shared fleet config file written beside `accounts.toml`
+/// ([`aterm_secrets::entry_class::FLEET_ACCOUNTS`]).
+pub const FLEET_ROSTER_FILE: &str = aterm_secrets::entry_class::FLEET_ACCOUNTS;
 
 /// Top-level key recording why a sync wrote this machine's fleet roster ([`OptIn`]).
 pub const OPT_IN_KEY: &str = "opt_in";
@@ -9940,8 +9941,9 @@ fn cli_sync_due(
     Ok(added)
 }
 
-/// The accounting sheet's name in `~/.secrets` (`DESIGN-secrets-2026-10-20.md` §11).
-pub const ACCOUNTS_CSV_FILE: &str = "ai-accounts.csv";
+/// The accounting sheet's name in `~/.secrets` (`DESIGN-secrets-2026-10-20.md` §11;
+/// [`aterm_secrets::entry_class::AI_ACCOUNTS_CSV`]).
+pub const ACCOUNTS_CSV_FILE: &str = aterm_secrets::entry_class::AI_ACCOUNTS_CSV;
 
 /// The pooled CLIs other than Claude Code, whose pools [`sync_cli_accounts_for_init`] and the
 /// window's upkeep ([`upkeep_live`]) keep beside Claude Code's.
@@ -9960,7 +9962,7 @@ pub fn syncs_by_default(cli: Cli) -> bool {
 /// aterm only reads it ([`sync_cli_with`]).
 #[must_use]
 pub fn cli_fleet_file(cli: Cli) -> String {
-    format!("ai-accounts-{}.toml", cli.id())
+    aterm_secrets::entry_class::cli_accounts(cli.id())
 }
 
 /// What a sync of another CLI's pool did ([`sync_cli_with`]).
@@ -14705,7 +14707,42 @@ pub(crate) fn rows_of_other_macs_at(
 /// network could read (reading who an account belongs to fetches nothing), one that does not
 /// parse, a lab that cannot be read, a Mac with no name and an unreadable pass roster each leave
 /// the rows unread: their account may be another Mac's.
+///
+/// With them, the rows that run on their vault token here ([`accounts::OtherMacs::on_token`]),
+/// whose stored login no door renews either (`DESIGN-claude-setup-token-2026-11-05` §5.8).
 pub(super) fn rows_of_other_macs(
+    cli: Cli,
+    env: &Env,
+    file_roster: &Roster,
+    logins: &accounts::Logins,
+) -> accounts::OtherMacs {
+    accounts::OtherMacs {
+        on_token: rows_on_token(cli, env, &accounts::bound(file_roster, logins)),
+        ..rows_of_other_macs_only(cli, env, file_roster, logins)
+    }
+}
+
+/// The rows of `roster` that run on their vault token on this Mac
+/// ([`super::accounts_tokens::rows_on_token`]): Claude Code's only, read from the vault under
+/// `env`'s home.
+fn rows_on_token(cli: Cli, env: &Env, roster: &Roster) -> BTreeMap<String, u64> {
+    #[cfg(unix)]
+    if cli == Cli::Claude
+        && let (Some(home), Some(store)) = (env.home.as_deref(), env.accounts_store_for(cli))
+    {
+        return super::accounts_tokens::rows_on_token(
+            &aterm_secrets::client::Paths::for_home(home),
+            &store,
+            roster,
+            env.now,
+        );
+    }
+    let _ = (cli, env, roster);
+    BTreeMap::new()
+}
+
+/// [`rows_of_other_macs`] less the rows on their vault token.
+fn rows_of_other_macs_only(
     cli: Cli,
     env: &Env,
     file_roster: &Roster,
@@ -14944,7 +14981,8 @@ pub(super) fn needed_renew_candidates_for(
 /// signed in here. Within a tier, roster order (rows this Mac prefers
 /// first in tier 0), a row with an unaddressed sign-in task after every row without one and the
 /// older task first (read through `store` where one is given, else from `logins` alone), a row
-/// whose last renewal answered another account last.
+/// whose last renewal answered another account last. A row that runs on its vault token here
+/// ([`accounts::OtherMacs::on_token`]) is in no tier: renewal is off for it.
 fn auto_renew_candidates_tiered(
     cli: Cli,
     store: Option<&accounts::Store>,
@@ -14955,8 +14993,11 @@ fn auto_renew_candidates_tiered(
     now: i64,
 ) -> Vec<(u8, accounts::Row)> {
     let mut tiered = rank_renewal_candidates(cli, store, file_roster, state, logins, others, now);
-    // Ordinary renewal never substitutes for fresh root authorization.
-    tiered.retain(|(_, row)| matches!(logins.shared.required(row), Ok(None)));
+    // Ordinary renewal never substitutes for fresh root authorization, and never runs for a row
+    // on its vault token (`DESIGN-claude-setup-token-2026-11-05` §5.8), whatever its tier.
+    tiered.retain(|(_, row)| {
+        matches!(logins.shared.required(row), Ok(None)) && !others.on_token.contains_key(&row.label)
+    });
     tiered
 }
 
@@ -15063,6 +15104,9 @@ fn upkeep_sign_in(
     row: &accounts::Row,
     now: i64,
 ) -> Option<SignIn> {
+    if others.on_token.contains_key(&row.label) {
+        return None;
+    }
     let roster = accounts::bound(&records.raw_roster, &records.logins);
     let bound = roster.row(&row.label)?;
     SignIn::session_sign_in(cli, bound, &records.state).or_else(|| {
@@ -21462,7 +21506,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         let who_m15_2 = accounts::ProcessLogin {
             login: None,
             default_home: true,
-            stored_login: true,
+            route: crate::harness::accounts::AuthRoute::Stored,
         };
         let standing_wall = super::super::upgrade::StandingWall {
             at: u64::try_from(now).unwrap(),
@@ -22854,7 +22898,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         let who_old = accounts::ProcessLogin {
             login: Some(old_dir_text),
             default_home: true,
-            stored_login: true,
+            route: crate::harness::accounts::AuthRoute::Stored,
         };
         let me_old = who_old.me(&bound_after);
         assert_eq!(
@@ -26544,7 +26588,7 @@ totp = "JBSWY3DPEHPK3PXP"
             let who = accounts::ProcessLogin {
                 login: Some(m2_2_text.clone()),
                 default_home: true,
-                stored_login: true,
+                route: crate::harness::accounts::AuthRoute::Stored,
             };
             accounts::advise(
                 &bound,

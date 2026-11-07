@@ -48,6 +48,7 @@ fn fixture() -> (aterm_tempfile::TempDir, Paths, Prepare, Binding) {
             observation: None,
             socket: "/private/native.sock".into(),
             forward: Box::new(RestartCommand {
+                settles: None,
                 account_intent: None,
                 image: image(90),
                 program: "/private/image-90".into(),

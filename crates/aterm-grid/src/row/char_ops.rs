@@ -30,8 +30,8 @@ impl Row {
         let shift_end = cols.saturating_sub(count);
 
         if self.is_cell_wide_continuation(col as u16) {
-            self.cells[col - 1] = fill;
-            self.cells[col] = fill;
+            self.cells.set(col - 1, fill);
+            self.cells.set(col, fill);
             blanked[0] = Some(u16_from_usize(col - 1));
             if shift_end > col {
                 blanked[1] = Some(u16_from_usize(col + count));
@@ -42,7 +42,7 @@ impl Row {
             && shift_end < cols
             && self.cells[shift_end - 1].flags().contains(CellFlags::WIDE)
         {
-            self.cells[shift_end - 1] = fill;
+            self.cells.set(shift_end - 1, fill);
             let head = shift_end - 1;
             blanked[2] = Some(u16_from_usize(if head >= col {
                 head + count
@@ -56,7 +56,7 @@ impl Row {
         }
 
         let fill_end = (col + count).min(cols);
-        for cell in &mut self.cells[col..fill_end] {
+        for cell in self.cells.slice_mut(col..fill_end) {
             *cell = fill;
         }
 
@@ -103,14 +103,14 @@ impl Row {
         let old_len = self.len as usize;
 
         if self.is_cell_wide_continuation(col as u16) {
-            self.cells[col - 1] = fill;
+            self.cells.set(col - 1, fill);
             blanked[0] = Some(u16_from_usize(col - 1));
         }
 
         let last_deleted = (col + count - 1).min(cols - 1);
         let src_start = (col + count).min(cols);
         if self.cells[last_deleted].flags().contains(CellFlags::WIDE) && src_start < cols {
-            self.cells[src_start] = fill;
+            self.cells.set(src_start, fill);
             blanked[1] = Some(u16_from_usize(col));
         }
 
@@ -121,7 +121,7 @@ impl Row {
         }
 
         let fill_start = col + shift_len;
-        for cell in &mut self.cells[fill_start..] {
+        for cell in self.cells.slice_mut(fill_start..cols) {
             *cell = fill;
         }
 
@@ -171,8 +171,8 @@ impl Row {
         let shift_end = rb.saturating_sub(count);
 
         if self.is_cell_wide_continuation(col as u16) {
-            self.cells[col - 1] = fill;
-            self.cells[col] = fill;
+            self.cells.set(col - 1, fill);
+            self.cells.set(col, fill);
             blanked[0] = Some(u16_from_usize(col - 1));
             if shift_end > col {
                 blanked[1] = Some(u16_from_usize(col + count));
@@ -183,12 +183,12 @@ impl Row {
             && shift_end < rb
             && self.cells[shift_end - 1].flags().contains(CellFlags::WIDE)
         {
-            self.cells[shift_end - 1] = fill;
+            self.cells.set(shift_end - 1, fill);
             blanked[2] = Some(u16_from_usize(rb - 1));
         }
 
         if rb < self.cells.len() && self.cells[rb - 1].flags().contains(CellFlags::WIDE) {
-            self.cells[rb] = fill;
+            self.cells.set(rb, fill);
             blanked[3] = Some(u16_from_usize(rb));
         }
 
@@ -197,7 +197,7 @@ impl Row {
         }
 
         let fill_end = (col + count).min(rb);
-        for cell in &mut self.cells[col..fill_end] {
+        for cell in self.cells.slice_mut(col..fill_end) {
             *cell = fill;
         }
 
@@ -227,7 +227,7 @@ impl Row {
         let rb = right_bound as usize;
 
         if self.is_cell_wide_continuation(col as u16) {
-            self.cells[col - 1] = fill;
+            self.cells.set(col - 1, fill);
             blanked[0] = Some(u16_from_usize(col - 1));
         }
 
@@ -235,18 +235,18 @@ impl Row {
         let src_start = (col + count).min(rb);
 
         if self.cells[last_deleted].flags().contains(CellFlags::WIDE) && src_start < rb {
-            self.cells[src_start] = fill;
+            self.cells.set(src_start, fill);
             blanked[1] = Some(u16_from_usize(col));
         }
 
         if rb < self.cells.len() && self.cells[rb - 1].flags().contains(CellFlags::WIDE) {
-            self.cells[rb] = fill;
+            self.cells.set(rb, fill);
             blanked[2] = Some(u16_from_usize(rb));
             // A lead the deletion keeps moves left with the shift: blanked with its spacer, or
             // it lands as half a glyph (Ghostty's `deleteChars` splits the boundary at the right
             // margin's edge, `splitCellBoundary(right + 1)`). Reported where the shift puts it.
             if rb > src_start {
-                self.cells[rb - 1] = fill;
+                self.cells.set(rb - 1, fill);
                 blanked[3] = Some(u16_from_usize(rb - 1 - (src_start - col)));
             }
         }
@@ -258,7 +258,7 @@ impl Row {
         }
 
         let fill_start = col + shift_len;
-        for cell in &mut self.cells[fill_start..rb] {
+        for cell in self.cells.slice_mut(fill_start..rb) {
             *cell = fill;
         }
 
@@ -289,16 +289,16 @@ impl Row {
         let old_len = self.len as usize;
 
         if self.is_cell_wide_continuation(col as u16) {
-            self.cells[col - 1] = fill;
+            self.cells.set(col - 1, fill);
             blanked[0] = Some(u16_from_usize(col - 1));
         }
 
         if end > col && end < cols && self.cells[end - 1].flags().contains(CellFlags::WIDE) {
-            self.cells[end] = fill;
+            self.cells.set(end, fill);
             blanked[1] = Some(u16_from_usize(end));
         }
 
-        for cell in &mut self.cells[col..end] {
+        for cell in self.cells.slice_mut(col..end) {
             *cell = fill;
         }
 
@@ -334,17 +334,17 @@ impl Row {
             && self.cells[col - 1].flags().contains(CellFlags::WIDE)
             && !self.is_cell_protected((col - 1) as u16)
         {
-            self.cells[col - 1] = fill;
-            self.cells[col] = fill;
+            self.cells.set(col - 1, fill);
+            self.cells.set(col, fill);
             any_erased = true;
         }
 
         for c in col..end {
             if !self.is_cell_protected(c as u16) {
                 if self.cells[c].flags().contains(CellFlags::WIDE) && c + 1 < cols {
-                    self.cells[c + 1] = fill;
+                    self.cells.set(c + 1, fill);
                 }
-                self.cells[c] = fill;
+                self.cells.set(c, fill);
                 any_erased = true;
             }
         }

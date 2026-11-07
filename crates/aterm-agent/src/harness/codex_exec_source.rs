@@ -285,7 +285,7 @@ mod tests {
             crate::harness::accounts::Cli::Codex,
             source.account_env(&root.path().join(".codex")).unwrap(),
         );
-        assert!(login.default_home && login.stored_login);
+        assert!(login.default_home && login.route == crate::harness::accounts::AuthRoute::Stored);
         assert_eq!(login.login.as_deref(), root.path().join("source").to_str());
         assert_eq!(source.config_home, config);
         assert_eq!(source.auth_path, root.path().join("source/auth.json"));

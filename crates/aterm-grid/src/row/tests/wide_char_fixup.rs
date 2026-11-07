@@ -646,8 +646,7 @@ fn an_early_wrap_hole_ends_when_its_cell_is_rewritten_with_a_blank() {
     );
 
     let (_p, mut row) = hole_row();
-    // SAFETY: columns 2 and 3 exist; one glyph on a fresh boundary.
-    unsafe { row.write_wide_char_packed_no_fixup(2, '\u{6587}', packed, CellFlags::empty()) };
+    row.write_wide_run_packed_no_fixup(2, &['\u{6587}'], packed, |_| CellFlags::empty());
     row.settle_len_after_wide_run(2, 4, false);
     row.mark_has_wide_chars();
     row.write_char(2, 'x');

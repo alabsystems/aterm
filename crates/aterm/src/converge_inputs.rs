@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Executable-owned readiness observation for the subscriber's ordinary converge job.
+//! Executable-owned readiness observation for automatic converge jobs.
 //! Reuse the existing one-second lane; metadata gates private token/inventory reads.
 
 use aterm_machines::init_github::{
     RepositoryCheckoutMetadata, RepositoryInputMark, RepositoryInputPathCache,
-    repository_input_mark,
+    RepositoryRefreshCursor, repository_input_mark,
 };
 use aterm_machines::port::{Live, System};
 use aterm_secrets::client::Paths;
@@ -111,21 +111,21 @@ impl Inputs {
         inputs
     }
 
-    fn changed(&mut self, sys: &dyn System, allowed: bool) -> Option<RepositoryWork> {
+    fn changed(&mut self, sys: &dyn System, allowed: bool) -> Result<Option<RepositoryWork>, ()> {
         if !allowed {
             self.held = true;
-            return None;
+            return Ok(None);
         }
         let Ok((mut metadata, reusable)) =
             Metadata::read(sys, &self.paths, self.seen.as_ref(), &mut self.control)
         else {
-            return None;
+            return Err(());
         };
         if reusable && !self.held && self.metadata.as_ref() == Some(&metadata) {
-            return None;
+            return Ok(None);
         }
         let Ok(mark) = repository_input_mark(sys) else {
-            return None;
+            return Err(());
         };
         let work = if self.held
             || self
@@ -149,22 +149,38 @@ impl Inputs {
         self.metadata = Some(metadata);
         self.seen = Some(mark);
         self.held = false;
-        work
+        Ok(work)
+    }
+
+    fn request(
+        &mut self,
+        sys: &dyn System,
+        allowed: bool,
+        observed: aterm_secrets::converge::RefreshObservation,
+        cursor: &mut RepositoryRefreshCursor,
+    ) -> Option<aterm_secrets::converge::RepositoryRequest> {
+        let work = self.changed(sys, allowed).ok()?;
+        if allowed {
+            cursor.observe(self.seen.as_ref(), observed, work)
+        } else {
+            None
+        }
     }
 }
 
-/// This observer follows only the subscriber's own real account. The ordinary job still reads
+/// This observer follows only the runtime's own real account. The ordinary job still reads
 /// current source, materialization, Stop/off and path admission before every effect.
 pub(super) fn observe(
     paths: &aterm_secrets::client::Paths,
-) -> aterm_secrets::client::SubscriberInputs {
+    _role: aterm_secrets::client::ConvergenceRole,
+) -> aterm_secrets::client::ConvergenceInputs {
     let sys = Live::new();
     if !sys.identity().is_ok_and(|identity| {
         identity.user.uid == sys.euid()
             && sys.euid() != 0
             && std::path::Path::new(&identity.user.home) == paths.home
     }) {
-        return aterm_secrets::client::SubscriberInputs::new(Box::new(|| None));
+        return aterm_secrets::client::ConvergenceInputs::new(Box::new(|_| None));
     }
     let home = paths.home.clone();
     let allowed = move || {
@@ -172,8 +188,25 @@ pub(super) fn observe(
             && !super::converge::setup_holds()
                 .holds(aterm_types::macos_setup::Setting::Repositories)
     };
+    let state = aterm_types::dirs::account_state_dir();
+    let mut receipt = aterm_machines::sync::repository_refresh::Observer::default();
+    // Establish the generation BEFORE the first source capture. Another owner may
+    // fulfill the next source before this actor gets its first callback.
+    let initial = state
+        .as_ref()
+        .map(|state| receipt.read(&sys, state, aterm_time::unix_millis().unwrap_or(0)))
+        .unwrap_or_default();
     let mut inputs = Inputs::new(&sys, paths, allowed());
-    aterm_secrets::client::SubscriberInputs::new(Box::new(move || inputs.changed(&sys, allowed())))
+    let mut cursor = RepositoryRefreshCursor::new(initial, inputs.seen.as_ref());
+    aterm_secrets::client::ConvergenceInputs::new(Box::new(move |observed| {
+        inputs.request(&sys, allowed(), observed, &mut cursor)
+    }))
+    .with_refresh(Box::new(move || {
+        state
+            .as_ref()
+            .map(|state| receipt.read(&Live::new(), state, aterm_time::unix_millis().unwrap_or(0)))
+            .unwrap_or_default()
+    }))
 }
 
 #[cfg(test)]
@@ -297,11 +330,11 @@ mod tests {
             "parked setup sees the same repair"
         );
         assert!(
-            inputs.changed(&sys, true) == Some(RepositoryWork::Refresh),
+            inputs.changed(&sys, true).unwrap() == Some(RepositoryWork::Refresh),
             "the repaired execution route is new readiness"
         );
         assert!(
-            inputs.changed(&sys, true).is_none(),
+            inputs.changed(&sys, true).unwrap().is_none(),
             "one wake for the same repair"
         );
     }
@@ -388,7 +421,7 @@ mod tests {
             .0;
         let mut inputs = Inputs::new(&sys, &paths, true);
         assert!(
-            inputs.changed(&sys, true).is_none(),
+            inputs.changed(&sys, true).unwrap().is_none(),
             "blocked but unchanged"
         );
 
@@ -405,19 +438,19 @@ mod tests {
                 .files
         );
         assert_eq!(
-            inputs.changed(&sys, true),
+            inputs.changed(&sys, true).unwrap(),
             Some(RepositoryWork::Refresh),
             "path admission repaired"
         );
         assert!(
-            inputs.changed(&sys, true).is_none(),
+            inputs.changed(&sys, true).unwrap().is_none(),
             "one wake for the repair"
         );
         let mut policy = Live::new().stat(&parent).unwrap();
         policy.len += 1;
         sys.stat_of(parent.to_str().unwrap(), policy);
         assert!(
-            inputs.changed(&sys, true).is_none(),
+            inputs.changed(&sys, true).unwrap().is_none(),
             "unrelated directory contents do not move admission"
         );
     }
@@ -488,9 +521,28 @@ mod tests {
         });
         let paths = Paths::locate_for_home(std::path::Path::new(&user.home));
         let mut inputs = Inputs::new(&sys, &paths, true);
+        let context = aterm_machines::items::Ctx {
+            facts: aterm_machines::model::HostFacts::default(),
+            users: vec![user.clone()],
+            console: None,
+            host_name: String::new(),
+            cache_dir: PathBuf::new(),
+            disrupt: false,
+        };
+        let captured =
+            aterm_machines::init_github::InitialRepositoryInputs::capture(&sys, &context).unwrap();
+        let refresh_scope = captured.refresh_scope(&sys).unwrap();
+        assert_eq!(
+            inputs
+                .seen
+                .as_ref()
+                .and_then(RepositoryInputMark::refresh_scope),
+            Some(refresh_scope),
+            "the actual observer and Native capture share the production scope builder"
+        );
         private_reads.store(0, Ordering::SeqCst);
         for _ in 0..3 {
-            assert!(inputs.changed(&sys, true).is_none());
+            assert!(inputs.changed(&sys, true).unwrap().is_none());
         }
         assert_eq!(
             private_reads.load(Ordering::SeqCst),
@@ -499,11 +551,11 @@ mod tests {
         );
         sys.stat_of(&format!("{checkout}/.git"), directory);
         assert!(
-            inputs.changed(&sys, true) == Some(RepositoryWork::Repair),
+            inputs.changed(&sys, true).unwrap() == Some(RepositoryWork::Repair),
             "an externally completed checkout is useful input"
         );
         private_reads.store(0, Ordering::SeqCst);
-        assert!(inputs.changed(&sys, true).is_none());
+        assert!(inputs.changed(&sys, true).unwrap().is_none());
         assert_eq!(
             private_reads.load(Ordering::SeqCst),
             0,
@@ -511,23 +563,147 @@ mod tests {
         );
         file(&format!("{checkout}/working.txt"), b"unrelated work");
         assert!(
-            inputs.changed(&sys, true).is_none(),
+            inputs.changed(&sys, true).unwrap().is_none(),
             "ordinary worktree content is not observed"
         );
         file(&format!("{checkout}/.git/config"), b"repaired origin");
         assert!(
-            inputs.changed(&sys, true) == Some(RepositoryWork::Repair),
+            inputs.changed(&sys, true).unwrap() == Some(RepositoryWork::Repair),
             "in-place Git identity repair is useful input"
         );
-        assert!(inputs.changed(&sys, true).is_none());
+        assert!(inputs.changed(&sys, true).unwrap().is_none());
+        assert_eq!(
+            inputs
+                .seen
+                .as_ref()
+                .and_then(RepositoryInputMark::refresh_scope),
+            Some(refresh_scope),
+            "checkout-only repair cannot request its own remote refresh"
+        );
+        use aterm_secrets::converge::{RefreshObservation, RefreshVersion, RepositoryRequest};
+        let before = RefreshObservation {
+            scope: Some(refresh_scope),
+            version: RefreshVersion {
+                input: 7,
+                attempt: 9,
+                fulfilled: 9,
+            },
+            recheck_ms: Some(aterm_secrets::converge::RECHECK_MS),
+            ..RefreshObservation::default()
+        };
+        // Receipt first, then local source capture, exactly as the real factory.
+        let mut delayed = Inputs::new(&sys, &paths, true);
+        let mut cursor = RepositoryRefreshCursor::new(before, delayed.seen.as_ref());
+        assert!(delayed.request(&sys, true, before, &mut cursor).is_some());
+        file(&token, b"inert_token_delayed");
+        let next = repository_input_mark(&sys)
+            .unwrap()
+            .refresh_scope()
+            .unwrap();
+        let winner = RefreshObservation {
+            scope: Some(next),
+            version: RefreshVersion {
+                input: 8,
+                attempt: 10,
+                fulfilled: 10,
+            },
+            ..before
+        };
+        let mut unavailable = user.clone();
+        unavailable.uid += 1;
+        sys.logged_in(&unavailable);
+        assert!(
+            delayed.request(&sys, true, winner, &mut cursor).is_none(),
+            "an unavailable own-account sample cannot relabel retained source facts"
+        );
+        sys.logged_in(&user);
+        let Some(RepositoryRequest::Refresh(request)) =
+            delayed.request(&sys, true, winner, &mut cursor)
+        else {
+            panic!("the actual callback observes the delivered source");
+        };
+        assert_eq!(
+            request.base_input, 7,
+            "a delayed actor retains its previous source basis"
+        );
+        assert!(
+            winner.fulfills(request),
+            "the winner already refreshed this materialization"
+        );
+        // An observed intermediate source cannot let an old same-byte success
+        // acknowledge the later return before any owner admitted that transition.
+        file(&token, b"inert_token_one");
+        let Some(RepositoryRequest::Refresh(away)) =
+            delayed.request(&sys, true, winner, &mut cursor)
+        else {
+            panic!("the intermediate source is observed");
+        };
+        file(&token, b"inert_token_delayed");
+        let Some(RepositoryRequest::Refresh(back)) =
+            delayed.request(&sys, true, winner, &mut cursor)
+        else {
+            panic!("the return is observed");
+        };
+        assert_eq!(back.scope, winner.scope);
+        assert!(
+            !winner.fulfills(away.merge(back)),
+            "unadmitted ABA still owes a new generation"
+        );
+        // Semantic source A returns before this actor samples at all. The init
+        // profile's inode is excluded from scope, so the semantic selection is A.
+        let declared = b"[develop]\ncheckouts=['~/elsewhere']\n";
+        file(&profile, declared);
+        let other_scope = repository_input_mark(&sys)
+            .unwrap()
+            .refresh_scope()
+            .unwrap();
+        let other = RefreshObservation {
+            scope: Some(other_scope),
+            version: RefreshVersion {
+                input: 9,
+                attempt: 11,
+                fulfilled: 11,
+            },
+            ..winner
+        };
+        file(&profile, b"");
+        let Some(RepositoryRequest::Refresh(intervening)) =
+            delayed.request(&sys, true, other, &mut cursor)
+        else {
+            panic!("a current source after a foreign admitted generation owes immediate refresh");
+        };
+        assert_eq!(intervening.scope, winner.scope);
+        assert_eq!(intervening.base_input, 9);
+        file(&profile, declared);
+        let Some(RepositoryRequest::Refresh(returned)) =
+            delayed.request(&sys, true, other, &mut cursor)
+        else {
+            panic!("the later semantic selection is observed");
+        };
+        assert_eq!(
+            returned.base_input, 9,
+            "the confirmed intervening source retains its temporal floor"
+        );
+        assert!(
+            !other.fulfills(intervening.merge(returned)),
+            "an earlier same-selection success cannot cover the return"
+        );
+        file(&profile, b"");
+        assert_eq!(
+            inputs.changed(&sys, true).unwrap(),
+            Some(RepositoryWork::Refresh)
+        );
         for declared in [
             b"[develop]\ncheckouts=['~/code']\n".as_slice(),
             b"".as_slice(),
         ] {
             file(&profile, declared);
-            assert_eq!(inputs.changed(&sys, true), Some(RepositoryWork::Refresh));
+            assert_eq!(
+                inputs.changed(&sys, true).unwrap(),
+                Some(RepositoryWork::Refresh)
+            );
             private_reads.store(0, Ordering::SeqCst);
-            assert!(inputs.changed(&sys, true).is_none());
+            assert!(inputs.changed(&sys, true).unwrap().is_none());
             assert_eq!(
                 private_reads.load(Ordering::SeqCst),
                 0,
@@ -536,7 +712,7 @@ mod tests {
         }
         file(&profile, b"[develop]\ncheckouts=[]\n");
         assert!(
-            inputs.changed(&sys, true).is_none(),
+            inputs.changed(&sys, true).unwrap().is_none(),
             "an empty declaration changes no refresh scope"
         );
         for (path, bytes) in [
@@ -549,12 +725,12 @@ mod tests {
         ] {
             file(path, bytes);
             assert_eq!(
-                inputs.changed(&sys, true),
+                inputs.changed(&sys, true).unwrap(),
                 Some(RepositoryWork::Refresh),
                 "changed declared input"
             );
             assert!(
-                inputs.changed(&sys, true).is_none(),
+                inputs.changed(&sys, true).unwrap().is_none(),
                 "one wake for unchanged readiness"
             );
         }
@@ -571,12 +747,12 @@ mod tests {
         };
         select(&custom);
         assert!(
-            inputs.changed(&sys, true).is_some(),
+            inputs.changed(&sys, true).unwrap().is_some(),
             "declared missing helper replaces legacy readiness"
         );
-        assert!(inputs.changed(&sys, true).is_none());
+        assert!(inputs.changed(&sys, true).unwrap().is_none());
         private_reads.store(0, Ordering::SeqCst);
-        assert!(inputs.changed(&sys, true).is_none());
+        assert!(inputs.changed(&sys, true).unwrap().is_none());
         assert_eq!(
             private_reads.load(Ordering::SeqCst),
             0,
@@ -584,36 +760,36 @@ mod tests {
         );
         file(&payload, b"arrived custom command");
         assert!(
-            inputs.changed(&sys, true).is_some(),
+            inputs.changed(&sys, true).unwrap().is_some(),
             "a dangling selected target repair wakes"
         );
-        assert!(inputs.changed(&sys, true).is_none());
+        assert!(inputs.changed(&sys, true).unwrap().is_none());
         file(&helper, b"old legacy command changed");
         assert!(
-            inputs.changed(&sys, true).is_none(),
+            inputs.changed(&sys, true).unwrap().is_none(),
             "exclusive selection retires legacy paths"
         );
         let replacement_helper = format!("{}/replacement store/aterm", user.home);
         select(&replacement_helper);
         assert!(
-            inputs.changed(&sys, true).is_some(),
+            inputs.changed(&sys, true).unwrap().is_some(),
             "declaration replacement is observed"
         );
-        assert!(inputs.changed(&sys, true).is_none());
+        assert!(inputs.changed(&sys, true).unwrap().is_none());
         file(&payload, b"old custom command changed");
         assert!(
-            inputs.changed(&sys, true).is_none(),
+            inputs.changed(&sys, true).unwrap().is_none(),
             "old declared targets retire"
         );
         file(&replacement_helper, b"repaired replacement command");
-        assert!(inputs.changed(&sys, true).is_some());
-        assert!(inputs.changed(&sys, true).is_none());
+        assert!(inputs.changed(&sys, true).unwrap().is_some());
+        assert!(inputs.changed(&sys, true).unwrap().is_none());
         file(
             &format!("{}/.config/aterm/init.toml", user.home),
             b"[develop]\ncheckouts=[]\n",
         );
         assert!(
-            inputs.changed(&sys, true).is_none(),
+            inputs.changed(&sys, true).unwrap().is_none(),
             "unrelated settings do not recreate a source change"
         );
         let selected = format!("{}/selected-token", user.home);
@@ -621,20 +797,20 @@ mod tests {
         let scoped = format!("[github]\naccount='fixture'\ntoken_file='{selected}'\n");
         file(&profile, scoped.as_bytes());
         assert!(
-            inputs.changed(&sys, true).is_some(),
+            inputs.changed(&sys, true).unwrap().is_some(),
             "a profile retarget is current input"
         );
-        assert!(inputs.changed(&sys, true).is_none());
+        assert!(inputs.changed(&sys, true).unwrap().is_none());
         private_reads.store(0, Ordering::SeqCst);
         file(&token, b"old_unselected_token");
         assert!(
-            inputs.changed(&sys, true).is_none(),
+            inputs.changed(&sys, true).unwrap().is_none(),
             "old token paths retire"
         );
         assert_eq!(private_reads.load(Ordering::SeqCst), 0);
         file(&selected, b"selected_token_two");
         assert!(
-            inputs.changed(&sys, true).is_some(),
+            inputs.changed(&sys, true).unwrap().is_some(),
             "new token path remains observed"
         );
         let parent = std::path::Path::new(&profile).parent().unwrap();
@@ -645,14 +821,14 @@ mod tests {
                 ..directory
             },
         );
-        assert!(inputs.changed(&sys, true).is_some());
-        assert!(inputs.changed(&sys, true).is_none());
+        assert!(inputs.changed(&sys, true).unwrap().is_some());
+        assert!(inputs.changed(&sys, true).unwrap().is_none());
         sys.stat_of(parent.to_str().unwrap(), directory);
         assert!(
-            inputs.changed(&sys, true).is_some(),
+            inputs.changed(&sys, true).unwrap().is_some(),
             "unchanged-leaf parent admission repairs wake"
         );
-        assert!(inputs.changed(&sys, true).is_none());
+        assert!(inputs.changed(&sys, true).unwrap().is_none());
         let replacement = format!("{}/replacement-token", user.home);
         file(&replacement, b"replacement_token_one");
         let replacement_profile =
@@ -684,25 +860,25 @@ mod tests {
             format!("{scoped}# new selection read\n").as_bytes(),
         );
         assert!(
-            inputs.changed(&sys, true).is_some(),
+            inputs.changed(&sys, true).unwrap().is_some(),
             "a raced profile read is recaptured, not relabeled"
         );
-        assert!(inputs.changed(&sys, true).is_none());
+        assert!(inputs.changed(&sys, true).unwrap().is_none());
         file(&replacement, b"replacement_token_two");
         assert!(
-            inputs.changed(&sys, true).is_some(),
+            inputs.changed(&sys, true).unwrap().is_some(),
             "the raced-in selection remains observable"
         );
-        assert!(inputs.changed(&sys, true).is_none());
+        assert!(inputs.changed(&sys, true).unwrap().is_none());
         private_reads.store(0, Ordering::SeqCst);
         file(&replacement, b"inert_token_new");
         assert!(
-            inputs.changed(&sys, false).is_none(),
+            inputs.changed(&sys, false).unwrap().is_none(),
             "Stop/off holds the observer"
         );
         assert_eq!(private_reads.load(Ordering::SeqCst), 0);
         assert!(
-            inputs.changed(&sys, true) == Some(RepositoryWork::Refresh),
+            inputs.changed(&sys, true).unwrap() == Some(RepositoryWork::Refresh),
             "current authority resumes with fresh inputs"
         );
         assert!(

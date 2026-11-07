@@ -717,18 +717,214 @@ fn a_workers_task_crosses_only_after_go() {
     fn deny(_: &str) -> String {
         "ERR denied: a drive's worker opens raise=false\n".to_owned()
     }
+    fn refused_after_go(sent: &str) -> String {
+        let len = sent
+            .split_whitespace()
+            .find_map(|w| w.strip_prefix("len="))
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0);
+        format!(
+            "{}ERR spawn: no window takes a worker\n",
+            aterm_types::control_verbs::task_frame_go(len)
+        )
+    }
     let task = b"read the README\nand say one line";
     let head = format!("spawn agent=claude len={}", task.len());
+    // What the exchange answered, and every line it printed on stdout and on stderr: none, for
+    // its caller prints the answer once it has recorded the worker (`spawn_worker`).
+    let exchanged = |answer: fn(&str) -> String| {
+        let ((answered, told), printed) = crate::stdout_lines_of(false, || {
+            crate::stderr_lines_of(|| spawn_exchange(link(answer, &SEEN), &head, task, OWN))
+        });
+        (answered.unwrap(), printed, told)
+    };
     assert_eq!(
-        spawn_exchange(link(go, &SEEN), &head, task, OWN).unwrap(),
-        (ExitCode::SUCCESS, None)
+        exchanged(go),
+        (("OK s-w1 task_rev=1".to_owned(), None), vec![], vec![]),
+        "`w1` is no sid"
     );
     assert_eq!(
-        spawn_exchange(link(deny, &SEEN), &head, task, OWN).unwrap(),
-        (ExitCode::FAILURE, None)
+        exchanged(deny),
+        (
+            (
+                "ERR denied: a drive's worker opens raise=false".to_owned(),
+                None
+            ),
+            vec![],
+            vec![]
+        ),
+        "a refusal before the task"
+    );
+    assert_eq!(
+        exchanged(refused_after_go),
+        (
+            ("ERR spawn: no window takes a worker".to_owned(), None),
+            vec![],
+            vec![]
+        ),
+        "a refusal of the task"
     );
     let seen = SEEN.lock().unwrap();
-    assert_eq!(*seen, [head.clone(), head]);
+    assert_eq!(*seen, [head.clone(), head.clone(), head]);
+}
+
+/// A worker `agent=claude cwd=/w -` sent to `host`, its task `go on`, by `s-5e1`.
+fn fleet_worker<'a>(host: &str, args: &'a [String]) -> Worker<'a> {
+    Worker {
+        host: host.to_owned(),
+        placed: crate::board::Placed::default(),
+        args,
+        label: Some("dx".to_owned()),
+        starter: Some("s-5e1"),
+        head: "spawn agent=claude cwd=/w - from=s-5e1",
+        task: b"go on",
+    }
+}
+
+/// The `kind=spawn` rows of the log in `log`.
+fn spawn_rows(log: &std::path::Path) -> Vec<aterm_telemetry::Row> {
+    aterm_telemetry::log::read(log, 4, None).map_or_else(
+        |_| Vec::new(),
+        |read| {
+            read.rows
+                .into_iter()
+                .filter(|r| r.kind == aterm_telemetry::Kind::Spawn)
+                .collect()
+        },
+    )
+}
+
+/// A FLEET WORKER IS RECORDED FROM ITS ANSWER, NOT FROM ITS PRINT (Continuum TM-1): a spawn
+/// whose answer cannot be printed (stdout closed: `… spawn … - | head -0`, here this thread's
+/// stdout seam) started its worker all the same, so the sender's `kind=spawn` row says `ok` and
+/// the worker's sid on the Mac its dial proved, and the board holds the worker; the closed stdout
+/// is the call's own error alone, which exits 0 (`exit_for`). The answer is printed once, after
+/// both.
+/// NEGATIVE CONTROL: the same spawn with stdout open writes the same row and board row, and
+/// prints `OK` once.
+#[test]
+fn a_fleet_spawn_whose_answer_cannot_be_printed_still_records_its_worker() {
+    static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    fn go(_: &str) -> String {
+        format!(
+            "{}OK s-0e1 task_rev=1\n",
+            aterm_types::control_verbs::task_frame_go(b"go on".len())
+        )
+    }
+    fn drive(host: &str, _: Duration) -> Result<DriveLink, DriveRefused> {
+        assert_eq!(host, "lab-mini");
+        Ok(DriveLink {
+            node: Some("0a".repeat(16)),
+            ..link(go, &SEEN)
+        })
+    }
+    let args = words("agent=claude cwd=/w -");
+    for closed in [true, false] {
+        let (tmp, _here, board) = scratch_board("unprinted");
+        let log = aterm_telemetry::log::dir_in(tmp.path());
+        let (ended, printed) = crate::stdout_lines_of(closed, || {
+            spawn_worker(
+                fleet_worker("lab-mini", &args),
+                OWN,
+                drive,
+                Some(log.clone()),
+            )
+        });
+        if closed {
+            let e = ended.expect_err("stdout closed");
+            assert!(crate::is_stdout_closed(&e), "{e}");
+            assert_eq!(crate::exit_for(&e), ExitCode::SUCCESS, "a closed stdout");
+        } else {
+            assert_eq!(ended.expect("printed"), ExitCode::SUCCESS);
+        }
+        assert_eq!(
+            printed,
+            ["OK s-0e1 task_rev=1"],
+            "the answer, printed once (closed stdout: {closed})"
+        );
+        let rows = spawn_rows(&log);
+        assert_eq!(
+            rows.iter()
+                .map(|r| (r.outcome, r.sid.as_deref(), r.on.as_deref()))
+                .collect::<Vec<_>>(),
+            [(
+                aterm_telemetry::Outcome::Ok,
+                Some("s-0e1"),
+                Some("0a".repeat(16).as_str())
+            )],
+            "one sender's row naming the worker (closed stdout: {closed})"
+        );
+        let row = board
+            .row("s-0e1")
+            .unwrap_or_else(|| panic!("the board holds the worker (closed stdout: {closed})"));
+        assert_eq!(
+            (
+                row.node,
+                row.host.as_deref(),
+                row.label.as_deref(),
+                row.cwd.as_deref(),
+                row.from.as_deref()
+            ),
+            (
+                Some("0a".repeat(16)),
+                Some("lab-mini"),
+                Some("dx"),
+                Some("/w"),
+                Some("s-5e1")
+            )
+        );
+    }
+}
+
+/// A FLEET SPAWN WHOSE DIAL FAILED WRITES ITS SENDER'S ROW (Continuum TM-1): no grant, no route,
+/// so nothing was sent: the row says `refused`, names no worker and names the Mac it was for as
+/// the spawn named it, since no dial proved its node. The board records nothing, nothing is
+/// printed, and the call is the dial's refusal.
+#[test]
+fn a_fleet_spawn_whose_dial_failed_writes_a_refused_row_for_the_mac_it_named() {
+    fn ungranted(host: &str, _: Duration) -> Result<DriveLink, DriveRefused> {
+        assert_eq!(host, "lab-mini");
+        Err(DriveRefused {
+            ungranted: true,
+            ..DriveRefused::once("lab-mini serves no drive to this Mac".to_owned())
+        })
+    }
+    let (tmp, _here, board) = scratch_board("undialled");
+    let log = aterm_telemetry::log::dir_in(tmp.path());
+    let args = words("agent=claude cwd=/w -");
+    let (ended, printed) = crate::stdout_lines_of(false, || {
+        spawn_worker(
+            fleet_worker("lab-mini", &args),
+            OWN,
+            ungranted,
+            Some(log.clone()),
+        )
+    });
+    let refusal = ended.expect_err("the dial failed");
+    assert!(refusal.to_string().contains("serves no drive"), "{refusal}");
+    assert!(printed.is_empty(), "no answer came: {printed:?}");
+    let rows = spawn_rows(&log);
+    assert_eq!(
+        rows.iter()
+            .map(|r| (
+                r.outcome,
+                r.sid.as_deref(),
+                r.on.as_deref(),
+                r.label.as_str()
+            ))
+            .collect::<Vec<_>>(),
+        [(
+            aterm_telemetry::Outcome::Refused,
+            None,
+            Some("lab-mini"),
+            "claude"
+        )],
+        "one refused row, for the Mac the spawn named"
+    );
+    assert!(
+        board.scan().rows.is_empty(),
+        "no worker started, so the board holds none"
+    );
 }
 
 #[test]

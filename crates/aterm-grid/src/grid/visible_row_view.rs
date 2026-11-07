@@ -358,6 +358,37 @@ impl Grid {
         }
     }
 
+    /// Visits the live on-screen rows top first (ignoring `display_offset`), each with its
+    /// screen row, its cells, its [written length](Row::written_len) and the columns whose cells
+    /// may have changed since this was last asked of the storage now there, which it forgets
+    /// ([`Row::take_touched`]). One reader owns the answer: the alternate-screen archive, which
+    /// re-reads only what changed.
+    #[inline]
+    pub fn take_screen_rows_touched(
+        &mut self,
+        mut each: impl FnMut(u16, &[Cell], u16, std::ops::Range<usize>),
+    ) {
+        let storage = &mut self.storage;
+        let n = storage.rows.len();
+        if n == 0 {
+            return;
+        }
+        // `row_at_screen`'s ring index for the top row, then one further for each row below.
+        let scrollback = storage
+            .total_lines
+            .saturating_sub(usize::from(storage.visible_rows));
+        let mut idx = (storage.ring_head + scrollback) % n;
+        for screen_row in 0..storage.visible_rows {
+            let row = &mut storage.rows[idx];
+            let touched = row.take_touched();
+            each(screen_row, row.as_slice(), row.written_len(), touched);
+            idx += 1;
+            if idx == n {
+                idx = 0;
+            }
+        }
+    }
+
     /// The live on-screen row at `screen_row`, ignoring `display_offset`, for live-frame
     /// cell reads whose extras lookups key on the live visible row.
     #[must_use]

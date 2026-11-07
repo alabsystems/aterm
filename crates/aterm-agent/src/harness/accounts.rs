@@ -17,6 +17,10 @@ use crate::ai::connector::{Flow, Region, RowKeys, Seam};
 
 use super::one_line;
 
+#[path = "accounts_auth_route.rs"]
+mod auth_route;
+pub use auth_route::{AuthRoute, TokenEntry};
+
 #[path = "accounts_signin_queue.rs"]
 mod signin_queue;
 pub use signin_queue::{
@@ -428,6 +432,16 @@ pub const HOMEDIR_ENV: &str = if cfg!(windows) { "USERPROFILE" } else { "HOME" }
 
 /// The variables that give a process a credential or a provider of its own
 /// ([`super::netwatch::ROUTE_KEYS`], [`ProcessLogin::of_env`]).
+///
+/// Its job is attribution: every variable that moves a Claude Code process off its stored login,
+/// so a process that sets one non-empty is judged outside its row (the vault token's descriptor
+/// apart, where the wrapper's marker names it: [`super::token_route`]). It is not the list a
+/// pooled line removes, which is [`crate::ai::connector::Connector::credential_env`] less
+/// `KEPT_CREDENTIALS` ([`super::relaunch::ahead_env`]): that one keeps the Bedrock and Vertex
+/// switches, so a pooled line never moves a session off the provider its person chose, and
+/// merging the two would change what pooled lines remove
+/// (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.8). aterm's token wrapper unsets every
+/// name here before it serves (`accounts_token_run`), where only empty ones can remain.
 pub const CREDENTIAL_KEYS: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
@@ -1624,15 +1638,16 @@ pub struct ProcessLogin {
     pub login: Option<String>,
     /// Its Claude home is the default one ([`HOME_ENV`]).
     pub default_home: bool,
-    /// It authenticates by a stored login ([`ProcessLogin::of_env`]).
-    pub stored_login: bool,
+    /// How it authenticates ([`ProcessLogin::of_env`]), before a gate resolves its account
+    /// ([`AuthRoute::for_account`]).
+    pub route: AuthRoute,
 }
 
 /// Whether a set variable `name = value` moves a Claude Code process off its stored login: a
 /// credential, profile or route variable ([`CREDENTIAL_KEYS`], [`PROFILE_KEYS`],
 /// [`super::netwatch::ROUTE_KEYS`] and its prefixes), whatever its value, but the lab stub's
 /// route its development seam admits ([`super::netwatch::lab_route`]; never in a shipped binary).
-fn names_another_login(name: &str, value: &str) -> bool {
+pub(super) fn names_another_login(name: &str, value: &str) -> bool {
     use super::netwatch::{ROUTE_KEYS, ROUTE_PREFIXES, lab_route};
     CREDENTIAL_KEYS.contains(&name)
         || PROFILE_KEYS.contains(&name)
@@ -1687,9 +1702,11 @@ pub fn profile_configured(configs: &Path) -> bool {
 /// `/bin/bash` (measured on macOS 26.7.2 and 27.0.1).
 ///
 /// Only the entries those checks read are kept ([`Self::reads`]), and only for a process that
-/// runs on its stored login ([`Self::admitted`]): such an environment sets no credential,
-/// profile or route variable ([`ProcessLogin::of_env`]), so a record holds directories and
-/// selectors, never a secret.
+/// runs on its account's own credential ([`Self::admitted`]): such an environment sets no
+/// credential, profile or route variable ([`ProcessLogin::of_env`]). A token session's own
+/// descriptor variable and marker are not kept either: aterm's wrapper made them, not the shell,
+/// and it makes them afresh for a relaunch ([`super::token_route::TOKEN_STATE_ENV`]). So a
+/// record holds directories and selectors, never a secret, and reads as a stored login's.
 #[derive(Clone, PartialEq, Eq)]
 pub struct LaunchEnv(Vec<String>);
 
@@ -1701,7 +1718,17 @@ impl LaunchEnv {
         if env.is_empty() {
             return None;
         }
-        Self::kept(env).admitted()
+        let pairs = env.iter().filter_map(|entry| entry.split_once('='));
+        let mut kept = Self::kept(env);
+        match ProcessLogin::of_env(pairs).route {
+            AuthRoute::VaultToken { .. } => kept.0.retain(|entry| {
+                entry
+                    .split_once('=')
+                    .is_none_or(|(name, _)| !super::token_route::TOKEN_STATE_ENV.contains(&name))
+            }),
+            AuthRoute::Stored | AuthRoute::Outside => {}
+        }
+        kept.admitted()
     }
 
     /// A record read back from where it was kept (`KEY=value` words): only the entries
@@ -1712,8 +1739,9 @@ impl LaunchEnv {
         Self::kept(words).admitted()
     }
 
-    /// The record where it runs on its stored login ([`ProcessLogin::of_env`]) and sets no
-    /// credential, profile or route variable empty. An empty one may be what the agent's own
+    /// The record where it runs on its account's own credential ([`ProcessLogin::of_env`]'s
+    /// route; a token session's record, its descriptor and marker set aside, reads as a stored
+    /// login's), and sets no credential, profile or route variable empty. An empty one may be what the agent's own
     /// command line set (`ANTHROPIC_API_KEY= claude`) over its shell's value, which a relaunch
     /// line, carrying no credential, would leave to the shell: such a record is no evidence of
     /// what the relaunch inherits.
@@ -1721,7 +1749,13 @@ impl LaunchEnv {
         let blanked = self
             .pairs()
             .any(|(name, value)| value.is_empty() && Self::routes(name));
-        (!blanked && ProcessLogin::of_env(self.pairs()).stored_login).then_some(self)
+        let admitted = match ProcessLogin::of_env(self.pairs()).route {
+            // The token's wrapper sets the descriptor and the marker afresh, so a token session's
+            // record holds the same directories and selectors a stored login's does.
+            AuthRoute::Stored | AuthRoute::VaultToken { .. } => true,
+            AuthRoute::Outside => false,
+        };
+        (!blanked && admitted).then_some(self)
     }
 
     /// Its `KEY=value` entries, in the process's order.
@@ -1791,23 +1825,34 @@ fn login_file_dir<'a>(value: &'a str, file: &str) -> Option<&'a Path> {
 
 impl ProcessLogin {
     /// Extracts [`ProcessLogin`] facts from `(name, value)` environment pairs: its login is the
-    /// first [`LOGIN_ENV`], its home the default without a non-empty [`HOME_ENV`], and it runs
-    /// on its stored login unless [`LOGIN_ENV`] is given twice differently or a credential,
-    /// profile or route variable is set non-empty, the lab stub's route its development seam
-    /// admits apart ([`super::netwatch::LAB_ROUTE_SEAM`]; never in a shipped binary).
+    /// first [`LOGIN_ENV`], its home the default without a non-empty [`HOME_ENV`], and its route:
+    ///
+    /// - [`AuthRoute::VaultToken`] where the token's descriptor variable
+    ///   ([`super::token_route::DESCRIPTOR_ENV`]) and the wrapper's marker
+    ///   ([`super::token_route::MARKER_ENV`], naming a token entry) are both set and no other
+    ///   credential, profile or route variable is (`docs/DESIGN-claude-setup-token-2026-11-05.md`
+    ///   §5.2). The shape alone, with no roster: a gate that resolves the account keeps it only
+    ///   where the marker names that account's entry ([`AuthRoute::for_account`]);
+    /// - [`AuthRoute::Outside`] where [`LOGIN_ENV`] is given twice differently, a credential,
+    ///   profile or route variable is set non-empty (the lab stub's route its development seam
+    ///   admits apart, [`super::netwatch::LAB_ROUTE_SEAM`]; never in a shipped binary), or the
+    ///   descriptor or the marker is set without the other, or the marker names no token entry;
+    /// - [`AuthRoute::Stored`] otherwise.
     #[must_use]
     pub fn of_env<'a>(env: impl IntoIterator<Item = (&'a str, &'a str)>) -> ProcessLogin {
+        use super::token_route::{DESCRIPTOR_ENV, MARKER_ENV};
         let mut login: Option<&str> = None;
+        let (mut descriptor, mut marker, mut marked_twice) = (false, None::<&str>, false);
         let mut out = ProcessLogin {
             login: None,
             default_home: true,
-            stored_login: true,
+            route: AuthRoute::Stored,
         };
         for (name, value) in env {
             if name == LOGIN_ENV {
                 match login {
                     None => login = Some(value),
-                    Some(first) if first != value => out.stored_login = false,
+                    Some(first) if first != value => out.route = AuthRoute::Outside,
                     Some(_) => {}
                 }
             }
@@ -1817,11 +1862,25 @@ impl ProcessLogin {
             if name == HOME_ENV {
                 out.default_home = false;
             }
-            if names_another_login(name, value) {
-                out.stored_login = false;
+            if name == DESCRIPTOR_ENV {
+                descriptor = true;
+            } else if name == MARKER_ENV {
+                marked_twice |= marker.is_some_and(|first| first != value);
+                marker.get_or_insert(value);
+            } else if names_another_login(name, value) {
+                out.route = AuthRoute::Outside;
             }
         }
         out.login = login.filter(|dir| !dir.is_empty()).map(str::to_owned);
+        if out.route == AuthRoute::Outside {
+            return out;
+        }
+        out.route = match (descriptor, marker.filter(|_| !marked_twice)) {
+            (false, None) if !marked_twice => AuthRoute::Stored,
+            (true, Some(marker)) => TokenEntry::parse(marker)
+                .map_or(AuthRoute::Outside, |entry| AuthRoute::VaultToken { entry }),
+            _ => AuthRoute::Outside,
+        };
         out
     }
 
@@ -1881,13 +1940,13 @@ impl ProcessLogin {
         let mut out = ProcessLogin {
             login: None,
             default_home: true,
-            stored_login: true,
+            route: AuthRoute::Stored,
         };
         for (name, value) in env {
             if name == seam.var() {
                 match login {
                     None => login = Some(value),
-                    Some(first) if first != value => out.stored_login = false,
+                    Some(first) if first != value => out.route = AuthRoute::Outside,
                     Some(_) => {}
                 }
             }
@@ -1898,14 +1957,14 @@ impl ProcessLogin {
                 out.default_home = false;
             }
             if ahead.contains(&name) {
-                out.stored_login = false;
+                out.route = AuthRoute::Outside;
             }
         }
         out.login = login.filter(|v| !v.is_empty()).map(|value| match seam {
             Seam::LoginFile { file, .. } => match login_file_dir(value, file) {
                 Some(dir) => dir.to_string_lossy().into_owned(),
                 None => {
-                    out.stored_login = false;
+                    out.route = AuthRoute::Outside;
                     value.to_owned()
                 }
             },
@@ -1940,29 +1999,32 @@ impl ProcessLogin {
                     })
             }),
         };
-        self.stored_login &= !settings.iter().any(|(_, source)| another(source));
+        self.route = self
+            .route
+            .unless(settings.iter().any(|(_, source)| another(source)));
         self
     }
 
     /// Attaches whether the vendor profile store holds an active `.json` configuration.
     #[must_use]
     pub const fn with_profile_store(mut self, configured: bool) -> ProcessLogin {
-        self.stored_login &= !configured;
+        self.route = self.route.unless(configured);
         self
     }
 
     /// Resolves this process against `roster` into a [`Me`] descriptor for [`advise`].
+    /// Its route is resolved against the row its login names ([`AuthRoute::for_account`]): a
+    /// token route stays one only where its marker names that row's entry.
     #[must_use]
     pub fn me<'a>(&self, roster: &'a Roster) -> Me<'a> {
+        let row = roster.row_for_login(self.login.as_deref());
         Me {
-            account: roster
-                .row_for_login(self.login.as_deref())
-                .map(|row| row.label.as_str()),
+            account: row.map(|row| row.label.as_str()),
             left: roster
                 .row_left(self.login.as_deref())
                 .map(|row| row.label.as_str()),
             default_home: self.default_home,
-            stored_login: self.stored_login,
+            route: self.route.for_account(row.and_then(TokenEntry::of_row)),
         }
     }
 }
@@ -1971,7 +2033,8 @@ impl ProcessLogin {
 #[must_use]
 pub fn judged_label<'a>(roster: &'a Roster, who: &ProcessLogin) -> Option<&'a str> {
     let me = who.me(roster);
-    me.label().filter(|_| me.default_home && me.stored_login)
+    me.label()
+        .filter(|_| me.default_home && me.route.on_account())
 }
 
 /// Returns the account label shown in UI surfaces when `roster` lists multiple accounts.
@@ -4009,6 +4072,11 @@ pub struct OtherMacs {
     pub unread: BTreeSet<String>,
     /// Why `unread` could not be compared, one cause for the whole read; `None` where none is.
     pub unread_why: Option<UnreadWhy>,
+    /// Each row that runs on its vault token on this Mac, with the token's end (unix seconds):
+    /// renewal is off for it, so no door signs its stored login in with nobody asking, and a
+    /// person's `accounts renew <label>` says so (`docs/DESIGN-claude-setup-token-2026-11-05.md`
+    /// §5.8; [`super::accounts_tokens::rows_on_token`]).
+    pub on_token: BTreeMap<String, u64>,
 }
 
 /// Why this Mac could not compare its source with its own names ([`OtherMacs::unread`]).
@@ -4049,12 +4117,16 @@ impl OtherMacs {
         named: BTreeMap::new(),
         unread: BTreeSet::new(),
         unread_why: None,
+        on_token: BTreeMap::new(),
     };
 
-    /// Whether `label` is one of them, named or unread: no door signs it in with nobody asking.
+    /// Whether `label` is one of them, named, unread or on its vault token: no door signs it in
+    /// with nobody asking.
     #[must_use]
     pub fn holds(&self, label: &str) -> bool {
-        self.named.contains_key(label) || self.unread.contains(label)
+        self.named.contains_key(label)
+            || self.unread.contains(label)
+            || self.on_token.contains_key(label)
     }
 }
 
@@ -7793,8 +7865,9 @@ pub struct Me<'a> {
     pub left: Option<&'a str>,
     /// Its Claude home is the default one.
     pub default_home: bool,
-    /// Its process authenticates by a stored login.
-    pub stored_login: bool,
+    /// How its process authenticates, resolved against [`Self::account`]'s row
+    /// ([`AuthRoute::for_account`]).
+    pub route: AuthRoute,
 }
 
 impl<'a> Me<'a> {
@@ -7816,7 +7889,8 @@ pub enum StayWhy {
     NotListed,
     /// The session's home is not the default.
     OtherHome,
-    /// The process does not authenticate by a stored login.
+    /// The process authenticates by neither its account's stored login nor its vault token
+    /// ([`AuthRoute::Outside`]).
     NotAStoredLogin,
     /// `active` has not served a response yet: nobody follows it, and nobody rotates past it.
     Canary,
@@ -8059,7 +8133,7 @@ pub fn effective_ranking_point<'a>(
 ) -> Cow<'a, Point> {
     if *point == Point::TurnEnd
         && me.default_home
-        && me.stored_login
+        && me.route.on_account()
         && let Some(mine) = me.label().and_then(|label| roster.row(label))
         && !row_available_here(mine, state, now)
     {
@@ -8407,11 +8481,17 @@ pub fn launch_row<'a>(
 }
 
 /// Whether a Claude Code worker whose starter runs as `who` may leave its starter's row: rotation
-/// is on, and `who` is this machine's own stored login. The launcher asks this before it reads
+/// is on, and `who` is this machine's own stored login or its row's vault token. The launcher asks this before it reads
 /// any record, so a launch under `Off` reads none.
 #[must_use]
 pub fn claude_worker_may_move(mode: Mode, who: &ProcessLogin) -> bool {
-    mode != Mode::Off && who.default_home && who.stored_login
+    // A starter on its row's token moves as one on its stored login does (`judged_label` credits
+    // only the row its marker names).
+    let own = match who.route {
+        AuthRoute::Stored | AuthRoute::VaultToken { .. } => true,
+        AuthRoute::Outside => false,
+    };
+    mode != Mode::Off && who.default_home && own
 }
 
 /// The starter's row and the row a Claude Code worker whose starter runs as `who` starts on, where
@@ -8467,7 +8547,7 @@ pub fn worker_row<'a>(
         account: Some(from),
         left: None,
         default_home: true,
-        stored_login: true,
+        route: AuthRoute::Stored,
     };
     match advise_past_probe(roster, state, enrolled, &me, &point, mode, now) {
         Advice::Move {
@@ -8524,8 +8604,12 @@ fn advise_with(
     if !me.default_home {
         return Advice::Stay(StayWhy::OtherHome);
     }
-    if !me.stored_login {
-        return Advice::Stay(StayWhy::NotAStoredLogin);
+    // A token session goes through every rule after this one, as a stored login does: the
+    // yield, the walls, `LeasedElsewhere` and `ClockOff` (§5.2). Only a process outside its
+    // account's own credential stays.
+    match me.route {
+        AuthRoute::Stored | AuthRoute::VaultToken { .. } => {}
+        AuthRoute::Outside => return Advice::Stay(StayWhy::NotAStoredLogin),
     }
     let at_wall = matches!(
         point,
@@ -10805,7 +10889,7 @@ impl LoginObservation<'_> {
     pub(super) fn matches_current(&self, current: &Roster) -> bool {
         let me = self.who.me(current);
         me.default_home
-            && me.stored_login
+            && me.route.on_account()
             && me.account == Some(self.row.label.as_str())
             && current.row(&self.row.label) == Some(self.row)
     }
@@ -10945,6 +11029,27 @@ impl Drop for Lock {
     fn drop(&mut self) {
         self.release();
     }
+}
+
+/// Takes the `flock(2)` of the lock file at `path` (made, mode 0600, where it is absent; never one
+/// a link names) now and after each pause of `ladder`; `None` while it stays held. Claude Code's
+/// setup-token verb takes its per-account lock and `tokens.lock` so
+/// (`super::accounts_tokens`), neither of which is `accounts.lock` or [`SIGNIN_LOCK_FILE`].
+/// # Errors
+/// The file cannot be opened, is not a regular file, or the lock call fails.
+pub fn lock_at_within(path: &Path, ladder: &[std::time::Duration]) -> io::Result<Option<Lock>> {
+    let mut file = match Store::try_take(open_retained_file(path, "lock")?)? {
+        Ok(lock) => return Ok(Some(lock)),
+        Err(file) => file,
+    };
+    for pause in ladder {
+        std::thread::sleep(*pause);
+        file = match Store::try_take(file)? {
+            Ok(lock) => return Ok(Some(lock)),
+            Err(file) => file,
+        };
+    }
+    Ok(None)
 }
 
 /// A pure snapshot pinned to the actual account writer. No constructor from
@@ -13050,7 +13155,8 @@ pub enum Recorded {
     /// No roster, or the process's login is no row's of it, nor one a renewal moved a row off
     /// ([`Me::label`]).
     NotListed,
-    /// The process's home is not the default one, or it does not authenticate by a stored login.
+    /// The process's home is not the default one, or it authenticates by neither its account's
+    /// stored login nor its vault token ([`AuthRoute::Outside`]).
     NotStored,
     /// The row is older than the process.
     NotThisProcess,
@@ -13106,7 +13212,7 @@ pub fn record_wall(
     let Some(account) = me.label() else {
         return Recorded::NotListed;
     };
-    if !me.default_home || !me.stored_login {
+    if !me.default_home || !me.route.on_account() {
         return Recorded::NotStored;
     }
     let written = i64::try_from(wall.at).unwrap_or(i64::MAX);
@@ -13241,7 +13347,7 @@ pub fn record_usage(
     let Some(account) = me.label() else {
         return Recorded::NotListed;
     };
-    if !me.default_home || !me.stored_login {
+    if !me.default_home || !me.route.on_account() {
         return Recorded::NotStored;
     }
     let at = said.at.min(now);

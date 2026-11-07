@@ -1105,11 +1105,16 @@ pub(crate) fn launch_env_of_agent(
     ))
 }
 
-/// Returns whether agent `pid`'s settings leave its stored login active.
-pub(crate) fn stored_login_of_agent(pid: u32, argv: &[String], cwd: &str) -> bool {
+/// How agent `pid` authenticates once its settings and profile store are read: they only move
+/// its environment's route off its account's own credential.
+pub(crate) fn auth_route_of_agent(
+    pid: u32,
+    argv: &[String],
+    cwd: &str,
+) -> aterm_agent::harness::accounts::AuthRoute {
     let env = atpkg::caller_shell::process_args(pid).map(|a| a.env);
     let home = aterm_types::dirs::home_dir();
-    stored_login_of(
+    route_of_facts(
         &gather(
             env,
             argv,
@@ -1160,11 +1165,14 @@ pub(crate) fn tap_settings_admit_line(argv: &[String], cwd: &str) -> bool {
     })
 }
 
-/// [`stored_login_of_agent`] over what was gathered.
-fn stored_login_of(facts: &RouteFacts, home: Option<&Path>) -> bool {
+/// [`auth_route_of_agent`] over what was gathered: an unread or empty environment is outside.
+fn route_of_facts(
+    facts: &RouteFacts,
+    home: Option<&Path>,
+) -> aterm_agent::harness::accounts::AuthRoute {
     use aterm_agent::harness::accounts;
     let Some(env) = facts.env.as_ref().filter(|env| !env.is_empty()) else {
-        return false;
+        return accounts::AuthRoute::Outside;
     };
     let pairs = || env.iter().filter_map(|kv| kv.split_once('='));
     let profile = accounts::profile_configs_dir(pairs()).is_some_and(|configs| {
@@ -1179,7 +1187,7 @@ fn stored_login_of(facts: &RouteFacts, home: Option<&Path>) -> bool {
     accounts::ProcessLogin::of_env(pairs())
         .with_settings(&facts.settings)
         .with_profile_store(profile)
-        .stored_login
+        .route
 }
 
 #[cfg(test)]
@@ -2406,7 +2414,7 @@ mod tests {
         };
         let stored = |env: Option<Vec<String>>, argv: &[&str]| {
             let argv: Vec<String> = argv.iter().map(|s| (*s).to_string()).collect();
-            stored_login_of(
+            route_of_facts(
                 &gather(
                     env,
                     &argv,
@@ -2417,6 +2425,7 @@ mod tests {
                 ),
                 Some(&home),
             )
+            .is_stored()
         };
         let user = home.join(".claude/settings.json");
         assert!(stored(env(&[]), &["claude"]), "a quiet tree");
@@ -2475,7 +2484,7 @@ mod tests {
             env: Some(Vec::new()),
             settings: Vec::new(),
         };
-        assert!(!stored_login_of(&empty, Some(&home)));
+        assert!(!route_of_facts(&empty, Some(&home)).is_stored());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2584,7 +2593,7 @@ mod tests {
             )
         };
         assert_eq!(netwatch::route_of(&facts(&cloud)), Route::Default);
-        assert!(stored_login_of(&facts(&cloud), Some(&home)));
+        assert!(route_of_facts(&facts(&cloud), Some(&home)).is_stored());
         let quiet = "{\"permissions\":{\"allow\":[\"Bash(ls:*)\"]}}";
         std::fs::create_dir_all(cloud.join(".claude")).expect(".claude");
         write(&cloud.join(".claude/settings.local.json"), quiet);
@@ -2593,7 +2602,7 @@ mod tests {
             matches!(&r, Route::Custom(why) if why.contains("settings.local.json could not be read")),
             "{r:?}"
         );
-        assert!(!stored_login_of(&facts(&cloud), Some(&home)));
+        assert!(!route_of_facts(&facts(&cloud), Some(&home)).is_stored());
         write(&dir.join("proj/.claude/settings.local.json"), quiet);
         assert_eq!(
             netwatch::route_of(&facts(&dir.join("proj"))),

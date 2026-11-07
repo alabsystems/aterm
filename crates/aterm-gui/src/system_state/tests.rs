@@ -6915,7 +6915,7 @@ fn each_phrase_outcome_has_its_own_words_and_only_a_spent_phrase_empties_the_fie
     assert_eq!(typed(&app), "river stone lamp", "the words stay");
 }
 
-/// GitHub refusing the vault's token says who renews it (only a vault admin can) and the exact
+/// GitHub refusing the vault's token says who renews it (any member can) and the exact
 /// line they run, which the row's Copy Command puts on the clipboard (§3.6).
 #[test]
 fn a_refused_github_token_says_who_renews_it_and_copies_the_line() {
@@ -6924,7 +6924,7 @@ fn a_refused_github_token_says_who_renews_it_and_copies_the_line() {
     let plan = status.plan.clone().unwrap();
     let row = row_view(repositories, &status, plan.selection);
     let note = row.note.clone().unwrap();
-    assert!(note.contains("only a vault admin"), "{note}");
+    assert!(note.contains("any member of the vault"), "{note}");
     assert!(
         note.ends_with(aterm_types::macos_setup::GITHUB_TOKEN_COMMAND),
         "{note}"

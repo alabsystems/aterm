@@ -69,17 +69,6 @@ impl NotifyMsg {
         )
     }
 
-    /// The consent attention path's notice.
-    pub(crate) fn consent(notice: &crate::consent_observer::AttentionNotice) -> Self {
-        Self::with_origin(
-            notice.session,
-            Some(notice.title.to_owned()),
-            notice.body.clone(),
-            true,
-            Some(notice.validity.clone()),
-        )
-    }
-
     #[cfg(test)]
     fn own(session: u64, title: Option<String>, body: String) -> Self {
         Self::with_origin(session, title, body, true, None)
@@ -111,8 +100,8 @@ impl NotifyMsg {
 /// Program notices the queue holds at once, counting the one being delivered.
 const PROGRAM_SLOTS: usize = 16;
 
-/// Queue slots no program notice may take: aterm's own (the herald's, a consent prompt's) always
-/// find room, whatever a tab floods.
+/// Queue slots no program notice may take: aterm's own (the herald's) always find room, whatever
+/// a tab floods.
 const OWN_SLOTS: usize = 8;
 
 const NOTIFY_QUEUE_CAP: usize = PROGRAM_SLOTS + OWN_SLOTS;
@@ -1377,10 +1366,6 @@ fn fold_to_utf16(s: &str, out: &mut [u16]) {
 }
 
 #[cfg(all(test, target_os = "macos"))]
-#[path = "notify_consent_tests.rs"]
-mod consent_tests;
-
-#[cfg(all(test, target_os = "macos"))]
 #[path = "notify_live_policy_tests.rs"]
 mod live_policy_tests;
 
@@ -1591,28 +1576,6 @@ mod tests {
         assert!(
             !delivers(&own, &looking, true),
             "for aterm's own notices too"
-        );
-    }
-
-    #[test]
-    fn instance_level_consent_is_not_a_desktop_alert() {
-        use crate::consent_observer::{AttentionEvent, AttentionGate};
-        let mut gate = AttentionGate::new();
-        let notice = gate
-            .note(AttentionEvent::ProtectedEperm { session: None })
-            .notice
-            .expect("a first denial notifies");
-        let first_tab_focused = HashSet::from([0u64]);
-        let own = NotifyMsg::consent(&notice);
-        assert!(own.own, "the consent door speaks in aterm's own voice");
-        assert!(
-            !delivers(&own, &first_tab_focused, true),
-            "an instance-level diagnostic also stays off the desktop"
-        );
-        let first_tab = NotifyMsg::own(0, None, "tab 0".into());
-        assert!(
-            !delivers(&first_tab, &first_tab_focused, true),
-            "session 0's own notice is suppressed (control)"
         );
     }
 

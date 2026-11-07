@@ -58,6 +58,7 @@ fn laid_out(phase: ImagePhase) -> (St, Prepare) {
         cwd: Some("/model/project".into()),
         heal: None,
         dialect: Dialect::Zsh,
+        settles: None,
         account_intent: Some(Box::new(intent("/model/old", "34"))),
     };
     let mut back = command.clone();

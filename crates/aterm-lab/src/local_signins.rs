@@ -1547,6 +1547,158 @@ pub fn cmd(args: &[String]) -> Res {
     Ok(i32::from(!lines.iter().all(|l| l.pass)))
 }
 
+// ---------------------------------------------------------------------------------------------
+// The setup-token stand-in: `setup-token-lab`'s lane B (DESIGN-claude-setup-token S9).
+
+/// The hidden verb that is lane B's Claude Code build ([`setup_token_main`]): a store build's
+/// `bin/claude` script execs this lab binary with it, the stand-in's folder and Claude Code's own
+/// words.
+pub const SETUP_TOKEN_VERB: &str = "local-signins-setup-token";
+
+/// In the stand-in's folder: the label whose lab token ([`crate::stub::labelled_oauth_token`]) it
+/// shows and is served; the token itself is never written anywhere.
+pub const SETUP_TOKEN_LABEL: &str = "label";
+/// Written by the stand-in once its sign-in frame is shown, so the lane can look at every process
+/// while the capture holds it.
+pub const SETUP_TOKEN_WAITING: &str = "waiting";
+/// Written by the lane: the browser's return, after which the stand-in shows its token.
+pub const SETUP_TOKEN_GO: &str = "go";
+/// Written by the stand-in as a launch the wrapper served: what its descriptor held, never what.
+pub const SETUP_TOKEN_SERVED: &str = "served";
+/// Written by the lane: the served stand-in may end.
+pub const SETUP_TOKEN_RELEASE: &str = "release";
+
+/// How long the stand-in waits for the lane: the hang detector.
+const STANDIN_HANG: Duration = Duration::from_secs(60);
+
+/// What 2.1.318's setup-token authorize URL looks like (`Ngo`): `scope` is `user:inference` alone,
+/// URL-encoded, and no lifetime is named (the lifetime goes in the exchange).
+#[must_use]
+pub fn setup_token_url() -> String {
+    "https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e\
+     &response_type=code&redirect_uri=http%3A%2F%2Flocalhost%3A54545%2Fcallback\
+     &scope=user%3Ainference&code_challenge=LABCHALLENGE&code_challenge_method=S256&state=LABSTATE"
+        .to_string()
+}
+
+/// 2.1.318's waiting frame (`urlToCopy`), as Ink lays it out with colour: the dim hint, `url` as an
+/// OSC 8 link whose text is the URL, and the paste prompt.
+#[must_use]
+pub fn setup_token_waiting_frame(url: &str) -> String {
+    format!(
+        "\x1b[2mBrowser didn't open? Use the url below to sign in \x1b[22m\n\n\
+         \x1b]8;;{url}\x1b\\\x1b[2m{url}\x1b[22m\x1b]8;;\x1b\\\n\n\
+         Paste code here if prompted > "
+    )
+}
+
+/// 2.1.318's success frame, `token` in warning colour, `words` its lifetime ("1 year"), after Ink's
+/// erase of the waiting frame's five lines.
+#[must_use]
+pub fn setup_token_success_frame(token: &str, words: &str) -> String {
+    format!(
+        "{}\x1b[32m\u{2713} Long-lived authentication token created successfully!\x1b[39m\n\n\
+         Your OAuth token (valid for {words}):\n\n\
+         \x1b[33m{token}\x1b[39m\n\n\
+         \x1b[2mStore this token securely. You won't be able to see it again.\x1b[22m\n\n\
+         \x1b[2mUse this token by setting: export CLAUDE_CODE_OAUTH_TOKEN=<token>\x1b[22m\n",
+        "\x1b[2K\x1b[1A".repeat(5) + "\x1b[2K\x1b[G"
+    )
+}
+
+/// What a served stand-in found ([`SETUP_TOKEN_SERVED`]): the descriptor variable's number, whether
+/// its socket held the label's token, and the marker, as `descriptor=<n|-> matched=<0|1>
+/// marker=<entry|->`.
+#[must_use]
+pub fn served_line(descriptor: Option<i32>, matched: bool, marker: Option<&str>) -> String {
+    format!(
+        "descriptor={} matched={} marker={}",
+        descriptor.map_or_else(|| "-".to_string(), |n| n.to_string()),
+        u8::from(matched),
+        marker.unwrap_or("-")
+    )
+}
+
+/// Waits for `path` to be there, within [`STANDIN_HANG`].
+fn standin_waits_for(path: &Path) -> bool {
+    let until = Instant::now() + STANDIN_HANG;
+    while Instant::now() < until {
+        if path.exists() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+/// Lane B's Claude Code build (`<dir> <claude words…>`): `--version` says 2.1.318's line;
+/// `setup-token` shows 2.1.318's frames, the token being the folder's label's lab token, the
+/// success frame only once the lane wrote [`SETUP_TOKEN_GO`]; any other launch is one the token
+/// wrapper started, whose descriptor it peeks and compares with that token, noting only whether
+/// they matched ([`served_line`]), and which ends once the lane wrote [`SETUP_TOKEN_RELEASE`].
+/// No byte of the token is printed but by the success frame, to the capture's own terminal.
+#[must_use]
+pub fn setup_token_main(args: &[String]) -> i32 {
+    let Some((dir, words)) = args.split_first() else {
+        eprintln!("usage: aterm-lab {SETUP_TOKEN_VERB} <dir> <claude words…>");
+        return 2;
+    };
+    let dir = Path::new(dir);
+    let Ok(label) = crate::util::read_regular_text(&dir.join(SETUP_TOKEN_LABEL)) else {
+        eprintln!("claude: a lab stand-in with no label");
+        return 1;
+    };
+    let token = crate::stub::labelled_oauth_token(label.trim());
+    let mut out = std::io::stdout().lock();
+    let mut say = |text: &str| {
+        let _ = out.write_all(text.as_bytes());
+        let _ = out.flush();
+    };
+    match words.first().map(String::as_str) {
+        Some("--version") => {
+            say("2.1.318 (Claude Code)\n");
+            0
+        }
+        Some("setup-token") => {
+            say(&setup_token_waiting_frame(&setup_token_url()));
+            let _ = put(&dir.join(SETUP_TOKEN_WAITING), "1\n");
+            if !standin_waits_for(&dir.join(SETUP_TOKEN_GO)) {
+                return 1;
+            }
+            say(&setup_token_success_frame(&token, "1 year"));
+            // 2.1.318 exits by itself 500 ms after its success frame.
+            std::thread::sleep(Duration::from_millis(500));
+            0
+        }
+        _ => {
+            let descriptor = std::env::var(aterm_agent::harness::token_route::DESCRIPTOR_ENV)
+                .ok()
+                .and_then(|n| n.parse::<i32>().ok());
+            let marker = std::env::var(aterm_agent::harness::token_route::MARKER_ENV).ok();
+            let matched = descriptor.is_some_and(|fd| {
+                let mut buf = vec![0u8; 4096];
+                let n = crate::sys::peek_fd(fd, crate::sys::FdKind::Socket, &mut buf);
+                let line = buf[..n].split(|b| *b == b'\n').next().unwrap_or_default();
+                let matched = line == token.as_bytes();
+                buf.fill(0);
+                matched
+            });
+            let _ = put(
+                &dir.join(SETUP_TOKEN_SERVED),
+                &format!("{}\n", served_line(descriptor, matched, marker.as_deref())),
+            );
+            say(&format!(
+                "lab stand-in: served, the descriptor {} the token\n",
+                if matched { "held" } else { "did not hold" }
+            ));
+            if !standin_waits_for(&dir.join(SETUP_TOKEN_RELEASE)) {
+                return 1;
+            }
+            0
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "local_signins_tests.rs"]
 mod tests;

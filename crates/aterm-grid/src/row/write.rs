@@ -34,7 +34,9 @@ impl Row {
             }
         }
 
-        self.cells[col_usize].set_char(c);
+        if let Some(cell) = self.cells.get_mut(col_usize) {
+            cell.set_char(c);
+        }
         self.note_span(col, col + 1);
         self.note_write_through(col_usize + 1);
         self.settle_len_after_write(old_len, col_usize + 1, end_half_blanked);
@@ -167,11 +169,11 @@ impl Row {
     ) -> bool {
         let col = u16_from_usize(col_usize);
         if self.is_cell_wide_continuation(col) {
-            self.cells[col_usize - 1] = orphan;
+            self.cells.set(col_usize - 1, orphan);
             self.note_span(col - 1, col);
         }
         if current_flags.contains(CellFlags::WIDE) && col_usize + 1 < cells_len {
-            self.cells[col_usize + 1] = orphan;
+            self.cells.set(col_usize + 1, orphan);
             self.note_span(col + 1, col + 2);
             return orphan.is_empty();
         }
@@ -198,7 +200,7 @@ impl Row {
         let end = start.saturating_add(usize::from(count)).min(cells_len);
         let actual = end - start;
 
-        self.cells[start..end].fill(template);
+        self.cells.slice_mut(start..end).fill(template);
         self.note_cells_written(start, end);
         self.note_write_through(end);
 
@@ -225,7 +227,7 @@ impl Row {
         }
         let halves = self.orphaned_wide_halves(start_col, start_col.saturating_add(count));
         for col in halves.into_iter().flatten() {
-            self.cells[usize::from(col)] = orphan;
+            self.cells.set(usize::from(col), orphan);
             self.note_span(col, col + 1);
         }
         halves[1].is_some() && orphan.is_empty()
@@ -306,20 +308,7 @@ impl Row {
                 Cell::bce_blank(colors),
             );
 
-        let cp = c as u32;
-        let char_data = if cp <= Cell::MAX_DIRECT_CODEPOINT {
-            cp as u16
-        } else {
-            '\u{FFFD}' as u16
-        };
-
-        // SAFETY: Bounds already verified.
-        unsafe {
-            *self.cells.get_unchecked_mut(col_usize) =
-                Cell::from_raw_parts(char_data, colors, flags.union(CellFlags::WIDE));
-            *self.cells.get_unchecked_mut(col_usize + 1) =
-                Cell::from_raw_parts(' ' as u16, colors, flags.wide_continuation_of());
-        }
+        self.write_wide_run_packed_no_fixup(col, &[c], colors, |_| flags);
         self.note_span(col, col + 2);
 
         self.note_write_through(col_usize + 2);
@@ -328,47 +317,35 @@ impl Row {
         true
     }
 
-    /// Write a wide character without bounds checks or orphan fixup.
-    /// # Safety
-    ///
-    /// (a) `(col as usize) + 1 < self.cells_len()`: both `col` and `col + 1` are valid indices.
-    ///
-    /// (b) `col` is on a wide-cell boundary (sequential writes at `col, col+2, ...` on a freshly
-    ///     sized run); an odd offset inside an existing pair leaves a torn pair.
-    ///
-    /// (c) Writes are sequential and non-overlapping, so nothing in the row conflicts with the
-    ///     skipped orphan fixup.
+    /// Write `chars` as wide glyphs from `col` on, two cells each, without orphan fixup, each
+    /// with the flags `flags_of` gives it, noting the run's cells touched once (not a cell at a
+    /// time). The run starts on a wide-cell boundary (sequential glyphs at `col, col + 2, ...` on
+    /// a freshly sized span: an odd offset inside an existing pair leaves a torn pair), and
+    /// nothing in the row conflicts with the skipped fixup. Panics when the run passes the row's
+    /// end.
     ///
     /// The write leaves the row's written window alone: the run's
     /// [`Self::settle_len_after_wide_run`] widens it over the whole run once.
     #[inline]
-    pub unsafe fn write_wide_char_packed_no_fixup(
+    pub fn write_wide_run_packed_no_fixup(
         &mut self,
         col: u16,
-        c: char,
+        chars: &[char],
         colors: super::super::PackedColors,
-        flags: CellFlags,
+        flags_of: impl Fn(char) -> CellFlags,
     ) {
-        let col_usize = col as usize;
-        debug_assert!(
-            col_usize + 1 < self.cells.len(),
-            "write_wide_char_packed_no_fixup: col + 1 ({}) must be < cells.len() ({})",
-            col_usize + 1,
-            self.cells.len()
-        );
-        let cp = c as u32;
-        let char_data = if cp <= Cell::MAX_DIRECT_CODEPOINT {
-            cp as u16
-        } else {
-            '\u{FFFD}' as u16
-        };
-
-        // SAFETY: `col + 1 < self.cells.len()` is the caller's invariant (a).
-        unsafe {
-            *self.cells.get_unchecked_mut(col_usize) =
-                Cell::from_raw_parts(char_data, colors, flags.union(CellFlags::WIDE));
-            *self.cells.get_unchecked_mut(col_usize + 1) =
-                Cell::from_raw_parts(' ' as u16, colors, flags.wide_continuation_of());
+        let start = usize::from(col);
+        let run = self.cells.slice_mut(start..start + 2 * chars.len());
+        for (pair, &c) in run.as_chunks_mut::<2>().0.iter_mut().zip(chars) {
+            let cp = c as u32;
+            let char_data = if cp <= Cell::MAX_DIRECT_CODEPOINT {
+                cp as u16
+            } else {
+                '\u{FFFD}' as u16
+            };
+            let flags = flags_of(c);
+            pair[0] = Cell::from_raw_parts(char_data, colors, flags.union(CellFlags::WIDE));
+            pair[1] = Cell::from_raw_parts(' ' as u16, colors, flags.wide_continuation_of());
         }
     }
 
@@ -387,11 +364,11 @@ impl Row {
     ) -> bool {
         let col = u16_from_usize(col_usize);
         if self.is_cell_wide_continuation(col) {
-            self.cells[col_usize - 1] = orphan;
+            self.cells.set(col_usize - 1, orphan);
             self.note_span(col - 1, col);
         }
         if second_flags.contains(CellFlags::WIDE) && col_usize + 2 < cells_len {
-            self.cells[col_usize + 2] = orphan;
+            self.cells.set(col_usize + 2, orphan);
             self.note_span(col + 2, col + 3);
             return orphan.is_empty();
         }

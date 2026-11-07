@@ -368,6 +368,78 @@ fn the_writer_appends_without_blocking_and_says_what_it_lost() {
     );
 }
 
+/// A batch cut short after the window's gap line (a disk that filled mid-write) never has the
+/// line's rows said again: the next gap line says only the row the batch lost.
+#[test]
+fn a_batch_cut_short_after_its_gap_line_never_has_the_line_said_twice() {
+    use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+    const HANG: Duration = Duration::from_secs(60);
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path().join("telemetry");
+    let left = std::sync::Arc::new(AtomicU64::new(u64::MAX));
+    let log = Log::new(dir.clone(), Limits::DEFAULT, facts()).cut_after(left.clone());
+    let sink = Sink::start(log).expect("start");
+    sink.emit(row(1, Kind::Spawn, 1));
+    assert!(sink.flush(HANG), "the writer answers");
+    // Two rows the queue lost, then a batch the disk fills during, just past its gap line.
+    sink.counts().dropped.fetch_add(2, SeqCst);
+    let gap = row::gap_line(crate::now_ms(), 2).len() as u64;
+    left.store(gap + 10, SeqCst);
+    sink.emit(row(2, Kind::Spawn, 2));
+    assert!(sink.flush(HANG), "the writer answers");
+    left.store(u64::MAX, SeqCst);
+    sink.emit(row(3, Kind::Spawn, 3));
+    assert!(sink.flush(HANG), "the writer answers");
+    let read = log::read(&dir, 4, None).expect("read");
+    assert_eq!(
+        read.rows.iter().map(|r| r.at_ms).collect::<Vec<_>>(),
+        vec![1, 3]
+    );
+    assert_eq!(
+        (read.dropped, read.torn),
+        (3, 0),
+        "the two and the cut row, each said once, and none of the cut row left"
+    );
+    let counts = sink.counts();
+    assert_eq!(
+        (counts.written.load(SeqCst), counts.dropped.load(SeqCst)),
+        (2, 3)
+    );
+}
+
+/// A gap line cut only of its line feed would read as whole: the write is cut back, so the line
+/// the append reports unwritten is not in the log, and its rows are said once, by the next.
+#[test]
+fn a_gap_line_cut_before_its_line_feed_is_not_said_twice() {
+    use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+    const HANG: Duration = Duration::from_secs(60);
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path().join("telemetry");
+    let left = std::sync::Arc::new(AtomicU64::new(u64::MAX));
+    let log = Log::new(dir.clone(), Limits::DEFAULT, facts()).cut_after(left.clone());
+    let sink = Sink::start(log).expect("start");
+    sink.emit(row(1, Kind::Spawn, 1));
+    assert!(sink.flush(HANG), "the writer answers");
+    sink.counts().dropped.fetch_add(2, SeqCst);
+    let gap = row::gap_line(crate::now_ms(), 2).len() as u64;
+    left.store(gap - 1, SeqCst);
+    sink.emit(row(2, Kind::Spawn, 2));
+    assert!(sink.flush(HANG), "the writer answers");
+    left.store(u64::MAX, SeqCst);
+    sink.emit(row(3, Kind::Spawn, 3));
+    assert!(sink.flush(HANG), "the writer answers");
+    let read = log::read(&dir, 4, None).expect("read");
+    assert_eq!(
+        read.rows.iter().map(|r| r.at_ms).collect::<Vec<_>>(),
+        vec![1, 3]
+    );
+    assert_eq!(
+        (read.dropped, read.torn),
+        (3, 0),
+        "the two and the row behind the cut line, each said once"
+    );
+}
+
 #[test]
 fn a_stalled_writer_never_holds_up_an_emit_and_says_every_row_it_lost() {
     use std::sync::atomic::Ordering::Relaxed;

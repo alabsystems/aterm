@@ -11,8 +11,8 @@ use std::time::Duration;
 use super::accounts::{self, Class, Cli, Vendor};
 use crate::ai::connector::{Flow, Region, RowKeys};
 
-/// Vault-delivered account pool file in `~/.secrets/`.
-pub const AI_POOL_FILE: &str = "ai-pool.toml";
+/// Vault-delivered account pool file in `~/.secrets/` ([`aterm_secrets::entry_class::AI_POOL`]).
+pub const AI_POOL_FILE: &str = aterm_secrets::entry_class::AI_POOL;
 
 /// Maximum warm Macs per account in `ai-pool.toml` (`DESIGN-alab-swarm` §6.3).
 pub const MAX_WARM_SLOTS: usize = 3;
@@ -1382,7 +1382,7 @@ warm = ["m3"]
             account: Some("pool-a"),
             left: None,
             default_home: true,
-            stored_login: true,
+            route: crate::harness::accounts::AuthRoute::Stored,
         };
         assert_eq!(
             accounts::advise(

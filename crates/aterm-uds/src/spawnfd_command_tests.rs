@@ -84,6 +84,7 @@ fn resource_accounting_reaps_once_and_keeps_the_childs_status() {
         .recv_timeout(Duration::from_secs(60))
         .expect("child never reached its handshake");
     assert_eq!(child.try_wait_with_rusage().unwrap(), None);
+    assert_eq!(child.usage(), None, "no reap, no accounting");
     assert!(!child.exited().unwrap());
     child.stdin.as_mut().unwrap().write_all(b"x").unwrap();
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -102,6 +103,7 @@ fn resource_accounting_reaps_once_and_keeps_the_childs_status() {
     assert!(usage.cpu > Duration::ZERO, "{usage:?}");
     assert!(usage.user > Duration::ZERO, "{usage:?}");
     assert_eq!(usage.cpu, usage.user + usage.system);
+    assert_eq!(child.usage(), Some(usage), "the reap's accounting, kept");
     assert_eq!(child.try_wait_with_rusage().unwrap(), Some(usage));
     assert_eq!(child.wait_with_rusage().unwrap(), usage);
     assert_eq!(child.wait().unwrap(), usage.status);
@@ -110,6 +112,7 @@ fn resource_accounting_reaps_once_and_keeps_the_childs_status() {
 
     let mut ordinary = command("/bin/sh").args(["-c", "exit 3"]).spawn().unwrap();
     assert_eq!(ordinary.wait().unwrap().code(), Some(3));
+    assert_eq!(ordinary.usage(), None, "a plain reap collects none");
     assert!(
         ordinary.try_wait_with_rusage().is_err(),
         "a consumed status has no recoverable accounting"

@@ -59,6 +59,7 @@ pub(super) fn fixture() -> HarnessState {
             need: None,
             hold: None,
             receipt: None,
+            token: None,
         }],
         stats: HarnessStatsSlot {
             report: Some(std::sync::Arc::new(HarnessStatsReport::new(

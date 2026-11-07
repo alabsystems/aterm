@@ -51,6 +51,7 @@ fn pair() -> (Prepare, Prepare) {
         cwd: Some(at!("/model/project").into()),
         heal: None,
         dialect: Dialect::Zsh,
+        settles: None,
         account_intent: Some(stored(Some(at!("/model/old")), "34")),
     };
     let old = Prepare {

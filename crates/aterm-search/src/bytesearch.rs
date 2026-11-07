@@ -12,6 +12,11 @@ std::thread_local! {
     static FACTORIZATIONS: Cell<usize> = const { Cell::new(0) };
 }
 
+#[cfg(test)]
+pub(crate) fn factorizations() -> usize {
+    FACTORIZATIONS.with(Cell::get)
+}
+
 const WORD: usize = core::mem::size_of::<usize>();
 const UNROLL: usize = 8;
 const BLOCK: usize = WORD * UNROLL;
@@ -613,23 +618,48 @@ impl NeedlePlan {
 
 /// An immutable owned query and its preparation, shared by successive row searches.
 pub(crate) struct OwnedSearcher {
-    needle: Box<[u8]>,
+    needle: String,
+    /// Exact-byte facts, including the raw byte chosen for skipping.
     plan: NeedlePlan,
+    /// ASCII folding can change both the skip byte and the query's period.
+    ascii_plan: NeedlePlan,
 }
 
 impl OwnedSearcher {
     pub(crate) fn new(query: &str) -> Self {
-        Self {
-            needle: query.as_bytes().into(),
-            plan: NeedlePlan::new(),
-        }
+        query.to_owned().into()
     }
 
     pub(crate) fn searcher(&self) -> Searcher<'_> {
         Searcher {
-            needle: &self.needle,
+            needle: self.needle.as_bytes(),
             plan: Cow::Borrowed(&self.plan),
         }
+    }
+
+    pub(crate) fn searcher_ascii(&self) -> Searcher<'_, true> {
+        Searcher {
+            needle: self.needle.as_bytes(),
+            plan: Cow::Borrowed(&self.ascii_plan),
+        }
+    }
+}
+
+impl From<String> for OwnedSearcher {
+    fn from(needle: String) -> Self {
+        Self {
+            needle,
+            plan: NeedlePlan::new(),
+            ascii_plan: NeedlePlan::new(),
+        }
+    }
+}
+
+impl std::ops::Deref for OwnedSearcher {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.needle
     }
 }
 
@@ -641,6 +671,7 @@ impl<'n> Searcher<'n> {
     }
 }
 
+#[cfg(test)]
 impl<'n> Searcher<'n, true> {
     /// Prepare an ASCII case-insensitive byte needle without copying it.
     #[inline]
@@ -774,6 +805,64 @@ impl<'n, const FOLD: bool> Searcher<'n, FOLD> {
 #[cfg(test)]
 mod tests {
     use super::{Searcher, memchr};
+
+    #[test]
+    fn owned_query_keeps_ascii_and_exact_preparation_separate() {
+        use super::{OwnedSearcher, factorizations};
+        for query in ["AaBa", "aABaba", "AaAaAa", "ΣσAa"] {
+            let owned = OwnedSearcher::new(query);
+            let row = format!(
+                "é{query}y{}z{}",
+                query.to_ascii_lowercase(),
+                query.to_ascii_uppercase()
+            );
+            let exact: Vec<_> = row
+                .as_bytes()
+                .windows(query.len())
+                .enumerate()
+                .filter_map(|(i, bytes)| (bytes == query.as_bytes()).then_some(i))
+                .collect();
+            let folded: Vec<_> = row
+                .as_bytes()
+                .windows(query.len())
+                .enumerate()
+                .filter_map(|(i, bytes)| bytes.eq_ignore_ascii_case(query.as_bytes()).then_some(i))
+                .collect();
+            let before = factorizations();
+            for _ in 0..128 {
+                assert_eq!(
+                    owned
+                        .searcher()
+                        .matches_in::<false>(row.as_bytes())
+                        .collect::<Vec<_>>(),
+                    exact
+                );
+                assert_eq!(
+                    owned
+                        .searcher_ascii()
+                        .matches_in::<false>(row.as_bytes())
+                        .collect::<Vec<_>>(),
+                    folded
+                );
+                assert_eq!(
+                    owned
+                        .searcher()
+                        .matches_in::<true>(row.as_bytes())
+                        .collect::<Vec<_>>(),
+                    exact.iter().copied().rev().collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    owned
+                        .searcher_ascii()
+                        .matches_in::<true>(row.as_bytes())
+                        .collect::<Vec<_>>(),
+                    folded.iter().copied().rev().collect::<Vec<_>>()
+                );
+            }
+            let prepared = factorizations() - before;
+            assert!(prepared <= 4, "prepared {prepared} times for one query");
+        }
+    }
 
     #[test]
     fn owned_query_preparation_is_shared_across_rows_and_directions() {

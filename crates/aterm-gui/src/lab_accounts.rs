@@ -24,6 +24,9 @@ pub(crate) struct LabAccounts {
 pub(crate) struct LabAccount {
     pub label: String,
     pub facts: Vec<(String, String)>,
+    /// The quiet offer's one step for its vault token, where one stands
+    /// (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.9).
+    pub offer: Option<crate::token_shown::TokenOffer>,
 }
 
 /// Read only the consistent local metadata snapshot. An admitted interrupted publication
@@ -40,12 +43,37 @@ pub(crate) fn collect(config: &Path, now_ms: u64) -> LabAccounts {
     match store.read_account_records(Some(&roster), now) {
         // What the journal holds now, never waited on: the first ask starts its read, and a later
         // collection shows it.
-        Ok(records) => project_with(
-            &records,
-            aterm_agent::harness::alab_seen::current(false).as_deref(),
-            now_ms,
-        ),
+        Ok(records) => {
+            let mut lab = project_with(
+                &records,
+                aterm_agent::harness::alab_seen::current(false).as_deref(),
+                now_ms,
+            );
+            // The token facts the window last read, read now where a minute has passed (§5.9).
+            crate::token_shown::refresh(now);
+            with_tokens(&mut lab, crate::token_shown::shown().as_deref());
+            lab
+        }
         Err(_) => unavailable("Local account records could not be read consistently"),
+    }
+}
+
+/// Each row's vault token, value-free, and the quiet offer's step where one stands; nothing
+/// before the window's first read.
+pub(crate) fn with_tokens(lab: &mut LabAccounts, tokens: Option<&crate::token_shown::Tokens>) {
+    let Some(tokens) = tokens else {
+        return;
+    };
+    for row in &mut lab.rows {
+        let Some(token) = tokens.of(Some(&row.label), None) else {
+            continue;
+        };
+        row.facts.push(("Vault token".into(), token.words.clone()));
+        if let Some(offer) = &token.offer {
+            row.facts
+                .push(("Vault token offer".into(), offer.line.clone()));
+        }
+        row.offer.clone_from(&token.offer);
     }
 }
 
@@ -252,7 +280,7 @@ fn project_with(
         }) {
             journal_facts(found, now, &mut facts);
         }
-        LabAccount { label: row.label.clone(), facts }
+        LabAccount { label: row.label.clone(), facts, offer: None }
     }).collect();
     let status = if rows.is_empty() {
         "No configured Claude account rows; a default login may be unlisted".into()

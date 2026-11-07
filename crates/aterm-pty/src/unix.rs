@@ -1424,18 +1424,44 @@ fn ensure_above_stdio(fd: &mut libc::c_int) -> io::Result<()> {
 /// (`ETXTBSY` once `spawn_past_text_busy` has stopped trying).
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn spawn_session_leader_on_pty(
+    build: impl FnMut(&std::os::fd::OwnedFd) -> io::Result<aterm_uds::spawnfd::StdCommand>,
+) -> io::Result<(
+    std::os::fd::OwnedFd,
+    std::os::fd::OwnedFd,
+    std::process::Child,
+)> {
+    spawn_session_leader_on_pty_sized(24, 80, build)
+}
+
+/// [`spawn_session_leader_on_pty`] on a pty whose window is `rows` by `cols` from before the
+/// fork, so the child's first read of its size (and every line it lays out to it) sees that
+/// size: the setup-token capture's 25 by 512, on which no token line wraps.
+///
+/// # Errors
+/// As [`spawn_session_leader_on_pty`]'s.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn spawn_session_leader_on_pty_sized(
+    rows: u16,
+    cols: u16,
     mut build: impl FnMut(&std::os::fd::OwnedFd) -> io::Result<aterm_uds::spawnfd::StdCommand>,
 ) -> io::Result<(
     std::os::fd::OwnedFd,
     std::os::fd::OwnedFd,
     std::process::Child,
 )> {
-    aterm_uds::spawnfd::spawn_past_text_busy(|| spawn_session_leader_on_fresh_pty(&mut build))
+    let ws = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    aterm_uds::spawnfd::spawn_past_text_busy(|| spawn_session_leader_on_fresh_pty(&ws, &mut build))
 }
 
-/// One try of [`spawn_session_leader_on_pty`], on a pty of its own.
+/// One try of [`spawn_session_leader_on_pty_sized`], on a pty of its own whose window is `ws`.
 #[cfg_attr(trust_verify, trust::skip)]
 fn spawn_session_leader_on_fresh_pty(
+    ws: &libc::winsize,
     build: &mut impl FnMut(&std::os::fd::OwnedFd) -> io::Result<aterm_uds::spawnfd::StdCommand>,
 ) -> io::Result<(
     std::os::fd::OwnedFd,
@@ -1446,17 +1472,11 @@ fn spawn_session_leader_on_fresh_pty(
     use std::os::fd::{FromRawFd as _, OwnedFd};
     use std::os::unix::process::CommandExt as _;
 
-    let ws = libc::winsize {
-        ws_row: 24,
-        ws_col: 80,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    let mut kit = fresh_kit(&ws)?;
+    let mut kit = fresh_kit(ws)?;
     let mut deaths: Vec<String> = Vec::new();
     loop {
         if let Some(died_of) = dead_pty(kit.master, kit.slave) {
-            let dead = std::mem::replace(&mut kit, replace_dead_pty(&mut deaths, died_of, &ws)?);
+            let dead = std::mem::replace(&mut kit, replace_dead_pty(&mut deaths, died_of, ws)?);
             drop(dead);
             continue;
         }
@@ -1473,7 +1493,7 @@ fn spawn_session_leader_on_fresh_pty(
             Err(err) => match dead_pty(kit.master, kit.slave) {
                 Some(died_of) => {
                     let dead =
-                        std::mem::replace(&mut kit, replace_dead_pty(&mut deaths, died_of, &ws)?);
+                        std::mem::replace(&mut kit, replace_dead_pty(&mut deaths, died_of, ws)?);
                     drop(dead);
                     continue;
                 }
@@ -1550,8 +1570,7 @@ fn spawn_session_leader_on_fresh_pty(
                     _ => return Err(spawn_err),
                 };
                 let died_of = format!("{}: {how} ({spawn_err})", pty_label(kit.master));
-                let dead =
-                    std::mem::replace(&mut kit, replace_dead_pty(&mut deaths, died_of, &ws)?);
+                let dead = std::mem::replace(&mut kit, replace_dead_pty(&mut deaths, died_of, ws)?);
                 drop(dead);
             }
         }

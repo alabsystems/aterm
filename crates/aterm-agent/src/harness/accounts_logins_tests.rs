@@ -733,7 +733,7 @@ fn a_bound_roster_reads_the_renewed_login_and_the_superseded_one_byte_for_byte()
     let who = |login: Option<&str>| ProcessLogin {
         login: login.map(str::to_owned),
         default_home: true,
-        stored_login: true,
+        route: crate::harness::accounts::AuthRoute::Stored,
     };
     let on = |login: Option<&str>| {
         let me = who(login).me(&b);
@@ -786,7 +786,7 @@ fn a_superseded_logins_usage_is_recorded_for_its_rows_account() {
     let on = |login: &str| ProcessLogin {
         login: Some(login.to_owned()),
         default_home: true,
-        stored_login: true,
+        route: crate::harness::accounts::AuthRoute::Stored,
     };
     let said = UsageSaid {
         at: NOW - 60,
@@ -906,7 +906,7 @@ fn the_default_login_stays_the_own_rows_past_every_renewal() {
         ProcessLogin {
             login: login.map(str::to_owned),
             default_home: true,
-            stored_login: true,
+            route: crate::harness::accounts::AuthRoute::Stored,
         }
         .me(&b)
         .left
@@ -938,7 +938,7 @@ fn a_login_end_is_advised_the_sessions_own_label_and_never_another() {
         account: Some("main"),
         left: None,
         default_home: true,
-        stored_login: true,
+        route: crate::harness::accounts::AuthRoute::Stored,
     };
     let advise_at = |roster: &Roster, state: &State, me: &Me<'_>, point: &Point, mode: Mode| {
         advise(roster, state, &enrolled, me, point, mode, NOW)
@@ -981,7 +981,7 @@ fn a_login_end_is_advised_the_sessions_own_label_and_never_another() {
     let left = ProcessLogin {
         login: None,
         default_home: true,
-        stored_login: true,
+        route: crate::harness::accounts::AuthRoute::Stored,
     };
     let me = left.me(&b);
     assert_eq!((me.account, me.left), (None, Some("main")));
@@ -1015,7 +1015,7 @@ fn a_login_end_is_advised_the_sessions_own_label_and_never_another() {
         Advice::Stay(StayWhy::NothingDue)
     );
     let keyed = Me {
-        stored_login: false,
+        route: crate::harness::accounts::AuthRoute::Outside,
         ..me
     };
     assert_eq!(
@@ -1058,7 +1058,7 @@ fn a_renewal_made_under_a_wall_is_followed_at_once() {
         let on_old = ProcessLogin {
             login: None,
             default_home: true,
-            stored_login: true,
+            route: crate::harness::accounts::AuthRoute::Stored,
         };
         let me = on_old.me(&b);
         assert_eq!((me.account, me.left), (None, Some("main")));
@@ -1091,7 +1091,7 @@ fn a_renewal_made_under_a_wall_is_followed_at_once() {
             account: Some("main"),
             left: None,
             default_home: true,
-            stored_login: true,
+            route: crate::harness::accounts::AuthRoute::Stored,
         };
         assert_eq!(
             advise(

@@ -2,14 +2,15 @@
 // Copyright 2026 Andrew Yates
 
 //! Authenticated, locally applied entries. An observation of bytes is never a
-//! grant to use them as a provider login or to spend an account's budget.
+//! grant to use them as a provider login or to spend an account's budget, with one exception:
+//! the typed read of a Claude Code token ([`read_claude_token_until`], `crate::claude_token`),
+//! which the owner sanctioned on 2026-11-05 as Claude Code's headless login
+//! (`docs/DESIGN-claude-setup-token-2026-11-05.md` §4.2). Only that read returns a token class
+//! value; every other reading refuses the class.
 
 use super::*;
 
-const PUBLIC_ROSTER_NAMES: [&str; 2] = [
-    "~/.aterm/release-ring/roster/aterm-machines.toml",
-    "~/.aterm/release-ring/roster/aterm-machines.toml.sig",
-];
+const PUBLIC_ROSTER_NAMES: [&str; 2] = crate::entry_class::PUBLIC_ROSTER;
 
 /// Public release-roster bytes observed together in the authenticated, locally applied vault.
 /// The caller must verify the release master signature and apply its roster authority policy.
@@ -495,6 +496,14 @@ impl EntrySnapshot {
         project = "aterm_secrets::client::entry::tests::entry_transition"
     )
 )]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbVerifiedEntry",
+        action = "ClaudeTokenMaterialized",
+        project = "aterm_secrets::client::entry::tests::entry_transition"
+    )
+)]
 pub fn read_verified_entry(
     paths: &Paths,
     expected: &Config,
@@ -556,15 +565,6 @@ pub(super) fn read_publication_material(
     Ok(read_entry(paths, expected, name, Reading::PublicationMaterial)?.map(|(entry, _)| entry))
 }
 
-fn signing_material_name(name: &str) -> bool {
-    name.strip_prefix(super::release::APPLE_PREFIX)
-        .and_then(|leaf| {
-            leaf.strip_suffix(".cer")
-                .or_else(|| leaf.strip_suffix(".key"))
-        })
-        .is_some_and(|stem| !stem.is_empty() && !stem.contains(['/', '\\']))
-}
-
 pub(crate) fn read_reserved_entry(
     paths: &Paths,
     expected: &Config,
@@ -596,6 +596,108 @@ pub(crate) fn read_reserved_entry_and_admin(
     read_entry(paths, expected, name, Reading::ReservedAndAdmin)
 }
 
+/// What one typed read of Claude Code token entries saw, under one observation of this Mac's
+/// applied vault ([`read_claude_token_until`]): each value as the log decodes it (opened from its
+/// inner seal where this Mac holds the sealing epoch, `membership_log::entries::inner`), the
+/// trusted log the read opened, and this Mac's identity.
+pub(crate) struct ClaudeTokenSnapshot {
+    /// Each name's value, in the order asked, where the vault holds one.
+    pub(crate) values: Vec<Option<SecretBytes>>,
+    /// The trusted membership log the values came from.
+    pub(crate) log: crate::membership_log::Log,
+    /// This Mac's identity, which opened them.
+    pub(crate) identity: Identity,
+}
+
+/// Read Claude Code token entries (`names`, each of the class,
+/// [`crate::entry_class::claude_token`]) through [`Reading::ClaudeToken`], under one shared state
+/// guard, waiting for a writer holding the vault state only until `deadline`. With no names it
+/// authenticates the snapshot alone (by the reserved read of the swarm roster, which every
+/// member may make) and hands out its log, for a listing. `None` where the state is busy past the
+/// deadline, unconfigured, unsigned, revoked, failed or mid-apply (`State.pending`), where this
+/// Mac reads no trusted log, or where two reads saw different snapshots: as every reader, it
+/// serves nothing from a state it cannot authenticate. An absent entry is a snapshot with that
+/// value `None`. It fetches no source and changes no state.
+///
+/// # Errors
+/// A name is not of the class, or local state cannot be read.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "DbVerifiedEntry",
+        action = "ClaudeToken",
+        project = "aterm_secrets::client::entry::tests::entry_transition"
+    )
+)]
+pub(crate) fn read_claude_token_until(
+    paths: &Paths,
+    names: &[&str],
+    deadline: Instant,
+) -> crate::Result<Option<ClaudeTokenSnapshot>> {
+    if !names
+        .iter()
+        .all(|name| crate::entry_class::claude_token(name))
+    {
+        return Err(Error::new("not a Claude Code token entry name"));
+    }
+    let Some(expected) = config(paths)? else {
+        return Ok(None);
+    };
+    if expected.signer.is_none() {
+        return Ok(None);
+    }
+    let Some(observation) = StateLock::observe_until(paths, deadline)? else {
+        return Ok(None);
+    };
+    let reads: Vec<(&str, Reading)> = if names.is_empty() {
+        vec![(crate::SWARM_ROSTER_ENTRY, Reading::Reserved)]
+    } else {
+        names
+            .iter()
+            .map(|name| (*name, Reading::ClaudeToken))
+            .collect()
+    };
+    let mut seen: Option<(EntryVersion, crate::membership_log::Log)> = None;
+    let mut values = Vec::with_capacity(names.len());
+    for (name, reading) in reads {
+        let (mut version, mut log) = (None, None);
+        let value = read_entry_held(
+            paths,
+            &expected,
+            name,
+            reading,
+            &mut version,
+            &observation,
+            &mut log,
+        )?
+        .map(|(entry, _)| entry.value);
+        let (Some(version), Some(log)) = (version, log) else {
+            return Ok(None);
+        };
+        if let Some((first, _)) = &seen
+            && (first.config != version.config
+                || first.recipient != version.recipient
+                || first.seq != version.seq
+                || first.envelope != version.envelope
+                || first.log_ids != version.log_ids)
+        {
+            return Ok(None);
+        }
+        seen.get_or_insert((version, log));
+        if matches!(reading, Reading::ClaudeToken) {
+            values.push(value);
+        }
+    }
+    let (Some((_, log)), Some(identity)) = (seen, read_identity(paths)?) else {
+        return Ok(None);
+    };
+    Ok(Some(ClaudeTokenSnapshot {
+        values,
+        log,
+        identity,
+    }))
+}
+
 #[derive(Clone, Copy)]
 enum Reading {
     Materialized,
@@ -604,6 +706,9 @@ enum Reading {
     Reserved,
     ReservedAndAdmin,
     PublicRoster,
+    /// The typed read of a Claude Code token entry ([`read_claude_token_until`]): only a class
+    /// name, read from the trusted log in place, never from a file.
+    ClaudeToken,
 }
 
 fn holds_admin_locker(
@@ -650,10 +755,12 @@ fn read_entry_with_version(
     );
     let valid = if matches!(reading, Reading::PublicRoster) {
         PUBLIC_ROSTER_NAMES.contains(&name)
+    } else if matches!(reading, Reading::ClaudeToken) {
+        crate::entry_class::claude_token(name)
     } else if matches!(reading, Reading::SigningMaterial) {
-        text::valid_entry_name(name) && signing_material_name(name)
+        text::valid_entry_name(name) && crate::entry_class::signing_material(name)
     } else if matches!(reading, Reading::PublicationMaterial) {
-        matches!(name, "gh_access_token" | "gh_access_token_alabsystems")
+        name == "gh_access_token" || name == crate::entry_class::RELEASE_GH_TOKEN
     } else if materialized {
         text::valid_entry_name(name) && !crate::reserved_name(name)
     } else {
@@ -686,8 +793,33 @@ fn read_entry_with_version_held(
     name: &str,
     reading: Reading,
     version: &mut Option<EntryVersion>,
-    _observation: &StateLock,
+    observation: &StateLock,
 ) -> crate::Result<Option<(VerifiedEntry, bool)>> {
+    read_entry_held(
+        paths,
+        expected,
+        name,
+        reading,
+        version,
+        observation,
+        &mut None,
+    )
+}
+
+/// [`read_entry_with_version_held`], also handing out in `trusted` the trusted membership log the
+/// read opened, wherever it sets `version`.
+fn read_entry_held(
+    paths: &Paths,
+    expected: &Config,
+    name: &str,
+    reading: Reading,
+    version: &mut Option<EntryVersion>,
+    _observation: &StateLock,
+    trusted: &mut Option<crate::membership_log::Log>,
+) -> crate::Result<Option<(VerifiedEntry, bool)>> {
+    if matches!(reading, Reading::ClaudeToken) != crate::entry_class::claude_token(name) {
+        return Err(Error::new("invalid or reserved secret entry name"));
+    }
     let materialized = matches!(
         reading,
         Reading::Materialized | Reading::SigningMaterial | Reading::PublicationMaterial
@@ -814,6 +946,7 @@ fn read_entry_with_version_held(
     let log_ids = trusted_log
         .as_ref()
         .map(|log| std::sync::Arc::new(log.records().map(|record| *record.id()).collect()));
+    *trusted = trusted_log;
     *version = Some(EntryVersion {
         config: config.clone(),
         name: name.into(),

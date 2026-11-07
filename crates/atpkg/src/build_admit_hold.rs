@@ -29,7 +29,8 @@
 //!
 //! At the build's end: an exit lets the claim go at once ([`super::Held::let_go`], before the
 //! meter's last read), its peak then kept as the front's would have been ([`super::Ended::keep`]:
-//! the meter's peak, with no reaped-children floor, which a non-parent cannot read). A death by a signal keeps it while the build's SURVIVORS still work
+//! the meter's peak, with no floor of the build's own peak, which only the process that reaps it
+//! reads: `wait4`'s accounting). A death by a signal keeps it while the build's SURVIVORS still work
 //! (the compilers a killed `cargo` leaves running, `TreeMeter::survivors_using`), crediting them
 //! with their use (`Claim::credit`), and lets it go ([`Survival`]) once none is left, once they
 //! hold less than [`SURVIVORS_IDLE_UNDER`] together (a shell, a sleeper, a server waiting: no

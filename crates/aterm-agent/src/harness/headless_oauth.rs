@@ -56,10 +56,11 @@ pub const WEBMAIL_PASS_ENV: &str = "ATERM_OPEN_URL_WEBMAIL_PASS";
 pub const TOTP_SECRET_ENV: &str = "ATERM_OPEN_URL_TOTP_SECRET";
 
 /// File name for mailbox configuration under `<accounts store>` or `~/.config/aterm/`.
-pub const MAILBOX_TOML_FILE: &str = "mailbox.toml";
+pub const MAILBOX_TOML_FILE: &str = aterm_secrets::entry_class::MAILBOX;
 
-/// File name for mailbox configuration under `~/.secrets/`.
-pub const SECRETS_MAILBOX_TOML_FILE: &str = "ai-mailbox.toml";
+/// File name for mailbox configuration under `~/.secrets/`
+/// ([`aterm_secrets::entry_class::AI_MAILBOX`]).
+pub const SECRETS_MAILBOX_TOML_FILE: &str = aterm_secrets::entry_class::AI_MAILBOX;
 
 /// Subdirectory under the accounts store holding persistent per-account browser profiles.
 pub const BROWSER_PROFILES_DIR: &str = "browsers";
@@ -1439,7 +1440,7 @@ pub fn mailbox_scope_environment() {}
 /// (`ai-accounts.csv`, `ai-accounts-<cli>.toml`): fleet data, never a mailbox fragment, whatever
 /// machine or account its name happens to carry.
 fn is_fleet_roster_name(lower: &str) -> bool {
-    lower == "ai-accounts.csv" || lower.starts_with("ai-accounts-")
+    lower == aterm_secrets::entry_class::AI_ACCOUNTS_CSV || lower.starts_with("ai-accounts-")
 }
 
 fn is_machine_account_label(key: &str) -> bool {

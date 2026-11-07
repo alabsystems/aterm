@@ -366,7 +366,8 @@ impl Front {
 
     /// WAIT FOR the build to end and reap it: its exit is seen first with the build left
     /// unreaped (`waitid` with `WNOWAIT`), then nothing more is sent to its pid, and only then is
-    /// it reaped, so the pid this front signals cannot be another process's.
+    /// it reaped, with its accounting ([`super::reap_accounted`]: the build's own resident peak),
+    /// so the pid this front signals cannot be another process's.
     ///
     /// # Errors
     /// The reap's.
@@ -379,7 +380,7 @@ impl Front {
         // still holds custody rather than interpreting the error as completion.
         let _ = child.wait_exited();
         self.reaped();
-        child.wait()
+        super::reap_accounted(child)
     }
 
     /// A stop acknowledgement can race an exit. Hold arriving signals while the

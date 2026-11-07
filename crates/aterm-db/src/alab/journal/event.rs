@@ -61,6 +61,15 @@ words!(
         Enrolled = "enrolled",
         Unenrolled = "unenrolled",
         Probe = "probe",
+        // A Claude Code setup-token's life on this Mac (DESIGN-claude-setup-token §4.6, §5.6,
+        // §5.9): value-free, the account key alone naming it.
+        TokenMinted = "token-minted",
+        TokenServed = "token-served",
+        TokenVerified = "token-verified",
+        TokenRejected = "token-rejected",
+        TokenFallback = "token-fallback",
+        TokenOffered = "token-offered",
+        TokenRemoved = "token-removed",
     }
 );
 

@@ -782,6 +782,8 @@ fn each_level_emits_exactly_its_fields() {
         "usage_5h_pct",
         "usage_7d_pct",
         "account",
+        "auth",
+        "token",
         "detail",
         "doing",
         "role",
@@ -1664,6 +1666,7 @@ fn an_instance_lists_its_account_rows_and_each_session_its_account() {
         last_used: None,
         read_at: None,
         launch: None,
+        token: None,
     };
     let store = crate::session_store::new_store();
     let claude = crate::session_store::test_handle(5);
@@ -1893,6 +1896,7 @@ fn survey_rows_emits_c16_facts_and_round_trips_with_drive_isolation() {
             last_used: Some(1_793_159_000),
             read_at: None,
             launch: None,
+            token: None,
         }],
         accounts_unread: Vec::new(),
         session_accounts: std::collections::BTreeMap::new(),

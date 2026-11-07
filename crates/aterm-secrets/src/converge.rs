@@ -20,6 +20,11 @@ use aterm_uds::spawnfd::{Child, Command, Stdio};
 use std::net::IpAddr;
 use std::path::Path;
 
+mod refresh;
+pub use refresh::{
+    RefreshObservation, RefreshRequest, RefreshScope, RefreshVersion, RepositoryRequest,
+};
+
 /// The exit status a runner ends with while another pass holds the pass's lock: it did not run.
 pub const HELD: u8 = 75;
 
@@ -80,16 +85,20 @@ pub const LONGEST_RETRY_MS: u64 = 5 * 60 * 1000;
 /// Responsibility is never disclaimed: the runner's privacy-gated acts stay the starting app's.
 #[must_use]
 pub fn runner(exe: &Path, trigger: &str, work: RepositoryWork) -> Command {
+    runner_argument(exe, trigger, "--repository-work", work.word())
+}
+
+/// A runner carrying one retained shared refresh request, including its original boundary.
+#[must_use]
+pub fn runner_requested(exe: &Path, trigger: &str, request: RepositoryRequest) -> Command {
+    let encoded = aterm_json::to_string(&request).expect("repository request serializes");
+    runner_argument(exe, trigger, "--repository-request", &encoded)
+}
+
+fn runner_argument(exe: &Path, trigger: &str, argument: &str, value: &str) -> Command {
     let mut command = aterm_uds::spawnfd::command(exe);
     command
-        .args([
-            "init",
-            "--converge",
-            "--trigger",
-            trigger,
-            "--repository-work",
-            work.word(),
-        ])
+        .args(["init", "--converge", "--trigger", trigger, argument, value])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -105,6 +114,18 @@ pub fn runner(exe: &Path, trigger: &str, work: RepositoryWork) -> Command {
 /// The runner could not be started.
 pub fn start(exe: &Path, trigger: &str, work: RepositoryWork) -> std::io::Result<Child> {
     runner(exe, trigger, work).spawn()
+}
+
+/// Start a runner with one already captured request boundary.
+///
+/// # Errors
+/// The runner could not be started.
+pub fn start_requested(
+    exe: &Path,
+    trigger: &str,
+    request: RepositoryRequest,
+) -> std::io::Result<Child> {
+    runner_requested(exe, trigger, request).spawn()
 }
 
 /// This Mac's routes as the subscriber compares them (`crate::server::route_sources`).
@@ -203,24 +224,44 @@ impl RunnerRetry {
 /// bounded backoff; every time here is elapsed milliseconds on the subscriber's monotonic clock.
 #[derive(Debug, Default)]
 pub struct Due {
-    /// When the last Refresh runner started, and the routes then. Repair attempts
-    /// never postpone the ordinary remote refresh.
-    started: Option<(u64, Routes)>,
+    /// The last refresh boundary's local start and remaining wait. A shared
+    /// acknowledgment preserves its actual remaining time; repairs never postpone it.
+    started: Option<(u64, u64)>,
+    /// Routes already observed, including a request queued while the lane was held.
+    routes: Option<Routes>,
     /// A start came due while the last runner ran, or the last one found the lock held.
-    pending: Option<RepositoryWork>,
+    pending: Option<RepositoryRequest>,
     /// The last chosen run, retained until its terminal result and used by the starter.
-    repository_work: RepositoryWork,
+    repository_request: RepositoryRequest,
     /// Failed work waits for RunnerRetry, unless new work starts a stronger combined run.
-    retry_work: Option<RepositoryWork>,
+    retry_request: Option<RepositoryRequest>,
+    /// One shared receipt sample, read before the corresponding local-input observation.
+    observed: RefreshObservation,
     /// A pass failed since the last healthy one ([`Due::failed`]).
     failing: bool,
     retry: RunnerRetry,
 }
 
 impl Due {
+    /// Supply the same receipt facts used to bind this round's input transition.
+    pub fn observe(&mut self, observed: RefreshObservation) {
+        self.observed = observed;
+    }
+
+    /// Retain a request while the owned runner or a shared retry still holds the lane.
+    pub(crate) fn request(&mut self, request: RepositoryRequest) {
+        self.pending = merge_requests(self.pending, Some(request));
+    }
+
     /// Service the same job while another subscriber lane is waiting on HTTP.
     pub(crate) fn poll(&mut self, now_ms: u64, routes: Routes, last: Last) -> bool {
         self.start(None, now_ms, routes, last)
+    }
+
+    /// Keep custody and capture event boundaries while the LAN prevents a start.
+    pub(crate) fn hold(&mut self, now_ms: u64, routes: Routes, last: Last) {
+        self.reaped(last, now_ms);
+        self.refresh_due(now_ms, routes);
     }
 
     /// Verified local member admission may have delivered work independently of HTTP.
@@ -231,13 +272,38 @@ impl Due {
         routes: Routes,
         last: Last,
     ) -> bool {
-        self.start(Some(work), now_ms, routes, last)
+        let request = match work {
+            RepositoryWork::Repair => RepositoryRequest::Repair,
+            RepositoryWork::Refresh => {
+                RepositoryRequest::Refresh(RefreshRequest::after(None, self.observed.version))
+            }
+        };
+        self.after_request(request, now_ms, routes, last)
+    }
+
+    /// Service one input transition with the same pacing and child custody as other triggers.
+    pub(crate) fn after_request(
+        &mut self,
+        request: RepositoryRequest,
+        now_ms: u64,
+        routes: Routes,
+        last: Last,
+    ) -> bool {
+        self.start(Some(request), now_ms, routes, last)
     }
 
     /// Whether the subscriber starts a runner as it starts: always, unless one it started still
     /// runs (none can yet), at `now_ms` with `routes`.
     pub fn at_start(&mut self, now_ms: u64, routes: Routes, last: Last) -> bool {
-        self.start(Some(RepositoryWork::Refresh), now_ms, routes, last)
+        self.start(
+            Some(RepositoryRequest::Refresh(RefreshRequest::ensure(
+                None,
+                self.observed.version,
+            ))),
+            now_ms,
+            routes,
+            last,
+        )
     }
 
     /// Whether the subscriber starts a runner after a healthy pass that ended with `outcome`, at
@@ -252,7 +318,7 @@ impl Due {
         let applied = matches!(outcome, SyncOutcome::Applied { .. });
         let back = std::mem::take(&mut self.failing);
         self.start(
-            (applied || back).then_some(RepositoryWork::Repair),
+            (applied || back).then_some(RepositoryRequest::Repair),
             now_ms,
             routes,
             last,
@@ -270,7 +336,7 @@ impl Due {
     ) -> bool {
         self.failed();
         self.start(
-            matches!(outcome, SyncOutcome::Applied { .. }).then_some(RepositoryWork::Repair),
+            matches!(outcome, SyncOutcome::Applied { .. }).then_some(RepositoryRequest::Repair),
             now_ms,
             routes,
             last,
@@ -286,23 +352,36 @@ impl Due {
     /// completion ends its failure streak; a held lock stays owed without consuming backoff.
     /// A Repair that ran beside deferred Refresh debt cannot retire or reschedule that debt.
     pub fn reaped(&mut self, last: Last, now_ms: u64) {
-        if self.repository_work == RepositoryWork::Repair
-            && self.retry_work == Some(RepositoryWork::Refresh)
+        if self.repository_work() == RepositoryWork::Repair
+            && self
+                .retry_request
+                .is_some_and(|request| request.work() == RepositoryWork::Refresh)
         {
-            if last == Last::Held {
-                self.pending = self.pending.max(Some(RepositoryWork::Repair));
-            }
+            // The stronger retained refresh includes acquisition/repair. A held
+            // repair cannot create an immediate queue or spend that retry budget.
             return;
         }
-        self.retry.reaped(last, now_ms);
+        // A started job already took its captured work from the queues. A later
+        // success cannot clear retry work that arrived while that job ran.
+        if last != Last::Ended || self.retry_request.is_none() {
+            self.retry.reaped(last, now_ms);
+        }
         match last {
             Last::Failed | Last::Unfinished => {
-                self.retry_work = self.retry_work.max(Some(self.repository_work));
+                self.retry_request =
+                    merge_requests(Some(self.repository_request), self.retry_request);
             }
             Last::Held => {
-                self.pending = self.pending.max(Some(self.repository_work));
+                self.retry_request =
+                    merge_requests(Some(self.repository_request), self.retry_request);
             }
-            Last::Ended => self.retry_work = None,
+            Last::Ended => {
+                if let RepositoryRequest::Refresh(request) = self.repository_request
+                    && self.observed.fulfills(request)
+                {
+                    self.acknowledged(now_ms);
+                }
+            }
             Last::None | Last::Running => {}
         }
     }
@@ -310,24 +389,57 @@ impl Due {
     /// The work selected by the latest pacing method that returned true.
     #[must_use]
     pub fn repository_work(&self) -> RepositoryWork {
-        self.repository_work
+        self.repository_request.work()
+    }
+
+    /// The retained request selected by the latest pacing method that returned true.
+    #[must_use]
+    pub fn repository_request(&self) -> RepositoryRequest {
+        self.repository_request
     }
 
     fn start(
         &mut self,
-        called: Option<RepositoryWork>,
+        called: Option<RepositoryRequest>,
         now_ms: u64,
         routes: Routes,
         last: Last,
     ) -> bool {
         self.reaped(last, now_ms);
-        let refresh_due = self
-            .started
-            .is_none_or(|(at, was)| was != routes || now_ms < at || now_ms - at >= RECHECK_MS);
-        self.pending = self
+        self.pending = merge_requests(self.pending, called);
+        // A new Refresh supersedes retained retry inputs before acknowledgment
+        // can demote it to Repair. A local Repair alone leaves that retry intact.
+        if self
             .pending
-            .max(called)
-            .max(refresh_due.then_some(RepositoryWork::Refresh));
+            .is_some_and(|request| request.work() == RepositoryWork::Refresh)
+        {
+            self.pending = merge_requests(self.retry_request.take(), self.pending);
+        }
+        let (pending, acknowledged) = self.demote_fulfilled(self.pending);
+        self.pending = pending;
+        let (retry, retry_acknowledged) = self.demote_fulfilled(self.retry_request);
+        if acknowledged || retry_acknowledged {
+            self.acknowledged(now_ms);
+        }
+        self.retry_request = retry;
+        self.refresh_due(now_ms, routes);
+        if let Some(RepositoryRequest::Refresh(request)) = self.pending {
+            if self.observed.fulfills(request) {
+                self.pending = Some(RepositoryRequest::Repair);
+                self.acknowledged(now_ms);
+            } else if let Some(remaining) = self.observed.retry_for(request)
+                && remaining > 0
+            {
+                self.retry_request = merge_requests(self.retry_request, self.pending.take());
+                self.retry.at = Some(now_ms.saturating_add(remaining));
+                self.started = Some((now_ms, RECHECK_MS));
+            }
+        }
+        if let Some(RepositoryRequest::Refresh(request)) = self.retry_request
+            && let Some(remaining) = self.observed.retry_for(request)
+        {
+            self.retry.at = Some(now_ms.saturating_add(remaining));
+        }
         if self.pending.is_none() && !self.retry.due(now_ms) {
             return false;
         }
@@ -338,21 +450,74 @@ impl Due {
         // A checkout wake can be repaired now without repeating a failed remote refresh.
         // Only its own deadline, or a new Refresh request, consumes that stronger debt.
         let consume_retry = self.retry.due(now_ms)
-            || pending == Some(RepositoryWork::Refresh)
-            || self.retry_work != Some(RepositoryWork::Refresh);
-        let retry_work = if consume_retry {
-            self.retry_work.take()
+            || pending.is_some_and(|request| request.work() == RepositoryWork::Refresh)
+            || self
+                .retry_request
+                .is_none_or(|request| request.work() != RepositoryWork::Refresh);
+        let retry_request = if consume_retry {
+            self.retry_request.take()
         } else {
             None
         };
-        self.repository_work = pending.max(retry_work).unwrap_or_default();
+        self.repository_request = merge_requests(retry_request, pending).unwrap_or_default();
         if consume_retry {
             self.retry.started();
         }
-        if self.repository_work == RepositoryWork::Refresh {
-            self.started = Some((now_ms, routes));
+        if self.repository_work() == RepositoryWork::Refresh {
+            self.started = Some((now_ms, RECHECK_MS));
         }
         true
+    }
+
+    fn demote_fulfilled(
+        &self,
+        request: Option<RepositoryRequest>,
+    ) -> (Option<RepositoryRequest>, bool) {
+        match request {
+            Some(RepositoryRequest::Refresh(request)) if self.observed.fulfills(request) => {
+                // A repository receipt covers only its row. Every trigger still
+                // owes its owned full pass, including failures in other rows.
+                (Some(RepositoryRequest::Repair), true)
+            }
+            _ => (request, false),
+        }
+    }
+
+    fn acknowledged(&mut self, now_ms: u64) {
+        if let Some(remaining) = self.observed.recheck_ms {
+            self.started = Some((now_ms, remaining));
+        }
+    }
+
+    fn refresh_due(&mut self, now_ms: u64, routes: Routes) {
+        let moved = self
+            .routes
+            .replace(routes)
+            .is_some_and(|before| before != routes);
+        let went_back = self.started.is_some_and(|(at, _)| now_ms < at);
+        let request = if moved || went_back {
+            if went_back {
+                self.started = Some((now_ms, RECHECK_MS));
+            }
+            Some(RefreshRequest::after(None, self.observed.version))
+        } else if self.started.is_none_or(|(at, wait)| now_ms - at >= wait) {
+            Some(RefreshRequest::ensure(None, self.observed.version))
+        } else {
+            None
+        };
+        if let Some(request) = request {
+            self.request(RepositoryRequest::Refresh(request));
+        }
+    }
+}
+
+fn merge_requests(
+    older: Option<RepositoryRequest>,
+    newer: Option<RepositoryRequest>,
+) -> Option<RepositoryRequest> {
+    match (older, newer) {
+        (Some(older), Some(newer)) => Some(older.merge(newer)),
+        _ => newer.or(older),
     }
 }
 
@@ -408,8 +573,8 @@ mod tests {
     }
 
     /// A start that comes due while the last runner runs waits for it to end rather than start a
-    /// second that would find the lock held; one that found the lock held starts again at the
-    /// next round, as does nothing else.
+    /// second that would find the lock held; one that found the lock held keeps its request
+    /// until the existing five-second retry boundary.
     #[test]
     fn a_start_due_while_a_runner_runs_or_after_a_held_lock_is_owed_to_the_next_round() {
         let mut due = Due::default();
@@ -428,9 +593,16 @@ mod tests {
         );
         assert!(!due.after_pass(&unchanged(), 4 * MINUTE, HOME, Last::Ended));
         assert!(
-            due.after_pass(&unchanged(), 5 * MINUTE, HOME, Last::Held),
-            "another pass held the lock: start again"
+            !due.after_pass(&unchanged(), 5 * MINUTE, HOME, Last::Held),
+            "another pass held the lock: retain the request without a per-look loop"
         );
+        assert!(!due.after_pass(
+            &unchanged(),
+            5 * MINUTE + FIRST_RETRY_MS - 1,
+            HOME,
+            Last::None
+        ));
+        assert!(due.after_pass(&unchanged(), 5 * MINUTE + FIRST_RETRY_MS, HOME, Last::None));
         assert!(!due.after_pass(&unchanged(), 6 * MINUTE, HOME, Last::Ended));
     }
 
@@ -515,19 +687,21 @@ mod tests {
         assert!(due.after_pass(&unchanged(), 5_001, HOME, Last::None));
         due.reaped(Last::Held, 5_002);
         assert!(
-            due.after_pass(&unchanged(), 5_002, HOME, Last::None),
-            "a held lock still owes a pass at the next round"
+            !due.after_pass(&unchanged(), 5_002, HOME, Last::None),
+            "a held lock keeps its existing bounded retry"
         );
-        due.reaped(Last::Failed, 5_003);
-        assert!(!due.after_pass(&unchanged(), 15_002, HOME, Last::None));
+        assert!(!due.after_pass(&unchanged(), 10_001, HOME, Last::None));
+        assert!(due.after_pass(&unchanged(), 10_002, HOME, Last::None));
+        due.reaped(Last::Failed, 10_003);
+        assert!(!due.after_pass(&unchanged(), 20_002, HOME, Last::None));
         assert!(
-            due.after_pass(&unchanged(), 15_003, HOME, Last::None),
+            due.after_pass(&unchanged(), 20_003, HOME, Last::None),
             "a lock hold did not erase the failure streak"
         );
-        assert!(!due.after_pass(&applied(), 15_004, HOME, Last::Running));
-        assert!(!due.after_pass(&unchanged(), 15_005, HOME, Last::Running));
-        assert!(due.after_pass(&unchanged(), 15_006, HOME, Last::Ended));
-        assert!(!due.after_pass(&unchanged(), 15_007, HOME, Last::Ended));
+        assert!(!due.after_pass(&applied(), 20_004, HOME, Last::Running));
+        assert!(!due.after_pass(&unchanged(), 20_005, HOME, Last::Running));
+        assert!(due.after_pass(&unchanged(), 20_006, HOME, Last::Ended));
+        assert!(!due.after_pass(&unchanged(), 20_007, HOME, Last::Ended));
     }
 
     #[test]
@@ -564,6 +738,9 @@ mod tests {
         assert!(!due.poll(5, HOME, Last::Ended));
         due.reaped(Last::Held, 6);
         assert!(due.after_local_progress(RepositoryWork::Repair, 7, HOME, Last::None));
+        assert_eq!(due.repository_work(), RepositoryWork::Repair);
+        assert!(!due.poll(5_005, HOME, Last::Ended));
+        assert!(due.poll(5_006, HOME, Last::None));
         assert_eq!(due.repository_work(), RepositoryWork::Refresh);
     }
 
@@ -616,16 +793,290 @@ mod tests {
         assert_eq!(due.repository_work(), RepositoryWork::Refresh);
     }
 
-    /// The runner is `aterm init --converge --trigger <who>` of the program given, never
-    /// disclaims responsibility (macOS then keeps the runner's privacy-gated acts the starting
-    /// app's), and the subscriber's leaves its starter's background band, so the fleet book's
-    /// lock lift reaches its holder under the vault subscriber's `Background` job (that a child
-    /// so started leaves the band is `aterm_uds`'s
-    /// `a_child_started_out_of_the_background_band_runs_at_the_class_it_asks_for`), where a
-    /// window's or setup's keeps its starter's process type; its own session is proven on a
-    /// started child below.
-    /// NEGATIVE CONTROLS: a runner that disclaims responsibility, a subscriber's that stays in
-    /// the band, or another's that leaves its starter's type, fails here.
+    #[test]
+    fn producers_share_the_remote_wave_and_keep_their_generic_passes() {
+        let scope = RefreshScope::new([1; 32]);
+        let before = RefreshObservation {
+            version: RefreshVersion {
+                input: 1,
+                attempt: 1,
+                fulfilled: 1,
+            },
+            scope: Some(RefreshScope::new([0; 32])),
+            recheck_ms: Some(RECHECK_MS),
+            ..RefreshObservation::default()
+        };
+        let request = RepositoryRequest::Refresh(RefreshRequest::inputs(scope, before.version));
+        let mut node = Due::default();
+        let mut subscriber = Due::default();
+        for due in [&mut node, &mut subscriber] {
+            due.observe(before);
+            assert!(
+                due.at_start(0, HOME, Last::None),
+                "startup without a current scope cannot inherit the old source's receipt"
+            );
+            assert!(
+                due.after_request(
+                    RepositoryRequest::Refresh(RefreshRequest::ensure(
+                        before.scope,
+                        before.version
+                    )),
+                    1,
+                    HOME,
+                    Last::Ended,
+                ),
+                "a known matching ensure still owes its own generic pass"
+            );
+            assert_eq!(due.repository_work(), RepositoryWork::Repair);
+            assert!(due.after_request(request, 2, HOME, Last::Ended));
+            assert_eq!(due.repository_request(), request);
+        }
+        subscriber.reaped(Last::Held, 3);
+        let finished = RefreshObservation {
+            version: RefreshVersion {
+                input: 2,
+                attempt: 2,
+                fulfilled: 2,
+            },
+            scope: Some(scope),
+            recheck_ms: Some(RECHECK_MS - 100),
+            ..before
+        };
+        subscriber.observe(finished);
+        assert!(
+            !subscriber.poll(100, HOME, Last::None),
+            "the held follower keeps its bounded retry after sharing the remote wave"
+        );
+        assert!(
+            !subscriber.poll(FIRST_RETRY_MS + 2, HOME, Last::None),
+            "repository acknowledgment cannot accelerate the generic retry"
+        );
+        assert!(subscriber.poll(FIRST_RETRY_MS + 3, HOME, Last::None));
+        assert_eq!(subscriber.repository_work(), RepositoryWork::Repair);
+        assert!(!subscriber.poll(FIRST_RETRY_MS + 4, HOME, Last::Ended));
+        subscriber.observe(RefreshObservation {
+            recheck_ms: Some(0),
+            ..finished
+        });
+        assert!(
+            subscriber.poll(RECHECK_MS, HOME, Last::None),
+            "a delayed acknowledgment preserves the shared deadline"
+        );
+
+        let mut startup = Due::default();
+        startup.observe(finished);
+        startup.request(RepositoryRequest::Refresh(RefreshRequest::ensure(
+            finished.scope,
+            finished.version,
+        )));
+        assert!(startup.at_start(0, HOME, Last::None));
+        assert_eq!(startup.repository_work(), RepositoryWork::Repair);
+        assert!(!startup.poll(1, HOME, Last::Ended));
+        assert!(!startup.poll(2, HOME, Last::None));
+
+        let mut unknown = Due::default();
+        unknown.observe(RefreshObservation {
+            recheck_ms: Some(0),
+            ..finished
+        });
+        assert!(unknown.at_start(10, HOME, Last::None));
+        for (at, last) in [
+            (11, Last::Ended),
+            (12, Last::None),
+            (RECHECK_MS + 9, Last::None),
+        ] {
+            assert!(
+                !unknown.poll(at, HOME, last),
+                "an expired old receipt and successful NotApplicable cannot create a per-look loop"
+            );
+        }
+        assert!(unknown.poll(RECHECK_MS + 10, HOME, Last::None));
+        assert!(
+            unknown.after_request(
+                RepositoryRequest::Refresh(RefreshRequest::inputs(scope, finished.version)),
+                RECHECK_MS + 11,
+                HOME,
+                Last::Ended,
+            ),
+            "a real source transition interrupts ordinary unknown-source pacing"
+        );
+    }
+
+    #[test]
+    fn shared_refresh_retry_allows_local_repair_without_losing_its_original_request() {
+        let refresh = RefreshRequest::inputs(RefreshScope::new([1; 32]), RefreshVersion::default());
+        let request = RepositoryRequest::Refresh(refresh);
+        let mut due = Due::default();
+        let failed = RefreshObservation {
+            pending: Some(refresh),
+            retry_ms: Some(5_000),
+            ..RefreshObservation::default()
+        };
+        due.observe(failed);
+        assert!(!due.after_request(request, 0, HOME, Last::None));
+        due.observe(RefreshObservation {
+            retry_ms: Some(4_999),
+            ..failed
+        });
+        assert!(due.after_local_progress(RepositoryWork::Repair, 1, HOME, Last::None));
+        assert_eq!(due.repository_work(), RepositoryWork::Repair);
+        due.observe(RefreshObservation {
+            retry_ms: Some(4_998),
+            ..failed
+        });
+        assert!(
+            !due.poll(2, HOME, Last::Held),
+            "a held repair is subsumed without spinning or moving the refresh deadline"
+        );
+        due.observe(RefreshObservation {
+            retry_ms: Some(0),
+            ..failed
+        });
+        assert!(due.poll(5_000, HOME, Last::None));
+        assert_eq!(due.repository_request(), request);
+
+        let fulfilled = RefreshObservation {
+            scope: refresh.scope,
+            version: RefreshVersion {
+                input: 1,
+                attempt: 1,
+                fulfilled: 1,
+            },
+            recheck_ms: Some(RECHECK_MS),
+            ..RefreshObservation::default()
+        };
+        // This owner's full job can fail after its Native repository row succeeds.
+        // The repository receipt does not acknowledge the remaining generic rows.
+        for outcome in [Last::Failed, Last::Unfinished] {
+            let mut owned = Due::default();
+            assert!(owned.after_request(request, 0, HOME, Last::None));
+            owned.observe(fulfilled);
+            assert!(!owned.poll(1, HOME, outcome));
+            assert!(!owned.poll(FIRST_RETRY_MS, HOME, Last::None));
+            assert!(owned.poll(FIRST_RETRY_MS + 1, HOME, Last::None));
+            assert_eq!(owned.repository_work(), RepositoryWork::Repair);
+            assert!(!owned.poll(FIRST_RETRY_MS + 2, HOME, Last::Ended));
+
+            // The successful owned generic job clears its captured debt. A later
+            // held-only trigger still owes its own generic pass, at the held deadline.
+            let forced = RepositoryRequest::Refresh(RefreshRequest::after(
+                fulfilled.scope,
+                fulfilled.version,
+            ));
+            assert!(owned.after_request(forced, FIRST_RETRY_MS + 1_000, HOME, Last::None));
+            owned.observe(RefreshObservation {
+                version: RefreshVersion {
+                    attempt: 2,
+                    fulfilled: 2,
+                    ..fulfilled.version
+                },
+                ..fulfilled
+            });
+            assert!(!owned.poll(FIRST_RETRY_MS + 1_001, HOME, Last::Held));
+            assert!(!owned.poll(2 * FIRST_RETRY_MS + 1_000, HOME, Last::None));
+            assert!(owned.poll(2 * FIRST_RETRY_MS + 1_001, HOME, Last::None));
+            assert_eq!(owned.repository_work(), RepositoryWork::Repair);
+            assert!(!owned.poll(2 * FIRST_RETRY_MS + 1_002, HOME, Last::Ended));
+        }
+
+        // Repair can run beside another owner's deferred Refresh without spending
+        // that Refresh's failure streak. Its own non-repository failure still survives.
+        for outcome in [Last::Held, Last::Ended, Last::Failed, Last::Unfinished] {
+            let mut local = Due::default();
+            local.observe(failed);
+            assert!(!local.after_request(request, 0, HOME, Last::None));
+            local.observe(RefreshObservation {
+                retry_ms: Some(FIRST_RETRY_MS - 1),
+                ..failed
+            });
+            assert!(local.after_local_progress(RepositoryWork::Repair, 1, HOME, Last::None));
+            local.observe(fulfilled);
+            assert!(!local.poll(2, HOME, outcome));
+            assert!(!local.poll(FIRST_RETRY_MS - 1, HOME, Last::None));
+            assert!(local.poll(FIRST_RETRY_MS, HOME, Last::None));
+            assert_eq!(local.repository_work(), RepositoryWork::Repair);
+            assert!(!local.poll(FIRST_RETRY_MS + 1, HOME, Last::Ended));
+        }
+
+        let mut during = Due::default();
+        assert!(during.after_request(request, 0, HOME, Last::None));
+        assert!(!during.after_local_progress(RepositoryWork::Repair, 1, HOME, Last::Running));
+        during.observe(fulfilled);
+        assert!(!during.after_request(
+            RepositoryRequest::Refresh(RefreshRequest::ensure(fulfilled.scope, fulfilled.version)),
+            2,
+            HOME,
+            Last::Running,
+        ));
+        assert!(during.poll(3, HOME, Last::Ended));
+        assert_eq!(during.repository_work(), RepositoryWork::Repair);
+        assert!(!during.poll(4, HOME, Last::Ended));
+        assert!(!during.poll(5, HOME, Last::None));
+
+        // A completed new source consumes the old source's retained retry before
+        // its Refresh becomes Repair, so the obsolete source cannot revive later.
+        let mut superseded = Due::default();
+        superseded.observe(failed);
+        assert!(!superseded.after_request(request, 0, HOME, Last::None));
+        let winner = RefreshObservation {
+            scope: Some(RefreshScope::new([2; 32])),
+            version: RefreshVersion {
+                input: 2,
+                attempt: 2,
+                fulfilled: 2,
+            },
+            recheck_ms: Some(RECHECK_MS),
+            ..RefreshObservation::default()
+        };
+        superseded.observe(winner);
+        assert!(superseded.after_request(
+            RepositoryRequest::Refresh(RefreshRequest::inputs(
+                winner.scope.unwrap(),
+                fulfilled.version,
+            )),
+            1,
+            HOME,
+            Last::None,
+        ));
+        assert_eq!(superseded.repository_work(), RepositoryWork::Repair);
+        assert!(!superseded.poll(2, HOME, Last::Ended));
+        assert!(!superseded.poll(FIRST_RETRY_MS, HOME, Last::None));
+    }
+
+    #[test]
+    fn a_route_event_captures_one_boundary_while_the_lan_is_held() {
+        let mut due = Due::default();
+        assert!(due.at_start(0, HOME, Last::None));
+        let observed = RefreshObservation {
+            version: RefreshVersion {
+                attempt: 2,
+                ..RefreshVersion::default()
+            },
+            ..RefreshObservation::default()
+        };
+        due.observe(observed);
+        due.hold(1, AWAY, Last::Running);
+        due.observe(RefreshObservation {
+            version: RefreshVersion {
+                attempt: 3,
+                ..observed.version
+            },
+            ..observed
+        });
+        due.hold(2, AWAY, Last::Running);
+        assert!(due.poll(3, AWAY, Last::Ended));
+        let RepositoryRequest::Refresh(request) = due.repository_request() else {
+            panic!("a route move requests refresh");
+        };
+        assert_eq!(
+            request.after_attempt,
+            Some(2),
+            "waiting must not move the event's boundary"
+        );
+    }
+
+    /// The runner keeps its starting app's privacy responsibility and leaves only the
+    /// subscriber's background band. A started child below proves its own session.
     #[test]
     fn the_runner_is_init_converge_the_subscribers_out_of_the_band_never_disclaiming() {
         let exe = Path::new("/Applications/aterm.app/Contents/MacOS/aterm");
@@ -655,6 +1106,24 @@ mod tests {
                     "only the subscriber's runner leaves its starter's background band ({trigger})"
                 );
             }
+            let request = RepositoryRequest::Refresh(RefreshRequest::after(
+                Some(RefreshScope::new([7; 32])),
+                RefreshVersion {
+                    input: 2,
+                    attempt: 4,
+                    fulfilled: 3,
+                },
+            ));
+            let command = runner_requested(exe, trigger, request);
+            let args: Vec<_> = command.get_args().collect();
+            assert_eq!(args[4], "--repository-request");
+            assert_eq!(
+                aterm_json::from_str::<RepositoryRequest>(args[5].to_str().unwrap()).unwrap(),
+                request,
+                "the original request boundary survives runner IPC"
+            );
+            assert!(!command.get_disclaim_responsibility());
+            assert_eq!(command.leaves_background_band(), trigger == SUBSCRIBER);
         }
     }
 

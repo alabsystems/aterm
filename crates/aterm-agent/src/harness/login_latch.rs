@@ -13,8 +13,14 @@ use crate::supervise::policy::login::LoginShared;
 /// Stored-login key (`config:<dir>` or `service:<name>`) from a process's `KEY=value` env.
 #[must_use]
 pub fn login_key(env: &[String]) -> Option<String> {
-    let who = ProcessLogin::of_exec_env(env)?;
-    if !who.stored_login {
+    login_key_of(ProcessLogin::of_exec_env(env)?, env)
+}
+
+/// [`login_key`] of the login `who` read from `env`.
+fn login_key_of(who: ProcessLogin, env: &[String]) -> Option<String> {
+    // A login service: a token session's signed-out screen is a rejection, never a `/login`
+    // (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.8).
+    if !who.route.is_stored() {
         return None;
     }
     if let Some(dir) = who.login {

@@ -19,7 +19,7 @@ fn settled(op: &Operation, relation: &Relation) -> bool {
 
 // Once dispatch has begun, its lifecycle owner must settle the operation.
 // An ungranted helper is still a live participant, not a NoExec witness.
-fn before_dispatch(op: &Operation) -> bool {
+pub(super) fn before_dispatch(op: &Operation) -> bool {
     (!op.signal_sent || op.signal_accepted == Some(false))
         && !op.resume_sent
         && op.resume_attempt.is_none()

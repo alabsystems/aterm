@@ -83,11 +83,22 @@ pub enum LoginPin {
     /// A settings source of the session's could not be read, or its environment could not: aterm
     /// cannot tell whether `/login` opens the browser at once.
     Unread,
+    /// The session runs on its account's vault token, which aterm's wrapper served
+    /// (`AuthRoute::VaultToken`, `docs/DESIGN-claude-setup-token-2026-11-05.md` §5.8): the token
+    /// outranks any stored login, so `/login` replaces nothing, and aterm never types it there. A
+    /// lost login there is the token's refusal, which the host records and moves the session off.
+    Token,
 }
 
 impl LoginPin {
     /// Every pin, for a tape's words.
-    pub const ALL: [Self; 4] = [Self::Picker, Self::Method, Self::Gateway, Self::Unread];
+    pub const ALL: [Self; 5] = [
+        Self::Picker,
+        Self::Method,
+        Self::Gateway,
+        Self::Unread,
+        Self::Token,
+    ];
 
     /// Whether `/login` is the person's to type, not aterm's: anything but [`Self::Picker`].
     #[must_use]
@@ -103,6 +114,7 @@ impl LoginPin {
             Self::Method => "method",
             Self::Gateway => "gateway",
             Self::Unread => "unread",
+            Self::Token => "token",
         }
     }
 
@@ -121,6 +133,7 @@ impl LoginPin {
             Self::Method => Some(super::notice::WHY_PINNED),
             Self::Gateway => Some(super::notice::WHY_GATEWAY),
             Self::Unread => Some(super::notice::WHY_PIN_UNREAD),
+            Self::Token => Some(super::notice::WHY_TOKEN),
         }
     }
 }

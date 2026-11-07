@@ -181,8 +181,6 @@ pub(crate) struct Inert {
     locked_at_reads: Mutex<Vec<bool>>,
     sleeps: Mutex<Vec<Duration>>,
     fixed_wait_ms: Option<u64>,
-    /// Whether this Mac holds a fleet key already ([`Ports::holds_fleet_key`]).
-    fleet_key_held: bool,
 }
 
 impl Inert {
@@ -267,7 +265,6 @@ impl Inert {
             locked_at_reads: Mutex::new(Vec::new()),
             sleeps: Mutex::new(Vec::new()),
             fixed_wait_ms: Some(0),
-            fleet_key_held: true,
         }
     }
 
@@ -355,9 +352,6 @@ impl Ports for Inert {
     fn sleep(&self, duration: Duration) {
         self.dispatches.lock().unwrap().push("sleep");
         self.sleeps.lock().unwrap().push(duration);
-    }
-    fn holds_fleet_key(&self) -> bool {
-        self.fleet_key_held
     }
     fn installed_release(&self) -> bool {
         self.installed
@@ -528,7 +522,11 @@ impl Ports for Inert {
         }
         self.read(&self.owed)
     }
-    fn clone_owed(&self, work: aterm_secrets::converge::RepositoryWork) -> Result<String, String> {
+    fn clone_owed(
+        &self,
+        work: aterm_secrets::converge::RepositoryWork,
+        _execution: Option<repository_refresh::Execution>,
+    ) -> Result<String, String> {
         if matches!(
             *self.owed.lock().unwrap(),
             crate::init::OwedClone::Verified { .. }
@@ -659,6 +657,7 @@ fn record(build: &str, routes: &[&str], attempted_ms: u64) -> Record {
         routes: routes.iter().map(|route| (*route).to_owned()).collect(),
         rows: Vec::new(),
         base: None,
+        repositories: None,
     }
 }
 
@@ -2316,7 +2315,6 @@ fn independent_fabric_runs_before_remote_work_and_node_hosting_waits_for_node() 
             let ports = Inert {
                 fabric_needs_node: needs_node,
                 window: true,
-                fleet_key_held: false,
                 ..Inert::new(scratch.path())
             };
             *ports.fabric.lock().unwrap() = before;
@@ -2345,49 +2343,25 @@ fn independent_fabric_runs_before_remote_work_and_node_hosting_waits_for_node() 
 }
 
 #[test]
-fn init_skips_join_jitter_and_non_capacity_failures_do_not_retry() {
-    // 1. Trigger::Init skips initial 0..=120 s join jitter, while Trigger::Subscriber waits it.
-    let scratch_init = aterm_tempfile::tempdir().unwrap();
-    let init_ports = Inert {
-        fixed_wait_ms: Some(45_000),
-        ..Inert::new(scratch_init.path())
-    };
-    let init_pass = ran(init_ports.pass(Trigger::Init, Mode::Apply));
-    assert_eq!(row(&init_pass.rows, FLEET).outcome, Outcome::Changed);
-    assert!(
-        init_ports.sleeps.lock().unwrap().is_empty(),
-        "Trigger::Init must not wait initial join jitter"
-    );
-
-    let scratch_sub = aterm_tempfile::tempdir().unwrap();
-    let sub_ports = Inert {
-        fixed_wait_ms: Some(45_000),
-        ..Inert::new(scratch_sub.path())
-    };
-    let sub_pass = ran(sub_ports.pass(Trigger::Subscriber, Mode::Apply));
-    assert_eq!(row(&sub_pass.rows, FLEET).outcome, Outcome::Changed);
-    assert_eq!(
-        *sub_ports.sleeps.lock().unwrap(),
-        vec![Duration::from_secs(45)],
-        "Trigger::Subscriber must wait initial join jitter before dialing"
-    );
-
-    // A Mac in no fleet yet (the vault just let it in) joins at once on every trigger: the
-    // jitter spreads only a herd of members re-joining under a rotated code.
-    // NEGATIVE CONTROL: `&& ports.holds_fleet_key()` cut from `sync_fleet_with_retry`: the
-    // first join waits 45 s and this assert fails.
-    let scratch_first = aterm_tempfile::tempdir().unwrap();
-    let first_ports = Inert {
-        fixed_wait_ms: Some(45_000),
-        fleet_key_held: false,
-        ..Inert::new(scratch_first.path())
-    };
-    let first_pass = ran(first_ports.pass(Trigger::Subscriber, Mode::Apply));
-    assert_eq!(row(&first_pass.rows, FLEET).outcome, Outcome::Changed);
-    assert!(
-        first_ports.sleeps.lock().unwrap().is_empty(),
-        "a Mac in no fleet yet must not wait join jitter"
-    );
+fn fleet_handshakes_start_immediately_and_retry_only_reported_capacity() {
+    for trigger in [
+        Trigger::Init,
+        Trigger::Subscriber,
+        Trigger::Window,
+        Trigger::Setup,
+    ] {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let ports = Inert {
+            fixed_wait_ms: Some(45_000),
+            ..Inert::new(scratch.path())
+        };
+        let pass = ran(ports.pass(trigger, Mode::Apply));
+        assert_eq!(row(&pass.rows, FLEET).outcome, Outcome::Changed);
+        assert!(
+            ports.sleeps.lock().unwrap().is_empty(),
+            "{trigger:?}: dial before waiting for a capacity response"
+        );
+    }
 
     // 2. Non-capacity error and Blocked stand-aside do NOT retry at capacity backoff.
     let scratch_err = aterm_tempfile::tempdir().unwrap();
@@ -2424,7 +2398,7 @@ fn init_skips_join_jitter_and_non_capacity_failures_do_not_retry() {
     let total_slept: Duration = cap_ports.sleeps.lock().unwrap().iter().copied().sum();
     assert!(
         total_slept <= FLEET_JOIN_RETRY_BUDGET,
-        "total jitter + retry sleep {total_slept:?} exceeded {FLEET_JOIN_RETRY_BUDGET:?}"
+        "capacity retry sleep {total_slept:?} exceeded {FLEET_JOIN_RETRY_BUDGET:?}"
     );
     assert!(
         cap_ports
@@ -2456,7 +2430,6 @@ fn thirty_five_joins_against_sixteen_connections_all_land_within_ten_minutes() {
         state: Mutex<SimState>,
         cvar: Condvar,
         retry_at_capacity: bool,
-        simultaneous_burst: bool,
     }
 
     impl SimCluster {
@@ -2469,7 +2442,7 @@ fn thirty_five_joins_against_sixteen_connections_all_land_within_ten_minutes() {
             }
         }
 
-        fn run(retry_at_capacity: bool, simultaneous_burst: bool) -> (usize, usize, u64) {
+        fn run(retry_at_capacity: bool) -> (usize, usize, u64) {
             let root = aterm_tempfile::tempdir().unwrap();
             let cluster = Arc::new(Self {
                 state: Mutex::new(SimState {
@@ -2480,7 +2453,6 @@ fn thirty_five_joins_against_sixteen_connections_all_land_within_ten_minutes() {
                 }),
                 cvar: Condvar::new(),
                 retry_at_capacity,
-                simultaneous_burst,
             });
 
             struct RunnerGuard(Arc<SimCluster>);
@@ -2498,7 +2470,7 @@ fn thirty_five_joins_against_sixteen_connections_all_land_within_ten_minutes() {
                 cluster: Arc<SimCluster>,
                 rng: Mutex<u64>,
                 joined: AtomicBool,
-                initial_jitter: Mutex<Option<Duration>>,
+                first_attempt_ms: Mutex<Option<u64>>,
             }
 
             impl Ports for SimSubscriber {
@@ -2525,21 +2497,6 @@ fn thirty_five_joins_against_sixteen_connections_all_land_within_ten_minutes() {
                     let max_ms = u64::try_from(max.as_millis()).unwrap_or(u64::MAX);
                     if max_ms == 0 {
                         return Duration::ZERO;
-                    }
-                    let mut first = self.initial_jitter.lock().unwrap();
-                    if first.is_none() && max == FLEET_JOIN_JITTER_MAX {
-                        let pick = if self.cluster.simultaneous_burst {
-                            // Synchronize all 35 subscribers onto t = 1 ms to force 19 collisions!
-                            Duration::from_millis(1)
-                        } else {
-                            let mut s = self.rng.lock().unwrap();
-                            *s ^= *s << 13;
-                            *s ^= *s >> 7;
-                            *s ^= *s << 17;
-                            Duration::from_millis(*s % (max_ms + 1))
-                        };
-                        *first = Some(pick);
-                        return pick;
                     }
                     let mut s = self.rng.lock().unwrap();
                     *s ^= *s << 13;
@@ -2599,6 +2556,7 @@ fn thirty_five_joins_against_sixteen_connections_all_land_within_ten_minutes() {
                 fn sync_fleet(&self) -> Result<FleetDone, String> {
                     let mut state = self.cluster.state.lock().unwrap();
                     let now = state.now_ms;
+                    self.first_attempt_ms.lock().unwrap().get_or_insert(now);
                     state.slot_free_at_ms.retain(|&free_at| free_at > now);
                     if state.slot_free_at_ms.len() >= MAX_CONNECTIONS {
                         let msg =
@@ -2689,7 +2647,7 @@ fn thirty_five_joins_against_sixteen_connections_all_land_within_ten_minutes() {
                         cluster,
                         rng: Mutex::new(seed),
                         joined: AtomicBool::new(false),
-                        initial_jitter: Mutex::new(None),
+                        first_attempt_ms: Mutex::new(None),
                     };
                     let pass = ran(converge(
                         &ports,
@@ -2698,12 +2656,11 @@ fn thirty_five_joins_against_sixteen_connections_all_land_within_ten_minutes() {
                         aterm_secrets::converge::RepositoryWork::Refresh,
                         &mut |_| {},
                     ));
-                    if !ports.cluster.simultaneous_burst {
-                        assert!(
-                            ports.initial_jitter.lock().unwrap().is_some(),
-                            "the subscriber's pass draws its join jitter"
-                        );
-                    }
+                    assert_eq!(
+                        *ports.first_attempt_ms.lock().unwrap(),
+                        Some(0),
+                        "every first handshake precedes any capacity wait"
+                    );
                     row(&pass.rows, FLEET).outcome
                 }));
             }
@@ -2724,30 +2681,21 @@ fn thirty_five_joins_against_sixteen_connections_all_land_within_ten_minutes() {
 
     // NEGATIVE CONTROL (§7.1, §12.3 C18): Without retry at capacity, a simultaneous 35-subscriber
     // burst against 16 listener slots lands 16 and leaves 19 failed until the next 30-min pass.
-    let (no_retry_ok, no_retry_failed, _) = SimCluster::run(false, true);
+    let (no_retry_ok, no_retry_failed, _) = SimCluster::run(false);
     assert_eq!(no_retry_ok, 16, "without retry only 16 slots succeed");
     assert_eq!(
         no_retry_failed, 19,
         "without retry 19 of 35 subscribers fail at capacity"
     );
 
-    // Worst-case simultaneous burst (all 35 hit at t = 1 ms) WITH C18 backoff retry:
+    // Worst-case simultaneous burst (all 35 hit at t = 0) WITH C18 backoff retry:
     // all 35 land within <= 10 min.
-    let (burst_ok, burst_failed, burst_ms) = SimCluster::run(true, true);
+    let (burst_ok, burst_failed, burst_ms) = SimCluster::run(true);
     assert_eq!(burst_ok, SUBSCRIBERS);
     assert_eq!(burst_failed, 0);
     assert!(
         Duration::from_millis(burst_ms) <= FLEET_JOIN_RETRY_BUDGET,
         "simultaneous 35-join burst took {burst_ms} ms (> 10 min)"
-    );
-
-    // Full C18 (0..=120 s join jitter + backoff retry): all 35 land within <= 10 min.
-    let (jitter_ok, jitter_failed, jitter_ms) = SimCluster::run(true, false);
-    assert_eq!(jitter_ok, SUBSCRIBERS);
-    assert_eq!(jitter_failed, 0);
-    assert!(
-        Duration::from_millis(jitter_ms) <= FLEET_JOIN_RETRY_BUDGET,
-        "jittered 35-join pass took {jitter_ms} ms (> 10 min)"
     );
 }
 #[test]
@@ -2997,6 +2945,7 @@ pub(crate) mod owed_clone {
         fn clone_owed(
             &self,
             _work: aterm_secrets::converge::RepositoryWork,
+            _execution: Option<repository_refresh::Execution>,
         ) -> Result<String, String> {
             (self.clone)()
         }

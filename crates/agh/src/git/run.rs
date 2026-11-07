@@ -434,6 +434,11 @@ fn into_ok(into: &str) -> bool {
 }
 
 #[cfg(unix)]
+pub(crate) fn project_config_names(listed: &[u8], read_only: bool) -> Vec<u8> {
+    unix::project_config_names(listed, read_only)
+}
+
+#[cfg(unix)]
 mod unix {
     //! The runner's steps, on unix.
 
@@ -445,7 +450,7 @@ mod unix {
     use crate::client::Github;
     use crate::config::Dirs;
     use crate::error::{Error, Forbid, Kind, Result, SideEffect, Sub};
-    use crate::fx::child::{ChildOut, ChildSpec};
+    use crate::fx::child::{ChildOut, ChildSpec, ConfigQuery};
     use crate::git::GRANT_MAX;
     use crate::git::credential;
     use crate::git::grant::{self, Grant};
@@ -461,13 +466,90 @@ mod unix {
     /// --bare`: a fixed one, so a taped leased delete replays with nothing run.
     const INIT_SCRATCH: &str = "git init-scratch";
     /// The canonical request of a fetch's config read, followed by ` {owner}/{repo}`.
-    const CONFIG_LIST: &str = "git config-list";
+    const CONFIG_LIST: &str = "git config-screen-v2";
     /// How much of each stream a `GitOut` keeps: its last 64 KiB.
     const OUT_KEEP: usize = 64 * 1024;
     /// The longest config listing step 3 screens: 256 KiB of key names, far past any real
     /// clone's and well under the 1 MiB tail the child door keeps of a stream, so a listing
     /// the door cut is always longer than this and refused.
     const SCREEN_MAX: usize = 256 * 1024;
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    enum ConfigClass {
+        Url,
+        Http,
+        Credential,
+        Include,
+        IncludeIf,
+        Protocol,
+        Bundle,
+        Hook,
+        Fetch,
+        Remote,
+        Core,
+        Extensions,
+        Unknown,
+    }
+
+    impl ConfigClass {
+        fn of(key: &str) -> Self {
+            let section = key.split_once('.').map_or(key, |(section, _)| section);
+            match section.to_ascii_lowercase().as_str() {
+                "url" => Self::Url,
+                "http" => Self::Http,
+                "credential" => Self::Credential,
+                "include" => Self::Include,
+                "includeif" => Self::IncludeIf,
+                "protocol" => Self::Protocol,
+                "bundle" => Self::Bundle,
+                "hook" => Self::Hook,
+                "fetch" => Self::Fetch,
+                "remote" => Self::Remote,
+                "core" => Self::Core,
+                "extensions" => Self::Extensions,
+                _ => Self::Unknown,
+            }
+        }
+
+        fn key(&self) -> &'static str {
+            match self {
+                Self::Url => "url.*",
+                Self::Http => "http.*",
+                Self::Credential => "credential.*",
+                Self::Include => "include.*",
+                Self::IncludeIf => "includeif.*",
+                Self::Protocol => "protocol.*",
+                Self::Bundle => "bundle.*",
+                Self::Hook => "hook.*",
+                Self::Fetch => "fetch.*",
+                Self::Remote => "remote.*",
+                Self::Core => "core.*",
+                Self::Extensions => "extensions.*",
+                Self::Unknown => "repository-config.*",
+            }
+        }
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    enum ConfigVerdict {
+        Allowed { keys: usize },
+        TooLong { bytes: usize },
+        Refused { class: ConfigClass },
+    }
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    enum ConfigSourceVerdict {
+        Ready,
+        Missing,
+        Refused(String),
+    }
+
+    fn config_names_request(slug: &Slug, read_only: bool, scope: &str) -> Vec<u8> {
+        let access = if read_only { "read-only" } else { "write" };
+        format!("{CONFIG_LIST} {slug} names {access} {scope}").into_bytes()
+    }
     /// The variables a git child gets from the client's environment.
     const PASSED: [&str; 6] = [
         "USER",
@@ -680,7 +762,7 @@ mod unix {
         /// One child through `Fx::git`: `args`, in `cwd` (or the work directory), its request
         /// named `canonical`. An error keeps `Fx::git`'s side effect unless the run only reads.
         fn git(&self, args: &[OsString], cwd: Option<&Path>, canonical: &[u8]) -> Result<ChildOut> {
-            self.git_supplied(args, cwd, canonical, None)
+            self.git_supplied(args, cwd, canonical, None, None)
         }
 
         fn git_input(
@@ -690,7 +772,12 @@ mod unix {
             canonical: &[u8],
             input: &[u8],
         ) -> Result<ChildOut> {
-            self.git_supplied(args, cwd, canonical, Some(input))
+            self.git_supplied(args, cwd, canonical, Some(input), None)
+        }
+
+        fn config(&self, query: ConfigQuery, input: &[u8], canonical: &[u8]) -> Result<ChildOut> {
+            let args: Vec<_> = query.args().iter().map(|arg| os(*arg)).collect();
+            self.git_supplied(&args, None, canonical, Some(input), Some(query))
         }
 
         fn git_supplied(
@@ -699,10 +786,14 @@ mod unix {
             cwd: Option<&Path>,
             canonical: &[u8],
             input: Option<&[u8]>,
+            config_query: Option<ConfigQuery>,
         ) -> Result<ChildOut> {
             let mut spec = ChildSpec::new(&self.git).budget(self.budget);
             if let Some(input) = input {
-                spec = spec.input(input);
+                spec = match config_query {
+                    Some(query) => spec.config_input(input, query),
+                    None => spec.input(input),
+                };
             }
             for arg in args {
                 spec = spec.arg(arg.clone());
@@ -983,28 +1074,28 @@ mod unix {
                     ],
                 )
         } else if section.eq_ignore_ascii_case("extensions") {
-            sub.is_none() && is(var, &["worktreeconfig", "partialclone"])
+            sub.is_none() && var.eq_ignore_ascii_case("partialclone")
         } else {
             false
         }
     }
 
-    /// Step 3's screen over `git config --local --list --name-only -z`'s output: a listing
+    /// Step 3's screen over each local/worktree `git config --list --name-only -z` output: a listing
     /// longer than `SCREEN_MAX`, or the first key that rewrites where git goes, Refused. The
     /// child door keeps only the tail of a stream (`fx::child`, the last 1 MiB), so a listing
     /// past `SCREEN_MAX` may have lost its head, and a key cut off there would pass the screen
     /// while git still reads it: the screen fails closed on the length alone. Listing names
     /// only keeps a value from padding the listing; a long subsection name still can.
-    pub(super) fn screen(listed: &[u8], slug: &Slug, read_only: bool) -> Result<()> {
+    pub(super) fn project_config_names(listed: &[u8], read_only: bool) -> Vec<u8> {
         if listed.len() > SCREEN_MAX {
-            return Err(Error::refused(format!(
-                "the clone's config is too long to screen ({} bytes of names)",
-                listed.len()
-            ))
-            .with_next("remove the padding from the clone's .git/config, or clone again")
-            .with_repo(slug.to_string()));
+            return aterm_json::to_vec(&ConfigVerdict::TooLong {
+                bytes: listed.len(),
+            })
+            .unwrap_or_default();
         }
+        let mut keys = 0;
         for entry in listed.split(|b| *b == 0).filter(|e| !e.is_empty()) {
+            keys += 1;
             let key = entry.split(|b| *b == b'\n').next().unwrap_or_default();
             let key = String::from_utf8_lossy(key);
             // Fetch passes its routed URL explicitly, never a named remote.
@@ -1019,16 +1110,33 @@ mod unix {
                     })
             });
             if rewrites(&key) && !(read_only && write_only) {
-                let key = Redactor::shapes(&key);
-                return Err(Error::refused(format!(
-                    "the clone's config rewrites where git goes: {key}"
-                ))
-                .with_sub(Sub::GitConfig { key })
-                .with_next("remove the key from the clone's .git/config, or clone again")
-                .with_repo(slug.to_string()));
+                return aterm_json::to_vec(&ConfigVerdict::Refused {
+                    class: ConfigClass::of(&key),
+                })
+                .unwrap_or_default();
             }
         }
-        Ok(())
+        aterm_json::to_vec(&ConfigVerdict::Allowed { keys }).unwrap_or_default()
+    }
+
+    fn screen_projected(projected: &[u8], slug: &Slug) -> Result<()> {
+        let verdict: ConfigVerdict = aterm_json::from_slice(projected)
+            .map_err(|_| Error::local("invalid isolated config-screen verdict"))?;
+        match verdict {
+            ConfigVerdict::Allowed { keys } if keys <= SCREEN_MAX => Ok(()),
+            ConfigVerdict::Allowed { .. } => Err(Error::refused("invalid config-screen key count")),
+            ConfigVerdict::TooLong { bytes } => Err(Error::refused(format!(
+                "the clone's config is too long to screen ({bytes} bytes of names)"
+            ))
+            .with_repo(slug.to_string())),
+            ConfigVerdict::Refused { class } => {
+                let key = class.key().to_owned();
+                Err(Error::refused(format!("the clone's config rewrites where git goes: {key}"))
+                    .with_sub(Sub::GitConfig { key })
+                    .with_next("remove the guarded key from the clone's local/worktree config, or clone again")
+                    .with_repo(slug.to_string()))
+            }
+        }
     }
 
     /// Step 9: an exit that is not 0, mapped. Each phrase is looked for on stderr and stdout
@@ -1321,36 +1429,14 @@ mod unix {
         result
     }
 
-    /// Step 3 of a fetch: `dir`, absolute, once `git config --local --list` of it passed the
-    /// config screen (`screen`).
+    /// Step 3: snapshot owned config without entering source repository setup,
+    /// then parse only those bounded bytes in the run's safe scratch directory.
+    /// Git setup can follow includes before a --local/--worktree listing even
+    /// with --no-includes, so those repository-scoped queries are not admission.
     fn screened(children: &Children<'_>, run: &GitRun, dir: &Path) -> Result<PathBuf> {
         let slug = &run.slug;
         let dir = std::path::absolute(dir)
             .map_err(|e| Error::local(format!("{}: {e}", dir.display())))?;
-        let listed = children
-            .git(
-                &[
-                    os("-C"),
-                    dir.clone().into_os_string(),
-                    os("config"),
-                    os("--local"),
-                    os("--list"),
-                    os("--name-only"),
-                    os("-z"),
-                ],
-                None,
-                format!("{CONFIG_LIST} {slug}").as_bytes(),
-            )
-            .map_err(unsent)?;
-        if listed.code != Some(0) {
-            return Err(failed(
-                &run.op,
-                &listed,
-                children.gh.redactor(),
-                slug,
-                false,
-            ));
-        }
         let read_only = matches!(
             &run.op,
             GitOp::CheckLocal { .. }
@@ -1359,7 +1445,101 @@ mod unix {
                 | GitOp::FetchRef { .. }
                 | GitOp::FetchBatch { .. }
         );
-        screen(&listed.stdout, slug, read_only)?;
+        let mut source = None;
+        let admitted =
+            children
+                .gh
+                .fx()
+                .fact("git-source-config-v2", &slug.to_string(), &mut || {
+                    match super::super::source_config::SourceConfig::read(&dir, SCREEN_MAX) {
+                        Ok(snapshot) => {
+                            source = Some(snapshot);
+                            aterm_json::to_string(&ConfigSourceVerdict::Ready).unwrap_or_default()
+                        }
+                        Err(super::super::source_config::ReadError::Missing) => {
+                            aterm_json::to_string(&ConfigSourceVerdict::Missing).unwrap_or_default()
+                        }
+                        Err(super::super::source_config::ReadError::Refused(error)) => {
+                            aterm_json::to_string(&ConfigSourceVerdict::Refused(error))
+                                .unwrap_or_default()
+                        }
+                    }
+                })?;
+        let admitted: ConfigSourceVerdict = aterm_json::from_str(&admitted)
+            .map_err(|_| Error::local("invalid source-config admission"))?;
+        match admitted {
+            ConfigSourceVerdict::Ready => {}
+            ConfigSourceVerdict::Missing => {
+                return Err(Error::local(
+                    "source has no repository common configuration",
+                ));
+            }
+            ConfigSourceVerdict::Refused(error) => {
+                return Err(Error::refused(error).with_repo(slug.to_string()));
+            }
+        }
+        // In replay the filesystem closure is not called and the child door
+        // supplies its taped safe verdict. No raw config values enter a tape.
+        let common = source
+            .as_ref()
+            .map_or(&[][..], |source| source.common.as_slice());
+        let names = |input: &[u8], scope: &str| -> Result<()> {
+            let listed = children
+                .config(
+                    ConfigQuery::Names { read_only },
+                    input,
+                    &config_names_request(slug, read_only, scope),
+                )
+                .map_err(unsent)?;
+            if listed.code != Some(0) {
+                return Err(Error::refused("source configuration cannot be parsed")
+                    .with_repo(slug.to_string()));
+            }
+            screen_projected(&listed.stdout, slug)
+        };
+        names(common, "local")?;
+        let enabled = children
+            .config(
+                ConfigQuery::WorktreeFlag,
+                common,
+                format!("{CONFIG_LIST} {slug} worktree-flag").as_bytes(),
+            )
+            .map_err(unsent)?;
+        let enabled = match (enabled.code, enabled.stdout.as_slice()) {
+            (Some(0), b"true\n") => true,
+            (Some(0), b"false\n") | (Some(1), b"") => false,
+            _ => {
+                return Err(
+                    Error::refused("source worktreeConfig is not a valid boolean")
+                        .with_repo(slug.to_string()),
+                );
+            }
+        };
+        if enabled {
+            let mut worktree = None;
+            let admitted =
+                children
+                    .gh
+                    .fx()
+                    .fact("git-worktree-config-v2", &slug.to_string(), &mut || {
+                        let Some(source) = &source else {
+                            return "source config snapshot is unavailable".into();
+                        };
+                        match source.worktree() {
+                            Ok(Some(bytes)) => {
+                                worktree = Some(bytes);
+                                "present".into()
+                            }
+                            Ok(None) => "absent".into(),
+                            Err(error) => error,
+                        }
+                    })?;
+            match admitted.as_str() {
+                "present" => names(worktree.as_deref().unwrap_or_default(), "worktree")?,
+                "absent" => {}
+                _ => return Err(Error::refused(admitted).with_repo(slug.to_string())),
+            }
+        }
         Ok(dir)
     }
 
@@ -2415,6 +2595,58 @@ mod unix {
             grant,
         })
     }
+
+    #[cfg(test)]
+    mod config_replay_tests {
+        use super::*;
+
+        #[test]
+        fn read_only_config_projection_cannot_replay_as_write_admission() {
+            use crate::fx::tape::{TapeHeader, TapeMode};
+
+            let root = aterm_tempfile::Builder::new()
+                .prefix("agh-config-replay-")
+                .tempdir()
+                .unwrap();
+            let tape = root.path().join("config.tape");
+            let slug = Slug::new("fixture-dev", "app").unwrap();
+            let input = b"[remote \"origin\"]\npushurl = https://elsewhere.invalid/app\n";
+            let query = ConfigQuery::Names { read_only: true };
+            let mut spec = ChildSpec::new(&find_git(&crate::identity::ProcessEnv).unwrap())
+                .cwd(root.path())
+                .config_input(input, query);
+            for arg in query.args() {
+                spec = spec.arg(*arg);
+            }
+            let mut header = TapeHeader::for_run(
+                &["config-screen".into()],
+                &crate::wire::Endpoints::github_com(),
+            );
+            header.mode = TapeMode::Credentialed;
+            let recording = crate::fx::Fx::record_for_tests(&tape, &header).unwrap();
+            let answer = recording
+                .git(&spec, &config_names_request(&slug, true, "local"))
+                .unwrap();
+            assert_eq!(answer.code, Some(0));
+            screen_projected(&answer.stdout, &slug).unwrap();
+            recording.finish(0).unwrap();
+            let (replay, _) = crate::fx::Fx::replay_for_tests(&tape).unwrap();
+            let write = spec.config_input(input, ConfigQuery::Names { read_only: false });
+            replay
+                .git(&write, &config_names_request(&slug, false, "local"))
+                .expect_err("read-only pushurl permission must not become write permission");
+            assert!(
+                replay.finish(0).is_err(),
+                "the semantic divergence must stay latched"
+            );
+        }
+
+        #[test]
+        fn config_verdict_rejects_unknown_protocol_fields() {
+            let slug = Slug::new("fixture-dev", "app").unwrap();
+            assert!(screen_projected(br#"{"Allowed":{"keys":1,"extra":true}}"#, &slug).is_err());
+        }
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -2468,7 +2700,6 @@ mod tests {
             "include.path",
             "includeif.gitdir:/x.path",
             "protocol.ext.allow",
-            "extensions.worktreeConfig",
             "extensions.partialClone",
             "fetch.bundleURI",
             "bundle.version",
@@ -2492,6 +2723,7 @@ mod tests {
             "url.insteadof",
             "fetch.prune",
             "extensions.objectformat",
+            "extensions.worktreeconfig",
         ] {
             assert!(!rewrites(key), "{key}");
         }

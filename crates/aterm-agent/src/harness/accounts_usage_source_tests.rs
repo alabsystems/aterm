@@ -71,7 +71,7 @@ pub(crate) fn usage_source_transition(
             let mut who = ProcessLogin {
                 login: None,
                 default_home: true,
-                stored_login: true,
+                route: crate::harness::accounts::AuthRoute::Stored,
             };
             let current_login = root.path().join("login").join("current");
             let current_login = current_login.to_str().unwrap();
@@ -139,7 +139,7 @@ pub(crate) fn usage_source_transition(
                 }
                 15 => std::fs::rename(store.logins_file(), root.path().join("retained-logins"))
                     .unwrap(),
-                16 => who.stored_login = false,
+                16 => who.route = crate::harness::accounts::AuthRoute::Outside,
                 17 => {
                     let target = Row {
                         dir: Some(new_login.into()),
@@ -256,7 +256,7 @@ fn missing_roster_receipts_recover_only_while_the_source_stays_missing() {
         let who = ProcessLogin {
             login: None,
             default_home: true,
-            stored_login: true,
+            route: crate::harness::accounts::AuthRoute::Stored,
         };
         let witness = store.state_witness_file();
         let kept = root.path().join("retained-witness");
@@ -337,7 +337,7 @@ fn usage_recovers_legacy_receipts_through_the_original_parent_alias() {
     let who = ProcessLogin {
         login: None,
         default_home: true,
-        stored_login: true,
+        route: crate::harness::accounts::AuthRoute::Stored,
     };
     store
         .observe_usage_within(&[], NOW, &captured, &who, |state| {
@@ -377,7 +377,7 @@ fn an_absent_roster_cannot_alias_an_uncreated_state_file_through_a_parent_link()
     let who = ProcessLogin {
         login: None,
         default_home: true,
-        stored_login: true,
+        route: crate::harness::accounts::AuthRoute::Stored,
     };
     assert!(
         store

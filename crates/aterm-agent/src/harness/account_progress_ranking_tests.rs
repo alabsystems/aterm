@@ -79,7 +79,7 @@ fn project(case: i64, raw_ranking: bool) -> [(&'static str, i64); 7] {
             _ => None,
         },
         default_home: case != 21,
-        stored_login: case != 22,
+        route: crate::harness::accounts::AuthRoute::Stored.unless(case == 22),
     };
     let point = match case {
         0 | 16 => None,

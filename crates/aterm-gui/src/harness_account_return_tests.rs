@@ -13,7 +13,8 @@ fn fallback_rechecks_authentication_context_at_the_writer() {
     let ledger = a.ledger();
     let kept = Arc::clone(&idle.kept);
     a.at_seat_read(2, move |_| {
-        kept.lock().unwrap().snapshot.as_mut().unwrap().stored_login = false;
+        kept.lock().unwrap().snapshot.as_mut().unwrap().route =
+            aterm_agent::harness::accounts::AuthRoute::Outside;
     });
     assert!(!account_way_back(&job, &idle.hooks, &mut snap));
     assert_eq!(snap, before);
@@ -86,7 +87,11 @@ fn return_case(case: i64) -> [i64; 7] {
         match case {
             3 => kept.account.landing = Arc::default(),
             4 => kept.account.moved.as_mut().unwrap().id = MoveId::default(),
-            5 => kept.snapshot.as_mut().unwrap().stored_login = !request.stored_login,
+            5 => {
+                kept.snapshot.as_mut().unwrap().route =
+                    aterm_agent::harness::accounts::AuthRoute::Stored
+                        .unless(request.route.is_stored());
+            }
             6 => request.home = Some("/example/different-home".into()),
             7 => kept.snapshot = None,
             8 => {

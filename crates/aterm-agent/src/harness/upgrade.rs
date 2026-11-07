@@ -986,9 +986,27 @@ pub fn task_line_env_clear(
     args: &[String],
     operand: &str,
 ) -> Result<String, String> {
+    task_line_env_clear_for(dialect, env, unset, exe, exe, args, operand)
+}
+
+/// [`task_line_env_clear`] for a line whose program `exe` runs the store binary `shim_of` (aterm's
+/// token wrapper ahead of a Claude Code build): the line exports what `shim_of`'s managed shim
+/// does, as one that typed it would.
+///
+/// # Errors
+/// As [`task_line_env_clear`].
+pub(super) fn task_line_env_clear_for(
+    dialect: Dialect,
+    env: &[(&str, &str)],
+    unset: &[&str],
+    shim_of: &Path,
+    exe: &Path,
+    args: &[String],
+    operand: &str,
+) -> Result<String, String> {
     let tty = LineDiscipline::HOST;
     let unset = Some(unset).filter(|names| !names.is_empty());
-    with_store_env(env, unset, exe, |env| {
+    with_store_env(env, unset, shim_of, |env| {
         let line = relaunch_line_exact(tty, dialect, None, None, env, unset, exe, args)?;
         let line = format!("{line} {operand}");
         let max = tty.max_line();
@@ -1059,17 +1077,22 @@ pub(super) struct SelectedLine {
     pub(super) env: Vec<(String, String)>,
 }
 
+/// A relaunch line of `exe` with `args`, carrying `env` and the shim record of the store binary
+/// `shim_of` ([`with_store_env`]): `exe` itself, or the build aterm's token wrapper execs, which
+/// `exe` (the wrapper) passes it on to. It returns the line and the environment its length
+/// fallback selected.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn relaunch_line_selected(
+pub(super) fn relaunch_line_selected_for(
     dialect: Dialect,
     heal: Option<&Path>,
     cd: Option<&str>,
     env: &[(&str, &str)],
     unset: Option<&[&str]>,
+    shim_of: &Path,
     exe: &Path,
     args: &[String],
 ) -> Result<SelectedLine, String> {
-    with_store_env(env, unset, exe, |selected| {
+    with_store_env(env, unset, shim_of, |selected| {
         relaunch_line_exact(
             LineDiscipline::HOST,
             dialect,

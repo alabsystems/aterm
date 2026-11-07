@@ -2377,7 +2377,7 @@ fn owed_relaunch(tab: &str) -> aterm_agent::harness::relaunch::Snapshot {
     aterm_agent::harness::relaunch::Snapshot {
         launch_env: None,
         auth_observed: true,
-        stored_login: false,
+        route: aterm_agent::harness::accounts::AuthRoute::Outside,
         profile: None,
         tab: tab.to_string(),
         pid: 4242,

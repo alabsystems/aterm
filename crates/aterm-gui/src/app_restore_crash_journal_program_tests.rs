@@ -350,7 +350,7 @@ fn a_held_panes_folder_that_is_not_here_is_not_asked_for_or_counted() {
     let agent = aterm_agent::harness::relaunch::Snapshot {
         launch_env: None,
         auth_observed: true,
-        stored_login: false,
+        route: aterm_agent::harness::accounts::AuthRoute::Outside,
         profile: None,
         tab: sid.clone(),
         pid: 4242,

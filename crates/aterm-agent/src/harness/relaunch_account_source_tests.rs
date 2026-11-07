@@ -21,7 +21,7 @@ fn source() -> Snapshot {
         login: None,
         home: None,
         claude_dir: None,
-        stored_login: true,
+        route: crate::harness::accounts::AuthRoute::Stored,
         profile: None,
     }
 }
@@ -83,7 +83,7 @@ fn selection_case(case: i64) -> bool {
             })
         }
         11 => fresh.claude_dir = Some("/other/records".into()),
-        12 => fresh.stored_login = false,
+        12 => fresh.route = crate::harness::accounts::AuthRoute::Outside,
         13 => rows.rows[0].dir = Some("/other/login".into()),
         14 => rows.rows[0].email = Some("other@example.test".into()),
         15 => rows.rows[0].identity_email = Some("other@example.test".into()),

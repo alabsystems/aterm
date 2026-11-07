@@ -2024,6 +2024,7 @@ fn a_sessions_row_names_its_agent_once() {
             need: None,
             hold: None,
             receipt: None,
+            token: None,
         }];
         state.projection().sessions[0].detail.clone()
     };
@@ -2130,6 +2131,7 @@ fn the_sessions_state_line_is_formatted_from_the_glass_for_every_state() {
         need: None,
         hold: None,
         receipt: None,
+        token: None,
     };
     let row = |view: AutopilotView, glass: ChipGlass| dated(view, glass, TODAY);
     let clock = |h: u16, m: u16| Clock::of_minute(h * 60 + m);
@@ -2316,6 +2318,7 @@ fn the_state_line_says_the_pause_where_no_face_or_timer_has_the_line() {
         need: None,
         hold: None,
         receipt: None,
+        token: None,
     };
     let stamp = |h: u16, m: u16| Stamp {
         clock: Clock::of_minute(h * 60 + m),
@@ -2414,6 +2417,7 @@ fn the_state_line_leads_with_an_outage_wait_and_its_next_try() {
         need: None,
         hold: None,
         receipt: None,
+        token: None,
     };
     let stamp = |h: u16, m: u16, day: i64| Stamp {
         clock: Clock::of_minute(h * 60 + m),
@@ -3223,6 +3227,7 @@ fn each_row_takes_its_own_sessions_day_and_a_name_its_own() {
         need: None,
         hold: None,
         receipt: None,
+        token: None,
     };
     let mut today = HarnessStats::per_session(0);
     today.approved = 9;
@@ -3314,6 +3319,7 @@ fn a_rows_escalation_clock_uses_the_events_offset_not_the_readings() {
             need: None,
             hold: None,
             receipt: None,
+            token: None,
         };
         let mut state = HarnessState::unobserved();
         state.observed = true;
@@ -3730,6 +3736,7 @@ fn state_deciding(
         need: None,
         hold: None,
         receipt: None,
+        token: None,
     }];
     state.decided_open = vec![OpenSession {
         sid: "s-9".to_string(),
@@ -4305,6 +4312,7 @@ fn listed_with(local_id: u64, verdict: &crate::needs::Verdict) -> HarnessSession
         need: verdict.harness_ask().cloned(),
         hold: None,
         receipt: None,
+        token: None,
     }
 }
 
@@ -4371,6 +4379,47 @@ fn the_status_card_counts_sessions_that_need_you() {
     assert_eq!(sessions(&state).as_deref(), Some("1 of 1 supervised"));
 }
 
+/// The state line ends with the account's vault token phrase while the quiet offer stands, and
+/// says nothing of the token otherwise (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.9).
+#[test]
+fn the_state_line_holds_the_token_phrase_only_while_an_offer_stands() {
+    use crate::claude_lights::ChipGlass;
+    let row = |token: Option<&str>| HarnessSessionRow {
+        stopped: None,
+        waiting: None,
+        switch_asked: false,
+        local_id: 7,
+        title: "fix the build".to_string(),
+        name: "fix the build".to_string(),
+        day_line: None,
+        detail: String::new(),
+        mode: Some(Autopilot::Cruise),
+        default: Some(Autopilot::Cruise),
+        view: AutopilotView::Cruise,
+        glass: ChipGlass::default(),
+        armed_at_ms: None,
+        today: 20_007,
+        setting: "follows the default".to_string(),
+        need: None,
+        hold: None,
+        receipt: None,
+        token: token.map(str::to_owned),
+    };
+    let phrase = "login ends in 5 days; token: none";
+    assert_eq!(row(Some(phrase)).state_line().as_deref(), Some(phrase));
+    assert_eq!(row(None).state_line(), None);
+    let mut needed = row(Some(phrase));
+    needed.need = asked(
+        crate::harness_host::NEEDS_ATTENTION_OWNER,
+        "claude needs you: sign 0.48.0 \u{2014} carrying on",
+    )
+    .harness_ask()
+    .cloned();
+    let line = needed.state_line().expect("a line");
+    assert!(line.starts_with("needs you"), "{line}");
+    assert!(line.ends_with(phrase), "the phrase comes last: {line}");
+}
+
 #[test]
 fn a_need_heads_the_rows_state_line() {
     use crate::claude_lights::{ChipGlass, Clock, Stamp};
@@ -4399,6 +4448,7 @@ fn a_need_heads_the_rows_state_line() {
         need: ask.harness_ask().cloned(),
         hold: None,
         receipt: None,
+        token: None,
     };
     let pausing = ChipGlass {
         pause: Some(PauseGlass {
@@ -5522,6 +5572,7 @@ fn the_landed_state_line_says_what_aterm_checked_whole() {
         hold: None,
         switch_asked: false,
         receipt: receipt.map(std::sync::Arc::new),
+        token: None,
     };
     let long = format!("/Users//me/{}/proj", "deep/".repeat(30));
     let said = "Nothing left: the parser is committed and pushed to origin/main.";

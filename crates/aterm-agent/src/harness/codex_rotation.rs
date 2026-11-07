@@ -528,7 +528,8 @@ fn prepare_quota_wall<T, R: Clone>(
         .row(me.label().ok_or("source-unbound")?)
         .ok_or("source-missing")?
         .clone();
-    if !me.default_home || !me.stored_login {
+    // Codex never produces a token route: one reads as outside its stored login.
+    if !me.default_home || !me.route.is_stored() {
         return Err("source-unmanaged");
     }
     // Another row's pin keeps every session where it is, and the writer takes no target under one:

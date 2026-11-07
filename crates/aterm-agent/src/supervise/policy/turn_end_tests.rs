@@ -122,6 +122,7 @@ fn idle(said: &str, worked: Option<Duration>) -> TurnEndReading {
         program: aterm_phase::Program::Claude,
         seat: Default::default(),
         account: None,
+        route: None,
         autopilot: Autopilot::Cruise,
         login_label: None,
         autopilot_by_person: false,
@@ -4175,6 +4176,57 @@ fn a_lost_login_whose_settings_pin_its_sign_in_is_left_to_the_person() {
         assert!(notice.did.contains(why), "{pin:?}: {}", notice.did);
         assert_eq!(told.when, super::super::exception::Urgency::Now, "{pin:?}");
     }
+}
+
+/// A LOST LOGIN ON A SESSION THE WRAPPER SERVED ITS VAULT TOKEN NEVER GETS `/login`
+/// (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.8): the token outranks the stored login, so
+/// `/login` replaces nothing; aterm types none, and the person is told, quietly, that the way back
+/// is a new token (`login-token-refused`), never to type `/login`. CONTROL: the same wall with no
+/// pin types `/login`.
+#[test]
+fn the_loop_never_types_login_into_a_token_session() {
+    use super::super::login::LoginPin;
+    use super::super::notice::{LOGIN_TOKEN_REFUSED, WHY_TOKEN};
+    let t = t0();
+    let r = read_screen(
+        &login_screen(&["⏺ Login expired · Please run /login"]),
+        Some(3 * MIN),
+    );
+    let mut st = TurnEndState::default();
+    st.observe(&r, t);
+    assert!(
+        matches!(
+            decide_turn_end(&st, &r, &cfg(), t),
+            TurnEndAction::TypeCommand {
+                rule_id: RULE_LOGIN,
+                ..
+            }
+        ),
+        "CONTROL: no pin types /login"
+    );
+    let token = TurnEndReading {
+        login_pin: LoginPin::Token,
+        ..r.clone()
+    };
+    let mut st = TurnEndState::default();
+    st.observe(&token, t);
+    for at in [t, t + 20 * MIN] {
+        let a = decide_turn_end(&st, &token, &cfg(), at);
+        assert!(is_escalate(&a, WHY_TOKEN), "{a:?}");
+        assert!(
+            !matches!(a, TurnEndAction::TypeCommand { .. }),
+            "nothing is typed: {a:?}"
+        );
+    }
+    let told =
+        super::super::exception::exception_for(&st, &token, &cfg(), t).expect("the person is told");
+    let notice = told.notice.as_ref().expect("a notice");
+    assert_eq!(notice.id, LOGIN_TOKEN_REFUSED.id, "{told:?}");
+    assert!(
+        !LOGIN_TOKEN_REFUSED.todo.contains("/login")
+            && LOGIN_TOKEN_REFUSED.todo.contains("vault token"),
+        "the step is a new token, never /login"
+    );
 }
 
 #[test]
@@ -24012,3 +24064,207 @@ fn a_measured_outage_holds_the_continuation_and_its_return_types_it() {
 
 #[path = "sysmsg_replay_tests.rs"]
 mod sysmsg_replay;
+
+fn routed(r: &TurnEndReading, to: RouteTo) -> TurnEndReading {
+    TurnEndReading {
+        route: Some(to),
+        ..r.clone()
+    }
+}
+
+/// THE ROUTE MOVE AT A TURN END (DESIGN-claude-setup-token S10, §5.5): a session the host offers
+/// its account's vault token relaunches onto it at its turn end, around the act it would have
+/// taken; never while a turn runs, never where no relaunch reaches the tab, and a session that
+/// must yield its account makes that move instead. A move the host could not make is not asked
+/// again within the window, and is after it.
+#[test]
+fn a_route_onto_the_token_is_asked_at_a_turn_end_after_the_claims_ring() {
+    let t = t0();
+    let end = idle("Stage 2 done.", Some(JOB));
+    let cont = at(&mut TurnEndState::default(), &end, t);
+    assert_eq!(cont, typed(RULE_CONTINUE));
+    let onto = Restart::Route { to: RouteTo::Token };
+    let a = at(
+        &mut TurnEndState::default(),
+        &routed(&end, RouteTo::Token),
+        t,
+    );
+    assert!(restarts(&a, &onto, RULE_TOKEN_ROUTE), "{a:?}");
+    assert_eq!(otherwise_of(&a), &cont);
+    assert_eq!(onto.word(), Restart::ROUTE_TOKEN);
+    assert!(Restart::put_off(onto.word()) && Restart::moves(onto.word()));
+
+    let yields = advised(&routed(&end, RouteTo::Token), "work-2");
+    let a = at(&mut TurnEndState::default(), &yields, t);
+    assert!(
+        restarts(&a, &to_account("work-2", AccountAt::Ahead), RULE_ACCOUNT),
+        "the claims ring's move first: {a:?}"
+    );
+
+    let mut running = routed(&end, RouteTo::Token);
+    running.phase = Phase::Busy;
+    let a = at(&mut TurnEndState::default(), &running, t);
+    assert!(
+        !matches!(a, TurnEndAction::Restart { .. }),
+        "never mid-turn: {a:?}"
+    );
+    let mut bare = routed(&end, RouteTo::Token);
+    bare.restartable = false;
+    assert_eq!(at(&mut TurnEndState::default(), &bare, t), cont);
+
+    let mut st = TurnEndState::default();
+    st.restarted(&onto, false, &end, t);
+    assert_eq!(
+        at(&mut st, &routed(&end, RouteTo::Token), t + MIN),
+        cont,
+        "refused: not asked again within the window"
+    );
+    assert!(restarts(
+        &at(&mut st, &routed(&end, RouteTo::Token), t + 61 * MIN),
+        &onto,
+        RULE_TOKEN_ROUTE
+    ));
+    let mut st = TurnEndState::default();
+    st.restarted(&onto, false, &end, t);
+    st.account_news();
+    assert!(
+        restarts(
+            &at(&mut st, &routed(&end, RouteTo::Token), t + MIN),
+            &onto,
+            RULE_TOKEN_ROUTE
+        ),
+        "the accounts' news asks it again"
+    );
+}
+
+/// A REFUSED TOKEN'S MOVE BACK (S10, §5.6): at the anchored lost-login wall of a session the host
+/// offers the row's stored login, the session relaunches back onto it, and the lost login it drew
+/// is left with the token; with no route offered the wall's own act stands, and a session the
+/// host offers its account's token moves onto it there, around that act
+/// ([`a_stored_session_at_its_lost_login_wall_moves_onto_its_token`]).
+#[test]
+fn a_refused_token_moves_back_onto_the_stored_login_at_its_wall() {
+    let t = t0();
+    let gone = walled(
+        WallKind::Auth,
+        "OAuth token revoked · Please run /login",
+        None,
+    );
+    let today = at(&mut TurnEndState::default(), &gone, t);
+    assert!(!matches!(today, TurnEndAction::Restart { .. }), "{today:?}");
+    let back = Restart::Route {
+        to: RouteTo::Stored,
+    };
+    let a = at(
+        &mut TurnEndState::default(),
+        &routed(&gone, RouteTo::Stored),
+        t,
+    );
+    assert!(restarts(&a, &back, RULE_TOKEN_ROUTE), "{a:?}");
+    assert_eq!(back.word(), Restart::ROUTE_STORED);
+    let a = at(
+        &mut TurnEndState::default(),
+        &routed(&gone, RouteTo::Token),
+        t,
+    );
+    assert!(
+        restarts(&a, &Restart::Route { to: RouteTo::Token }, RULE_TOKEN_ROUTE),
+        "{a:?}"
+    );
+    assert_eq!(otherwise_of(&a), &today, "around the wall's own act");
+    let mut st = TurnEndState::default();
+    act(&mut st, &routed(&gone, RouteTo::Stored), t);
+    assert_eq!(
+        st.wall_attempts(WallKind::Auth),
+        None,
+        "the token's lost login left with it"
+    );
+}
+
+/// A STORED SESSION AT ITS LOST-LOGIN WALL MOVES ONTO ITS ACCOUNT'S TOKEN (S10, §5.5; design
+/// decision 20, a token in use carries its sessions past the login's end): a row whose token is
+/// in use here is never signed in again (its renewal is off), so at the anchored wall of a session
+/// on the row's stored login the host's offer of the token is taken, around the wait the wall
+/// would have made. That wait, and the one a move the host could not make leaves within the
+/// window, say the tab moves onto the token, never that aterm signs the row in. CONTROL: with no
+/// token offered, the wall waits on the row's own sign-in.
+///
+/// NEGATIVE CONTROL (2026-11-06, restored with cp from a backup plus touch, confirmed with cmp):
+/// with `wall_action` taking only `RouteTo::Stored` again, the routed wall restarts nothing: it is
+/// the wait `the login is gone: the tab moves onto work's vault token, in use here`.
+#[test]
+fn a_stored_session_at_its_lost_login_wall_moves_onto_its_token() {
+    let t = t0();
+    let gone = renewable(
+        &walled(
+            WallKind::Auth,
+            "Not logged in · Please run /login",
+            Some(Duration::from_secs(2)),
+        ),
+        "work",
+    );
+    let control = at(&mut TurnEndState::default(), &gone, t);
+    assert!(
+        matches!(&control, TurnEndAction::WaitUntil { why, .. }
+            if why.contains("aterm signs work in again by itself")),
+        "CONTROL: {control:?}"
+    );
+    let on_token = |a: &TurnEndAction| {
+        matches!(a, TurnEndAction::WaitUntil { why, .. }
+            if why.contains("work's vault token") && !why.contains("signs work in"))
+    };
+    let onto = Restart::Route { to: RouteTo::Token };
+    let a = at(
+        &mut TurnEndState::default(),
+        &routed(&gone, RouteTo::Token),
+        t,
+    );
+    assert!(restarts(&a, &onto, RULE_TOKEN_ROUTE), "{a:?}");
+    assert!(on_token(otherwise_of(&a)), "{:?}", otherwise_of(&a));
+    let mut st = TurnEndState::default();
+    st.restarted(&onto, false, &gone, t);
+    let refused = at(&mut st, &routed(&gone, RouteTo::Token), t + MIN);
+    assert!(
+        on_token(&refused),
+        "not made: within the window {refused:?}"
+    );
+}
+
+/// A TRANSCRIPT QUOTING A LOST LOGIN IS NO POINT (DESIGN-claude-setup-token S10, §5.6): a turn
+/// whose words quote "OAuth token revoked" is a turn end, never the lost login the host records a
+/// token's refusal at; only the read wall (`WallKind::Auth`, which the loop's wall confirmation
+/// never takes from a tool's output under a call) is.
+#[test]
+fn a_transcript_quoting_a_revoked_token_is_no_lost_login() {
+    let st = TurnEndState::default();
+    let lost = |point: Option<AccountPoint>| {
+        matches!(
+            point,
+            Some(
+                AccountPoint::Wall {
+                    kind: WallKind::Auth
+                } | AccountPoint::LoginEnded
+            )
+        )
+    };
+    let quoted = TurnEndReading {
+        login_label: Some("work".to_owned()),
+        ..idle(
+            "The log reads: OAuth token revoked · Please run /login. Fixed the parser.",
+            Some(MIN),
+        )
+    };
+    assert_eq!(quoted.wall, None);
+    let point = st.account_point(&quoted, &cfg());
+    assert!(!lost(point), "{point:?}");
+    let walled = TurnEndReading {
+        login_label: Some("work".to_owned()),
+        ..walled(
+            WallKind::Auth,
+            "OAuth token revoked · Please run /login",
+            None,
+        )
+    };
+    let point = st.account_point(&walled, &cfg());
+    assert!(lost(point), "{point:?}");
+}

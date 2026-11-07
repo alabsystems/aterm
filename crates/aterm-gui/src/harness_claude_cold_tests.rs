@@ -6,6 +6,7 @@ use super::*;
 fn external_seed(c: &ColdCase) -> aterm_agent::harness::native_act::RestartCommand {
     use aterm_agent::harness::native_act::{Image, RestartCommand};
     RestartCommand {
+        settles: None,
         account_intent: None,
         image: Image {
             path: b"/synthetic/claude".to_vec(),
@@ -28,7 +29,7 @@ fn external_intent() -> aterm_agent::harness::native_act::ColdIntent {
         login: None,
         home: None,
         auth_observed: false,
-        stored_login: false,
+        route: aterm_agent::harness::accounts::AuthRoute::Outside,
         conversation: None,
         profile: None,
         mode: accounts::Mode::Wall,
@@ -70,7 +71,7 @@ fn owned_helper_external_routes_use_actual_config_and_canonical_directory_guards
     std::fs::create_dir(&custom).unwrap();
     intent.home = Some(custom.to_str().unwrap().into());
     intent.auth_observed = true;
-    intent.stored_login = true;
+    intent.route = aterm_agent::harness::accounts::AuthRoute::Stored;
     let facts = external_facts(&c, &intent, &[]);
     assert_eq!(facts.config.as_deref(), custom.to_str());
     assert_ne!(facts.profile_configs.as_deref(), facts.config.as_deref());
@@ -133,22 +134,20 @@ fn owned_helper_provider_and_settings_routes_share_the_execute_interpretation() 
         };
         let (resolved, context, pooled) =
             cold_resolve_at(&c.seat, &seed, &intent, &facts, &derive).unwrap();
-        assert!(!pooled && !context.who.stored_login);
+        assert!(!pooled && !context.who.route.is_stored());
         assert!(
             cold_guard_at(&c.seat, &resolved, &context)
                 .unwrap()
                 .is_none()
         );
-        assert!(
-            resolved
-                .account_intent
-                .as_deref()
-                .unwrap()
-                .matches_process(&context.who, true)
-        );
+        assert!(resolved.account_intent.as_deref().unwrap().matches_process(
+            &context.who,
+            true,
+            None
+        ));
         if extra.is_empty() {
             assert!(
-                facts.process_login().stored_login,
+                facts.process_login().route.is_stored(),
                 "settings-only route would fail a raw-facts Execute check"
             );
         }
@@ -219,7 +218,7 @@ fn owned_helper_profile_availability_and_billing_are_not_external_fallbacks() {
     );
     let (resolved, context, pooled) =
         cold_resolve_at(&c.seat, &seed, &intent, &facts, &derive).unwrap();
-    assert!(!context.who.stored_login);
+    assert!(!context.who.route.is_stored());
     let proof = ColdCommandProof {
         context: c.seat.context(),
         intent: intent.clone(),
@@ -232,7 +231,7 @@ fn owned_helper_profile_availability_and_billing_are_not_external_fallbacks() {
     assert!(proof.current_at(&c.seat, &derive));
     std::fs::remove_file(configs.join("active.json")).unwrap();
     let changed = derive(&facts, &resolved).unwrap();
-    assert!(changed != context && !changed.who.stored_login);
+    assert!(changed != context && !changed.who.route.is_stored());
     assert!(!proof.current_at(&c.seat, &derive));
     std::fs::remove_dir(&configs).unwrap();
     #[cfg(unix)]
@@ -272,7 +271,7 @@ fn owned_helper_retained_managed_authority_rechecks_owner_and_generation() {
         let mut seed = external_seed(&c);
         let mut intent = external_intent();
         intent.auth_observed = true;
-        intent.stored_login = true;
+        intent.route = aterm_agent::harness::accounts::AuthRoute::Stored;
         intent.login = Some(c.original_dir.clone());
         let facts = external_facts(&c, &intent, &[]);
         let derive =
@@ -482,13 +481,14 @@ fn a_deferred_helper_relative_login_context_is_refused_before_local_policy_reads
         login: None,
         home: None,
         auth_observed: true,
-        stored_login: true,
+        route: aterm_agent::harness::accounts::AuthRoute::Stored,
         conversation: None,
         profile: None,
         mode: accounts::Mode::Wall,
         billing: aterm_agent::harness::native_act::ColdBilling::Keep,
     };
     let seed = RestartCommand {
+        settles: None,
         account_intent: None,
         image: Image {
             path: b"/private-fixture/claude".to_vec(),
@@ -634,7 +634,8 @@ fn cold_case(case: i64, record: Option<&str>) -> ColdCase {
     let legacy = case == 18 || case == 19;
     let mut original = Snapshot {
         auth_observed: case != 14 && case != 15 && !legacy,
-        stored_login: case != 8 && case != 14 && case != 15 && !legacy,
+        route: aterm_agent::harness::accounts::AuthRoute::Stored
+            .unless(case == 8 || case == 14 || case == 15 || legacy),
         login: (!default && case != 14).then(|| original_dir.clone()),
         session: Some(ACCT_TALK_A.into()),
         cwd: a.tmp.path().display().to_string(),
@@ -742,7 +743,7 @@ fn decide(case: i64) -> [i64; 3] {
         binding = chosen.login.as_deref() == Some(expected)
             && chosen.home == c.original.home
             && chosen.auth_observed
-            && chosen.stored_login;
+            && chosen.route.is_stored();
         profile = chosen.profile == c.original.profile;
     }
     [
@@ -1244,4 +1245,37 @@ fn a_worker_restored_cold_relaunches_on_its_recorded_environment_and_keeps_its_t
     let handed = handed.lock().unwrap();
     assert!(handed.len() > 1, "it retried: {handed:?}");
     assert!(handed.iter().all(|(_, deferred)| *deferred));
+}
+
+/// A WORKER THAT RAN ON ITS ACCOUNT'S VAULT TOKEN COMES BACK THROUGH THE WRAPPER
+/// (DESIGN-claude-setup-token S10, §5.4): on a qualified host, its own agent's end is admitted
+/// now, so the planned line (which carries the token wrapper ahead of the build) relaunches it,
+/// never the native constructor's fixed seed, which executes the build. NEGATIVE CONTROL: on its
+/// stored login, this host's own agent is deferred as before.
+#[test]
+fn a_token_session_of_this_host_is_admitted_for_the_planned_line() {
+    use aterm_agent::harness::accounts::{AuthRoute, TokenEntry};
+    let c = cold_case(20, None);
+    let token = Snapshot {
+        route: AuthRoute::VaultToken {
+            entry: TokenEntry::parse("aterm-claude-token-ac-fedcba9876543210").expect("an entry"),
+        },
+        ..c.original.clone()
+    };
+    let decided = |snap: &Snapshot| {
+        account_cold_decided(&c.seat, snap, c.mode, ColdEnd::ThisHost, true, || {
+            PLATFORM_SHELL
+        })
+    };
+    assert!(
+        matches!(
+            decided(&token),
+            Ok(relaunch::ColdAdmission::Immediate(Some(_)))
+        ),
+        "the token session is admitted now"
+    );
+    assert!(matches!(
+        decided(&c.original),
+        Ok(relaunch::ColdAdmission::Deferred(_))
+    ));
 }

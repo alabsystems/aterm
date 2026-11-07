@@ -2661,10 +2661,12 @@ struct Identity {
     task: Option<String>,
     /// The image and settings directory the stored-login verdict belongs to.
     login_checked_for: Option<(Option<u64>, PathBuf)>,
-    /// Settings, provider and profile-store evidence leave the stored login selected.
-    stored_login: bool,
+    /// How the process authenticates once settings, provider and profile-store evidence are read
+    /// ([`crate::harness_netprobe::auth_route_of_agent`]): only they move it off its account's own
+    /// credential.
+    route: accounts::AuthRoute,
     /// Why no relaunch line of this image's argv in its directory would carry the usage tap,
-    /// judged beside [`Self::stored_login`] ([`tap_line_refusal`]: its options and settings;
+    /// judged beside [`Self::route`] ([`tap_line_refusal`]: its options and settings;
     /// its home and login are judged at each read, [`tap_refusal`]); `None` where one would.
     unoffered: Option<tap::Refusal>,
     /// Exact captured exec environment, fingerprinted without retaining credentials.
@@ -2815,7 +2817,7 @@ struct Asks {
     files: fn(u32) -> Option<Vec<PathBuf>>,
     roster: fn() -> Option<accounts::Roster>,
     home: fn() -> Option<PathBuf>,
-    stored_login: fn(u32, &[String], &str) -> bool,
+    route: fn(u32, &[String], &str) -> accounts::AuthRoute,
     tap: TapAsks,
 }
 
@@ -2826,7 +2828,7 @@ struct TapAsks {
     seat: fn() -> TapSeat,
     /// Whether the settings chain a relaunch line of the process's argv in its directory reads
     /// admits the tap (`upgrade_drive::tap_settings_admit`), asked once per image beside
-    /// [`Asks::stored_login`].
+    /// [`Asks::route`].
     settings: fn(&[String], &str) -> bool,
     /// Whether aterm's restart in place is offered for process `pid` in tab `tab` now
     /// ([`crate::restart_act::offered_for`]), asked at a read whose footer would promise it.
@@ -2891,7 +2893,7 @@ const LIVE: Asks = Asks {
     args: process_args,
     roster: live_roster,
     home: aterm_types::dirs::home_dir,
-    stored_login: crate::harness_netprobe::stored_login_of_agent,
+    route: crate::harness_netprobe::auth_route_of_agent,
     tap: TapAsks {
         seat: live_tap,
         settings: crate::harness_netprobe::tap_settings_admit_line,
@@ -2926,7 +2928,7 @@ fn resolve_and_post(
         argv: Vec::new(),
         task: None,
         login_checked_for: None,
-        stored_login: false,
+        route: aterm_agent::harness::accounts::AuthRoute::Outside,
         unoffered: None,
         env_stamp: None,
     });
@@ -3141,12 +3143,13 @@ fn resolve_facts_at_with_cwd(
                         .as_ref()
                         .is_none_or(|(image, cwd)| *image != entry.started_at || *cwd != entry.cwd)
                 {
-                    identity.stored_login = false;
+                    identity.route = accounts::AuthRoute::Outside;
                     if identity.launch_for == Some(entry.started_at) {
                         let asked = u32::try_from(identity.pid).ok().zip(entry.cwd.to_str());
-                        identity.stored_login = asked.is_some_and(|(pid, cwd)| {
-                            (asks.stored_login)(pid, &identity.argv, cwd)
-                        });
+                        identity.route = asked
+                            .map_or(accounts::AuthRoute::Outside, |(pid, cwd)| {
+                                (asks.route)(pid, &identity.argv, cwd)
+                            });
                         let tapped = tap::carried_by(&identity.argv);
                         identity.unoffered = asked
                             .filter(|_| !tapped)
@@ -3341,6 +3344,7 @@ fn resolve_facts_at_with_cwd(
                     session_id: format!("{prefix}-{}", identity.pid),
                 }),
                 account: None,
+                route: None,
                 account_progress: None,
                 account_progress_busy: false,
                 top_effort: None,
@@ -3358,6 +3362,13 @@ fn resolve_facts_at_with_cwd(
             .at(std::time::Instant::now(), asks.roster)
             .and_then(|listed| accounts::footer_label(listed, who))
             .map(str::to_owned);
+        // The settings evidence only weakens the environment's route (as [`own_label`] reads it).
+        facts.route = Some(match identity.route {
+            accounts::AuthRoute::Stored | accounts::AuthRoute::VaultToken { .. } => who.route,
+            accounts::AuthRoute::Outside => accounts::AuthRoute::Outside,
+        });
+        // The vault token facts every surface maps, read here at most once a minute (§5.9).
+        crate::token_shown::refresh(clock.now);
     }
     let model = is_claude
         .then(|| {
@@ -3370,8 +3381,9 @@ fn resolve_facts_at_with_cwd(
     let read = is_claude.then(|| {
         (asks.args)(identity.pid).and_then(|args| {
             // A refused auth-source check says nothing, and a registry write
-            // missed during an exec cannot borrow the prior image's verdict.
-            if !identity.stored_login
+            // missed during an exec cannot borrow the prior image's verdict. A profile read
+            // leaves a token route out: its profile may be stale (§5.7).
+            if !identity.route.is_stored()
                 || args.argv != identity.argv
                 || Some(exec_env_stamp(&args.env)) != identity.env_stamp
             {
@@ -3433,7 +3445,7 @@ fn resolve_facts_at_with_cwd(
                 (std::time::Instant::now(), clock.now),
                 asks.roster,
                 &label,
-                (used, identity.stored_login),
+                (used, identity.route.on_account()),
             );
             // The tier this process's gated profile read named, as its row's `plan` row (§4.2).
             if gated.is_some()
@@ -3792,8 +3804,13 @@ fn own_label(identity: &Identity, roster: Option<&accounts::Roster>, asks: Asks)
     }
     let own = accounts::Roster::own();
     let roster = roster.map(|roster| if roster.rows.is_empty() { &own } else { roster })?;
+    // The settings evidence only weakens the environment's route; `judged_label` then credits
+    // a token route only to the row whose entry its marker names.
     let who = accounts::ProcessLogin {
-        stored_login: login.stored_login && identity.stored_login,
+        route: match identity.route {
+            accounts::AuthRoute::Stored | accounts::AuthRoute::VaultToken { .. } => login.route,
+            accounts::AuthRoute::Outside => accounts::AuthRoute::Outside,
+        },
         ..login.clone()
     };
     accounts::judged_label(roster, &who).map(str::to_owned)
@@ -3895,6 +3912,8 @@ pub(crate) fn fingerprint(
         effort_for,
         owner,
         account,
+        // The footer draws no route; a survey row and a status line read it.
+        route: _,
         account_progress,
         account_progress_busy,
         top_effort: _,
@@ -10990,7 +11009,7 @@ pub(crate) mod rig {
             argv: Vec::new(),
             task: None,
             login_checked_for: None,
-            stored_login: false,
+            route: aterm_agent::harness::accounts::AuthRoute::Outside,
             unoffered: None,
             env_stamp: None,
         };
@@ -11006,7 +11025,7 @@ pub(crate) mod rig {
             },
             roster: || None,
             home: scratch_home,
-            stored_login: |_, _, _| true,
+            route: |_, _, _| aterm_agent::harness::accounts::AuthRoute::Stored,
         };
         let (_, _, applied) = super::resolve_into(
             timeline,
@@ -12438,7 +12457,7 @@ mod tests {
                     argv: Vec::new(),
                     task: None,
                     login_checked_for: None,
-                    stored_login: false,
+                    route: aterm_agent::harness::accounts::AuthRoute::Outside,
                     unoffered: None,
                     env_stamp: None,
                 },
@@ -12612,7 +12631,7 @@ mod tests {
             args: |_| None,
             roster: || None,
             home: scratch_home,
-            stored_login: |_, _, _| true,
+            route: |_, _, _| accounts::AuthRoute::Stored,
         };
         let mut known = HashMap::new();
         let mut tails = ProcessTails::default();
@@ -12744,9 +12763,9 @@ mod tests {
             args: |_| args(false),
             roster: || None,
             home: scratch_home,
-            stored_login: |_, _, _| {
+            route: |_, _, _| {
                 AUTH_READS.set(AUTH_READS.get() + 1);
-                true
+                accounts::AuthRoute::Stored
             },
         };
         let mut known = HashMap::new();
@@ -12901,7 +12920,7 @@ mod tests {
             argv: Vec::new(),
             task: None,
             login_checked_for: None,
-            stored_login: false,
+            route: aterm_agent::harness::accounts::AuthRoute::Outside,
             unoffered: None,
             env_stamp: None,
         }
@@ -12982,7 +13001,7 @@ mod tests {
             },
             roster: || None,
             home: scratch_home,
-            stored_login: |_, _, _| true,
+            route: |_, _, _| accounts::AuthRoute::Stored,
         };
         let mut refresh = || {
             let (_, found) = resolve_facts(
@@ -13118,7 +13137,7 @@ mod tests {
             },
             roster: || None,
             home: scratch_home,
-            stored_login: |_, _, _| true,
+            route: |_, _, _| accounts::AuthRoute::Stored,
         };
         let refresh = |identity: &mut Identity,
                        tail: &mut footer::TailCache,
@@ -13325,12 +13344,12 @@ mod tests {
             args,
             roster: || None,
             home: scratch_home,
-            stored_login: |pid, argv, cwd| {
+            route: |pid, argv, cwd| {
                 assert_eq!(pid, PID as u32);
                 assert_eq!(argv[0], "claude");
                 assert!(std::path::Path::new(cwd).is_absolute());
                 CHECKS.set(CHECKS.get() + 1);
-                ALLOWED.get()
+                accounts::AuthRoute::Stored.unless(!ALLOWED.get())
             },
         };
         let mut refresh = |asks| {
@@ -13454,7 +13473,7 @@ mod tests {
             },
             roster: || None,
             home: scratch_home,
-            stored_login: |_, _, _| true,
+            route: |_, _, _| accounts::AuthRoute::Stored,
         };
         for (reset, expires_after) in [
             ("2099-01-01T00:00:00Z", 3600),
@@ -13577,7 +13596,7 @@ mod tests {
             args,
             roster: || Some(two_accounts()),
             home: scratch_home,
-            stored_login: |_, _, _| true,
+            route: |_, _, _| accounts::AuthRoute::Stored,
         };
         let unasked = |args| Asks {
             files: |_| None,
@@ -13585,7 +13604,7 @@ mod tests {
             args,
             roster: || unreachable!("no login was read: the roster is not asked"),
             home: scratch_home,
-            stored_login: |_, _, _| true,
+            route: |_, _, _| accounts::AuthRoute::Stored,
         };
         let read = |asks: Asks| {
             let mut memo = RosterMemo::default();
@@ -13609,7 +13628,7 @@ mod tests {
             args: on_main,
             roster: || None,
             home: scratch_home,
-            stored_login: |_, _, _| true,
+            route: |_, _, _| accounts::AuthRoute::Stored,
         };
         assert_eq!(read(none), (Some(None), true), "no roster: asked, none");
         assert_eq!(
@@ -13639,7 +13658,7 @@ mod tests {
             args: |_| unreachable!("no registry row: the process is not read"),
             roster: || unreachable!("no facts: the roster is not asked"),
             home: scratch_home,
-            stored_login: |_, _, _| true,
+            route: |_, _, _| accounts::AuthRoute::Stored,
         };
         assert_eq!(read(nothing), (None, false));
         let _ = std::fs::remove_dir_all(&root);
@@ -13669,7 +13688,7 @@ mod tests {
             args: |_| Some(args_of(&["HOME=/home/someone"])),
             roster: || None,
             home: scratch_home,
-            stored_login: |_, _, _| true,
+            route: |_, _, _| accounts::AuthRoute::Stored,
         };
         let read = |asks: Asks| {
             let timeline = Arc::new(Mutex::new(SessionTimeline::default()));
@@ -13702,7 +13721,7 @@ mod tests {
             args: |_| unreachable!("no registry row: the process is not read"),
             roster: || unreachable!("no facts: the roster is not asked"),
             home: scratch_home,
-            stored_login: |_, _, _| true,
+            route: |_, _, _| accounts::AuthRoute::Stored,
         };
         assert_eq!(read(nothing), (false, None));
         let _ = std::fs::remove_dir_all(&root);
@@ -13721,7 +13740,7 @@ mod tests {
             args: |_| Some(args_of(&["HOME=/home/someone"])),
             roster: || None,
             home: scratch_home,
-            stored_login: |_, _, _| false,
+            route: |_, _, _| accounts::AuthRoute::Outside,
         };
         let mut identity = unread(PID, &claude);
         let (mut tail, mut fold, mut memo) = (
@@ -13830,7 +13849,7 @@ mod tests {
             args,
             roster: || Some(two_accounts()),
             home: scratch_home,
-            stored_login: |_, _, _| true,
+            route: |_, _, _| accounts::AuthRoute::Stored,
         };
         let mut memo = RosterMemo::default();
         let mut identity = Identity {
@@ -16573,7 +16592,7 @@ mod tests {
                     args: |_| None,
                     roster: || None,
                     home: || None,
-                    stored_login: |_, _, _| false,
+                    route: |_, _, _| accounts::AuthRoute::Outside,
                 },
                 |_| None,
             ),
@@ -16811,7 +16830,7 @@ mod tests {
             args: |_| Some(args_of(&["HOME=/home/someone"])),
             roster: || None,
             home: scratch_home,
-            stored_login: |_, _, _| true,
+            route: |_, _, _| accounts::AuthRoute::Stored,
         };
         // No reading, no context fact (nor a word for a value the rule does not know); the
         // reading's arrival after it is the control that the facts are drawn there.
@@ -18578,7 +18597,7 @@ mod tests {
                         args: test_args,
                         roster: || None,
                         home: test_home,
-                        stored_login: |_, _, _| false,
+                        route: |_, _, _| accounts::AuthRoute::Outside,
                     },
                     |_| None,
                 ),
@@ -18818,7 +18837,7 @@ mod tests {
                     args: test_args,
                     roster: || None,
                     home: test_home,
-                    stored_login: |_, _, _| false,
+                    route: |_, _, _| accounts::AuthRoute::Outside,
                 },
                 |_| Some(home.clone()),
             ),

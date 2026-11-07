@@ -1593,7 +1593,7 @@ mod tests {
             account: Some("main"),
             left: None,
             default_home: true,
-            stored_login: true,
+            route: crate::harness::accounts::AuthRoute::Stored,
         };
         let ask = |used: f64| {
             let readings = rollout_rate_limits(&five_hour_reading(now, used));

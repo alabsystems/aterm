@@ -2239,6 +2239,73 @@ fn a_program_with_a_harness_here_is_its_agent_forms_and_any_other_is_not() {
     }
 }
 
+/// A CLAUDE CODE WORKER ON A STORE BUILD STARTS THROUGH THE TOKEN WRAPPER
+/// (DESIGN-claude-setup-token §5.4): `spawn agent=claude` types `<aterm> harness accounts
+/// token-run --auto -- <build>` with the worker's flags after it, and keeps its login, its home
+/// and `--chrome`; the line carries neither the descriptor variable nor the marker, which only
+/// the wrapper sets. CONTROL: a build outside atpkg's store is typed as before.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_claude_worker_on_a_store_build_starts_through_the_token_wrapper() {
+    let root = aterm_tempfile::Builder::new()
+        .prefix("aterm-worker-token-")
+        .suffix(".noindex")
+        .tempdir()
+        .unwrap();
+    let build = root.path().join("store/claude/7/bin/claude");
+    std::fs::create_dir_all(build.parent().unwrap()).unwrap();
+    std::fs::write(&build, "#!/bin/sh\n").unwrap();
+    let build = std::fs::canonicalize(&build).unwrap();
+    let claude = row(Program::Claude);
+    let starter = Starter {
+        exe: build.clone(),
+        env: vec![
+            ("CLAUDE_CONFIG_DIR".to_owned(), "/logins/work".to_owned()),
+            ("HOME".to_owned(), "/Users//u".to_owned()),
+        ],
+        ..claude.plain()
+    };
+    let with = Fresh {
+        chrome: true,
+        ..Fresh::default()
+    };
+    let typed = super::super::token_route::with_wrapper(PathBuf::from("/checked/aterm"), || {
+        line(claude, Dialect::Zsh, &starter, &with)
+    })
+    .expect("a line");
+    let head = format!(
+        "'/checked/aterm' 'harness' 'accounts' 'token-run' '--auto' '--' '{}'",
+        build.display()
+    );
+    let at = typed.find(&head).unwrap_or_else(|| panic!("{typed}"));
+    assert!(typed[at..].contains(" '--chrome' "), "{typed}");
+    assert!(
+        typed.contains("CLAUDE_CONFIG_DIR=") && typed.contains("/logins/work"),
+        "{typed}"
+    );
+    assert!(
+        typed.contains("HOME=") && typed.contains("/Users//u"),
+        "{typed}"
+    );
+    for name in super::super::token_route::TOKEN_STATE_ENV {
+        assert!(!typed.contains(&format!("{name}=")), "{name}: {typed}");
+    }
+    let loose = root.path().join("bin/claude");
+    std::fs::create_dir_all(loose.parent().unwrap()).unwrap();
+    std::fs::write(&loose, "#!/bin/sh\n").unwrap();
+    let loose = std::fs::canonicalize(&loose).unwrap();
+    let outside = Starter {
+        exe: loose.clone(),
+        ..starter
+    };
+    let plain = super::super::token_route::with_wrapper(PathBuf::from("/checked/aterm"), || {
+        line(claude, Dialect::Zsh, &outside, &with)
+    })
+    .expect("a line");
+    assert!(!plain.contains("token-run"), "{plain}");
+    assert!(plain.contains(&format!("'{}'", loose.display())), "{plain}");
+}
+
 /// A group's Claude Code is the one no other of the group runs, wherever the pids fall, and a
 /// group read short of that says what it read: a member no read names, or two Claude Codes side by
 /// side, is no proof that the group runs none, and never lends one's flags or login as the lead's.

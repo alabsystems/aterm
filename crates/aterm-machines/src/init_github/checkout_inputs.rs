@@ -365,7 +365,7 @@ mod tests {
         sys.euid = user.uid;
         sys.logged_in(&user);
         directory(&sys, &user, Path::new(&user.home));
-        let path = Path::new(&user.home).join(inventory::FILE);
+        let path = inventory::file(&user.home);
         let bytes = br#"{"schema":2,"account":"fixture","repositories":[{"id":1,"name":"code","owner":{"login":"fixture"},"full_name":"fixture/code","clone_url":"https://github.com/fixture/code.git","private":true,"default_branch":"main","required_submodules":["vendor/library"]}]}"#;
         file(&sys, &user, &path, bytes);
         inventory::Inventory::read(&sys, &user).unwrap();
@@ -540,7 +540,7 @@ mod tests {
             shell: String::new(),
             admin: false,
         };
-        let private = home.join(inventory::FILE);
+        let private = inventory::file(home.to_str().unwrap());
         let checkout = home.join("code");
         let admin = checkout.join(".git/modules/library");
         for directory in [
@@ -609,7 +609,12 @@ mod tests {
             &aterm_json::json!({"schema":2,"account":"fixture","repositories":repositories}),
         )
         .unwrap();
-        file(&sys, &user, &home.join(inventory::FILE), &bytes);
+        file(
+            &sys,
+            &user,
+            &inventory::file(home.to_str().unwrap()),
+            &bytes,
+        );
         inventory::Inventory::read(&sys, &user).unwrap();
         let scope = Checkouts::capture(&sys, &user);
         let mut calls = BTreeMap::<PathBuf, usize>::new();
@@ -667,7 +672,7 @@ mod tests {
         std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::create_dir_all(foreign.join(".git")).unwrap();
         std::fs::create_dir(home.join(".secrets")).unwrap();
-        let private = home.join(inventory::FILE);
+        let private = inventory::file(home.to_str().unwrap());
         std::fs::write(&private, br#"{"schema":2,"account":"fixture","repositories":[{"id":1,"name":"code","owner":{"login":"fixture"},"full_name":"fixture/code","private":true,"default_branch":"main","clone_url":"https://github.com/fixture/code.git"}]}"#).unwrap();
         std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::write(root.join(".git/config"), b"selected origin").unwrap();

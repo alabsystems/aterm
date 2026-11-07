@@ -853,14 +853,8 @@ fn item_paths(
     let env = crate::EnvSnapshot::capture();
     let tools = crate::preflight(&env, root)?;
     let mut cmd = aterm_uds::spawnfd::command(&tools.targo);
-    cmd.current_dir(root).args([
-        "--unverified",
-        "metadata",
-        "--locked",
-        "--no-deps",
-        "--format-version",
-        "1",
-    ]);
+    cmd.current_dir(root)
+        .args(["metadata", "--locked", "--no-deps", "--format-version", "1"]);
     scrub(&mut cmd);
     let text = judged::output(&mut cmd, None)?;
     let metadata: aterm_json::Value = aterm_json::from_str(&text).map_err(|e| e.to_string())?;
@@ -1044,6 +1038,17 @@ mod tests {
             gitlink_paths(&paths, "160000 commit abc\tvendor/bus\0"),
             BTreeSet::from(["vendor/bus".into(), "vendor/bus-other".into()])
         );
+    }
+    #[test]
+    fn attribution_queries_real_metadata_without_a_compilation_lane() {
+        let root = std::fs::canonicalize(aterm_tempfile::manifest_dir().join("../..")).unwrap();
+        let paths = item_paths(
+            &root,
+            &BTreeSet::from(["crates/aterm-verify".into()]),
+            false,
+        )
+        .unwrap();
+        assert_eq!(paths, BTreeSet::from(["crates/aterm-verify".into()]));
     }
     #[test]
     fn stopping_a_sample_first_allows_its_signal_handler_to_clean_up() {

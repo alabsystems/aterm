@@ -128,6 +128,10 @@ pub struct FooterFacts {
     pub owner: Option<FactsOwner>,
     /// The roster's label for the login this process runs under.
     pub account: Option<String>,
+    /// How this process authenticates, once its exec environment and settings are read
+    /// (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.10: a survey row's `auth=` and
+    /// `token=`, a status line's `auth=`): `None` before a read.
+    pub route: Option<super::accounts::AuthRoute>,
     /// The session's observed account recovery decision, independently of rotation policy.
     pub account_progress: Option<super::account_progress::AccountProgress>,
     /// The last supervisor progress read was unavailable. The retained decision is history
@@ -2530,6 +2534,7 @@ fn facts_for_entry_from(
             session_id: entry.session_id.clone(),
         }),
         account: None,
+        route: None,
         account_progress: None,
         account_progress_busy: false,
         top_effort,

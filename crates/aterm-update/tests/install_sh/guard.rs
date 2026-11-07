@@ -1650,9 +1650,10 @@ fn mac_alias_startup_targets_are_refused_before_metadata() {
 }
 
 /// A fold is a Perl start, seconds on a loaded machine, so a startup ask folds each home it
-/// compares paths against once, whatever it walks: the same ask with four more account homes,
-/// none of them reached, folds four more times. Folded at each step of each walk instead, the 7
-/// asks of `mac_alias_startup_targets_are_refused_before_metadata` started Perl 308 times for 13
+/// compares paths against once, whatever it walks: three more distinct account homes fold three
+/// more times even when the database repeats HOME and another account. Folded at each step of
+/// each walk instead, the 7 asks of `mac_alias_startup_targets_are_refused_before_metadata`
+/// started Perl 308 times for 13
 /// distinct inputs, and a starved run stretched one ask past the batch's one-minute hang
 /// detector.
 #[cfg(target_os = "macos")]
@@ -1668,47 +1669,86 @@ fn a_startup_ask_folds_each_home_once() {
     lib.step(
         r#"eval "$(declare -f zsh_rc_fold_mac | sed '1s/zsh_rc_fold_mac/zsh_rc_fold_counted/')"
            zsh_rc_fold_mac() { printf '%s\0' "$2" >>"$FOLDS"; zsh_rc_fold_counted "$@"; }
+           eval "$(declare -f zsh_rc_fold_home | sed '1s/zsh_rc_fold_home/zsh_rc_home_counted/')"
+           zsh_rc_fold_home() { printf '%s\0' "$2" >>"$HOMES"; zsh_rc_home_counted "$@"; }
            installer_uid() { printf 501; }"#,
     );
-    let others = ["Åone", "ßtwo", "雪three"].map(|name| q(s(&root.join(name))));
+    let other_homes = ["Åone", "ßtwo", "雪three"].map(|name| root.join(name));
+    let others = other_homes.each_ref().map(|home| q(s(home)));
     let asks = [
         ("alone", ":".to_owned()),
         (
             "accounts",
-            format!("printf '%s\\n' \"$HOME\" {}", others.join(" ")),
+            format!(
+                "printf '%s\\n' \"$HOME\" \"$HOME\" {} {}",
+                others.join(" "),
+                others[0]
+            ),
         ),
     ]
     .map(|(name, accounts)| {
         let folds = root.join(format!("{name}.folds"));
+        let homes = root.join(format!("{name}.homes"));
         let call = lib.call(
-            r#"( HOME=@HOME@; FOLDS=@FOLDS@; unset ZDOTDIR; account_homes() { @ACCOUNTS@; };
+            r#"( HOME=@HOME@; FOLDS=@FOLDS@; HOMES=@HOMES@; unset ZDOTDIR; account_homes() { @ACCOUNTS@; };
                  zsh_rc_dir got; [[ "$got" == "$HOME/dots" ]] && printf admitted )"#
                 .replace("@HOME@", &q(s(&home)))
                 .replace("@FOLDS@", &q(s(&folds)))
+                .replace("@HOMES@", &q(s(&homes)))
                 .replace("@ACCOUNTS@", &accounts),
             &[],
         );
-        (folds, call)
+        (folds, homes, call, name == "accounts")
     });
-    // The counted fold is the installer's: under it a `.zshenv` linked into a non-ASCII home's
-    // Documents is still refused unread.
+    // Reusing HOME must leave the distinct account's protected roots in the real walk.
     let guarded = root.join("Åguarded");
-    let documents = guarded.join("Documents/zshenv");
+    let documents = other_homes[0].join("Documents/zshenv");
     write(
         &documents,
         "printf executed >\"$HOME/executed\"\nZDOTDIR=\"$HOME/dots\"\n",
     );
-    symlink(&documents, &guarded.join(".zshenv"));
+    std::fs::create_dir_all(&guarded).unwrap();
+    let fence = root.join("a\u{30a}ONE/Documentſ");
+    symlink(fence.join("zshenv"), &guarded.join(".zshenv"));
     let refused = lib.call(
-        r#"( HOME=@HOME@; FOLDS=/dev/null; unset ZDOTDIR; account_homes() { :; };
-             zsh_rc_dir got; [[ -z "$got" && ! -e "$HOME/executed" ]] && printf refused )"#
-            .replace("@HOME@", &q(s(&guarded))),
+        r#"( HOME=@HOME@; FOLDS=/dev/null; HOMES=/dev/null; unset ZDOTDIR;
+             account_homes() { printf '%s\n' "$HOME" "$HOME" @OTHER@ @OTHER@; };
+             FENCE=@FENCE@; TRACE="$HOME/queries";
+             eval "$(declare -f zsh_rc_path_kind | sed '1s/zsh_rc_path_kind/zsh_rc_actual_kind/')";
+             zsh_rc_path_kind() {
+               case "$2" in "$FENCE"|"$FENCE"/*) printf forbidden >>"$TRACE"; return 1;; esac
+               zsh_rc_actual_kind "$@"
+             };
+             : >"$TRACE"; zsh_rc_path_kind ignored "$FENCE/zshenv" || true;
+             [[ -s "$TRACE" ]] || exit 1;
+             : >"$TRACE"; zsh_rc_dir got;
+             [[ -z "$got" && ! -s "$TRACE" && ! -e "$HOME/executed" ]] && printf refused )"#
+            .replace("@HOME@", &q(s(&guarded)))
+            .replace("@OTHER@", &others[0])
+            .replace("@FENCE@", &q(s(&fence))),
         &[],
     );
     let records = lib.run(&scratch);
     assert_eq!(records[refused].out, "refused", "{}", records[refused].err);
-    let [alone, accounts] = asks.map(|(folds, call)| {
+    let [alone, accounts] = asks.map(|(folds, homes, call, has_accounts)| {
         assert_eq!(records[call].out, "admitted", "{}", records[call].err);
+        let homes = std::fs::read(homes).unwrap();
+        let inputs: Vec<_> = homes.split(|byte| *byte == 0).collect();
+        for (path, expected) in std::iter::once((&home, 1)).chain(
+            other_homes
+                .iter()
+                .map(|path| (path, usize::from(has_accounts))),
+        ) {
+            assert_eq!(
+                inputs
+                    .iter()
+                    .filter(|input| **input == path.as_os_str().as_encoded_bytes())
+                    .count(),
+                expected,
+                "home fold input {}",
+                path.display(),
+            );
+        }
         std::fs::read(&folds)
             .unwrap()
             .iter()
@@ -1717,7 +1757,7 @@ fn a_startup_ask_folds_each_home_once() {
     });
     assert_eq!(
         accounts - alone,
-        4,
+        3,
         "each home is folded once ({alone} folds alone)"
     );
 }

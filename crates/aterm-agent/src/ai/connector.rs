@@ -15,8 +15,15 @@ pub struct Connector {
     /// Files under the home whose existence indicates a stored login (`stat`ed; only
     /// [`stored_login_lapsed`] opens one, Claude Code's, for its token fields).
     pub stores: &'static [&'static str],
-    /// Credential variables the CLI reads in place of or beside its stored login;
-    /// [`crate::harness::relaunch::ahead_env`] names those a pooled launch removes.
+    /// Credential variables the CLI reads in place of or beside its stored login. Its job: what
+    /// a pooled launch or relaunch removes ([`crate::harness::relaunch::ahead_env`], less the
+    /// provider switches `KEPT_CREDENTIALS` keeps, so a pooled line never moves a session off
+    /// the provider its person chose), and what sign-in, review and facts read. For Claude Code
+    /// it is deliberately not [`crate::harness::accounts::CREDENTIAL_KEYS`], whose job is
+    /// attribution (every variable that moves a process off its stored login): merging the two
+    /// would change what pooled lines remove (`docs/DESIGN-claude-setup-token-2026-11-05.md`
+    /// §5.8). Neither names the token wrapper's marker, which a Claude relaunch line unsets by
+    /// its own list ([`crate::harness::token_route::TOKEN_STATE_ENV`]).
     pub credential_env: &'static [&'static str],
     /// The sign-in flow.
     pub login: Login,

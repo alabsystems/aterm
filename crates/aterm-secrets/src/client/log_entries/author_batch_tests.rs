@@ -10,7 +10,7 @@ thread_local! {
     static BEFORE_COMMIT: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
 }
 
-pub(super) fn before_commit() {
+pub(in super::super) fn before_commit() {
     BEFORE_COMMIT.with(|hook| {
         if let Some(hook) = hook.borrow_mut().as_mut() {
             hook();
@@ -18,7 +18,7 @@ pub(super) fn before_commit() {
     });
 }
 
-pub(super) struct ResetHook;
+pub(in super::super) struct ResetHook;
 
 impl Drop for ResetHook {
     fn drop(&mut self) {
@@ -26,7 +26,7 @@ impl Drop for ResetHook {
     }
 }
 
-pub(super) fn install_hook(hook: impl FnMut() + 'static) -> ResetHook {
+pub(in super::super) fn install_hook(hook: impl FnMut() + 'static) -> ResetHook {
     BEFORE_COMMIT.with(|slot| {
         assert!(slot.borrow_mut().replace(Box::new(hook)).is_none());
     });

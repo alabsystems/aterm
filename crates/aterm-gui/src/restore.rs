@@ -488,11 +488,11 @@ impl AgentRestore {
     pub(crate) fn of(snap: aterm_agent::harness::relaunch::Snapshot) -> Self {
         let word = snap.agent().word().to_string();
         let claude_auth = (matches!(snap.run, AgentRun::Claude) && snap.auth_observed).then(|| {
-            ClaudeAuthRestore {
-                stored_login: snap.stored_login,
-                profile: snap.profile.map(Into::into),
-                launch_env: snap.launch_env.map(|env| env.entries().to_vec()),
-            }
+            ClaudeAuthRestore::new(
+                snap.route,
+                snap.launch_env.map(|env| env.entries().to_vec()),
+                snap.profile.map(Into::into),
+            )
         });
         let (session, lane_session) = match &snap.run {
             AgentRun::Muse(_) | AgentRun::Agy(_) => (None, snap.session),
@@ -565,11 +565,11 @@ impl AgentRestore {
         }
         let agent = self.agent()?;
         let auth_observed = self.claude_auth.is_some();
-        let (stored_login, profile, launch_env) = self
+        let (route, profile, launch_env) = self
             .claude_auth
             .map(|auth| {
                 (
-                    auth.stored_login,
+                    auth.route(),
                     auth.profile.map(Into::into),
                     auth.launch_env
                         .as_deref()
@@ -630,7 +630,7 @@ impl AgentRestore {
             claude_dir: None,
             login: self.login,
             home: self.home,
-            stored_login,
+            route,
             auth_observed,
             profile,
             launch_env,
@@ -6854,7 +6854,7 @@ metadata = "opaque=copy-me"
             login: None,
             home: None,
             claude_dir: None,
-            stored_login: false,
+            route: aterm_agent::harness::accounts::AuthRoute::Outside,
             profile: None,
         };
         let agent = AgentRestore::of(snap(OLD_TAB));
@@ -6977,7 +6977,7 @@ metadata = "opaque=copy-me"
         let claude = Snapshot {
             launch_env: None,
             auth_observed: true,
-            stored_login: false,
+            route: aterm_agent::harness::accounts::AuthRoute::Outside,
             profile: None,
             tab: "s-old".into(),
             pid: 5151,
@@ -7114,7 +7114,7 @@ metadata = "opaque=copy-me"
         let ran = |home: Option<&str>, login: Option<&str>| Snapshot {
             launch_env: None,
             auth_observed: true,
-            stored_login: false,
+            route: aterm_agent::harness::accounts::AuthRoute::Outside,
             profile: None,
             tab: "s-old".into(),
             pid: 4242,
@@ -7518,7 +7518,7 @@ metadata = "opaque=copy-me"
         let claude = Snapshot {
             launch_env: None,
             auth_observed: true,
-            stored_login: false,
+            route: aterm_agent::harness::accounts::AuthRoute::Outside,
             profile: None,
             tab: "s-old".into(),
             pid: 4242,
@@ -8077,7 +8077,7 @@ metadata = "opaque=copy-me"
                 claude_dir: None,
                 login: None,
                 home: None,
-                stored_login: false,
+                route: aterm_agent::harness::accounts::AuthRoute::Outside,
                 profile: None,
             })
         };

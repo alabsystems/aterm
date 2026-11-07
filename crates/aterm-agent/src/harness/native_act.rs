@@ -34,7 +34,8 @@ pub struct ColdIntent {
     pub login: Option<String>,
     pub home: Option<String>,
     pub auth_observed: bool,
-    pub stored_login: bool,
+    /// How the captured process authenticated ([`super::accounts::AuthRoute`]).
+    pub route: super::accounts::AuthRoute,
     pub conversation: Option<String>,
     pub profile: Option<super::profile::Context>,
     pub mode: super::accounts::Mode,
@@ -53,7 +54,13 @@ struct ColdIntentWire {
     login: Option<String>,
     home: Option<String>,
     auth_observed: bool,
-    stored_login: bool,
+    /// The route ([`legacy_route`]); absent from an intent v0.157.0 and older wrote, which
+    /// carried `stored_login`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    route: Option<super::accounts::AuthRoute>,
+    /// The route as v0.157.0 and older wrote it, read where `route` is absent; never written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stored_login: Option<bool>,
     conversation: Option<String>,
     profile: Option<ColdProfileWire>,
     mode: String,
@@ -69,6 +76,22 @@ struct ColdProfileWire {
     home: Option<String>,
     config: Option<String>,
     login: Option<String>,
+}
+
+/// A cold record's route: its `route`, or, from a record v0.157.0 and older wrote (an operation
+/// in flight across the update that brought the token route), its `stored_login` (`true` a
+/// stored login, `false` outside), as `ClaudeAuthRestore` reads the same field. Both, or neither,
+/// is no record.
+fn legacy_route(
+    route: Option<super::accounts::AuthRoute>,
+    stored_login: Option<bool>,
+) -> Option<super::accounts::AuthRoute> {
+    match (route, stored_login) {
+        (Some(route), None) => Some(route),
+        (None, Some(true)) => Some(super::accounts::AuthRoute::Stored),
+        (None, Some(false)) => Some(super::accounts::AuthRoute::Outside),
+        (Some(_), Some(_)) | (None, None) => None,
+    }
 }
 
 fn bounded_cold_text(value: &str) -> bool {
@@ -92,7 +115,8 @@ impl ColdIntent {
             login: self.login.clone(),
             home: self.home.clone(),
             auth_observed: self.auth_observed,
-            stored_login: self.stored_login,
+            route: Some(self.route),
+            stored_login: None,
             conversation: self.conversation.clone(),
             profile,
             mode: self.mode.as_str().into(),
@@ -138,7 +162,7 @@ impl ColdIntent {
             login: w.login,
             home: w.home,
             auth_observed: w.auth_observed,
-            stored_login: w.stored_login,
+            route: legacy_route(w.route, w.stored_login)?,
             conversation: w.conversation,
             profile,
             mode: super::accounts::Mode::parse(&w.mode)?,
@@ -148,12 +172,14 @@ impl ColdIntent {
 }
 
 /// Policy facts derived by the exact owned helper; credential values never cross the wire.
-#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
+///
+/// It is read through a wire form of its own, which also reads an older helper's route.
+#[derive(Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ColdEnvironmentFacts {
     pub login: Option<String>,
     pub default_home: bool,
-    pub stored_login: bool,
+    /// How the environment authenticates ([`super::accounts::ProcessLogin::of_env`]).
+    pub route: super::accounts::AuthRoute,
     pub home: Option<String>,
     /// Actual CLAUDE_CONFIG_DIR; distinct from the Anthropic profile store.
     pub config: Option<String>,
@@ -162,6 +188,42 @@ pub struct ColdEnvironmentFacts {
     pub inherited_named: bool,
     pub cwd: String,
 }
+/// [`ColdEnvironmentFacts`] as read: its fields, with the route also read from the
+/// `stored_login` a v0.157.0 or older helper wrote ([`legacy_route`]).
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ColdEnvironmentFactsWire {
+    login: Option<String>,
+    default_home: bool,
+    #[serde(default)]
+    route: Option<super::accounts::AuthRoute>,
+    #[serde(default)]
+    stored_login: Option<bool>,
+    home: Option<String>,
+    config: Option<String>,
+    profile_configs: Option<String>,
+    selection: super::profile::Selection,
+    inherited_named: bool,
+    cwd: String,
+}
+
+impl ColdEnvironmentFactsWire {
+    /// The facts, where they carry one route, as `route` or `stored_login`.
+    fn facts(self) -> Option<ColdEnvironmentFacts> {
+        Some(ColdEnvironmentFacts {
+            login: self.login,
+            default_home: self.default_home,
+            route: legacy_route(self.route, self.stored_login)?,
+            home: self.home,
+            config: self.config,
+            profile_configs: self.profile_configs,
+            selection: self.selection,
+            inherited_named: self.inherited_named,
+            cwd: self.cwd,
+        })
+    }
+}
+
 impl std::fmt::Debug for ColdEnvironmentFacts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("ColdEnvironmentFacts(redacted)")
@@ -176,7 +238,9 @@ impl ColdEnvironmentFacts {
         if text.len() > MAX_RESUME {
             return None;
         }
-        let v: Self = aterm_json::from_str(text).ok()?;
+        let v = aterm_json::from_str::<ColdEnvironmentFactsWire>(text)
+            .ok()?
+            .facts()?;
         if !std::path::Path::new(&v.cwd).is_absolute()
             || !bounded_cold_text(&v.cwd)
             || v.default_home != v.config.as_ref().is_none_or(|value| value.is_empty())
@@ -240,7 +304,7 @@ impl ColdEnvironmentFacts {
         let result = Self {
             login: who.login,
             default_home: who.default_home,
-            stored_login: who.stored_login,
+            route: who.route,
             home,
             config: effective
                 .iter()
@@ -305,7 +369,7 @@ impl ColdEnvironmentFacts {
         super::accounts::ProcessLogin {
             login: self.login.clone(),
             default_home: self.default_home,
-            stored_login: self.stored_login,
+            route: self.route,
         }
     }
 }
@@ -332,9 +396,21 @@ pub struct RestartCommand {
     pub dialect: super::upgrade::Dialect,
     /// Account identity bound to this exact command; absent legacy attribution grants nothing.
     pub account_intent: Option<Box<super::accounts_pool::ExecutionIntent>>,
+    /// The image `image` execs into in the same process, where `image` is aterm's token wrapper
+    /// (DESIGN-claude-setup-token §5.4: `aterm harness accounts token-run … -- <build>` execs the
+    /// store build in its own pid), captured when the command was planned. `None`: the program
+    /// runs as `image` itself.
+    pub settles: Option<Image>,
 }
 
 impl RestartCommand {
+    /// The image a launched child of this command settles on: [`Self::settles`], else
+    /// [`Self::image`]. A host holds the child to this, never to a wrapper it has left.
+    #[must_use]
+    pub fn settled(&self) -> &Image {
+        self.settles.as_ref().unwrap_or(&self.image)
+    }
+
     /// Render the exact selected legacy representation, without another store-env fallback.
     #[must_use]
     pub fn legacy_line(&self) -> Option<String> {
@@ -494,8 +570,18 @@ impl RestartCommand {
         {
             return None;
         }
+        if self
+            .settles
+            .as_ref()
+            .is_some_and(|image| image.path.first() != Some(&b'/') || image.path.contains(&0))
+        {
+            return None;
+        }
         let mut out = String::new();
         encode_image(&mut out, "exec", &self.image);
+        if let Some(settles) = &self.settles {
+            encode_image(&mut out, "settle", settles);
+        }
         let json = |value: &str| aterm_codec::hex::encode_lower(value.as_bytes());
         let optional = |value: Option<&str>| value.map_or_else(|| "-".into(), json);
         write!(
@@ -537,6 +623,11 @@ impl RestartCommand {
             }
         }
         let image = read_image(&mut words, "exec")?;
+        let settles = if words.contains_key("settle-path") {
+            Some(read_image(&mut words, "settle")?)
+        } else {
+            None
+        };
         let program = text_blob(take(&mut words, "program")?, MAX_PATH)?;
         let argv =
             aterm_json::from_str(&text_blob(take(&mut words, "argv")?, MAX_REQUEST)?).ok()?;
@@ -572,6 +663,7 @@ impl RestartCommand {
             heal,
             dialect,
             account_intent,
+            settles,
         };
         (words.is_empty() && command.encode().as_deref() == Some(encoded)).then_some(command)
     }
@@ -1964,7 +2056,7 @@ mod cold_wire_tests {
             login: None,
             home: None,
             auth_observed: false,
-            stored_login: true,
+            route: crate::harness::accounts::AuthRoute::Stored,
             conversation: None,
             profile: None,
             mode: super::super::accounts::Mode::Wall,
@@ -1980,7 +2072,7 @@ mod cold_wire_tests {
         );
         let empty =
             ColdEnvironmentFacts::observe(&[], &intent, std::path::Path::new("/fixture")).unwrap();
-        assert!(empty.default_home && empty.stored_login);
+        assert!(empty.default_home && empty.route == super::super::accounts::AuthRoute::Stored);
         assert_eq!(empty.selection, super::super::profile::Selection::Standard);
         assert_eq!(
             super::super::profile::Selection::of_exec_env(&[]),
@@ -1993,7 +2085,7 @@ mod cold_wire_tests {
             std::path::Path::new("/fixture"),
         )
         .unwrap();
-        assert!(!facts.stored_login);
+        assert_eq!(facts.route, super::super::accounts::AuthRoute::Outside);
         let encoded = facts.encode().unwrap();
         assert!(!encoded.contains(secret));
         assert!(!format!("{facts:?}").contains(secret));
@@ -2002,9 +2094,66 @@ mod cold_wire_tests {
         assert_eq!(ColdIntent::parse(&encoded), Some(intent));
     }
 
+    /// A COLD RECORD OF v0.157.0 AND OLDER STILL READS: an intent or facts in flight across the
+    /// update that brought the token route carry `stored_login`, which reads as the route
+    /// (`true` stored, `false` outside), as `ClaudeAuthRestore` reads it; what they encode again
+    /// carries `route` alone. CONTROLS: both fields, or neither, is no record.
+    #[test]
+    fn a_cold_record_of_an_older_build_reads_its_stored_login_as_the_route() {
+        use super::super::accounts::AuthRoute;
+        let facts = |route: &str| {
+            format!(
+                r#"{{"login":null,"default_home":true,{route}"home":null,"config":null,"profile_configs":null,"selection":"Standard","inherited_named":false,"cwd":"/fixture"}}"#
+            )
+        };
+        for (old, route) in [("true", AuthRoute::Stored), ("false", AuthRoute::Outside)] {
+            let read = ColdEnvironmentFacts::parse(&facts(&format!(r#""stored_login":{old},"#)))
+                .unwrap_or_else(|| panic!("stored_login {old} reads"));
+            assert_eq!(read.route, route);
+            let again = read.encode().unwrap();
+            assert!(!again.contains("stored_login"), "{again}");
+            assert_eq!(ColdEnvironmentFacts::parse(&again), Some(read));
+        }
+        assert!(ColdEnvironmentFacts::parse(&facts("")).is_none());
+        assert!(
+            ColdEnvironmentFacts::parse(&facts(r#""route":"stored","stored_login":true,"#))
+                .is_none()
+        );
+        let intent = |route: &str| {
+            format!(
+                r#"{{"login":null,"home":null,"auth_observed":true,{route}"conversation":null,"profile":null,"mode":"wall","billing":"Keep"}}"#
+            )
+        };
+        let current = ColdIntent {
+            login: None,
+            home: None,
+            auth_observed: true,
+            route: AuthRoute::Stored,
+            conversation: None,
+            profile: None,
+            mode: super::super::accounts::Mode::Wall,
+            billing: ColdBilling::Keep,
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(
+            current,
+            intent(r#""route":"stored","#),
+            "the wire as written"
+        );
+        for (old, route) in [("true", AuthRoute::Stored), ("false", AuthRoute::Outside)] {
+            let read = ColdIntent::parse(&intent(&format!(r#""stored_login":{old},"#)))
+                .unwrap_or_else(|| panic!("stored_login {old} reads"));
+            assert_eq!(read.route, route);
+            assert!(!read.encode().unwrap().contains("stored_login"));
+        }
+        assert!(ColdIntent::parse(&intent("")).is_none());
+        assert!(ColdIntent::parse(&intent(r#""route":"outside","stored_login":false,"#)).is_none());
+    }
+
     #[test]
     fn cold_facts_refuse_unknown_duplicate_and_oversize_authority_fields() {
-        let text = r#"{"login":null,"default_home":true,"stored_login":true,"home":null,"config":null,"profile_configs":null,"selection":"Standard","inherited_named":false,"cwd":"/fixture"}"#;
+        let text = r#"{"login":null,"default_home":true,"route":"stored","home":null,"config":null,"profile_configs":null,"selection":"Standard","inherited_named":false,"cwd":"/fixture"}"#;
         assert!(ColdEnvironmentFacts::parse(text).is_some());
         assert!(
             ColdEnvironmentFacts::parse(&text.replacen("{", "{\"config\":\"/other\",", 1))

@@ -3,6 +3,7 @@
 
 //! Writing a machine's secrets to disk (docs/DESIGN-secrets-2026-10-20.md §7, Sync).
 
+use crate::entry_class;
 use crate::fsx::{self, Kind};
 use crate::text::{self, Entry};
 use crate::{Error, SecretBytes};
@@ -35,9 +36,11 @@ pub struct Report {
     pub left: Vec<String>,
     /// Not written, or not removed: the name and why (never the value).
     pub failed: Vec<(String, String)>,
-    /// Never written, as no vault carries an AI CLI's login file ([`text::cli_login_refusal`]),
-    /// which a vault an older admin wrote may hold: the name and why. The rest of the vault is
-    /// applied all the same.
+    /// Never written and never taken back, the name and why: an entry set apart by its name
+    /// ([`entry_class::set_apart_refusal`]: an AI CLI's login file, a home path aterm does not
+    /// name, a case variant of a held or consumed name), which a vault an older or modified build
+    /// wrote may hold, and both names of a folded pair ([`entry_class::folded_pairs`]). The rest
+    /// of the vault is applied all the same.
     pub refused: Vec<(String, String)>,
 }
 
@@ -60,9 +63,10 @@ pub fn target_path(home: &Path, name: &str) -> crate::Result<PathBuf> {
     if crate::reserved_name(name) {
         return Err(Error::new("a reserved entry has no plaintext file path"));
     }
-    // A vault an older admin wrote one into still opens; its file is never written, nor taken
-    // back once the entry goes, since the CLI's own login stands there ([`Report::refused`]).
-    if let Some(why) = text::cli_login_refusal(name) {
+    // A vault an older or modified build wrote one into still opens; its file is never written,
+    // nor taken back once the entry goes ([`Report::refused`]): an AI CLI's own login, or a file
+    // of the Mac's own, stands there.
+    if let Some(why) = entry_class::set_apart_refusal(name) {
         return Err(Error::new(why));
     }
     written_path(home, name)
@@ -142,16 +146,27 @@ pub fn apply_resuming(
         .filter(|(name, _)| crate::reserved_name(name))
         .map(|(name, digest)| (name.clone(), digest.clone()))
         .collect();
-    // An AI CLI's login file is never the vault's: an entry naming one is refused, never
-    // written, and a file a build that did not refuse it wrote there is the CLI's own login now,
-    // neither taken back nor kept in the manifest.
+    // Only what the classification writes as files is the vault's (DESIGN-claude-setup-token
+    // §3.2): an entry set apart by its name (an AI CLI's login, a home path aterm does not name,
+    // a case variant of a held or consumed name) is refused, never written, and a file a build
+    // that did not refuse it wrote there is the Mac's own now, neither taken back nor kept in the
+    // manifest. So are both names of a folded pair, which a Mac's disk makes one file.
+    let folded = entry_class::folded_pairs(entries.iter().map(|entry| entry.name.as_str()));
     let refused: Vec<(String, String)> = entries
         .iter()
         .filter_map(|entry| {
-            text::cli_login_refusal(&entry.name).map(|why| (entry.name.clone(), why))
+            let why = match folded.get(entry.name.as_str()) {
+                Some(other) => Some(format!(
+                    "{}, so neither is written",
+                    entry_class::folded_pair_refusal(&entry.name, other)
+                )),
+                None => entry_class::set_apart_refusal(&entry.name),
+            };
+            why.map(|why| (entry.name.clone(), why))
         })
         .collect();
-    let set_apart = |name: &str| crate::reserved_name(name) || text::cli_login(name).is_some();
+    let folded: BTreeSet<String> = folded.keys().map(|name| (*name).to_owned()).collect();
+    let set_apart = |name: &str| !entry_class::of(name).materialized() || folded.contains(name);
     let ordinary;
     let entries = if entries.iter().any(|entry| set_apart(&entry.name)) {
         ordinary = entries
@@ -962,6 +977,7 @@ fn move_aside(places: &Places<'_>, name: &str, target: &Path) -> Result<PathBuf,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entry_class::SITE_DEPLOYER_KEY;
     use crate::text::Audience;
 
     fn scratch() -> aterm_tempfile::TempDir {
@@ -1078,10 +1094,12 @@ mod tests {
 
     /// Reserved names a build that did not reserve them could write as files, by the spelling
     /// its manifest held (a `~/.secrets/` spelling was never a valid entry name).
-    const RESERVED_COPIES: [&str; 3] = [
+    const RESERVED_COPIES: [&str; 5] = [
         "aterm-fleet-code",
         "ATERM-FLEET-CODE",
         crate::commons::ENTRY,
+        "aterm-claude-token-ac-0123456789abcdef",
+        "aterm-claude-token-ac-0123456789abcdef-meta",
     ];
 
     #[test]
@@ -1193,7 +1211,14 @@ mod tests {
             target_path(home, "~/.aterm/release-credentials.toml").expect("ok"),
             Path::new("/h/.aterm/release-credentials.toml")
         );
-        assert_eq!(target_path(home, "~/x").expect("ok"), Path::new("/h/x"));
+        assert_eq!(
+            target_path(home, "~/.config/gh/hosts.yml").expect("ok"),
+            Path::new("/h/.config/gh/hosts.yml")
+        );
+        assert!(
+            target_path(home, "~/x").is_err(),
+            "a home path aterm does not name"
+        );
         for bad in [
             "",
             "../x",
@@ -1557,10 +1582,10 @@ mod tests {
     #[test]
     fn a_dropped_file_whose_unlink_is_refused_keeps_its_bytes_for_the_next_pass() {
         let home = scratch();
-        let name = "~/locked/hosts.yml";
+        let name = "~/.config/gh/hosts.yml";
         let (held, _) =
             apply(home.path(), &[entry(name, b"v")], &Manifest::default(), 1).expect("first");
-        let locked = home.path().join("locked");
+        let locked = home.path().join(".config/gh");
         let target = locked.join("hosts.yml");
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).expect("lock");
         let refused = apply(home.path(), &[], &held, 2);
@@ -1594,7 +1619,7 @@ mod tests {
     #[test]
     fn a_home_path_target_gets_private_parents() {
         let home = scratch();
-        let name = "~/.aterm/deep/x.toml";
+        let name = "~/.aterm/release-ring/roster/aterm-machines.toml";
         let (manifest, report) = apply(
             home.path(),
             &[entry(name, b"k = 1\n")],
@@ -1603,21 +1628,24 @@ mod tests {
         )
         .expect("applied");
         assert_eq!(report.written, [name]);
-        let target = home.path().join(".aterm/deep/x.toml");
+        let target = home
+            .path()
+            .join(".aterm/release-ring/roster/aterm-machines.toml");
         assert_eq!(read(&target), b"k = 1\n");
         assert_eq!(mode(&target), 0o600);
         assert_eq!(mode(&home.path().join(".aterm")), 0o700);
-        assert_eq!(mode(&home.path().join(".aterm/deep")), 0o700);
+        assert_eq!(mode(&home.path().join(".aterm/release-ring")), 0o700);
+        assert_eq!(mode(&home.path().join(".aterm/release-ring/roster")), 0o700);
         assert_eq!(manifest.files[name], digest_hex(b"k = 1\n"));
 
         let other = scratch();
         let existing = other.path().join(".aterm");
         std::fs::create_dir(&existing).expect("dir");
         std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        plant(&existing.join("x.toml"), b"old", 0o644);
+        plant(&existing.join("machine.toml"), b"old", 0o644);
         let (_, report) = apply(
             other.path(),
-            &[entry("~/.aterm/x.toml", b"new")],
+            &[entry("~/.aterm/machine.toml", b"new")],
             &Manifest::default(),
             3,
         )
@@ -1625,13 +1653,13 @@ mod tests {
         assert_eq!(mode(&existing), 0o755, "an existing parent keeps its mode");
         let aside = other
             .path()
-            .join(".secrets/.replaced/~%2F.aterm%2Fx.toml.3");
+            .join(".secrets/.replaced/~%2F.aterm%2Fmachine.toml.3");
         assert_eq!(
             report.moved_aside,
-            [("~/.aterm/x.toml".to_string(), aside.clone())]
+            [("~/.aterm/machine.toml".to_string(), aside.clone())]
         );
         assert_eq!(read(&aside), b"old");
-        assert_eq!(read(&existing.join("x.toml")), b"new");
+        assert_eq!(read(&existing.join("machine.toml")), b"new");
     }
 
     #[test]
@@ -1678,14 +1706,14 @@ mod tests {
         let home = scratch();
         let secrets = home.path().join(".secrets");
         std::fs::create_dir_all(secrets.join("dir")).expect("dir");
-        std::fs::write(home.path().join("blocker"), b"x").expect("file");
+        std::fs::write(home.path().join(".config"), b"x").expect("file");
         let held = Manifest {
             files: BTreeMap::from([("dir".to_string(), digest_hex(b"old"))]),
         };
         let entries = [
             entry("dir", b"v"),
             entry("ok", b"v"),
-            entry("~/blocker/x", b"v"),
+            entry("~/.config/gh/hosts.yml", b"v"),
         ];
         let (manifest, report) = apply(home.path(), &entries, &held, 1).expect("applied");
         assert_eq!(report.written, ["ok"]);
@@ -1694,7 +1722,7 @@ mod tests {
             .iter()
             .map(|(name, _)| name.as_str())
             .collect();
-        assert_eq!(failed, ["dir", "~/blocker/x"]);
+        assert_eq!(failed, ["dir", "~/.config/gh/hosts.yml"]);
         assert!(
             report.failed[0].1.contains("directory"),
             "{}",
@@ -1711,16 +1739,16 @@ mod tests {
             digest_hex(b"old"),
             "a failed entry keeps what the vault wrote"
         );
-        assert!(!manifest.files.contains_key("~/blocker/x"));
+        assert!(!manifest.files.contains_key("~/.config/gh/hosts.yml"));
     }
 
     #[test]
     fn a_dropped_name_whose_directory_is_now_a_file_is_forgotten() {
         let home = scratch();
-        let name = "~/.config/foo/token";
+        let name = "~/.config/gh/hosts.yml";
         let (held, _) =
             apply(home.path(), &[entry(name, b"v")], &Manifest::default(), 1).expect("first");
-        let foo = home.path().join(".config/foo");
+        let foo = home.path().join(".config/gh");
         std::fs::remove_dir_all(&foo).expect("rm");
         plant(&foo, b"a file now", 0o600);
         let (manifest, report) = apply(home.path(), &[], &held, 2).expect("dropped");
@@ -1745,49 +1773,215 @@ mod tests {
             .collect()
     }
 
+    /// Two names that fold alike are one file where the volume folds case, as macOS's does: the
+    /// classification compares names folded, so neither is written on any volume, and both are
+    /// reported with the other's name (DESIGN-claude-setup-token §3.1). One the vault wrote
+    /// before is left as it is, out of the manifest. NEGATIVE CONTROL ([`entry_class::UNFOLDED`],
+    /// names compared byte for byte): on a volume that folds case the first spelling is written
+    /// and the second fails on its file.
     #[test]
-    fn two_names_for_one_file_are_refused_where_the_volume_makes_them_one() {
+    fn a_folded_pair_writes_neither_name_and_reports_both() {
         let home = scratch();
         let secrets = home.path().join(".secrets");
         std::fs::create_dir(&secrets).expect("dir");
-        let (manifest, report) = apply(
-            home.path(),
-            &[entry("Tok", b"1"), entry("tok", b"2")],
-            &Manifest::default(),
-            1,
-        )
-        .expect("applied");
+        plant(&secrets.join("tok"), b"0", 0o600);
+        let held = Manifest {
+            files: BTreeMap::from([("tok".to_string(), digest_hex(b"0"))]),
+        };
+        let entries = [entry("Tok", b"1"), entry("bar", b"b"), entry("tok", b"2")];
+        let (manifest, report) = apply(home.path(), &entries, &held, 1).expect("applied");
+        assert_eq!(report.written, ["bar"]);
+        assert!(
+            report.failed.is_empty() && report.removed.is_empty(),
+            "{report:?}"
+        );
+        let refused: Vec<(&str, &str)> = report
+            .refused
+            .iter()
+            .map(|(name, why)| (name.as_str(), why.as_str()))
+            .collect();
+        assert_eq!(refused.len(), 2, "{refused:?}");
+        assert_eq!(refused[0].0, "Tok");
+        assert!(refused[0].1.contains("`Tok` and `tok`"), "{}", refused[0].1);
+        assert_eq!(refused[1].0, "tok");
+        assert!(refused[1].1.contains("`tok` and `Tok`"), "{}", refused[1].1);
+        assert_eq!(
+            read(&secrets.join("tok")),
+            b"0",
+            "neither written nor taken back"
+        );
+        assert_eq!(manifest.files.keys().collect::<Vec<_>>(), ["bar"]);
+
+        let unfolded = scratch();
+        let secrets = unfolded.path().join(".secrets");
+        std::fs::create_dir(&secrets).expect("dir");
+        entry_class::UNFOLDED.with(|on| on.set(true));
+        let applied = apply(unfolded.path(), &entries, &Manifest::default(), 1);
+        entry_class::UNFOLDED.with(|on| on.set(false));
+        let (_, report) = applied.expect("applied");
+        assert!(report.refused.is_empty(), "CONTROL: {report:?}");
         if folds_case(&secrets) {
-            assert_eq!(report.written, ["Tok"]);
-            assert_eq!(failed_names(&report), ["tok"]);
-            assert!(report.failed[0].1.contains("`Tok`"), "{:?}", report.failed);
-            assert_eq!(read(&secrets.join("Tok")), b"1");
-            assert_eq!(manifest.files.keys().collect::<Vec<_>>(), ["Tok"]);
+            assert_eq!(report.written, ["Tok", "bar"], "CONTROL");
+            assert_eq!(failed_names(&report), ["tok"], "CONTROL");
+            assert_eq!(read(&secrets.join("tok")), b"1", "CONTROL: one file");
         } else {
-            assert_eq!(report.written, ["Tok", "tok"]);
-            assert!(report.failed.is_empty());
-            assert_eq!(read(&secrets.join("Tok")), b"1");
-            assert_eq!(read(&secrets.join("tok")), b"2");
+            assert_eq!(report.written, ["Tok", "bar", "tok"], "CONTROL");
         }
     }
 
+    /// A case variant of release material (`GH_ACCESS_TOKEN_ALABSYSTEMS`) is set apart: never
+    /// written, reported refused, and the real entry is written to its file. NEGATIVE CONTROL
+    /// ([`entry_class::UNFOLDED`]): without the fold the variant is a name of its own, sorted
+    /// first as a merged view sorts names, and on a volume that folds case it overwrites the
+    /// real entry's file, which then fails as landing on the same file.
+    #[test]
+    fn a_case_variant_of_release_material_is_refused_and_the_real_entry_written() {
+        let variant = "GH_ACCESS_TOKEN_ALABSYSTEMS";
+        let entries = [
+            entry(variant, b"the variant"),
+            entry(entry_class::RELEASE_GH_TOKEN, b"the release token"),
+        ];
+        let home = scratch();
+        let (manifest, report) =
+            apply(home.path(), &entries, &Manifest::default(), 1).expect("applied");
+        let file = home
+            .path()
+            .join(".secrets")
+            .join(entry_class::RELEASE_GH_TOKEN);
+        assert_eq!(read(&file), b"the release token");
+        assert_eq!(report.written, [entry_class::RELEASE_GH_TOKEN]);
+        assert!(report.failed.is_empty(), "{report:?}");
+        assert_eq!(report.refused.len(), 1, "{report:?}");
+        assert_eq!(report.refused[0].0, variant);
+        assert!(
+            report.refused[0].1.contains("release material"),
+            "{}",
+            report.refused[0].1
+        );
+        assert_eq!(
+            manifest.files.keys().collect::<Vec<_>>(),
+            [entry_class::RELEASE_GH_TOKEN]
+        );
+
+        let unfolded = scratch();
+        entry_class::UNFOLDED.with(|on| on.set(true));
+        let applied = apply(unfolded.path(), &entries, &Manifest::default(), 1);
+        entry_class::UNFOLDED.with(|on| on.set(false));
+        let (_, report) = applied.expect("applied");
+        let secrets = unfolded.path().join(".secrets");
+        if folds_case(&secrets) {
+            assert_eq!(
+                read(&secrets.join(entry_class::RELEASE_GH_TOKEN)),
+                b"the variant",
+                "CONTROL: the variant overwrites the file"
+            );
+            assert_eq!(
+                failed_names(&report),
+                [entry_class::RELEASE_GH_TOKEN],
+                "CONTROL"
+            );
+        } else {
+            assert_eq!(report.written.len(), 2, "CONTROL: {report:?}");
+        }
+    }
+
+    /// Home paths aterm does not name are set apart: never written, a file of the Mac's own there
+    /// never moved aside or taken back, even one a build before the classification wrote and
+    /// named in its manifest, and each is reported refused. NEGATIVE CONTROL: the same value
+    /// under a shared name is written.
+    #[test]
+    fn a_home_path_aterm_does_not_name_is_never_written_nor_taken_back() {
+        const SET_APART: [&str; 4] = [
+            "~/.zshrc",
+            "~/Library/LaunchAgents/x.plist",
+            "~/.ssh/config",
+            "~/.config/git/hooks/x",
+        ];
+        let home = scratch();
+        let mut held = Manifest::default();
+        for (i, name) in SET_APART.iter().enumerate() {
+            let path = written_path(home.path(), name).expect("valid");
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
+            if i % 2 == 0 {
+                plant(&path, b"the vault's old copy", 0o600);
+                held.files
+                    .insert((*name).to_owned(), digest_hex(b"the vault's old copy"));
+            }
+        }
+        let mut entries: Vec<Entry> = SET_APART
+            .iter()
+            .map(|name| entry(name, b"runs on every Mac"))
+            .collect();
+        entries.push(entry("shared", b"runs on every Mac"));
+        for (entries, pass) in [(&entries[..], 1), (&[][..], 2)] {
+            let (manifest, report) = apply(home.path(), entries, &held, pass).expect("applied");
+            assert!(
+                report.removed.is_empty()
+                    && report.failed.is_empty()
+                    && report.moved_aside.is_empty(),
+                "{report:?}"
+            );
+            for (i, name) in SET_APART.iter().enumerate() {
+                let path = written_path(home.path(), name).expect("valid");
+                if i % 2 == 0 {
+                    assert_eq!(read(&path), b"the vault's old copy", "{name}");
+                } else {
+                    assert!(!path.exists(), "{name}");
+                }
+                assert!(!manifest.files.contains_key(*name), "{name}");
+            }
+            if pass == 1 {
+                let refused: Vec<&str> = report
+                    .refused
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect();
+                assert_eq!(refused, SET_APART);
+                assert!(
+                    report
+                        .refused
+                        .iter()
+                        .all(|(_, why)| why.contains("no vault writes")),
+                    "{:?}",
+                    report.refused
+                );
+                assert_eq!(report.written, ["shared"], "CONTROL");
+                assert_eq!(
+                    read(&home.path().join(".secrets/shared")),
+                    b"runs on every Mac",
+                    "CONTROL"
+                );
+            }
+        }
+    }
+
+    fn apple(home: &Path) -> PathBuf {
+        let dir = home.join(".aterm/apple");
+        std::fs::create_dir_all(&dir).expect("dir");
+        dir
+    }
     #[test]
     fn a_second_name_for_a_placed_file_is_refused_whatever_its_spelling() {
         let home = scratch();
-        let first = home.path().join("first");
+        let first = apple(home.path()).join("devid-first.key");
         plant(&first, b"v", 0o600);
-        std::fs::hard_link(&first, home.path().join("second")).expect("link");
+        std::fs::hard_link(&first, apple(home.path()).join("devid-second.key")).expect("link");
         let (manifest, report) = apply(
             home.path(),
-            &[entry("~/first", b"v"), entry("~/second", b"w")],
+            &[
+                entry("~/.aterm/apple/devid-first.key", b"v"),
+                entry("~/.aterm/apple/devid-second.key", b"w"),
+            ],
             &Manifest::default(),
             1,
         )
         .expect("applied");
-        assert_eq!(report.unchanged, ["~/first"]);
-        assert_eq!(failed_names(&report), ["~/second"]);
+        assert_eq!(report.unchanged, ["~/.aterm/apple/devid-first.key"]);
+        assert_eq!(failed_names(&report), ["~/.aterm/apple/devid-second.key"]);
         assert!(
-            report.failed[0].1.contains("`~/first`"),
+            report.failed[0]
+                .1
+                .contains("`~/.aterm/apple/devid-first.key`"),
             "{:?}",
             report.failed
         );
@@ -1799,25 +1993,33 @@ mod tests {
     #[test]
     fn a_dropped_name_for_another_entrys_file_is_never_wiped() {
         let home = scratch();
-        let old = home.path().join("old");
+        let old = apple(home.path()).join("devid-old.key");
         plant(&old, b"v", 0o600);
-        let new = home.path().join("new");
+        let new = apple(home.path()).join("devid-new.key");
         std::fs::hard_link(&old, &new).expect("link");
         let held = Manifest {
-            files: BTreeMap::from([("~/old".to_string(), digest_hex(b"v"))]),
+            files: BTreeMap::from([("~/.aterm/apple/devid-old.key".to_string(), digest_hex(b"v"))]),
         };
-        let (manifest, report) =
-            apply(home.path(), &[entry("~/new", b"v")], &held, 2).expect("applied");
-        assert_eq!(report.unchanged, ["~/new"]);
+        let (manifest, report) = apply(
+            home.path(),
+            &[entry("~/.aterm/apple/devid-new.key", b"v")],
+            &held,
+            2,
+        )
+        .expect("applied");
+        assert_eq!(report.unchanged, ["~/.aterm/apple/devid-new.key"]);
         assert!(report.removed.is_empty() && report.left.is_empty());
         assert_eq!(read(&new), b"v");
         assert_eq!(read(&old), b"v");
-        assert_eq!(manifest.files.keys().collect::<Vec<_>>(), ["~/new"]);
+        assert_eq!(
+            manifest.files.keys().collect::<Vec<_>>(),
+            ["~/.aterm/apple/devid-new.key"]
+        );
 
-        let kept = home.path().join("kept");
+        let kept = apple(home.path()).join("kept");
         std::fs::hard_link(&new, &kept).expect("link");
         let (_, report) = apply(home.path(), &[], &manifest, 3).expect("dropped");
-        assert_eq!(report.removed, ["~/new"]);
+        assert_eq!(report.removed, ["~/.aterm/apple/devid-new.key"]);
         assert!(!new.exists());
         assert_eq!(read(&kept), [0u8]);
     }
@@ -1870,14 +2072,14 @@ mod tests {
         std::fs::create_dir(secrets.join("dir")).expect("dir");
         let entries = [
             gap("~/.aterm/machine.key", b"the vault's"),
-            gap("~/.aterm/missing.key", b"filled"),
+            gap("~/.aterm/apple/devid-missing.key", b"filled"),
             gap("same", b"v"),
             gap("link", b"v"),
             gap("dir", b"v"),
         ];
         let (manifest, report) =
             apply(home.path(), &entries, &Manifest::default(), 3).expect("applied");
-        assert_eq!(report.written, ["~/.aterm/missing.key"]);
+        assert_eq!(report.written, ["~/.aterm/apple/devid-missing.key"]);
         assert_eq!(report.left, ["~/.aterm/machine.key", "same", "link", "dir"]);
         assert!(report.moved_aside.is_empty() && report.failed.is_empty());
         assert_eq!(read(&aterm.join("machine.key")), b"this machine's own");
@@ -1892,21 +2094,21 @@ mod tests {
             Kind::Symlink
         );
         assert_eq!(read(&elsewhere), b"linked");
-        assert_eq!(read(&aterm.join("missing.key")), b"filled");
-        assert_eq!(mode(&aterm.join("missing.key")), 0o600);
+        assert_eq!(read(&aterm.join("apple/devid-missing.key")), b"filled");
+        assert_eq!(mode(&aterm.join("apple/devid-missing.key")), 0o600);
         assert_eq!(
             manifest.files.keys().collect::<Vec<_>>(),
-            ["~/.aterm/missing.key"],
+            ["~/.aterm/apple/devid-missing.key"],
             "a file left alone is not the vault's"
         );
         assert!(!secrets.join(REPLACED_DIR).exists());
 
         let (again, report) = apply(home.path(), &entries, &manifest, 4).expect("again");
         assert_eq!(again, manifest);
-        assert_eq!(report.unchanged, ["~/.aterm/missing.key"]);
+        assert_eq!(report.unchanged, ["~/.aterm/apple/devid-missing.key"]);
         assert_eq!(report.left.len(), 4);
         let (last, report) = apply(home.path(), &[], &again, 5).expect("dropped");
-        assert_eq!(report.removed, ["~/.aterm/missing.key"]);
+        assert_eq!(report.removed, ["~/.aterm/apple/devid-missing.key"]);
         assert!(report.left.is_empty() && report.failed.is_empty());
         assert!(last.files.is_empty());
         assert_eq!(read(&aterm.join("machine.key")), b"this machine's own");
@@ -1967,17 +2169,20 @@ mod tests {
     #[test]
     fn an_if_absent_entry_cannot_claim_a_file_another_entry_placed() {
         let home = scratch();
-        let first = home.path().join("first");
+        let first = apple(home.path()).join("devid-first.key");
         plant(&first, b"v", 0o600);
-        std::fs::hard_link(&first, home.path().join("second")).expect("link");
+        std::fs::hard_link(&first, apple(home.path()).join("devid-second.key")).expect("link");
         let (_, report) = apply(
             home.path(),
-            &[entry("~/first", b"v"), gap("~/second", b"w")],
+            &[
+                entry("~/.aterm/apple/devid-first.key", b"v"),
+                gap("~/.aterm/apple/devid-second.key", b"w"),
+            ],
             &Manifest::default(),
             1,
         )
         .expect("applied");
-        assert_eq!(failed_names(&report), ["~/second"]);
+        assert_eq!(failed_names(&report), ["~/.aterm/apple/devid-second.key"]);
         assert!(report.left.is_empty());
     }
 
@@ -2284,7 +2489,7 @@ mod tests {
     fn a_file_the_vault_wrote_beside_an_anchor_it_cannot_look_at_stays_the_vaults() {
         let home = scratch();
         let outside = scratch();
-        let anchor = "~/link/key";
+        let anchor = "~/.config/gh/hosts.yml";
         let (held, report) = apply(
             home.path(),
             &[gap("profile", b"v1")],
@@ -2293,7 +2498,7 @@ mod tests {
         )
         .expect("first");
         assert_eq!(report.written, ["profile"]);
-        std::os::unix::fs::symlink(outside.path(), home.path().join("link")).expect("link");
+        std::os::unix::fs::symlink(outside.path(), home.path().join(".config")).expect("link");
         let entries = [gap(anchor, b"v2"), anchored("profile", b"v2", anchor)];
         let (manifest, report) = apply(home.path(), &entries, &held, 2).expect("unseen");
         assert!(report.failed.is_empty(), "{:?}", report.failed);
@@ -2353,13 +2558,13 @@ mod tests {
     fn an_anchor_the_machine_cannot_judge_fills_nothing() {
         let home = scratch();
         let outside = scratch();
-        std::os::unix::fs::symlink(outside.path(), home.path().join("link")).expect("link");
+        std::os::unix::fs::symlink(outside.path(), home.path().join(".config")).expect("link");
         let entries = [
             anchored("a", b"v", "missing"),
             entry("plain", b"v"),
             anchored("b", b"v", "plain"),
-            gap("~/link/key", b"v"),
-            anchored("c", b"v", "~/link/key"),
+            gap("~/.config/gh/hosts.yml", b"v"),
+            anchored("c", b"v", "~/.config/gh/hosts.yml"),
         ];
         let (manifest, report) =
             apply(home.path(), &entries, &Manifest::default(), 1).expect("applied");
@@ -2375,12 +2580,12 @@ mod tests {
             "{:?}",
             report.failed
         );
-        assert_eq!(report.left, ["~/link/key", "c"]);
+        assert_eq!(report.left, ["~/.config/gh/hosts.yml", "c"]);
         let secrets = home.path().join(".secrets");
         for name in ["a", "b", "c"] {
             assert!(!secrets.join(name).exists(), "{name}");
         }
-        assert!(!outside.path().join("key").exists());
+        assert!(!outside.path().join("gh/hosts.yml").exists());
         assert_eq!(manifest.files.keys().collect::<Vec<_>>(), ["plain"]);
     }
 
@@ -2391,19 +2596,20 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), home.path().join(".aterm")).expect("link");
         let real = home.path().join("real");
         std::fs::create_dir_all(real.join("deep")).expect("dir");
-        std::fs::create_dir(home.path().join("a")).expect("dir");
-        std::os::unix::fs::symlink(real.join("deep"), home.path().join("a/b")).expect("link");
+        std::fs::create_dir(home.path().join("company-life")).expect("dir");
+        std::os::unix::fs::symlink(real.join("deep"), home.path().join("company-life/config"))
+            .expect("link");
         let entries = [
-            entry("~/.aterm/release.toml", b"v"),
-            entry("~/a/b/c/x", b"v"),
-            entry("~/a/fine", b"v"),
+            entry("~/.aterm/machine.toml", b"v"),
+            entry(SITE_DEPLOYER_KEY, b"v"),
+            entry("~/.config/gh/hosts.yml", b"v"),
         ];
         let (manifest, report) =
             apply(home.path(), &entries, &Manifest::default(), 1).expect("applied");
-        assert_eq!(report.written, ["~/a/fine"]);
+        assert_eq!(report.written, ["~/.config/gh/hosts.yml"]);
         assert_eq!(
             failed_names(&report),
-            ["~/.aterm/release.toml", "~/a/b/c/x"]
+            ["~/.aterm/machine.toml", SITE_DEPLOYER_KEY]
         );
         let aterm = home.path().join(".aterm").display().to_string();
         assert!(report.failed[0].1.contains(&aterm), "{:?}", report.failed);
@@ -2412,50 +2618,69 @@ mod tests {
             "{:?}",
             report.failed
         );
-        let b = home.path().join("a/b").display().to_string();
+        let b = home
+            .path()
+            .join("company-life/config")
+            .display()
+            .to_string();
         assert!(report.failed[1].1.contains(&b), "{:?}", report.failed);
-        assert!(!outside.path().join("release.toml").exists());
+        assert!(!outside.path().join("machine.toml").exists());
         assert!(
-            !real.join("deep/c").exists(),
+            !real.join("deep/local").exists(),
             "no directory made through the link"
         );
-        assert_eq!(manifest.files.keys().collect::<Vec<_>>(), ["~/a/fine"]);
+        assert_eq!(
+            manifest.files.keys().collect::<Vec<_>>(),
+            ["~/.config/gh/hosts.yml"]
+        );
 
-        plant(&outside.path().join("old.toml"), b"o", 0o600);
+        plant(
+            &outside.path().join("release-credentials.toml"),
+            b"o",
+            0o600,
+        );
         let held = Manifest {
-            files: BTreeMap::from([("~/.aterm/old.toml".to_string(), digest_hex(b"o"))]),
+            files: BTreeMap::from([(
+                "~/.aterm/release-credentials.toml".to_string(),
+                digest_hex(b"o"),
+            )]),
         };
         let (manifest, report) = apply(home.path(), &[], &held, 2).expect("dropped");
-        assert_eq!(report.left, ["~/.aterm/old.toml"]);
+        assert_eq!(report.left, ["~/.aterm/release-credentials.toml"]);
         assert!(report.removed.is_empty() && report.failed.is_empty());
         assert_eq!(manifest, held, "still what the vault wrote");
-        assert_eq!(read(&outside.path().join("old.toml")), b"o");
+        assert_eq!(read(&outside.path().join("release-credentials.toml")), b"o");
         let (again, report) = apply(home.path(), &[], &manifest, 3).expect("again");
-        assert_eq!(report.left, ["~/.aterm/old.toml"]);
+        assert_eq!(report.left, ["~/.aterm/release-credentials.toml"]);
         assert_eq!(again, held, "kept however many syncs meet the link");
 
         std::fs::remove_file(home.path().join(".aterm")).expect("unlink");
         std::fs::create_dir(home.path().join(".aterm")).expect("dir");
-        plant(&home.path().join(".aterm/old.toml"), b"o", 0o600);
+        plant(
+            &home.path().join(".aterm/release-credentials.toml"),
+            b"o",
+            0o600,
+        );
         let (last, report) = apply(home.path(), &[], &again, 4).expect("reached");
-        assert_eq!(report.removed, ["~/.aterm/old.toml"]);
+        assert_eq!(report.removed, ["~/.aterm/release-credentials.toml"]);
         assert!(report.left.is_empty());
         assert!(last.files.is_empty());
-        assert!(!home.path().join(".aterm/old.toml").exists());
+        assert!(!home.path().join(".aterm/release-credentials.toml").exists());
     }
 
     #[test]
     fn aterms_own_directory_by_another_spelling_is_refused() {
         let home = scratch();
-        let real = home.path().join("dotfiles/config");
-        let own = real.join("aterm/secrets");
+        // aterm's own directory is the site deployer key's, by a link in its own place.
+        let own = home.path().join("company-life/config/local");
         std::fs::create_dir_all(&own).expect("dir");
-        std::os::unix::fs::symlink(&real, home.path().join(".config")).expect("link");
+        std::fs::create_dir_all(home.path().join(".config/aterm")).expect("dir");
+        std::os::unix::fs::symlink(&own, home.path().join(".config/aterm/secrets")).expect("link");
         plant(&own.join("identity"), b"the machine key", 0o600);
-        let name = "~/dotfiles/config/aterm/secrets/identity";
+        let name = SITE_DEPLOYER_KEY;
         let (manifest, report) = apply(
             home.path(),
-            &[entry(name, b"v"), entry("~/dotfiles/x", b"v")],
+            &[entry(name, b"v"), entry("~/.config/gh/hosts.yml", b"v")],
             &Manifest::default(),
             1,
         )
@@ -2466,10 +2691,13 @@ mod tests {
             "{:?}",
             report.failed
         );
-        assert_eq!(report.written, ["~/dotfiles/x"]);
+        assert_eq!(report.written, ["~/.config/gh/hosts.yml"]);
         assert!(report.moved_aside.is_empty());
         assert_eq!(read(&own.join("identity")), b"the machine key");
-        assert_eq!(manifest.files.keys().collect::<Vec<_>>(), ["~/dotfiles/x"]);
+        assert_eq!(
+            manifest.files.keys().collect::<Vec<_>>(),
+            ["~/.config/gh/hosts.yml"]
+        );
 
         let held = Manifest {
             files: BTreeMap::from([(name.to_string(), digest_hex(b"the machine key"))]),
@@ -2488,7 +2716,12 @@ mod tests {
         let secrets = home.path().join(".secrets");
         std::os::unix::fs::symlink(&real, &secrets).expect("link");
         plant(&real.join("dropped"), b"d", 0o600);
-        plant(&home.path().join("foreign"), b"hand-made", 0o600);
+        std::fs::create_dir_all(home.path().join(".config/git")).expect("dir");
+        plant(
+            &home.path().join(".config/git/credentials"),
+            b"hand-made",
+            0o600,
+        );
         let held = Manifest {
             files: BTreeMap::from([
                 ("a".to_string(), digest_hex(b"old")),
@@ -2497,12 +2730,12 @@ mod tests {
         };
         let entries = [
             entry("a", b"v"),
-            entry("~/fine", b"v"),
-            entry("~/foreign", b"v"),
+            entry("~/.config/gh/hosts.yml", b"v"),
+            entry("~/.config/git/credentials", b"v"),
         ];
         let (manifest, report) = apply(home.path(), &entries, &held, 1).expect("applied");
-        assert_eq!(report.written, ["~/fine"]);
-        assert_eq!(failed_names(&report), ["a", "~/foreign"]);
+        assert_eq!(report.written, ["~/.config/gh/hosts.yml"]);
+        assert_eq!(failed_names(&report), ["a", "~/.config/git/credentials"]);
         for (_, why) in &report.failed {
             assert!(
                 why.contains(&secrets.display().to_string()) && why.contains("symlink"),
@@ -2515,7 +2748,7 @@ mod tests {
         assert!(!real.join(REPLACED_DIR).exists());
         assert_eq!(read(&real.join("dropped")), b"d");
         assert_eq!(
-            read(&home.path().join("foreign")),
+            read(&home.path().join(".config/git/credentials")),
             b"hand-made",
             "not overwritten when it cannot be moved aside"
         );
@@ -2554,58 +2787,81 @@ mod tests {
         plant(&real.join("gh_token"), b"theirs", 0o600);
         let deep = home.path().join("deep");
         std::fs::create_dir(&deep).expect("dir");
-        plant(&deep.join("c"), b"theirs", 0o600);
-        std::fs::create_dir(home.path().join("a")).expect("dir");
-        std::os::unix::fs::symlink(&deep, home.path().join("a/b")).expect("link");
-        let target = home.path().join("target");
-        std::fs::create_dir(&target).expect("dir");
-        plant(&target.join("x"), b"v", 0o600);
-        std::os::unix::fs::symlink(&target, home.path().join("link")).expect("link");
-        plant(&deep.join("d"), b"held", 0o600);
+        plant(&deep.join("config"), b"theirs", 0o600);
+        std::fs::create_dir(home.path().join(".config")).expect("dir");
+        std::os::unix::fs::symlink(&deep, home.path().join(".config/git")).expect("link");
+        let target = home.path().join(".aterm/release-ring/roster");
+        std::fs::create_dir_all(&target).expect("dir");
+        plant(&target.join("aterm-machines.toml"), b"v", 0o600);
+        std::os::unix::fs::symlink(&target, home.path().join(".aterm/roster")).expect("link");
+        plant(&deep.join("credentials"), b"held", 0o600);
         let entries = [
             gap("gh_token", b"vault"),
-            gap("~/a/b/c", b"vault"),
-            gap("~/a/b/d", b"vault"),
-            entry("~/link/x", b"v"),
-            entry("~/target/x", b"v"),
+            gap("~/.config/git/config", b"vault"),
+            gap("~/.config/git/credentials", b"vault"),
+            entry("~/.aterm/roster/aterm-machines.toml", b"v"),
+            entry("~/.aterm/release-ring/roster/aterm-machines.toml", b"v"),
         ];
         let held = Manifest {
-            files: BTreeMap::from([("~/a/b/d".to_string(), digest_hex(b"held"))]),
+            files: BTreeMap::from([("~/.config/git/credentials".to_string(), digest_hex(b"held"))]),
         };
         let (manifest, report) = apply(home.path(), &entries, &held, 1).expect("applied");
-        assert_eq!(failed_names(&report), ["gh_token", "~/link/x"]);
-        for ((_, why), link) in report.failed.iter().zip([".secrets", "link"]) {
+        assert_eq!(
+            failed_names(&report),
+            ["gh_token", "~/.aterm/roster/aterm-machines.toml"]
+        );
+        for ((_, why), link) in report.failed.iter().zip([".secrets", ".aterm/roster"]) {
             let link = home.path().join(link).display().to_string();
             assert!(why.contains(&link) && why.contains("symlink"), "{why}");
         }
-        assert_eq!(report.left, ["~/a/b/c", "~/a/b/d"]);
-        assert_eq!(report.unchanged, ["~/target/x"]);
+        assert_eq!(
+            report.left,
+            ["~/.config/git/config", "~/.config/git/credentials"]
+        );
+        assert_eq!(
+            report.unchanged,
+            ["~/.aterm/release-ring/roster/aterm-machines.toml"]
+        );
         assert_eq!(
             manifest.files,
-            BTreeMap::from([("~/a/b/d".to_string(), digest_hex(b"held"))]),
+            BTreeMap::from([("~/.config/git/credentials".to_string(), digest_hex(b"held"))]),
             "the vault's file behind the link stays the vault's"
         );
         assert_eq!(read(&real.join("gh_token")), b"theirs");
-        assert_eq!(read(&deep.join("c")), b"theirs");
-        assert_eq!(read(&deep.join("d")), b"held");
+        assert_eq!(read(&deep.join("config")), b"theirs");
+        assert_eq!(read(&deep.join("credentials")), b"held");
     }
 
     #[test]
     fn a_dropped_name_for_a_file_a_refused_entry_names_is_kept() {
         let home = scratch();
-        let real = home.path().join("real");
-        std::fs::create_dir(&real).expect("dir");
-        plant(&real.join("x"), b"v", 0o600);
-        std::os::unix::fs::symlink(&real, home.path().join("link")).expect("link");
+        let real = home.path().join(".aterm/release-ring/roster");
+        std::fs::create_dir_all(&real).expect("dir");
+        plant(&real.join("aterm-machines.toml"), b"v", 0o600);
+        std::os::unix::fs::symlink(&real, home.path().join(".aterm/roster")).expect("link");
         let held = Manifest {
-            files: BTreeMap::from([("~/real/x".to_string(), digest_hex(b"v"))]),
+            files: BTreeMap::from([(
+                "~/.aterm/release-ring/roster/aterm-machines.toml".to_string(),
+                digest_hex(b"v"),
+            )]),
         };
-        let (manifest, report) =
-            apply(home.path(), &[entry("~/link/x", b"w")], &held, 2).expect("applied");
-        assert_eq!(failed_names(&report), ["~/link/x"]);
-        assert_eq!(report.left, ["~/real/x"]);
+        let (manifest, report) = apply(
+            home.path(),
+            &[entry("~/.aterm/roster/aterm-machines.toml", b"w")],
+            &held,
+            2,
+        )
+        .expect("applied");
+        assert_eq!(
+            failed_names(&report),
+            ["~/.aterm/roster/aterm-machines.toml"]
+        );
+        assert_eq!(
+            report.left,
+            ["~/.aterm/release-ring/roster/aterm-machines.toml"]
+        );
         assert!(report.removed.is_empty());
-        assert_eq!(read(&real.join("x")), b"v");
+        assert_eq!(read(&real.join("aterm-machines.toml")), b"v");
         assert_eq!(manifest, held);
     }
 
@@ -2642,31 +2898,6 @@ mod tests {
             assert_eq!(a, aside_name(&one, now), "deterministic");
             assert!(a.starts_with("~%2Fcccc"), "{a}");
             assert!(a.ends_with(&format!(".{now}")), "{a}");
-        }
-
-        let home = scratch();
-        let target = target_path(home.path(), &one).expect("valid");
-        std::fs::create_dir_all(target.parent().expect("parent")).expect("dirs");
-        for (round, before) in [(0, b"first".as_slice()), (1, b"second".as_slice())] {
-            plant(&target, before, 0o600);
-            let (_, report) = apply(
-                home.path(),
-                &[entry(&one, b"vault")],
-                &Manifest::default(),
-                9,
-            )
-            .expect("applied");
-            let base = home
-                .path()
-                .join(".secrets/.replaced")
-                .join(aside_name(&one, 9));
-            let want = if round == 0 {
-                base
-            } else {
-                PathBuf::from(format!("{}.1", base.display()))
-            };
-            assert_eq!(report.moved_aside, [(one.clone(), want.clone())]);
-            assert_eq!(read(&want), before);
         }
     }
 

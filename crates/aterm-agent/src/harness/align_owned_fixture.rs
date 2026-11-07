@@ -21,7 +21,7 @@ pub(in crate::harness) struct Born {
 
 impl Born {
     /// `pid` as it reads now; `None` once it is gone.
-    fn of(pid: i32) -> Option<Self> {
+    pub(in crate::harness) fn of(pid: i32) -> Option<Self> {
         read_identity(pid).map(|now| Self {
             pid,
             birth: now.birth,

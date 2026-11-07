@@ -156,7 +156,7 @@ impl Kernel for DeferredFacts {
         _: &RestartCommand,
         facts: &ColdEnvironmentFacts,
     ) -> Result<(RestartCommand, Arc<dyn ColdProof>), String> {
-        assert!(facts.default_home && facts.stored_login);
+        assert!(facts.default_home && facts.route.is_stored());
         self.resolution_calls.fetch_add(1, Ordering::SeqCst);
         Ok((
             self.command.clone(),
@@ -204,7 +204,7 @@ fn deferred_resolution_keeps_the_prepare_and_requires_its_selected_identity_at_e
             login: None,
             home: None,
             auth_observed: false,
-            stored_login: true,
+            route: aterm_agent::harness::accounts::AuthRoute::Stored,
             conversation: Some("captured-conversation".into()),
             profile: None,
             mode: aterm_agent::harness::accounts::Mode::Wall,

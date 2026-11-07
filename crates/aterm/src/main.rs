@@ -218,7 +218,7 @@ fn run_init(entry: InitEntry) -> ExitCode {
         full_disk_access: &|| None,
         records: &aterm_machines::init::NoRecords,
         grants: aterm_machines::init::no_grants,
-        workstation_check: &|| {
+        workstation_check: &|_| {
             aterm_machines::init::WorkstationObservation::Unavailable("macOS only".into())
         },
         walk: &|_| None,
@@ -739,9 +739,9 @@ fn front_door_main(argv: Vec<OsString>, lab_window_guarded: bool) -> ExitCode {
         aterm_agent::members_cli::bootstrap_from_members(paths, current)
     });
     #[cfg(all(unix, not(target_os = "macos")))]
-    aterm_secrets::client::on_subscriber_inputs(converge_inputs::observe);
+    aterm_secrets::client::on_convergence_inputs(converge_inputs::observe);
     #[cfg(target_os = "macos")]
-    aterm_secrets::client::on_subscriber_inputs(input_attachments::subscriber_inputs);
+    aterm_secrets::client::on_convergence_inputs(input_attachments::convergence_inputs);
     #[cfg(target_os = "macos")]
     aterm_secrets::client::on_bootstrap_allowed(|_| {
         aterm_cli::macos_doctor::automatic_vault_bootstrap_allowed()

@@ -1023,6 +1023,8 @@ mod test_fork_settle;
 mod test_scratch;
 #[cfg(test)]
 mod test_socket;
+/// The vault token facts the window shows, and the quiet offer's step (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.9).
+mod token_shown;
 mod toolbar;
 #[cfg(target_os = "macos")]
 mod toolbar_drive;
@@ -13891,40 +13893,12 @@ impl App {
                         .map(|session| (session.id, session.pid))
                         .collect()
                 });
-        if fresh.is_empty() {
-            return;
+        if !fresh.is_empty() {
+            self.mark_status_dirty();
         }
-        for prompt in &fresh {
-            self.post_consent_notification(&self.consent_prompt_notice(prompt));
-        }
-        self.mark_status_dirty();
     }
 
-    fn consent_prompt_notice(
-        &self,
-        prompt: &consent_observer::ObservedPrompt,
-    ) -> consent_observer::AttentionNotice {
-        let mut notice = prompt.notice();
-        let title = {
-            let store = self.store.read().unwrap_or_else(|p| p.into_inner());
-            store.by_local(prompt.session).map(|h| {
-                let user_title = h
-                    .ctx
-                    .meta
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .user_title
-                    .clone();
-                user_title.unwrap_or_else(|| h.title.clone())
-            })
-        };
-        if let Some(title) = title {
-            notice.body = status_item::tab_body(&title, &notice.body);
-        }
-        notice
-    }
-
-    /// Fold one observed consent fact through the rate-limiting gate and act on what it decides.
+    /// Fold one observed consent fact through the attention gate and act on what it decides.
     pub(crate) fn note_consent_attention(&mut self, event: consent_observer::AttentionEvent) {
         let outcome = self
             .consent_attention
@@ -13935,9 +13909,6 @@ impl App {
             && self.consent_attention.mark_session(session, Instant::now())
         {
             self.refresh_consent_tab_attention();
-        }
-        if let Some(notice) = &outcome.notice {
-            self.post_consent_notification(notice);
         }
         if outcome.refresh_status_item {
             // The menu-bar renderer rebuilds only if something moved.
@@ -14006,24 +13977,6 @@ impl App {
     fn on_consent_probe_ready(&mut self, now: Instant) {
         self.recover_consent_tab_attention();
         self.tick_macos_access_card(now);
-    }
-
-    fn post_consent_notification(&self, notice: &consent_observer::AttentionNotice) {
-        if !self.config.desktop_alerts_or_default() {
-            aterm_log::debug!(
-                "consent notification for session {} not posted: desktop_alerts is off",
-                notice.session
-            );
-            return;
-        }
-        let message = crate::notify::NotifyMsg::consent(notice);
-        match self.session_factory.notify_tx.try_send(message) {
-            Ok(()) => {}
-            Err(std::sync::mpsc::TrySendError::Full(dropped))
-            | Err(std::sync::mpsc::TrySendError::Disconnected(dropped)) => {
-                aterm_log::debug!("consent notification not delivered: {}", dropped.body);
-            }
-        }
     }
 
     #[inline]

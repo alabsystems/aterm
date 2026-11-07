@@ -39,6 +39,9 @@ mod account_observation;
 #[path = "native_account_claim.rs"]
 mod account_claim;
 
+#[path = "native_account_fence.rs"]
+mod account_fence;
+
 #[path = "native_account_retention.rs"]
 mod account_retention;
 use account_retention::{AccountLineages, AccountSlot};
@@ -274,7 +277,8 @@ pub(crate) struct Operations {
     coordinated_connections: std::collections::BTreeSet<u64>,
     coordinated_actors: Vec<(u32, u64)>,
     builtin_coordinated: bool,
-    reservations: std::collections::BTreeSet<String>,
+    reservations: BTreeMap<String, Option<aterm_agent::harness::native_account_wire::Relation>>,
+    account_fences: BTreeMap<String, aterm_agent::harness::native_account_wire::Relation>,
     cancelled: BTreeMap<String, CancelledPrepare>,
     receipt_flights: BTreeMap<String, usize>,
     account_lineages: AccountLineages,
@@ -297,7 +301,7 @@ impl Operations {
             .saturating_add(
                 self.cancelled
                     .keys()
-                    .filter(|id| !self.reservations.contains(*id))
+                    .filter(|id| !self.reservations.contains_key(*id))
                     .count(),
             )
             .saturating_add(self.account_lineages.spares())
@@ -325,7 +329,7 @@ impl Operations {
             .cancelled
             .iter()
             .filter(|(id, seal)| {
-                seal.request.deadline_us <= now_us && !self.reservations.contains(*id)
+                seal.request.deadline_us <= now_us && !self.reservations.contains_key(*id)
             })
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
@@ -464,12 +468,24 @@ impl Drop for ReceiptFlight<'_> {
 }
 
 impl<'a> PrepareSlot<'a> {
+    #[cfg(test)]
     fn reserve(
         ctx: &'a crate::SessionCtx,
         id: &str,
         now_us: u64,
         crash: bool,
         account: AccountSlot,
+    ) -> Result<Self, String> {
+        Self::reserve_relation(ctx, id, now_us, crash, account, None)
+    }
+
+    fn reserve_relation(
+        ctx: &'a crate::SessionCtx,
+        id: &str,
+        now_us: u64,
+        crash: bool,
+        account: AccountSlot,
+        relation: Option<&aterm_agent::harness::native_account_wire::Relation>,
     ) -> Result<Self, String> {
         let (retired, result) = {
             let mut table = ctx
@@ -492,7 +508,8 @@ impl<'a> PrepareSlot<'a> {
             let result = if unresolved {
                 Err("ERR busy unresolved native operation\n".into())
             } else if table.by_id.contains_key(id)
-                || table.reservations.contains(id)
+                || table.reservations.contains_key(id)
+                || table.account_fences.contains_key(id)
                 || table.cancelled.contains_key(id)
             {
                 Err("ERR busy native operation prepare\n".into())
@@ -502,7 +519,7 @@ impl<'a> PrepareSlot<'a> {
                     .account_lineages
                     .reserve(&account, id, occupied)
                     .map(|()| {
-                        table.reservations.insert(id.to_string());
+                        table.reservations.insert(id.to_string(), relation.cloned());
                     })
             };
             (retired, result)
@@ -1041,6 +1058,12 @@ enum Phase {
 /// Process/image facts are injected in conformance tests; the production arm reads the
 /// kernel, never a caller's holder, argv text, pathname alone or status-as-permission.
 trait Kernel {
+    fn fence_account_claim(
+        &self,
+        _relation: &aterm_agent::harness::native_account_wire::Relation,
+    ) -> Option<account_fence::FenceRecord> {
+        None
+    }
     fn record_account_closure(
         &self,
         _prepare: &Prepare,
@@ -1137,6 +1160,34 @@ trait Kernel {
 struct System<'a>(&'a crate::native_session_policy::SessionPolicy, bool);
 
 impl Kernel for System<'_> {
+    fn fence_account_claim(
+        &self,
+        relation: &aterm_agent::harness::native_account_wire::Relation,
+    ) -> Option<account_fence::FenceRecord> {
+        #[cfg(unix)]
+        {
+            use aterm_agent::harness::native_receipts;
+            let record =
+                native_receipts::fence_account_successor(native_receipts::AccountRelation {
+                    predecessor: relation.predecessor().prepare(),
+                    predecessor_binding: relation.predecessor().binding(),
+                    phase: relation.phase(),
+                    candidate: relation.candidate(),
+                })
+                .ok()?;
+            (record.outcome == native_receipts::AccountOutcome::Fenced).then_some(
+                account_fence::FenceRecord {
+                    sequence: record.sequence,
+                    recorded_ms: record.recorded_ms,
+                },
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = relation;
+            None
+        }
+    }
     fn record_account_closure(
         &self,
         prepare: &Prepare,
@@ -1339,7 +1390,7 @@ impl Kernel for System<'_> {
         intent: &aterm_agent::harness::accounts_pool::ExecutionIntent,
     ) -> Result<Option<aterm_agent::harness::accounts_pool::ExecutionGuard>, ()> {
         use aterm_agent::harness::{accounts, accounts_pool};
-        if !matches!(intent, accounts_pool::ExecutionIntent::Stored { .. }) {
+        if !seat_admitted(intent) {
             return Err(());
         }
         let home = aterm_primer::home_dir().ok_or(())?;
@@ -1377,12 +1428,22 @@ impl Kernel for System<'_> {
                 .ok()
                 .zip(std::fs::canonicalize(&home).ok())
                 .is_some_and(|(actual, expected)| actual == expected);
-        if !intent.matches_process(&who, same_user_home) {
+        // Only a token route asks which entry the intent's account owns.
+        let owner_entry = match who.route {
+            accounts::AuthRoute::VaultToken { .. } => {
+                accounts::Roster::load(&accounts::default_roster_path().ok_or(())?)
+                    .ok()
+                    .and_then(|roster| intent.owner_entry(&roster))
+            }
+            accounts::AuthRoute::Stored | accounts::AuthRoute::Outside => None,
+        };
+        if !intent.matches_process(&who, same_user_home, owner_entry) {
             return Err(());
         }
         if matches!(intent, accounts_pool::ExecutionIntent::External { .. }) {
-            if !who.stored_login {
-                return Ok(None);
+            match who.route {
+                accounts::AuthRoute::Outside => return Ok(None),
+                accounts::AuthRoute::Stored | accounts::AuthRoute::VaultToken { .. } => {}
             }
             let mut directories = Vec::new();
             if let Some(custom) = args
@@ -1516,6 +1577,18 @@ impl Kernel for System<'_> {
     }
     fn record_key(&self, ctx: &crate::SessionCtx) -> Option<String> {
         current_conversation(ctx)
+    }
+}
+
+/// Whether an intent is one [`Kernel::account_admission`] admits through the account seat
+/// (`accounts_pool::admit_execution`): a stored login, or the account's vault token, which
+/// admission holds to its row's custody and its standing in use here
+/// (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.2). An external route is admitted apart.
+fn seat_admitted(intent: &aterm_agent::harness::accounts_pool::ExecutionIntent) -> bool {
+    use aterm_agent::harness::accounts_pool::ExecutionIntent;
+    match intent {
+        ExecutionIntent::Stored { .. } | ExecutionIntent::Token { .. } => true,
+        ExecutionIntent::External { .. } => false,
     }
 }
 
@@ -1854,7 +1927,10 @@ fn cancel_prepare(
     }
     // A pending reservation already owns this id's bounded slot. Publishing the seal
     // leaves that reservation live so neither its late worker nor pressure can erase it.
-    if !table.reservations.contains(&request.id) && table.slots() >= MAX_COMPLETED {
+    if table.account_fences.contains_key(&request.id) {
+        return UNKNOWN.into();
+    }
+    if !table.reservations.contains_key(&request.id) && table.slots() >= MAX_COMPLETED {
         return "ERR busy native operation history\n".into();
     }
     table.cancelled.insert(
@@ -2085,7 +2161,14 @@ fn prepare_inner(
     );
     let account_slot =
         AccountSlot::for_request(&request, &caller, renewal.is_some(), account.as_ref());
-    let mut slot = match PrepareSlot::reserve(ctx, &request.id, now, crash, account_slot) {
+    let mut slot = match PrepareSlot::reserve_relation(
+        ctx,
+        &request.id,
+        now,
+        crash,
+        account_slot,
+        account.as_ref().map(AccountContinuation::relation),
+    ) {
         Ok(slot) => slot,
         Err(refusal) => return refusal,
     };
@@ -2476,7 +2559,7 @@ fn image_outcome(op: &Operation, master: i32, phase: ImagePhase, kernel: &dyn Ke
             && actual.parent == shell.pid
             && actual.group == child.process.group
             && actual.session == child.process.session
-            && actual.image == command.image
+            && actual.image == *command.settled()
             && kernel.process(shell.pid).as_ref() == Some(shell)
             && kernel.foreground(master) == Some(actual.group);
     }

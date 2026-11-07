@@ -229,7 +229,7 @@ pub(crate) enum Vault {
         entries: usize,
         follows: Follows,
         /// Entries saved with different values while apart, by name.
-        conflicts: Vec<String>,
+        conflicts: Vec<aterm_secrets::client::Conflict>,
     },
     /// The latest envelope has no locker for this machine and it is not [`Vault::Dropped`]: an
     /// act it can read took it out, or its log does not say a rotation left it out on purpose
@@ -497,14 +497,28 @@ pub(crate) fn vault_area(vault: &Vault, setup: &Setup) -> Area {
         } => {
             let says = format!("{name}: in, {entries} entries");
             if !conflicts.is_empty() {
+                let (plain, tokens) = aterm_secrets::client::Conflict::split(conflicts);
+                let set = "pick each value with `aterm secrets set <name>`";
+                let pick = match (plain.is_empty(), tokens.is_empty()) {
+                    (_, true) => set.to_owned(),
+                    (true, false) => aterm_secrets::client::TOKEN_CONFLICT_PICK.to_owned(),
+                    (false, false) => {
+                        format!("{set}; {}", aterm_secrets::client::TOKEN_CONFLICT_PICK)
+                    }
+                };
                 return Area::due(
                     NAME,
                     format!(
                         "{says}; saved with different values while apart: {}",
-                        conflicts.join(", ")
+                        plain
+                            .iter()
+                            .chain(&tokens)
+                            .copied()
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     ),
                     Who::Person,
-                    "pick each value with `aterm secrets set <name>`",
+                    pick,
                 );
             }
             match follows {
